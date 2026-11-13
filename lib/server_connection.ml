@@ -76,7 +76,9 @@ type t =
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
 let is_active t = not (Queue.is_empty t.request_queue)
 let current_reqd_exn t = Queue.peek t.request_queue
-let yield_reader t k = Reader.on_wakeup t.reader k
+
+let yield_reader t k =
+  if Reader.is_closed t.reader then k () else Reader.on_wakeup t.reader k
 
 let wakeup_reader t =
   (if is_active t
@@ -89,7 +91,9 @@ let wakeup_reader t =
      Reqd.flush_request_body reqd);
   Reader.wakeup t.reader
 
-let yield_writer t k = Writer.on_wakeup t.writer k
+let yield_writer t k =
+  if Writer.is_closed t.writer then k () else Writer.on_wakeup t.writer k
+
 let wakeup_writer t = Writer.wakeup t.writer
 
 let default_error_handler ?request:_ error handle =
@@ -117,6 +121,10 @@ let shutdown_writer t =
        fail? *)
     Reqd.fail_request_body reqd;
     Reqd.flush_response_body reqd);
+  (match t.error_code with
+  | Error { response_state; _ } ->
+    Response_state.flush_response_body response_state
+  | No_error -> ());
   Writer.close t.writer;
   wakeup_writer t
 
@@ -127,9 +135,11 @@ let shutdown t =
   shutdown_reader t;
   shutdown_writer t
 
-let upgrade t impl =
+let upgrade t (Runtime.Impl ((module P), p) as impl) =
+  let eof = Reader.is_closed t.reader in
   t.upgraded <- Some impl;
-  shutdown t
+  shutdown t;
+  if eof then ignore (P.read_eof p Bigstringaf.empty ~off:0 ~len:0 : int)
 
 let create
       ?(config = Config.default)
@@ -191,6 +201,11 @@ let set_error_and_handle ?request t error =
       t.error_code <- Error { request; response_state = Waiting };
       (match
          t.error_handler ?request error (fun headers ->
+           (match t.error_code with
+           | Error { response_state = Waiting; _ } -> ()
+           | Error _ | No_error ->
+             failwith
+               "ache.Server_connection.error_handler: response already started");
            let response, encoding =
              (* If we haven't parsed the request method, just use GET as a
                 standard placeholder. The method is only used for edge cases,

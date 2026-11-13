@@ -309,16 +309,16 @@ let report_error t error =
     | exception _ ->
       Body.Reader.fail t.request_body;
       Writer.close_and_drain t.writer;
+      Response_state.flush_response_body t.response_state;
       Reader.force_close t.reader;
       Reader.wakeup t.reader)
   | other ->
     Body.Reader.fail t.request_body;
     (match other with
-    | Waiting, `Exn _ ->
-      (* XXX(seliopou): Decide what to do in this unlikely case. There is an *
-         outstanding call to the [error_handler], but an intervening exception *
-         has been reported as well. *)
-      failwith "ache.Reqd.report_exn: NYI"
+    | Waiting, _ ->
+      Writer.close_and_drain t.writer;
+      Reader.force_close t.reader;
+      Reader.wakeup t.reader
     | Streaming (_response, response_body), `Ok ->
       Body.Writer.force_close response_body;
       Body.Writer.close_and_drain response_body;
@@ -327,7 +327,7 @@ let report_error t error =
       Writer.close_and_drain t.writer;
       Body.Writer.close_and_drain response_body;
       Reader.wakeup t.reader
-    | (Fixed _ | Streaming _ | Upgrade _ | Waiting), _ ->
+    | (Fixed _ | Streaming _ | Upgrade _), _ ->
       (* XXX(seliopou): Once additional logging support is added, log the error
        * in case it is not spurious. *)
       ())
@@ -364,10 +364,12 @@ let input_state t : Io_state.t =
   | Upgrade _, _ -> Wait
   | Waiting, _
     when Reader.may_switch_protocols t.request
-         && Body.Reader.is_closed t.request_body ->
+         && Body.Reader.is_closed t.request_body
+         && not (Reader.is_closed t.reader) ->
     Wait
   | (Fixed response | Streaming (response, _)), `CONNECT
-    when Status.is_successful response.status ->
+    when Status.is_successful response.status && not (Reader.is_closed t.reader)
+    ->
     Wait
   | _ ->
     if Body.Reader.is_closed t.request_body

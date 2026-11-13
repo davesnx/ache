@@ -481,7 +481,8 @@ module Server_connection : sig
       in a response to [HEAD], and a body without [Content-Length] ends when
       the connection closes. When [error_handler] raises, for example because
       the head it gives is invalid, the connection drops its pending output
-      and closes.
+      and closes. Its response function raises [Failure] when called a second
+      time.
 
       After a request that may switch protocols ([CONNECT], or an [Upgrade]
       field with the [upgrade] connection option), the connection reads
@@ -489,7 +490,11 @@ module Server_connection : sig
       (RFC 9110 §7.8, §9.3.6). After a 101 response, or a 2xx response to
       [CONNECT], those bytes are not read as HTTP: a 101 hands them to the
       new protocol. After any other response, they are read as the next
-      request.
+      request. When the input ends before a 101 is written, the new protocol
+      gets end of input after the switch.
+
+      Requests are still read and dispatched after the write side has
+      closed; use [?idle_timeout] in the runtimes to bound an idle peer.
 
       When the response is complete and no read is scheduled on the request
       body, the connection reads the rest of the body to find the next
@@ -632,12 +637,16 @@ module Client_connection : sig
 
       A request is written right away, or after the requests before it: it is
       pipelined behind a request with an idempotent method (RFC 9110 §9.2.2)
-      whose request has been sent, and it waits behind any other request until
+      whose request has been sent, and it waits behind any other request, and
+      behind a request that may switch protocols ([CONNECT], or [Upgrade] with
+      the [upgrade] connection option), until
       that request's response is complete (RFC 9112 §9.3.2). When a response
       ends the connection ([Connection: close], an HTTP/1.0 response without
       keep-alive or with [Transfer-Encoding], or both [Content-Length] and
       [Transfer-Encoding]), the connection stops writing, also in the middle of
-      a request body, and the later requests get [`Connection_closed].
+      a request body, and the later requests get [`Connection_closed]. A
+      request made after the connection stopped writing gets
+      [`Connection_closed] before [request] returns.
 
       Response bytes that arrive when no request waits for a response close the
       connection. Empty lines before a response are discarded.
