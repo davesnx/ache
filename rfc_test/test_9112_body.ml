@@ -187,8 +187,7 @@ let request_framing_tests =
            ; [ "chunked"; "gzip" ]
            ; [ "chunked, chunked, identity" ]
            ])
-  ; known_failure
-      ~ticket:"05"
+  ; test
       "§6.1 server SHOULD: unknown coding before chunked gets 400 or 501"
       (fun () ->
          List.iter
@@ -208,8 +207,7 @@ let request_framing_tests =
            let s = Server.run (post [ te v ] "3\r\nabc\r\n0\r\n\r\n" ^ next) in
            check_head_rejected ~allowed:[ 400; 501 ] v s)
         [ "chunked;foo=bar"; "chunked; q=1" ])
-  ; known_failure
-      ~ticket:"05"
+  ; test
       "§6.1 server MUST: close after a request with both Content-Length and \
        Transfer-Encoding"
       (fun () ->
@@ -238,8 +236,7 @@ let request_framing_tests =
            ; [ cl "0"; te "chunked" ]
            ; [ cl "100"; te "chunked" ]
            ])
-  ; known_failure
-      ~ticket:"05"
+  ; test
       "§6.1 server MUST: HTTP/1.0 request with Transfer-Encoding closes the \
        connection"
       (fun () ->
@@ -262,7 +259,16 @@ let request_framing_tests =
                       "/next")
               in
               (match Server.statuses s with
-              | [ 400 ] | [ 200 ] -> ()
+              | [ 400 ] ->
+                Alcotest.(check int)
+                  "handler not called"
+                  0
+                  (Server.handler_calls s)
+              | [ 200 ] ->
+                Alcotest.(check (list string))
+                  "body read by Transfer-Encoding"
+                  [ "abc" ]
+                  (bodies s)
               | l ->
                 Alcotest.failf "expected [400] or [200], got [%s]" (codes l));
               check_not_dispatched "/next" s;
@@ -275,8 +281,7 @@ let request_framing_tests =
            (fun v ->
               check_head_rejected v (Server.run (post [ cl v ] "abc" ^ next)))
            [ "abc"; "-1"; ""; "1 2"; "3, 4"; "3,4"; "3;"; "3 3" ])
-  ; known_failure
-      ~ticket:"05"
+  ; test
       "§6.3 server MUST: 400 then close for a Content-Length that is not \
        1*DIGIT"
       (fun () ->
@@ -945,7 +950,7 @@ let incomplete_tests =
            ; "3"
            ])
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"25"
       "§8 server MUST: an incomplete request body is not reported as complete"
       (fun () ->
          List.iter

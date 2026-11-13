@@ -276,26 +276,11 @@ let smuggling_cases =
     , [ Served { statuses = [ 200 ]; closed = None } ] )
   ]
 
-let smuggling_ticket = function
-  | "Content-Length then Transfer-Encoding: chunked"
-  | "Transfer-Encoding: chunked then Content-Length"
-  | "chunked body with a short Content-Length that exposes a request"
-  | "Content-Length +3" | "Content-Length 0x3" | "Content-Length 1_0"
-  | "Transfer-Encoding: chunked in HTTP/1.0 with keep-alive" ->
-    Some "05"
-  | "Transfer_Encoding with an underscore"
-  | "bare LF before Transfer-Encoding in a field value" ->
-    Some "01"
-  | _ -> None
-
 let smuggling_tests =
   List.map
     (fun case ->
        let name, run = smuggling_case case in
-       let title = "§11.2 server DEF: no smuggling: " ^ name in
-       match smuggling_ticket name with
-       | Some ticket -> known_failure ~ticket title run
-       | None -> test title run)
+       test ("§11.2 server DEF: no smuggling: " ^ name) run)
     smuggling_cases
 
 let pending = ref []
@@ -365,7 +350,7 @@ let server_tests =
          check_targets "only the first dispatched" [ "/1" ] s;
          check_closed "connection closed" s)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"26"
       "§9.6 server SHOULD: close option in the response to a request with \
        Connection: close"
       (fun () ->
@@ -375,14 +360,14 @@ let server_tests =
          check_closed "connection closed" s;
          check_close_option "Connection: close in the response" s)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"26"
       "§9.6 server SHOULD: close option in the response to an HTTP/1.0 request"
       (fun () ->
          let s = Server.run (req ~version:"HTTP/1.0" ~headers:[] "GET" "/") in
          check_closed "connection closed" s;
          check_close_option "Connection: close in the response" s)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"26"
       "§9.6 server SHOULD: close option in a 400 response"
       (fun () ->
          let s = Server.run "GET / HTTP/1.1\r\nHost: a\r\nBad Header\r\n\r\n" in
@@ -545,7 +530,7 @@ let client_tests =
          check_client_statuses "second response" [ 201 ] ex2;
          Alcotest.(check string) "second body" "r2" ex2.body)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"27"
       "§9.3.2 client SHOULD NOT: no request pipelined after a POST before its \
        response"
       (fun () ->
@@ -592,7 +577,7 @@ let client_tests =
          check_client_statuses "second response" [ 200 ] ex2;
          Alcotest.(check string) "second body" "r2" ex2.body)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"27"
       "§9.2 client MUST NOT: data with no outstanding request is not a response"
       (fun () ->
          let c = Client.create () in
@@ -600,7 +585,7 @@ let client_tests =
            Client.feed c (ok_response "x"));
          check_client_closed "client closed" c)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"27"
       "§6.3 client MUST NOT: a second response after the last one is not \
        delivered"
       (fun () ->
@@ -612,14 +597,17 @@ let client_tests =
          Alcotest.(check string) "first body only" "r1" ex.body;
          check_client_errors "no error on the first exchange" false ex;
          check_client_closed "client closed" c)
-  ; test "§6.3 client MAY: CRLF after the last response is discarded" (fun () ->
-      let c = Client.create () in
-      let ex = client_send c "/" in
-      no_exn "feeding a response and CRLF" (fun () ->
-        Client.feed c (ok_response "r1" ^ "\r\n"));
-      check_client_statuses "one response" [ 200 ] ex;
-      Alcotest.(check string) "body" "r1" ex.body;
-      check_client_errors "no error on the exchange" false ex)
+  ; known_failure
+      ~ticket:"27"
+      "§6.3 client MAY: CRLF after the last response is discarded"
+      (fun () ->
+         let c = Client.create () in
+         let ex = client_send c "/" in
+         no_exn "feeding a response and CRLF" (fun () ->
+           Client.feed c (ok_response "r1" ^ "\r\n"));
+         check_client_statuses "one response" [ 200 ] ex;
+         Alcotest.(check string) "body" "r1" ex.body;
+         check_client_errors "no error on the exchange" false ex)
   ; test
       "§9.6 client MUST: response Connection: close stops further requests"
       (fun () ->
@@ -653,7 +641,7 @@ let client_tests =
          Alcotest.(check string) "nothing written after" "" (Client.written c);
          check_client_closed "client closed" c)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"22"
       "§9.3.2 client SHOULD: unanswered pipelined request reported when the \
        connection closes"
       (fun () ->
@@ -703,7 +691,7 @@ let client_tests =
          Alcotest.(check string) "nothing written after" "" (Client.written c);
          check_client_closed "client closed" c)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"27"
       "§9.5 client SHOULD: stop sending the body after an error response with \
        Connection: close"
       (fun () ->

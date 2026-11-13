@@ -160,8 +160,7 @@ let tests =
   ; test
       "§2.2 server MAY: bare LF ending the request-line gets 400 and close"
       (fun () -> check_rejected (serve "GET / HTTP/1.1\nHost: a\n\n"))
-  ; known_failure
-      ~ticket:"01"
+  ; test
       "§2.2 server MAY: bare LF ending a field line gets 400 and close"
       (fun () ->
          check_rejected_each
@@ -169,8 +168,7 @@ let tests =
            ; "GET / HTTP/1.1\r\nHost: a\n\r\n"
            ; "GET / HTTP/1.1\r\nHost: a\r\n\n"
            ])
-  ; known_failure
-      ~ticket:"01"
+  ; test
       "§2.2 client MAY: bare LF line endings are a malformed response"
       (fun () ->
          List.iter
@@ -198,18 +196,13 @@ let tests =
   ; test "§2.2 server MUST: bare CR before a line end gets 400" (fun () ->
       check_rejected_each
         [ "GET / HTTP/1.1\r\r\nHost: a\r\n\r\n"; host_request "Host: a\r\r\n" ])
-  ; known_failure
-      ~ticket:"01"
-      "§2.2 server MUST: bare CR in the method or target gets 400"
-      (fun () ->
-         check_rejected_each
-           [ "G\rET / HTTP/1.1\r\nHost: a\r\n\r\n"
-           ; "GET /a\rb HTTP/1.1\r\nHost: a\r\n\r\n"
-           ])
-  ; known_failure
-      ~ticket:"02"
-      "§2.2 server MUST: bare CR in a field name gets 400"
-      (fun () -> check_rejected_each [ host_request "Host: a\r\nX\rY: 1\r\n" ])
+  ; test "§2.2 server MUST: bare CR in the method or target gets 400" (fun () ->
+      check_rejected_each
+        [ "G\rET / HTTP/1.1\r\nHost: a\r\n\r\n"
+        ; "GET /a\rb HTTP/1.1\r\nHost: a\r\n\r\n"
+        ])
+  ; test "§2.2 server MUST: bare CR in a field name gets 400" (fun () ->
+      check_rejected_each [ host_request "Host: a\r\nX\rY: 1\r\n" ])
   ; test "§2.2 server MUST: bare CR in a field value gets 400" (fun () ->
       check_rejected_each [ host_request "Host: a\r\nX: a\rb\r\n" ])
   ; test
@@ -220,8 +213,7 @@ let tests =
            [ "HTTP/1.1 200 O\rK\r\nContent-Length: 0\r\n\r\n"
            ; "HTTP/1.1 200\r OK\r\nContent-Length: 0\r\n\r\n"
            ])
-  ; known_failure
-      ~ticket:"02"
+  ; test
       "§2.2 client MUST: bare CR in a field name is a malformed response"
       (fun () ->
          check_malformed
@@ -247,12 +239,10 @@ let tests =
          Host: a\r\n\
          \r\n"
         (Client.written c))
-  ; known_failure
-      ~ticket:"new"
+  ; test
       "§2.2 server SHOULD: one empty line before the request-line is ignored"
       (fun () -> check_accepted ~target:"/" ("\r\n" ^ get "/"))
-  ; known_failure
-      ~ticket:"new"
+  ; test
       "§2.2 server SHOULD: an empty line between pipelined requests is ignored"
       (fun () ->
          let s = serve (get "/a" ^ "\r\n" ^ get "/b") in
@@ -262,8 +252,7 @@ let tests =
            "methods"
            [ `GET; `GET ]
            (List.map (fun (r : Request.t) -> r.meth) (Server.requests s)))
-  ; known_failure
-      ~ticket:"new"
+  ; test
       "§2.2 server SHOULD: two empty lines before the request-line are ignored \
        or get 400"
       (fun () ->
@@ -309,8 +298,7 @@ let tests =
          in
          check "server" (server_writes [ " X-A", "1" ] ());
          check "client" (client_writes ~headers:[ "\tX-A", "1" ] "/"))
-  ; known_failure
-      ~ticket:"01"
+  ; test
       "§2.2 server SHOULD: 400 and close for octets that are not HTTP"
       (fun () ->
          check_rejected_each
@@ -337,8 +325,7 @@ let tests =
         ; "GET /a b HTTP/1.1\r\nHost: a\r\n\r\n"
         ; "GET /\r\nHost: a\r\n\r\n"
         ])
-  ; known_failure
-      ~ticket:"01"
+  ; test
       "§3 server SHOULD: 400 for a missing version, empty method or empty \
        target"
       (fun () ->
@@ -375,14 +362,14 @@ let tests =
          in
          check_status "501" [ 501 ] s)
   ; known_failure
-      ~ticket:"03"
+      ~ticket:"23"
       "§3 server SHOULD: 501 for a method longer than the head limit"
       (fun () ->
          check_rejected
            ~allowed:[ 501 ]
            (serve (req (String.make 20000 'M') "/")))
   ; known_failure
-      ~ticket:"03"
+      ~ticket:"23"
       "§3 server MUST: 414 for a request-target longer than the head limit"
       (fun () ->
          let config = { Config.default with max_header_size = 1024 } in
@@ -441,40 +428,34 @@ let tests =
          Alcotest.check meth "method" `OPTIONS (only_request s).meth;
          Alcotest.check strings "target" [ "*" ] (targets s))
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"23"
       "§3.2 server SHOULD: 400 for asterisk-form or authority-form outside \
        OPTIONS and CONNECT"
       (fun () ->
          check_rejected_each
            [ req "GET" "*"; req "GET" "127.0.0.1:80"; req "POST" "[::1]:8080" ])
-  ; known_failure
-      ~ticket:"04"
-      "§3.2 server MUST: 400 for an HTTP/1.1 request without Host"
-      (fun () -> check_rejected (serve (host_request "")))
+  ; test "§3.2 server MUST: 400 for an HTTP/1.1 request without Host" (fun () ->
+      check_rejected (serve (host_request "")))
   ; test
       "§3.2 server MUST: an HTTP/1.0 request without Host is accepted"
       (fun () ->
          check_accepted ~target:"/" (host_request ~version:"HTTP/1.0" ""))
-  ; known_failure
-      ~ticket:"04"
-      "§3.2 server MUST: 400 for more than one Host field line"
-      (fun () ->
-         check_rejected_each
-           (List.concat_map
-              (fun version ->
-                 [ host_request ~version "Host: a\r\nHost: a\r\n"
-                 ; host_request ~version "Host: a\r\nHost: b\r\n"
-                 ; host_request ~version "Host: a\r\nhost: a\r\n"
-                 ])
-              [ "HTTP/1.1"; "HTTP/1.0" ]))
-  ; known_failure
-      ~ticket:"04"
+  ; test "§3.2 server MUST: 400 for more than one Host field line" (fun () ->
+      check_rejected_each
+        (List.concat_map
+           (fun version ->
+              [ host_request ~version "Host: a\r\nHost: a\r\n"
+              ; host_request ~version "Host: a\r\nHost: b\r\n"
+              ; host_request ~version "Host: a\r\nhost: a\r\n"
+              ])
+           [ "HTTP/1.1"; "HTTP/1.0" ]))
+  ; test
       "§3.2 server MUST: 400 for a Host field with an invalid value"
       (fun () ->
          check_rejected_each
            (List.map
               (fun v -> host_request ("Host: " ^ v ^ "\r\n"))
-              [ "a b"; "a/b"; "a@b"; "a:port"; "a?b"; "a#b"; "[::1"; "a,b" ]))
+              [ "a b"; "a/b"; "a@b"; "a:port"; "a?b"; "a#b"; "[::1" ]))
   ; test
       "§3.2 server DEF: valid Host values are accepted, including empty"
       (fun () ->
@@ -488,6 +469,7 @@ let tests =
            ; "127.0.0.1:80"
            ; "[::1]:443"
            ; "xn--d-1ga.example"
+           ; "a,b"
            ])
   ; test
       "§4 client DEF: an empty reason-phrase after the SP is accepted"
@@ -586,7 +568,7 @@ let tests =
            abc"
         ])
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"24"
       "§5.2 client MUST: obs-fold in a response is replaced with SP"
       (fun () ->
          let ex =
