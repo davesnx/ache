@@ -31,6 +31,8 @@
 
 type error =
   [ `Bad_request
+  | `Not_implemented
+  | `Http_version_not_supported
   | `Bad_gateway
   | `Internal_server_error
   | `Request_header_fields_too_large

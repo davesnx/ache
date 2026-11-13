@@ -53,27 +53,21 @@ let long_target = "/" ^ String.make 7999 'a'
 let tests =
   [ test "§7.6.1 server DEF: Connection: close ends the connection" (fun () ->
       served_then_closed "close" ())
-  ; known_failure
-      ~ticket:"05"
+  ; test
       "§7.6.1 server DEF: connection option close matched case-insensitively"
       (fun () ->
          served_then_closed "Close" ();
          served_then_closed "CLOSE" ())
-  ; known_failure
-      ~ticket:"05"
+  ; test
       "§7.6.1 server DEF: close found in a list of connection options"
       (fun () ->
          served_then_closed "keep-alive, close" ();
          served_then_closed "close, upgrade" ();
          served_then_closed "foo ,close" ())
-  ; known_failure
-      ~ticket:"05"
-      "§7.6.1 server DEF: close found among empty list elements"
-      (fun () ->
-         served_then_closed ", close" ();
-         served_then_closed "close ," ())
-  ; known_failure
-      ~ticket:"05"
+  ; test "§7.6.1 server DEF: close found among empty list elements" (fun () ->
+      served_then_closed ", close" ();
+      served_then_closed "close ," ())
+  ; test
       "§7.6.1 server DEF: close in the first of two Connection field lines"
       (fun () ->
          let s =
@@ -95,15 +89,13 @@ let tests =
          served_and_kept_open "upgrade" ();
          served_and_kept_open "closed" ();
          served_and_kept_open "x-close" ())
-  ; known_failure
-      ~ticket:"05"
+  ; test
       "§7.6.1 server DEF: HTTP/1.0 Keep-Alive option matched case-insensitively"
       (fun () -> served_and_kept_open ~version:"HTTP/1.0" "Keep-Alive" ())
   ; test
       "§7.6.1 client DEF: response Connection: close closes the client"
       (fun () -> client_closes_after "close" ())
-  ; known_failure
-      ~ticket:"05"
+  ; test
       "§7.6.1 client DEF: response connection option close matched \
        case-insensitively and in a list"
       (fun () ->

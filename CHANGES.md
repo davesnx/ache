@@ -52,6 +52,42 @@ ache Unreleased
   parse. httpun consumed up to the last complete header line, or up to the
   failure position. An incomplete head that follows a complete message in the
   same read is still not consumed.
+- Request line: the method is a non-empty token, the request-target is
+  non-empty with no CTL. A request line without a version gets 400; httpun
+  waited for more input. HTTP/1.x with x > 1 is processed as HTTP/1.1 and
+  keeps its minor version in `Request.t`. Other major versions get the new
+  `` `Http_version_not_supported `` case of `Reqd.error` (505). A response
+  with a major version other than 1 is a malformed response. One CRLF before
+  the request line is ignored (RFC 9112 §2.2).
+- Field lines in requests, responses and trailers: the field name is a
+  non-empty token directly followed by `:`; the value and the reason phrase
+  accept only HTAB, SP, VCHAR and obs-text. httpun accepted any name byte
+  except whitespace and `:`, and NUL, bare LF and other CTLs in values.
+- The server answers 400 to an HTTP/1.1 request without Host, a request with
+  more than one Host field line, and a Host value that is not
+  `uri-host [":" port]`: a reg-name or IPv4 address, or an IP-literal in
+  brackets, then an optional `:` and digits (RFC 9112 §3.2, RFC 3986 §3.2).
+- The server answers 400 to a CONNECT request whose target is not
+  `host:port` with a non-empty host and a port of 0 to 65535 (RFC 9110
+  §9.3.6).
+- A request that the server rejects after earlier pipelined requests gets its
+  error response after the responses to those requests, and the connection
+  closes, also when both requests arrive in one read. httpun's
+  `Server_connection` asserts that no parsed request comes with an error while
+  an earlier request is active.
+- Request body framing: Content-Length is a list of `1*DIGIT` values that must
+  all be equal; httpun accepted `+3`, `0x3`, `1_0` and `0o3`. This applies to
+  responses too. A request with both Content-Length and Transfer-Encoding, or
+  an HTTP/1.0 request with Transfer-Encoding, gets 400 and the connection
+  closes. chunked must be the final transfer coding, read across all
+  Transfer-Encoding field lines, and appear once; otherwise 400. Any other
+  transfer coding gets the new `` `Not_implemented `` case of `Reqd.error`
+  (501). `Request.body_length` returns `` `Error `Bad_request `` for a request
+  with both Content-Length and Transfer-Encoding, so
+  `Client_connection.request` raises `Failure` for it.
+- Connection options are matched case-insensitively in every list member of
+  every Connection field line: `Connection: Close` and
+  `Connection: keep-alive, close` close the connection.
 
 httpun history
 ==============

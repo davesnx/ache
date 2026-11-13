@@ -73,13 +73,10 @@ let tests =
                 name
                 (Method.to_string (`Other name)))
            [ "PATCH"; "M-SEARCH"; "PROPFIND"; "X_Custom.1~!" ])
-  ; known_failure
-      ~ticket:"01"
-      "§9.1 server DEF: method with a non-tchar byte gets 400"
-      (fun () ->
-         List.iter
-           (fun name -> check_bad_request ~msg:name (Server.run (req name "/")))
-           [ "GE(T"; "GE\"T"; "GE,T"; "GE/T"; "GE:T"; "G\x7fET" ])
+  ; test "§9.1 server DEF: method with a non-tchar byte gets 400" (fun () ->
+      List.iter
+        (fun name -> check_bad_request ~msg:name (Server.run (req name "/")))
+        [ "GE(T"; "GE\"T"; "GE,T"; "GE/T"; "GE:T"; "G\x7fET" ])
   ; test "§9.1 server MUST: GET and HEAD are supported" (fun () ->
       let s =
         Server.run
@@ -289,8 +286,7 @@ let tests =
               Alcotest.check meth target `CONNECT r.meth;
               Alcotest.(check string) "target" target r.target)
            [ "example.com:443"; "example.com:80"; "[::1]:8080" ])
-  ; known_failure
-      ~ticket:"18"
+  ; test
       "§9.3.6 server MUST: 400 for CONNECT with an empty or invalid port"
       (fun () ->
          List.iter

@@ -37,6 +37,8 @@ type request_handler = Reqd.t -> unit
 type error =
   [ `Bad_gateway
   | `Bad_request
+  | `Not_implemented
+  | `Http_version_not_supported
   | `Internal_server_error
   | `Request_header_fields_too_large
   | `Exn of exn
@@ -267,40 +269,32 @@ let rec _next_read_operation t =
            case, we need to return that exception and signal the runtime to *
            close. *)
         (match Reader.next t.reader with
-        | `Error _ as operation -> operation
+        | `Error _ as operation
+          when not (Body.Reader.is_closed (Reqd.request_body reqd)) ->
+          operation
         | _ -> `Yield))
     | Ready -> Reader.next t.reader
     | Complete -> _final_read_operation_for t reqd
 
 and _final_read_operation_for t reqd =
-  if Reader.is_closed t.reader || not (Reqd.persistent_connection reqd)
+  if not (Reqd.persistent_connection reqd)
   then (
     shutdown_reader t;
-    Reader.next t.reader)
+    match Reader.next t.reader with
+    | `Error _ -> `Close
+    | operation -> operation)
   else
-    match Reqd.output_state reqd with
-    | Wait | Ready -> `Yield
-    | Complete ->
-      (* The "final read" operation for a request descriptor that is *
-         `Complete` from both input and output perspectives needs to account *
-         for the fact that the reader may not have finished reading the *
-         request body. * It's important that we don't advance the request queue
-         in this case * for persistent connections, or we'd break the invariant
-         that a * non-empty `request_queue` has had the request handler called
-         on its * head element. *)
-      (match Reader.next t.reader with
-      | `Error _ as op ->
-        (* Keep reading when in a "partial" state (`Read). * Don't advance the
-           request queue if in an error state. *)
-        op
-      | `Read as op ->
-        (* we just don't advance the request queue in the case of a parser
-           error. *)
-        advance_request_queue t;
-        op
-      | _ ->
-        advance_request_queue t;
-        _next_read_operation t)
+    match Reader.next t.reader, Reqd.output_state reqd with
+    | `Close, _ ->
+      shutdown_reader t;
+      `Close
+    | _, (Wait | Ready) -> `Yield
+    | `Read, Complete ->
+      advance_request_queue t;
+      `Read
+    | (`Start | `Error _), Complete ->
+      advance_request_queue t;
+      _next_read_operation t
 
 let next_read_operation t =
   match _next_read_operation t with
@@ -310,8 +304,8 @@ let next_read_operation t =
   | `Error `Header_too_large ->
     set_error_and_handle t `Request_header_fields_too_large;
     `Close
-  | `Error (`Bad_request request) ->
-    set_error_and_handle ~request t `Bad_request;
+  | `Error (`Invalid_request (request, error)) ->
+    set_error_and_handle ~request t (error :> error);
     `Close
   | `Start | `Read -> `Read
   | (`Yield | `Close) as operation -> operation
@@ -336,10 +330,11 @@ let rec _next_write_operation t =
       Writer.next t.writer
     | Error { request; response_state } ->
       (match
+         (* RFC 9110 §9.3.6: only a 2xx response to CONNECT starts a tunnel. *)
          let request_method =
-           Option.value
-             ~default:`GET
-             (Option.map (fun (t : Request.t) -> t.meth) request)
+           match request with
+           | None | Some { Request.meth = `CONNECT; _ } -> `GET
+           | Some { Request.meth; _ } -> meth
          in
          Response_state.output_state
            response_state
@@ -383,12 +378,9 @@ and _final_write_operation_for t reqd =
       wakeup_reader t;
       Writer.next t.writer
     | Complete ->
-      (match Reader.next t.reader with
-      | `Error _ -> Writer.next t.writer
-      | _ ->
-        advance_request_queue t;
-        wakeup_reader t;
-        _next_write_operation t)
+      advance_request_queue t;
+      wakeup_reader t;
+      _next_write_operation t
 
 let next_write_operation t = _next_write_operation t
 let report_write_result t result = Writer.report_result t.writer result

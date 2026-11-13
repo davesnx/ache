@@ -4,6 +4,8 @@ let iovecs_to_string = Helpers.Write_operation.iovecs_to_string
 
 let error_to_string = function
   | `Bad_request -> "Bad_request"
+  | `Not_implemented -> "Not_implemented"
+  | `Http_version_not_supported -> "Http_version_not_supported"
   | `Bad_gateway -> "Bad_gateway"
   | `Internal_server_error -> "Internal_server_error"
   | `Request_header_fields_too_large -> "Request_header_fields_too_large"
@@ -225,11 +227,15 @@ let test_get () = check_server ~expect:[ get_summary, "" ] get
 
 let test_post_fixed () =
   check_server
-    ~expect:[ {|"POST" "/p" HTTP/1.1 ["Content-Length":"11"]|}, "hello world" ]
-    "POST /p HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world"
+    ~expect:
+      [ ( {|"POST" "/p" HTTP/1.1 ["Host":"a";"Content-Length":"11"]|}
+        , "hello world" )
+      ]
+    "POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 11\r\n\r\nhello world"
 
 let chunked_post =
   "POST /c HTTP/1.1\r\n\
+   Host: a\r\n\
    Transfer-Encoding: chunked\r\n\
    \r\n\
    5;name=value;flag\r\n\
@@ -244,7 +250,8 @@ let chunked_post =
 let test_post_chunked () =
   check_server
     ~expect:
-      [ {|"POST" "/c" HTTP/1.1 ["Transfer-Encoding":"chunked"]|}, "hello world"
+      [ ( {|"POST" "/c" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}
+        , "hello world" )
       ]
     chunked_post
 
@@ -252,9 +259,9 @@ let test_pipelined () =
   check_server
     ~expect:
       [ get_summary, ""
-      ; {|"POST" "/p" HTTP/1.1 ["Content-Length":"3"]|}, "abc"
+      ; {|"POST" "/p" HTTP/1.1 ["Host":"a";"Content-Length":"3"]|}, "abc"
       ]
-    (get ^ "POST /p HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc")
+    (get ^ "POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc")
 
 let test_pipelined_incomplete_head_unconsumed () =
   let s = server () in
@@ -269,10 +276,10 @@ let test_pipelined_incomplete_head_unconsumed () =
   in
   Alcotest.(check int) "consumed" (String.length get) consumed;
   s.feeder.pending <- "GET /b";
-  Feeder.feed s.feeder " HTTP/1.1\r\n\r\n";
+  Feeder.feed s.feeder " HTTP/1.1\r\nHost: a\r\n\r\n";
   Alcotest.(check (list request_body))
     "both requests"
-    [ get_summary, ""; {|"GET" "/b" HTTP/1.1 []|}, "" ]
+    [ get_summary, ""; {|"GET" "/b" HTTP/1.1 ["Host":"a"]|}, "" ]
     (List.rev s.requests)
 
 let test_response_fixed () =
@@ -321,9 +328,9 @@ let test_crlf_across_reads () =
        (List.init (String.length head) Fun.id))
 
 let head_of_size n =
-  let base = "GET / HTTP/1.1\r\nX: \r\n\r\n" in
+  let base = "GET / HTTP/1.1\r\nHost: a\r\nX: \r\n\r\n" in
   let pad = n - String.length base in
-  "GET / HTTP/1.1\r\nX: " ^ String.make pad 'v' ^ "\r\n\r\n"
+  "GET / HTTP/1.1\r\nHost: a\r\nX: " ^ String.make pad 'v' ^ "\r\n\r\n"
 
 let test_head_limit () =
   let config = { Config.default with max_header_size = 100 } in
@@ -363,7 +370,9 @@ let test_head_limit_client () =
 
 let test_chunk_line_limit () =
   let config = { Config.default with max_header_size = 64 } in
-  let head = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" in
+  let head =
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+  in
   let request line_size =
     head ^ "5;" ^ String.make (line_size - 4) 'x' ^ "\r\nhello\r\n0\r\n\r\n"
   in
@@ -373,7 +382,9 @@ let test_chunk_line_limit () =
        Alcotest.(check (list string)) "line at the limit" [] s.errors;
        Alcotest.(check (list request_body))
          "body"
-         [ {|"POST" "/" HTTP/1.1 ["Transfer-Encoding":"chunked"]|}, "hello" ]
+         [ ( {|"POST" "/" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}
+           , "hello" )
+         ]
          s.requests)
     (all_splits (request 64));
   List.iter
@@ -387,7 +398,7 @@ let test_chunk_line_limit () =
 
 let test_large_header_small_reads () =
   let value = String.make (6 * 1024) 'v' in
-  let input = "GET / HTTP/1.1\r\nX-Big: " ^ value ^ "\r\n\r\n" in
+  let input = "GET / HTTP/1.1\r\nHost: a\r\nX-Big: " ^ value ^ "\r\n\r\n" in
   let s = server () in
   List.iter
     (fun chunk ->
@@ -396,7 +407,7 @@ let test_large_header_small_reads () =
     (sized 4096 input);
   Alcotest.(check (list request_body))
     "6 KiB header through 4096-byte reads"
-    [ Printf.sprintf {|"GET" "/" HTTP/1.1 ["X-Big":%S]|} value, "" ]
+    [ Printf.sprintf {|"GET" "/" HTTP/1.1 ["Host":"a";"X-Big":%S]|} value, "" ]
     s.requests;
   Alcotest.(check int) "consumed" (String.length input) s.feeder.consumed
 
@@ -413,6 +424,7 @@ let test_chunk_size_overflow () =
   let s =
     run_server
       [ "POST / HTTP/1.1\r\n\
+         Host: a\r\n\
          Transfer-Encoding: chunked\r\n\
          \r\n\
          7fffffffffffffff\r\n\
@@ -424,11 +436,14 @@ let test_chunk_size_overflow () =
   Alcotest.(check (list string)) "400" [ "Bad_request" ] s.errors;
   Alcotest.(check (list request_body))
     "no body bytes"
-    [ {|"POST" "/" HTTP/1.1 ["Transfer-Encoding":"chunked"]|}, "" ]
+    [ {|"POST" "/" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}, "" ]
     s.requests
 
-let chunked_head = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
-let chunked_summary = {|"POST" "/" HTTP/1.1 ["Transfer-Encoding":"chunked"]|}
+let chunked_head =
+  "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+let chunked_summary =
+  {|"POST" "/" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}
 
 let test_chunk_size_leading_zeros () =
   check_server
@@ -457,7 +472,9 @@ let test_chunk_size_leading_zeros () =
     [ "10000000000000000"; "7fffffffffffffff"; "ffffffffffffffff" ]
 
 let test_eof_states () =
-  let chunked = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" in
+  let chunked =
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+  in
   List.iter
     (fun (name, input) ->
        List.iter
@@ -466,7 +483,8 @@ let test_eof_states () =
             Alcotest.(check (list string)) name [ "Bad_request" ] s.errors)
          (all_splits input))
     [ "mid-head", "GET / HTTP/1.1\r\nHost: a\r\n"
-    ; "mid-fixed-body", "POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nhello"
+    ; ( "mid-fixed-body"
+      , "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nhello" )
     ; "mid-chunk-size", chunked ^ "5;ext"
     ; "mid-chunk-data", chunked ^ "5\r\nhel"
     ; "mid-chunk-crlf", chunked ^ "5\r\nhello\r"
@@ -516,7 +534,9 @@ let test_interleaved_connections () =
   done;
   Alcotest.(check (list request_body))
     "a"
-    [ {|"POST" "/c" HTTP/1.1 ["Transfer-Encoding":"chunked"]|}, "hello world" ]
+    [ ( {|"POST" "/c" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}
+      , "hello world" )
+    ]
     a.requests;
   Alcotest.(check (list request_body))
     "b"
@@ -534,7 +554,7 @@ let test_shutdown_suspended () =
   let b = server () in
   Feeder.feed
     b.feeder
-    "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5;e";
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;e";
   Server_connection.shutdown b.conn;
   Alcotest.(check (list string)) "no error" [] (a.errors @ b.errors);
   check_server ~expect:[ get_summary, "" ] get

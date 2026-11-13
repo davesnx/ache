@@ -1,10 +1,23 @@
 open Ache
 open Helpers
 
+let request_to_string ?body (r : Request.t) =
+  let r =
+    if
+      Version.compare r.version Version.v1_1 >= 0
+      && not (Headers.mem r.headers "host")
+    then { r with headers = Headers.add r.headers "host" "example.com" }
+    else r
+  in
+  request_to_string ?body r
+
 let trace fmt = Format.ksprintf (Format.printf "%s\n%!") fmt
 
 let request_error_pp_hum fmt = function
   | `Bad_request -> Format.fprintf fmt "Bad_request"
+  | `Not_implemented -> Format.fprintf fmt "Not_implemented"
+  | `Http_version_not_supported ->
+    Format.fprintf fmt "Http_version_not_supported"
   | `Bad_gateway -> Format.fprintf fmt "Bad_gateway"
   | `Internal_server_error -> Format.fprintf fmt "Internal_server_error"
   | `Request_header_fields_too_large ->
@@ -384,7 +397,10 @@ let test_commit_parse_after_every_header () =
   let single_header = "Links: /path/to/some/website\r\n" in
   let r =
     (* Each header is 30 bytes *)
-    request_line ^ single_header ^ single_header ^ "connection: close\r\n\r\n"
+    request_line
+    ^ single_header
+    ^ single_header
+    ^ "host: a\r\nconnection: close\r\n\r\n"
   in
   let bs = Bigstringaf.of_string r ~off:0 ~len:(String.length r) in
   let c = read t bs ~off:0 ~len:30 in
@@ -1615,7 +1631,11 @@ let test_bad_request () =
   (* A `Bad_request is returned in a number of cases surrounding
      transfer-encoding or content-length headers. *)
   let request =
-    Request.create `GET "/" ~headers:(Headers.encoding_fixed (-1))
+    Request.create
+      `GET
+      "/"
+      ~headers:
+        (Headers.of_list [ "host", "example.com"; "content-length", "-1" ])
   in
   let error_handler_fired = ref false in
   let error_handler ?request:request' error start_response =
@@ -2486,7 +2506,10 @@ let test_write_response_after_read_eof () =
   let single_header = "Links: /path/to/some/website\r\n" in
   let r =
     (* Each header is 30 bytes *)
-    request_line ^ single_header ^ single_header ^ "connection: close\r\n\r\n"
+    request_line
+    ^ single_header
+    ^ single_header
+    ^ "host: a\r\nconnection: close\r\n\r\n"
   in
   let bs = Bigstringaf.of_string r ~off:0 ~len:(String.length r) in
   let c = read t bs ~off:0 ~len:30 in
@@ -2522,7 +2545,7 @@ let test_connect_method () =
     (Request.create
        ~headers:(Headers.of_list [ "host", "example.com:80" ])
        `CONNECT
-       "/");
+       "example.com:80");
   write_response
     ~msg:"Upgrade response written"
     t

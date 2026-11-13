@@ -183,6 +183,11 @@ module Request : sig
   val body_length : t -> Body_length.t
   (** [body_length t] is the length of the message body accompanying [t]. It is
       an error to generate a request with a close-delimited message body.
+      [`Error `Bad_request] when [t] has both Content-Length and
+      Transfer-Encoding, when chunked is not the final transfer coding, or when
+      the Content-Length field lines do not all hold the same [1*DIGIT] value
+      (RFC 9110 §8.6). {!Client_connection.request} raises [Failure] for such a
+      request.
 
       See {{:https://tools.ietf.org/html/rfc7230#section-3.3.3} RFC7230§3.3.3}
       for more details. *)
@@ -190,7 +195,9 @@ module Request : sig
   val persistent_connection : ?proxy:bool -> t -> bool
   (** [persistent_connection ?proxy t] indicates whether the connection for [t]
       can be reused for multiple requests and responses. If the calling code
-      is acting as a proxy, it should pass [~proxy:true].
+      is acting as a proxy, it should pass [~proxy:true]. Connection options
+      are read case-insensitively from every member of every Connection field
+      line.
 
       See {{:https://tools.ietf.org/html/rfc7230#section-6.3} RFC7230§6.3 for
       more details. *)
@@ -247,7 +254,9 @@ module Response : sig
   val persistent_connection : ?proxy:bool -> t -> bool
   (** [persistent_connection ?proxy t] indicates whether the connection for [t]
       can be reused for multiple requests and responses. If the calling code
-      is acting as a proxy, it should pass [~proxy:true].
+      is acting as a proxy, it should pass [~proxy:true]. Connection options
+      are read case-insensitively from every member of every Connection field
+      line.
 
       See {{:https://tools.ietf.org/html/rfc7230#section-6.3} RFC7230§6.3 for
       more details. *)
@@ -261,6 +270,8 @@ module Reqd : sig
 
   type error =
     [ `Bad_request
+    | `Not_implemented
+    | `Http_version_not_supported
     | `Bad_gateway
     | `Internal_server_error
     | `Request_header_fields_too_large
@@ -340,7 +351,29 @@ module Server_connection : sig
     -> request_handler
     -> t
   (** [create ?config ?error_handler ~request_handler] creates a connection
-      handler that will service individual requests with [request_handler]. *)
+      handler that will service individual requests with [request_handler].
+
+      The connection rejects a request before [request_handler] runs, calls
+      [error_handler] and closes after the error response:
+      - [`Bad_request] (400): the request line or a field line does not match
+        RFC 9112 §3 and §5 (lines end with CRLF; a bare LF is an error;
+        obs-fold is an error); an HTTP/1.1 request has no Host field; a request
+        has more than one Host field or a Host value that is not
+        [uri-host [":" port]] (RFC 3986 §3.2); a CONNECT target is not
+        [host:port] with a port of 0 to 65535; Content-Length is not a list of one
+        repeated [1*DIGIT] value; the request has both Content-Length and
+        Transfer-Encoding; an HTTP/1.0 request has Transfer-Encoding; chunked
+        is not the final transfer coding or is applied twice.
+      - [`Not_implemented] (501): a transfer coding other than chunked.
+      - [`Http_version_not_supported] (505): a major version other than 1.
+
+      A request with version HTTP/1.x, x > 1, is processed as HTTP/1.1. Its
+      [version] field keeps the received minor version. Request-target bytes
+      0x80 to 0xFF are accepted, because clients send them unencoded.
+
+      A request that is rejected after earlier pipelined requests gets its
+      error response after the responses to those requests. A request that
+      follows a request with [Connection: close] is not read. *)
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
   (** [next_read_operation t] returns a value describing the next operation that

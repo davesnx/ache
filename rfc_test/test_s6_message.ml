@@ -156,20 +156,16 @@ let version_tests =
              ~msg:version
              (Server.run ~handler:ok_handler (req ~version "GET" "/")))
         [ "HTTP/1.10"; "HTTP/11.1"; "HTTP/1"; "HTTP/1." ])
-  ; known_failure
-      ~ticket:"01"
+  ; test
       "§2.5 server DEF: HTTP/2.0 request is not processed as HTTP/1.x"
       (fun () -> check_refused_version "HTTP/2.0")
-  ; known_failure
-      ~ticket:"01"
+  ; test
       "§2.5 server DEF: HTTP/0.9 request is not processed as HTTP/1.x"
       (fun () -> check_refused_version "HTTP/0.9")
-  ; known_failure
-      ~ticket:"01"
+  ; test
       "§2.5 server DEF: HTTP/9.9 request is not processed as HTTP/1.x"
       (fun () -> check_refused_version "HTTP/9.9")
-  ; known_failure
-      ~ticket:"01"
+  ; test
       "§2.5 client DEF: HTTP/2.0 response is not processed as HTTP/1.x"
       (fun () ->
          let c = Client.create () in

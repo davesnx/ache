@@ -88,22 +88,10 @@ let syntax_tests =
   [ test "§8.6 server DEF: Content-Length 3 frames a 3 octet body" (fun () ->
       check_echo "plain" "abc" (Server.run (post_cl [ "3" ]));
       check_echo "with OWS" "abc" (Server.run (post_cl [ " 3 " ])))
-  ; known_failure
-      ~ticket:"05"
-      "§8.6 server DEF: 400 for Content-Length 0x3"
-      (reject_cl "0x3")
-  ; known_failure
-      ~ticket:"05"
-      "§8.6 server DEF: 400 for Content-Length +3"
-      (reject_cl "+3")
-  ; known_failure
-      ~ticket:"05"
-      "§8.6 server DEF: 400 for Content-Length 1_0"
-      (reject_cl "1_0")
-  ; known_failure
-      ~ticket:"05"
-      "§8.6 server DEF: 400 for Content-Length 0o3"
-      (reject_cl "0o3")
+  ; test "§8.6 server DEF: 400 for Content-Length 0x3" (reject_cl "0x3")
+  ; test "§8.6 server DEF: 400 for Content-Length +3" (reject_cl "+3")
+  ; test "§8.6 server DEF: 400 for Content-Length 1_0" (reject_cl "1_0")
+  ; test "§8.6 server DEF: 400 for Content-Length 0o3" (reject_cl "0o3")
   ; test
       "§8.6 server DEF: 400 for negative, empty or non-digit Content-Length"
       (fun () ->
@@ -115,14 +103,10 @@ let syntax_tests =
         ~msg:"two field lines"
         (Server.run (post_cl [ "3"; "4" ]));
       check_bad_request ~msg:"one list" (Server.run (post_cl [ "3, 4" ])))
-  ; known_failure
-      ~ticket:"05"
+  ; test
       "§8.6 client DEF: error for Content-Length 0x2"
       (client_reject_cl "0x2")
-  ; known_failure
-      ~ticket:"05"
-      "§8.6 client DEF: error for Content-Length +2"
-      (client_reject_cl "+2")
+  ; test "§8.6 client DEF: error for Content-Length +2" (client_reject_cl "+2")
   ; test
       "§8.6 client DEF: error for negative or non-digit Content-Length"
       (fun () ->
