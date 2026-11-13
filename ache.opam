@@ -14,9 +14,9 @@ depends: [
   "dune" {>= "3.17"}
   "ocaml" {>= "5.3"}
   "angstrom"
-  "faraday"
   "bigstringaf"
   "alcotest" {with-test}
+  "faraday" {with-test}
   "odoc" {with-doc}
 ]
 build: [

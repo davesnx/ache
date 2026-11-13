@@ -13,6 +13,8 @@ module Server_connection = Server_connection
 module Client_connection = Client_connection
 
 module Ache_private = struct
+  module Faraday = Faraday
+
   module Runtime = struct
     module Upgradable = Runtime.Upgradable
     module Buffer = Runtime.Buffer

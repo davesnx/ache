@@ -1,4 +1,7 @@
+(copy_files#
+ (files ../vendor/faraday/faraday.{ml,mli}))
+
 (library
  (name ache)
  (public_name ache)
- (libraries angstrom faraday bigstringaf))
+ (libraries angstrom bigstringaf))

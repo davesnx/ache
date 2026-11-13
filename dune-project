@@ -23,9 +23,9 @@
   (ocaml
    (>= 5.3))
   angstrom
-  faraday
   bigstringaf
-  (alcotest :with-test)))
+  (alcotest :with-test)
+  (faraday :with-test)))
 
 (package
  (name ache-eio)

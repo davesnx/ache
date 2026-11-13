@@ -494,6 +494,8 @@ end
 (**/**)
 
 module Ache_private : sig
+  module Faraday = Faraday
+
   module Runtime : sig
     module Upgradable : sig
       include Runtime.S

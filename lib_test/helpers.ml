@@ -1,4 +1,5 @@
 open Ache
+module Faraday = Ache_private.Faraday
 
 let maybe_serialize_body f body =
   match body with None -> () | Some body -> Faraday.write_string f body

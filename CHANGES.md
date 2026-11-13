@@ -22,6 +22,9 @@ ache Unreleased
 - `ache-eio`: `Server.create_connection_handler` and
   `Client.create_connection` accept any `_ Eio.Flow.two_way`, for example a
   TLS flow. `Client.t` is abstract.
+- Vendor Faraday 0.8.2 in `vendor/faraday`. It compiles as `Ache__Faraday`
+  inside `ache`, so `ache` no longer depends on the opam `faraday` package and
+  links with it in the same program. `Ache.IOVec.t` is unchanged.
 
 httpun history
 ==============

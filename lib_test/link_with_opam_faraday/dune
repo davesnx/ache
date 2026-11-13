@@ -1,0 +1,4 @@
+(test
+ (name link_with_opam_faraday)
+ (package ache)
+ (libraries ache faraday))
