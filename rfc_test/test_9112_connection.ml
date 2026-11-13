@@ -524,8 +524,7 @@ let client_tests =
          Alcotest.(check string) "first body" "r1" ex1.body;
          check_client_statuses "second response" [ 201 ] ex2;
          Alcotest.(check string) "second body" "r2" ex2.body)
-  ; known_failure
-      ~ticket:"27"
+  ; test
       "§9.3.2 client SHOULD NOT: no request pipelined after a POST before its \
        response"
       (fun () ->
@@ -571,16 +570,14 @@ let client_tests =
          Client.feed c (ok_response "r2");
          check_client_statuses "second response" [ 200 ] ex2;
          Alcotest.(check string) "second body" "r2" ex2.body)
-  ; known_failure
-      ~ticket:"27"
+  ; test
       "§9.2 client MUST NOT: data with no outstanding request is not a response"
       (fun () ->
          let c = Client.create () in
          no_exn "feeding an unsolicited response" (fun () ->
            Client.feed c (ok_response "x"));
          check_client_closed "client closed" c)
-  ; known_failure
-      ~ticket:"27"
+  ; test
       "§6.3 client MUST NOT: a second response after the last one is not \
        delivered"
       (fun () ->
@@ -592,17 +589,14 @@ let client_tests =
          Alcotest.(check string) "first body only" "r1" ex.body;
          check_client_errors "no error on the first exchange" false ex;
          check_client_closed "client closed" c)
-  ; known_failure
-      ~ticket:"27"
-      "§6.3 client MAY: CRLF after the last response is discarded"
-      (fun () ->
-         let c = Client.create () in
-         let ex = client_send c "/" in
-         no_exn "feeding a response and CRLF" (fun () ->
-           Client.feed c (ok_response "r1" ^ "\r\n"));
-         check_client_statuses "one response" [ 200 ] ex;
-         Alcotest.(check string) "body" "r1" ex.body;
-         check_client_errors "no error on the exchange" false ex)
+  ; test "§6.3 client MAY: CRLF after the last response is discarded" (fun () ->
+      let c = Client.create () in
+      let ex = client_send c "/" in
+      no_exn "feeding a response and CRLF" (fun () ->
+        Client.feed c (ok_response "r1" ^ "\r\n"));
+      check_client_statuses "one response" [ 200 ] ex;
+      Alcotest.(check string) "body" "r1" ex.body;
+      check_client_errors "no error on the exchange" false ex)
   ; test
       "§9.6 client MUST: response Connection: close stops further requests"
       (fun () ->
@@ -635,8 +629,7 @@ let client_tests =
          Alcotest.(check string) "first body" "ok" ex1.body;
          Alcotest.(check string) "nothing written after" "" (Client.written c);
          check_client_closed "client closed" c)
-  ; known_failure
-      ~ticket:"22"
+  ; test
       "§9.3.2 client SHOULD: unanswered pipelined request reported when the \
        connection closes"
       (fun () ->
@@ -685,8 +678,7 @@ let client_tests =
          check_client_statuses "second not answered" [] ex2;
          Alcotest.(check string) "nothing written after" "" (Client.written c);
          check_client_closed "client closed" c)
-  ; known_failure
-      ~ticket:"27"
+  ; test
       "§9.5 client SHOULD: stop sending the body after an error response with \
        Connection: close"
       (fun () ->

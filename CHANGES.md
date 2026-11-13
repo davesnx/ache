@@ -50,8 +50,7 @@ ache Unreleased
 - `read` and `read_eof` consume every byte of an incomplete head, chunk-size
   line or trailer section, and every byte given to a head that fails to
   parse. httpun consumed up to the last complete header line, or up to the
-  failure position. An incomplete head that follows a complete message in the
-  same read is still not consumed.
+  failure position.
 - Request line: the method is a non-empty token, the request-target is
   non-empty with no CTL. A request line without a version gets 400; httpun
   waited for more input. HTTP/1.x with x > 1 is processed as HTTP/1.1 and
@@ -203,6 +202,66 @@ ache Unreleased
   connection no longer raises `Failure "cannot write to closed writer"`: the
   response is recorded, its bytes are dropped, and a streaming body writer is
   returned closed.
+- `ache-eio`, `ache-lwt`: a write that fails because the peer is gone
+  (`EPIPE`, `ECONNRESET`, `ENOTCONN`, Eio `Connection_reset`) reports
+  `` `Closed ``, so a pending `Body.Writer.flush` callback gets `` `Closed ``
+  and the connection ends. httpun reported `ECONNRESET` as an exception and
+  the flush callback was never called (httpun #155). A read that fails with
+  `ECONNRESET` or `ENOTCONN` is end of input in `ache-lwt`, as in `ache-eio`.
+- `ache-eio`: `Server.create_connection_handler` takes the flow before the
+  address and no longer takes `~sw`, so
+  `create_connection_handler ~request_handler ~error_handler` can be passed
+  to `Eio.Net.run_server` or `Eio.Net.accept_fork` (httpun #154).
+- Server timeouts, off by default: `?idle_timeout` closes a connection that
+  has no request in progress and receives nothing for that many seconds;
+  `?head_timeout` rejects a request head that is not complete that many
+  seconds after its first bytes (408 through `error_handler`). A request body
+  or a response in progress is never timed out. `Ache_eio` also takes
+  `?clock`, which a timeout requires. Added to both
+  `create_connection_handler`; the runtimes use the new
+  `Server_connection.read_timeout`.
+- `ache-eio`: cancelling the connection fiber no longer reports
+  `Cancelled` to the error handler. Each direction of the flow is shut down
+  once; after a failure httpun shut down the sending side twice.
+- `ache-lwt`: the socket is closed once, also when the peer reset the
+  connection (the close was skipped when `shutdown` failed) and when
+  `Client.shutdown` and the IO loop both close it.
+- Client: add `` `Connection_closed `` to `Client_connection.error`. Every
+  request without any byte of its response when the connection stops reading
+  (end of input, a response that closes the connection, `shutdown`, or an
+  error on an earlier response) gets it once. httpun called no handler for
+  pipelined requests behind a closing response, and gave
+  `` `Malformed_response "unexpected eof" `` to every request at end of input.
+  An end of input inside a response head or inside a body framed by
+  Content-Length or chunked coding is still `` `Malformed_response ``.
+- Client: response bytes with no request waiting for a response close the
+  connection. httpun raised `Assert_failure` from `read`.
+- Client: a request is not pipelined behind a request with a non-idempotent
+  method until that request's response is complete (RFC 9112 §9.3.2).
+- Client: a response that closes the connection also stops the request body
+  being sent (RFC 9112 §9.5). httpun kept writing it.
+- Client: `Client_connection.request` checks the request head before it
+  queues the request, so an invalid request raises `Invalid_argument` and
+  later requests are still sent. httpun left the invalid request at the head
+  of the queue and sent nothing after it.
+- Client: an HTTP/1.0 response with Transfer-Encoding closes the connection
+  after it (RFC 9112 §6.1).
+- Client: empty lines before a response are discarded (RFC 9112 §2.2).
+- Client: an obs-fold in a response field value is replaced with one space
+  (RFC 9112 §5.2). Requests with obs-fold still get 400.
+- Client: after a 101 response, and after a 2xx response to CONNECT, the
+  connection stops reading HTTP; the bytes after the head are not consumed,
+  so `upgrade` gives them to the new protocol. httpun parsed them as the next
+  response or as the CONNECT response body.
+- Client: a response body cut by end of input, by a framing error, by an
+  exception or by `shutdown` calls the `on_error` given to
+  `Body.Reader.schedule_read`, not `on_eof`. A close-delimited body still ends
+  with `on_eof` at end of input. httpun called `on_eof` in every case.
+- Server: a request with `Connection: close` and `Upgrade` that gets a 101
+  switches protocols: the reader is not shut down while the response is
+  pending, and the bytes after the request go to the new protocol.
+- Server: add `` `Request_timeout `` to `Reqd.error`. A request head that
+  `?head_timeout` cuts gets 408 Request Timeout in place of 400.
 
 httpun history
 ==============

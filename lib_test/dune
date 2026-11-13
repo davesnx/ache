@@ -7,6 +7,7 @@
   test_grammar
   test_parse
   test_client_connection
+  test_client
   test_headers
   test_ache
   test_iovec

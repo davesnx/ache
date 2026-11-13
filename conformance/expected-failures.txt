@@ -1,0 +1,4 @@
+# h1spec checks that ache fails today. One per line:
+#   <check description, exactly as h1spec prints it> | <ticket> | <reason>
+# run.sh fails when a check not listed here fails, and when a listed check
+# passes (then delete its line).

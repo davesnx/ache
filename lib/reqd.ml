@@ -37,6 +37,7 @@ type error =
   | `Bad_gateway
   | `Internal_server_error
   | `Request_header_fields_too_large
+  | `Request_timeout
   | `Exn of exn
   ]
 
@@ -360,7 +361,11 @@ let persistent_connection t =
 let input_state t : Io_state.t =
   match t.response_state, t.request.meth with
   | Upgrade _, _ when Reader.is_closed t.reader -> Complete
-  | Upgrade _, _ | Waiting, `CONNECT -> Wait
+  | Upgrade _, _ -> Wait
+  | Waiting, _
+    when Reader.may_switch_protocols t.request
+         && Body.Reader.is_closed t.request_body ->
+    Wait
   | (Fixed response | Streaming (response, _)), `CONNECT
     when Status.is_successful response.status ->
     Wait

@@ -47,7 +47,27 @@ module Make (Io : IO) : sig
 end
 
 (** The function that results from [create_connection_handler] can be passed to
-    [Lwt_io.establish_server_with_client_socket]. *)
+    [Lwt_io.establish_server_with_client_socket].
+
+    Timeouts of [create_connection_handler] are in seconds and are off by
+    default:
+    - [idle_timeout]: when no request is in progress and no byte arrives for
+      [idle_timeout], the connection closes without a response.
+    - [head_timeout]: when a request head is not complete [head_timeout] after
+      its first bytes were read, [error_handler] is called with
+      [`Request_timeout] (408) and the connection closes after the error
+      response.
+
+    A request body or a response in progress is never timed out.
+    [create_connection_handler] raises [Invalid_argument] when applied to a
+    socket if a timeout is not positive.
+
+    The application must ignore [SIGPIPE], for example with
+    [Sys.set_signal Sys.sigpipe Sys.Signal_ignore], before it serves
+    connections. Otherwise a write to a peer that closed the connection kills
+    the process. With [SIGPIPE] ignored, that write ends the connection and
+    pending [Body.Writer.flush] callbacks get [`Closed]. ache does not install
+    signal handlers. *)
 module Server :
   Server with type socket = Lwt_unix.file_descr and type addr = Unix.sockaddr
 

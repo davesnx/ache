@@ -164,7 +164,10 @@ let frame ~fn ~proxy ~request_method ~request_version ~persistent ~length t =
     (not tunnel) && (encoding = `Close_delimited || not (persists t))
   in
   (* RFC 9112 §9.6 *)
-  if closes && not (Message.has_option t.headers "close")
+  if
+    closes
+    && not
+         (Message.has_member (Headers.get_multi t.headers "connection") "close")
   then add "connection" "close" t, encoding
   else if
     (not http_1_1) && persists t && not (Headers.mem t.headers "connection")

@@ -42,6 +42,7 @@ type error =
   | `Uri_too_long
   | `Internal_server_error
   | `Request_header_fields_too_large
+  | `Request_timeout
   | `Exn of exn
   ]
 
@@ -459,3 +460,12 @@ let shutdown t =
   match t.upgraded with
   | None -> shutdown t
   | Some (Runtime.Impl ((module P), p)) -> P.shutdown p
+
+let read_timeout t =
+  match t.upgraded, t.error_code with
+  | None, No_error when not (is_active t) ->
+    (match Reader.next t.reader with
+    | `Start -> Some (`Idle, fun () -> shutdown t)
+    | `Read -> Some (`Head, fun () -> set_error_and_handle t `Request_timeout)
+    | `Close | `Error _ -> None)
+  | _ -> None

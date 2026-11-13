@@ -69,15 +69,22 @@ module Grammar = struct
     | _ -> false
 
   (* [Parseff.consume] reads the whole literal before it compares any byte. *)
-  let literal s =
-    Parseff.expect (Printf.sprintf "%S" s) (fun () ->
-      String.iter (fun c -> ignore (Parseff.char c)) s)
+  let crlf () =
+    ignore (Parseff.char '\r');
+    ignore (Parseff.char '\n')
 
-  let eol () = literal "\r\n"
+  let http_slash () =
+    ignore (Parseff.char 'H');
+    ignore (Parseff.char 'T');
+    ignore (Parseff.char 'T');
+    ignore (Parseff.char 'P');
+    ignore (Parseff.char '/')
+
+  let eol () = Parseff.expect {|"\r\n"|} crlf
   let digit () = Char.code (Parseff.satisfy is_digit ~label:"digit") - 48
 
   let version () =
-    literal "HTTP/";
+    Parseff.expect {|"HTTP/"|} http_slash;
     let major = digit () in
     ignore (Parseff.char '.');
     let minor = digit () in
@@ -128,7 +135,30 @@ module Grammar = struct
     | 3 -> Status.of_code (int_of_string code)
     | _ -> Parseff.fail (Printf.sprintf "status-code too long: %S" code)
 
+  (* RFC 9112 §5.2: a recipient of a response replaces each obs-fold with SP. *)
+  let folded_headers () =
+    let rec loop acc =
+      match Parseff.peek_char (), acc with
+      | Some '\r', _ -> Headers.of_rev_list acc
+      | Some (' ' | '\t'), (name, value) :: acc ->
+        Parseff.skip_while is_space;
+        let more = Parseff.take_while is_field_char in
+        eol ();
+        loop ((name, String.trim (value ^ " " ^ more)) :: acc)
+      | Some _, _ -> loop (header () :: acc)
+      | None, _ -> Parseff.fail "unexpected end of input"
+    in
+    loop []
+
+  (* RFC 9112 §2.2: empty lines before a response are discarded. *)
   let response_head () =
+    let rec skip_empty_lines () =
+      if Parseff.peek_char () = Some '\r'
+      then (
+        eol ();
+        skip_empty_lines ())
+    in
+    skip_empty_lines ();
     let version = version () in
     if version.major <> 1
     then
@@ -142,7 +172,7 @@ module Grammar = struct
     ignore (Parseff.char ' ');
     let reason = Parseff.take_while is_field_char in
     eol ();
-    let headers = headers () in
+    let headers = folded_headers () in
     eol ();
     Response.create ~reason ~version ~headers status
 
@@ -225,6 +255,7 @@ module Reader = struct
     [ `Invalid_response_body_length of Response.t
     | `Parse of string
     | `Header_too_large
+    | `Unsolicited_response
     ]
 
   type _ Effect.t += Need_input : unit Effect.t
@@ -375,7 +406,9 @@ module Reader = struct
   let may_switch_protocols (request : Request.t) =
     request.meth = `CONNECT
     || (Headers.mem request.headers "upgrade"
-       && Message.has_option request.headers "upgrade")
+       && Message.has_member
+            (Headers.get_multi request.headers "connection")
+            "upgrade")
 
   let request ~max_header_size handler =
     let line = ref `Method in
@@ -410,7 +443,6 @@ module Reader = struct
 
   let response ~max_header_size request_queue =
     let on_head t response =
-      assert (not (Queue.is_empty request_queue));
       let exception Local of Respd.t option in
       match
         Queue.iter
@@ -421,31 +453,34 @@ module Reader = struct
              then raise (Local None))
           request_queue
       with
-      | () -> assert false
+      | () -> t.state <- Fail `Unsolicited_response
       | exception Local None -> t.state <- Cancelled_parse
       | exception Local (Some respd) ->
         let request = Respd.request respd in
-        (match Response.body_length ~request_method:request.meth response with
-        | `No_body
-          when Status.is_informational response.status
-               && response.status <> `Switching_protocols ->
-          t.state <- Done
-        | `Error `Bad_gateway -> assert false
-        | `Error `Internal_server_error ->
-          t.state <- Fail (`Invalid_response_body_length response)
-        | `No_body | `Fixed 0L ->
-          respd.response_handler response (Body.Reader.create_empty ());
-          t.state <- Done
-        | (`Fixed _ | `Chunked | `Close_delimited) as encoding ->
-          let body = create_body t in
-          let framing =
-            match encoding with
-            | `Fixed n -> Fixed n
-            | `Chunked -> Chunk_line None
-            | `Close_delimited -> Close_delimited
-          in
-          t.state <- Body (body, framing);
-          respd.response_handler response body)
+        if response.Response.status = `Switching_protocols
+        then respd.response_handler response (Body.Reader.create_empty ())
+        else if request.meth = `CONNECT && Status.is_successful response.status
+        then respd.response_handler response (create_body t)
+        else (
+          match Response.body_length ~request_method:request.meth response with
+          | `No_body when Status.is_informational response.status ->
+            t.state <- Done
+          | `Error `Bad_gateway -> assert false
+          | `Error `Internal_server_error ->
+            t.state <- Fail (`Invalid_response_body_length response)
+          | `No_body | `Fixed 0L ->
+            respd.response_handler response (Body.Reader.create_empty ());
+            t.state <- Done
+          | (`Fixed _ | `Chunked | `Close_delimited) as encoding ->
+            let body = create_body t in
+            let framing =
+              match encoding with
+              | `Fixed n -> Fixed n
+              | `Chunked -> Chunk_line None
+              | `Close_delimited -> Close_delimited
+            in
+            t.state <- Body (body, framing);
+            respd.response_handler response body)
     in
     create
       ~max_header_size
@@ -518,10 +553,7 @@ module Reader = struct
     t.state <- Head_done;
     t.on_head t head
 
-  (* A head that follows a message in the same read and is incomplete stays
-     unconsumed, so that a protocol that takes over the connection after that
-     message receives its bytes. *)
-  let step t bs ~off ~len more ~after_message =
+  let step t bs ~off ~len more =
     match t.state with
     | Fail _ | Head_done -> 0
     | Cancelled_parse -> len
@@ -536,13 +568,8 @@ module Reader = struct
         ~len
         more
         ~on_suspend:(fun k ->
-          if after_message
-          then (
-            cancel k;
-            0)
-          else (
-            t.state <- Head k;
-            len))
+          t.state <- Head k;
+          len)
         ~on_parsed:(head_parsed t)
     | Head _ when len = 0 && more = Incomplete -> 0
     | Head k ->
@@ -662,7 +689,7 @@ module Reader = struct
 
   let rec read_loop t bs ~off ~len more consumed =
     let previous = t.state in
-    let n = step t bs ~off ~len more ~after_message:(consumed > 0) in
+    let n = step t bs ~off ~len more in
     let consumed = consumed + n in
     let len = len - n in
     if

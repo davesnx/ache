@@ -32,11 +32,15 @@ module Reader : sig
     [ `Invalid_response_body_length of Response.t
     | `Parse of string
     | `Header_too_large
+    | `Unsolicited_response
     ]
 
   type ('head, 'error) t
   type request = (Request.t, request_error) t
   type response = (Response.t, response_error) t
+
+  val may_switch_protocols : Request.t -> bool
+  (** [CONNECT], or an [Upgrade] field with the [upgrade] connection option. *)
 
   val request :
      max_header_size:int
@@ -56,9 +60,9 @@ module Reader : sig
     -> more
     -> int
   (** Returns the number of bytes consumed. A head, chunk-size line or trailer
-      section that is still incomplete consumes all the bytes it was given,
-      except a head that follows a complete message in the same call: its bytes
-      are not consumed. *)
+      section that is still incomplete consumes all the bytes it was given.
+      Nothing is consumed after a message that may switch protocols until the
+      response decides. *)
 
   val force_close : (_, _) t -> unit
   (** Closes the reader and cancels a suspended parse. *)

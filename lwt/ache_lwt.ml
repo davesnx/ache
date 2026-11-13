@@ -45,15 +45,35 @@ module IO_loop = struct
       (fun n -> Lwt.wakeup_later u n);
     p
 
+  let untimed_read read = read () >|= Result.ok
+
+  let close_once close socket =
+    let closing = ref None in
+    fun () ->
+      match !closing with
+      | Some closing -> closing
+      | None ->
+        let p = close socket in
+        closing := Some p;
+        p
+
   let start : type t fd.
     (module IO with type socket = fd)
     -> (module Ache.Runtime.S with type t = t)
     -> t
     -> read_buffer_size:int
+    -> timed_read:((unit -> int Lwt.t) -> (int, [ `Timeout ]) result Lwt.t)
+    -> close:(unit -> unit Lwt.t)
     -> fd
     -> unit Lwt.t
     =
-   fun (module Io) (module Runtime) t ~read_buffer_size socket ->
+   fun (module Io)
+     (module Runtime)
+     t
+     ~read_buffer_size
+     ~timed_read
+     ~close
+     socket ->
     let read_buffer = Buffer.create read_buffer_size in
     let failed, notify_failed = Lwt.wait () in
     let fail exn =
@@ -69,11 +89,13 @@ module IO_loop = struct
           Lwt.catch
             (fun () ->
                (if Buffer.unread read_buffer
-                then Lwt.return 0
-                else read (module Io) socket read_buffer)
-               >|= fun (_ : int) ->
-               let (_ : int) = Buffer.get read_buffer ~f:(Runtime.read t) in
-               ())
+                then Lwt.return (Ok 0)
+                else timed_read (fun () -> read (module Io) socket read_buffer))
+               >|= function
+               | Ok (_ : int) ->
+                 let (_ : int) = Buffer.get read_buffer ~f:(Runtime.read t) in
+                 ()
+               | Error `Timeout -> ())
             (function
               | End_of_file ->
                 let (_ : int) =
@@ -113,7 +135,7 @@ module IO_loop = struct
     read_loop ();
     write_loop ();
     Lwt.choose [ Lwt.join [ read_loop_exited; write_loop_exited ]; failed ]
-    >>= fun () -> Io.close socket
+    >>= close
 end
 
 module Make (Io : IO) = struct
@@ -121,13 +143,67 @@ module Make (Io : IO) = struct
     type socket = Io.socket
     type addr = Io.addr
 
+    let check_timeout name = function
+      | Some seconds when not (seconds > 0.) ->
+        invalid_arg
+          (Printf.sprintf
+             "Ache_lwt.Server.create_connection_handler: %s must be positive"
+             name)
+      | _ -> ()
+
+    let timed_read ~idle_timeout ~head_timeout connection =
+      match idle_timeout, head_timeout with
+      | None, None -> IO_loop.untimed_read
+      | _ ->
+        let head_timer = ref None in
+        let stop_head_timer () =
+          Option.iter Lwt.cancel !head_timer;
+          head_timer := None
+        in
+        fun read ->
+          let limit =
+            match Ache.Server_connection.read_timeout connection with
+            | Some (`Idle, on_timeout) ->
+              stop_head_timer ();
+              Option.map (fun s -> Lwt_unix.sleep s, on_timeout) idle_timeout
+            | Some (`Head, on_timeout) ->
+              Option.map
+                (fun s ->
+                   let timer =
+                     match !head_timer with
+                     | Some timer -> timer
+                     | None ->
+                       let timer = Lwt_unix.sleep s in
+                       head_timer := Some timer;
+                       timer
+                   in
+                   Lwt.protected timer, on_timeout)
+                head_timeout
+            | None ->
+              stop_head_timer ();
+              None
+          in
+          (match limit with
+          | None -> IO_loop.untimed_read read
+          | Some (timer, on_timeout) ->
+            Lwt.pick
+              [ IO_loop.untimed_read read
+              ; ( timer >|= fun () ->
+                  on_timeout ();
+                  Error `Timeout )
+              ])
+
     let create_connection_handler
           ?(config = Ache.Config.default)
+          ?idle_timeout
+          ?head_timeout
           ~request_handler
           ~error_handler
           client_addr
           socket
       =
+      check_timeout "idle_timeout" idle_timeout;
+      check_timeout "head_timeout" head_timeout;
       let connection =
         Ache.Server_connection.create
           ~config
@@ -139,6 +215,8 @@ module Make (Io : IO) = struct
         (module Ache.Server_connection)
         connection
         ~read_buffer_size:config.read_buffer_size
+        ~timed_read:(timed_read ~idle_timeout ~head_timeout connection)
+        ~close:(IO_loop.close_once Io.close socket)
         socket
   end
 
@@ -148,7 +226,7 @@ module Make (Io : IO) = struct
     type t =
       { connection : Ache.Client_connection.t
       ; runtime : Upgradable.t
-      ; socket : socket
+      ; close : unit -> unit Lwt.t
       }
 
     let create_connection ?(config = Ache.Config.default) socket =
@@ -157,20 +235,23 @@ module Make (Io : IO) = struct
         Upgradable.create
           (Ache.Runtime.make (module Ache.Client_connection) connection)
       in
+      let close = IO_loop.close_once Io.close socket in
       Lwt.async (fun () ->
         IO_loop.start
           (module Io)
           (module Upgradable)
           runtime
           ~read_buffer_size:config.read_buffer_size
+          ~timed_read:IO_loop.untimed_read
+          ~close
           socket);
-      Lwt.return { connection; runtime; socket }
+      Lwt.return { connection; runtime; close }
 
     let request t = Ache.Client_connection.request t.connection
 
     let shutdown t =
       Upgradable.shutdown t.runtime;
-      Io.close t.socket
+      t.close ()
 
     let is_closed t = Upgradable.is_closed t.runtime
     let upgrade t impl = Upgradable.upgrade t.runtime impl
@@ -185,17 +266,15 @@ module Io = struct
     match Lwt_unix.state socket with
     | Closed -> Lwt.return_unit
     | _ ->
-      Lwt.catch
-        (fun () ->
-           Lwt_unix.shutdown socket SHUTDOWN_ALL;
-           Lwt_unix.close socket)
-        (fun _exn -> Lwt.return_unit)
+      (try Lwt_unix.shutdown socket SHUTDOWN_ALL with Unix.Unix_error _ -> ());
+      Lwt.catch (fun () -> Lwt_unix.close socket) (fun _exn -> Lwt.return_unit)
 
   let read socket bigstring ~off ~len =
     Lwt.catch
       (fun () -> Lwt_bytes.read socket bigstring off len)
       (function
-        | Unix.Unix_error (Unix.EBADF, _, _) -> Lwt.return 0
+        | Unix.Unix_error ((Unix.EBADF | ECONNRESET | ENOTCONN), _, _) ->
+          Lwt.return 0
         | exn ->
           Lwt.async (fun () -> close socket);
           Lwt.fail exn)
@@ -213,7 +292,7 @@ module Io = struct
       (fun () -> Lwt_unix.writev socket lwt_iovecs >|= fun n -> `Ok n)
       (function
         | Unix.Unix_error (Unix.EBADF, "check_descriptor", _)
-        | Unix.Unix_error (Unix.EPIPE, _, _) ->
+        | Unix.Unix_error ((Unix.EPIPE | ECONNRESET | ENOTCONN), _, _) ->
           Lwt.return `Closed
         | exn -> Lwt.fail exn)
 

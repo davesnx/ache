@@ -9,6 +9,7 @@ let response_error_pp_hum fmt = function
       fmt
       "Invalid_response_body_length: %s"
       (response_to_string resp)
+  | `Connection_closed -> Format.pp_print_string fmt "Connection_closed"
   | `Exn exn -> Format.fprintf fmt "Exn (%s)" (Printexc.to_string exn)
 
 module Response = struct
@@ -317,7 +318,7 @@ let test_response_eof () =
       ~flush_headers_immediately:true
       ~response_handler:(default_response_handler response)
       ~error_handler:(function
-      | `Malformed_response msg -> error_message := Some msg
+      | `Connection_closed -> error_message := Some "connection closed"
       | _ -> assert false)
   in
   Body.Writer.close body;
@@ -327,8 +328,8 @@ let test_response_eof () =
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   connection_is_shutdown t;
   Alcotest.(check (option string))
-    "unexpected eof"
-    (Some "unexpected eof")
+    "connection closed before the response"
+    (Some "connection closed")
     !error_message
 
 let test_persistent_connection_requests () =
@@ -1271,6 +1272,7 @@ let test_failed_response_parse () =
 
 let test_shutdown_hangs_response_body_read () =
   let got_eof = ref false in
+  let got_error = ref false in
   let request' = Request.create `GET "/" in
   let response =
     Response.create ~headers:(Headers.of_list [ "content-length", "10" ]) `OK
@@ -1282,9 +1284,10 @@ let test_shutdown_hangs_response_body_read () =
       expected_response
       response;
     let rec on_read _buffer ~off:_ ~len:_ =
-      Body.Reader.schedule_read response_body ~on_eof ~on_read
-    and on_eof () = got_eof := true in
-    Body.Reader.schedule_read response_body ~on_eof ~on_read
+      Body.Reader.schedule_read response_body ~on_error ~on_eof ~on_read
+    and on_eof () = got_eof := true
+    and on_error () = got_error := true in
+    Body.Reader.schedule_read response_body ~on_error ~on_eof ~on_read
   in
   let t = create () in
   let body =
@@ -1307,9 +1310,13 @@ let test_shutdown_hangs_response_body_read () =
     t;
   shutdown t;
   Alcotest.(check bool)
-    "EOF delivered to the request body if the connection shuts down"
-    true
+    "EOF not delivered to an incomplete response body"
+    false
     !got_eof;
+  Alcotest.(check bool)
+    "error delivered to the response body if the connection shuts down"
+    true
+    !got_error;
   connection_is_shutdown t
 
 let test_response_arrives_before_body_uploaded () =
@@ -1858,18 +1865,23 @@ let test_flush_response_before_shutdown () =
   let request' = Request.create `GET "/" ~headers:Headers.encoding_chunked in
   let response_handler _response _body = assert false in
   let t = create () in
+  let errors = ref [] in
   let body =
     request
       t
       request'
       ~flush_headers_immediately:true
       ~response_handler
-      ~error_handler:no_error_handler
+      ~error_handler:(fun error -> errors := error :: !errors)
   in
   write_request t request';
 
   Body.Writer.write_string body "hello world";
   shutdown t;
+  Alcotest.(check (list response_error))
+    "unanswered request gets Connection_closed"
+    [ `Connection_closed ]
+    !errors;
   Alcotest.(check bool)
     "Shutting down closes the request body"
     true
@@ -1883,6 +1895,7 @@ let test_report_exn_during_body_read () =
   let response = Response.create `OK in
 
   let body_done = ref false in
+  let body_failed = ref false in
   let error_message = ref None in
   let t = create () in
   let body =
@@ -1892,7 +1905,8 @@ let test_report_exn_during_body_read () =
       ~response_handler:(fun _ body ->
         let on_read _ ~off:_ ~len:_ = () in
         let on_eof () = body_done := true in
-        Body.Reader.schedule_read body ~on_read ~on_eof)
+        let on_error () = body_failed := true in
+        Body.Reader.schedule_read body ~on_error ~on_read ~on_eof)
       ~error_handler:(function
         | `Exn (Failure msg) ->
           Alcotest.(check bool) "body is not complete" false !body_done;
@@ -1910,7 +1924,8 @@ let test_report_exn_during_body_read () =
     "something went wrong"
     (Some "something went wrong")
     !error_message;
-  Alcotest.(check bool) "body is complete" true !body_done
+  Alcotest.(check bool) "body is not complete" false !body_done;
+  Alcotest.(check bool) "body failed" true !body_failed
 
 let test_can_read_response_after_write_eof () =
   let request' = Request.create `GET "/" ~headers:Headers.encoding_chunked in

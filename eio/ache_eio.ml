@@ -46,7 +46,12 @@ module IO_loop = struct
     in
     match Eio.Flow.write socket cstructs with
     | () -> `Ok lenv
-    | exception End_of_file -> `Closed
+    | exception
+        ( End_of_file
+        | Unix.Unix_error (ENOTCONN, _, _)
+        | Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (ENOTCONN, _, _)), _)
+        | Eio.Io (Eio.Net.E (Connection_reset _), _) ) ->
+      `Closed
 
   let read_once flow buffer =
     let p, u = Promise.create () in
@@ -77,40 +82,72 @@ module IO_loop = struct
     (module Ache.Runtime.S with type t = t)
     -> read_buffer_size:int
     -> read_closed:unit Promise.t * unit Promise.u
+    -> timed_read:
+         ([ `Read | `Linger ] -> (unit -> int) -> (int, [ `Timeout ]) result)
     -> t
     -> _ Eio.Flow.two_way
     -> unit
     =
-   fun (module Runtime) ~read_buffer_size ~read_closed t socket ->
+   fun (module Runtime) ~read_buffer_size ~read_closed ~timed_read t socket ->
     let read_closed, resolve_read_closed = read_closed
-    and write_closed = ref false
+    and receive_shut = ref false
+    and send_shut = ref false
     and failed, resolve_failed = Promise.create () in
-    let fail exn =
-      Runtime.report_exn t exn;
-      ignore (Promise.try_resolve resolve_failed () : bool)
+    let shutdown_once cmd =
+      let receive =
+        (match cmd with `Receive | `All -> true | `Send -> false)
+        && not !receive_shut
+      and send =
+        (match cmd with `Send | `All -> true | `Receive -> false)
+        && not !send_shut
+      in
+      if receive then receive_shut := true;
+      if send then send_shut := true;
+      match receive, send with
+      | true, true -> shutdown socket `All
+      | true, false -> shutdown socket `Receive
+      | false, true -> shutdown socket `Send
+      | false, false -> ()
+    in
+    let fail = function
+      | Eio.Cancel.Cancelled _ as exn -> raise exn
+      | exn ->
+        Runtime.report_exn t exn;
+        ignore (Promise.try_resolve resolve_failed () : bool)
     in
     let read_buffer = Buffer.create read_buffer_size in
     let rec read_loop =
-      let read socket read_buffer =
+      let read () =
         Fiber.first
           (fun () -> read socket read_buffer)
           (fun () ->
              Promise.await read_closed;
              raise End_of_file)
       in
+      let rec linger () =
+        match timed_read `Linger read with
+        | Ok (_ : int) ->
+          let (_ : int) =
+            Buffer.get read_buffer ~f:(fun _ ~off:_ ~len -> len)
+          in
+          linger ()
+        | Error `Timeout -> if !send_shut then `Stopped else linger ()
+        | exception End_of_file -> `Eof
+      in
       fun () ->
         let rec read_loop_step () =
           match Runtime.next_read_operation t with
           | `Read ->
             (match
-               if Buffer.unread read_buffer then 0 else read socket read_buffer
+               if Buffer.unread read_buffer then Ok 0 else timed_read `Read read
              with
-            | _n ->
+            | Ok (_ : int) ->
               let (_ : int) =
                 Buffer.get read_buffer ~f:(fun buf ~off ~len ->
                   Runtime.read t buf ~off ~len)
               in
               ()
+            | Error `Timeout -> ()
             | exception End_of_file ->
               let (_ : int) =
                 Buffer.get read_buffer ~f:(fun buf ~off ~len ->
@@ -124,17 +161,13 @@ module IO_loop = struct
             Promise.await p;
             read_loop ()
           | `Close ->
-            (match Promise.is_resolved read_closed with
-            | true -> ()
-            | false ->
-              (match read socket read_buffer with
-              | _n -> assert false
-              | exception (End_of_file as exn) ->
-                shutdown socket `Receive;
-                Promise.resolve resolve_read_closed ();
-                (match !write_closed with
-                | true -> ()
-                | false -> Runtime.report_exn t exn)))
+            if not (Promise.is_resolved read_closed)
+            then (
+              let result = linger () in
+              shutdown_once `Receive;
+              ignore (Promise.try_resolve resolve_read_closed () : bool);
+              if result = `Eof && not !send_shut
+              then Runtime.report_exn t End_of_file)
         in
         match read_loop_step () with () -> () | exception exn -> fail exn
     in
@@ -150,9 +183,7 @@ module IO_loop = struct
           Runtime.yield_writer t (fun () -> Promise.resolve u ());
           Promise.await p;
           write_loop ()
-        | `Close _ ->
-          write_closed := true;
-          shutdown socket `Send
+        | `Close _ -> shutdown_once `Send
       in
       match write_loop_step () with () -> () | exception exn -> fail exn
     in
@@ -160,30 +191,90 @@ module IO_loop = struct
       (fun () -> Fiber.both read_loop write_loop)
       (fun () ->
          Promise.await failed;
-         shutdown socket `All)
+         shutdown_once `All)
+
+  let untimed_read _ read = Ok (read ())
 end
 
 module Server = struct
+  let check_timeout name = function
+    | Some seconds when not (seconds > 0.) ->
+      invalid_arg
+        (Printf.sprintf
+           "Ache_eio.Server.create_connection_handler: %s must be positive"
+           name)
+    | _ -> ()
+
   let create_connection_handler
         ?(config = Ache.Config.default)
+        ?clock
+        ?idle_timeout
+        ?head_timeout
         ~request_handler
         ~error_handler
-        ~sw:_
-        client_addr
-        socket
     =
-    let connection =
-      Ache.Server_connection.create
-        ~config
-        ~error_handler:(error_handler client_addr)
-        (request_handler client_addr)
+    check_timeout "idle_timeout" idle_timeout;
+    check_timeout "head_timeout" head_timeout;
+    let timed_read =
+      match clock, idle_timeout, head_timeout with
+      | _, None, None -> fun _ -> IO_loop.untimed_read
+      | None, _, _ ->
+        invalid_arg
+          "Ache_eio.Server.create_connection_handler: a timeout needs ~clock"
+      | Some clock, _, _ ->
+        fun connection ->
+          let head_deadline = ref None in
+          fun phase read ->
+            let limit =
+              match phase with
+              | `Linger -> Option.map (fun s -> s, ignore) idle_timeout
+              | `Read ->
+                (match Ache.Server_connection.read_timeout connection with
+                | Some (`Idle, on_timeout) ->
+                  head_deadline := None;
+                  Option.map (fun s -> s, on_timeout) idle_timeout
+                | Some (`Head, on_timeout) ->
+                  Option.map
+                    (fun s ->
+                       let deadline =
+                         match !head_deadline with
+                         | Some deadline -> deadline
+                         | None ->
+                           let deadline = Eio.Time.now clock +. s in
+                           head_deadline := Some deadline;
+                           deadline
+                       in
+                       deadline -. Eio.Time.now clock, on_timeout)
+                    head_timeout
+                | None ->
+                  head_deadline := None;
+                  None)
+            in
+            (match limit with
+            | None -> Ok (read ())
+            | Some (seconds, on_timeout) ->
+              (match
+                 Eio.Time.with_timeout clock seconds (fun () -> Ok (read ()))
+               with
+              | Ok n -> Ok n
+              | Error `Timeout ->
+                on_timeout ();
+                Error `Timeout))
     in
-    IO_loop.start
-      (module Ache.Server_connection)
-      ~read_buffer_size:config.read_buffer_size
-      ~read_closed:(Promise.create ())
-      connection
-      socket
+    fun socket client_addr ->
+      let connection =
+        Ache.Server_connection.create
+          ~config
+          ~error_handler:(error_handler client_addr)
+          (request_handler client_addr)
+      in
+      IO_loop.start
+        (module Ache.Server_connection)
+        ~read_buffer_size:config.read_buffer_size
+        ~read_closed:(Promise.create ())
+        ~timed_read:(timed_read connection)
+        connection
+        socket
 end
 
 module Client = struct
@@ -208,6 +299,7 @@ module Client = struct
           (module Upgradable)
           ~read_buffer_size:config.read_buffer_size
           ~read_closed
+          ~timed_read:IO_loop.untimed_read
           runtime
           socket));
     { connection

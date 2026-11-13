@@ -20,4 +20,5 @@ let () =
     [ "-p", Arg.Set_int port, " Listening port number (8080 by default)" ]
     ignore
     "Responds to requests with a fixed string for benchmarking purposes.";
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   main !port

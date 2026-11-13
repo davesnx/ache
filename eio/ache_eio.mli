@@ -34,13 +34,36 @@
 module Server : sig
   val create_connection_handler :
      ?config:Ache.Config.t
+    -> ?clock:_ Eio.Time.clock
+    -> ?idle_timeout:float
+    -> ?head_timeout:float
     -> request_handler:(Eio.Net.Sockaddr.stream -> Ache.Reqd.t -> unit)
     -> error_handler:
          (Eio.Net.Sockaddr.stream -> Ache.Server_connection.error_handler)
-    -> sw:Eio.Switch.t
-    -> Eio.Net.Sockaddr.stream
     -> _ Eio.Flow.two_way
+    -> Eio.Net.Sockaddr.stream
     -> unit
+  (** [create_connection_handler ~request_handler ~error_handler flow addr]
+      serves HTTP/1.1 on [flow] until the connection closes. The partial
+      application [create_connection_handler ~request_handler ~error_handler]
+      can be passed to [Eio.Net.run_server] or [Eio.Net.accept_fork]. The
+      caller owns [flow] and closes it after the handler returns.
+
+      Timeouts are in seconds and are off by default:
+      - [idle_timeout]: when no request is in progress and no byte arrives
+        for [idle_timeout], the connection closes without a response. After
+        the connection stops reading, it waits at most [idle_timeout] for the
+        peer to close.
+      - [head_timeout]: when a request head is not complete [head_timeout]
+        after its first bytes were read, [error_handler] is called with
+        [`Request_timeout] (408) and the connection closes after the error
+        response.
+
+      A request body or a response in progress is never timed out.
+
+      @raise Invalid_argument
+        when applied to a flow, if a timeout is given without [clock] or a
+        timeout is not positive. *)
 end
 
 module Client : sig

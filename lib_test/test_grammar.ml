@@ -12,7 +12,8 @@ let outcome =
 (* Results of the head parsers of httpun 37fdcd8 on [Grammar_corpus.all], except
    four status codes that made httpun raise [Failure] and the rows where httpun
    accepted a method, field-name or field value outside RFC 9110 §9.1, §5.1 and
-   §5.5. *)
+   §5.5, and the response with an obs-fold, which RFC 9112 §5.2 makes a client
+   accept. *)
 let expected =
   [ Accept "\"GET\" \"/\" HTTP/1.1 []"
   ; Accept "\"some-other-verb\" \"/\" HTTP/1.1 []"
@@ -107,7 +108,7 @@ let expected =
   ; Reject
   ; Reject
   ; Reject
-  ; Reject
+  ; Accept "HTTP/1.1 200 \"OK\" [\"X\":\"y z\"]"
   ; Reject
   ; Reject
   ; Reject

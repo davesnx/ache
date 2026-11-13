@@ -10,6 +10,7 @@ let error_to_string = function
   | `Bad_gateway -> "Bad_gateway"
   | `Internal_server_error -> "Internal_server_error"
   | `Request_header_fields_too_large -> "Request_header_fields_too_large"
+  | `Request_timeout -> "Request_timeout"
   | `Exn exn -> Printexc.to_string exn
 
 let request_summary (r : Request.t) = Grammar_corpus.request_to_string r
@@ -154,6 +155,7 @@ let client ?config ?(meth = `GET) () =
           match error with
           | `Malformed_response msg -> "Malformed_response " ^ msg
           | `Invalid_response_body_length _ -> "Invalid_response_body_length"
+          | `Connection_closed -> "Connection_closed"
           | `Exn exn -> Printexc.to_string exn
         in
         c.cerrors <- e :: c.cerrors)
@@ -265,7 +267,7 @@ let test_pipelined () =
       ]
     (get ^ "POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc")
 
-let test_pipelined_incomplete_head_unconsumed () =
+let test_pipelined_incomplete_head_consumed () =
   let s = server () in
   let input = get ^ "GET /b" in
   let len = String.length input in
@@ -276,8 +278,7 @@ let test_pipelined_incomplete_head_unconsumed () =
       ~off:0
       ~len
   in
-  Alcotest.(check int) "consumed" (String.length get) consumed;
-  s.feeder.pending <- "GET /b";
+  Alcotest.(check int) "consumed" len consumed;
   Feeder.feed s.feeder " HTTP/1.1\r\nHost: a\r\n\r\n";
   Alcotest.(check (list request_body))
     "both requests"
@@ -768,9 +769,9 @@ let tests =
   ; "POST fixed body at every split", `Quick, test_post_fixed
   ; "POST chunked with extensions and trailers", `Quick, test_post_chunked
   ; "pipelined requests at every split", `Quick, test_pipelined
-  ; ( "incomplete head after a message stays unconsumed"
+  ; ( "incomplete head after a message is consumed"
     , `Quick
-    , test_pipelined_incomplete_head_unconsumed )
+    , test_pipelined_incomplete_head_consumed )
   ; "response with fixed body", `Quick, test_response_fixed
   ; "response with chunked body", `Quick, test_response_chunked
   ; "response with close-delimited body", `Quick, test_response_close_delimited

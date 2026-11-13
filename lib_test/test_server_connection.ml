@@ -23,6 +23,7 @@ let request_error_pp_hum fmt = function
   | `Internal_server_error -> Format.fprintf fmt "Internal_server_error"
   | `Request_header_fields_too_large ->
     Format.fprintf fmt "Request_header_fields_too_large"
+  | `Request_timeout -> Format.fprintf fmt "Request_timeout"
   | `Exn exn -> Format.fprintf fmt "Exn (%s)" (Printexc.to_string exn)
 
 module Alcotest = struct
@@ -3311,6 +3312,88 @@ let test_respond_on_closed_writer () =
           Body.Writer.close body )
     ]
 
+let test_head_timeout_is_408 () =
+  List.iter
+    (fun (split, chunk) ->
+       let errors = ref [] in
+       let t =
+         Raw.create
+           ~error_handler:(fun ?request:_ error start_response ->
+             errors := error :: !errors;
+             Body.Writer.close (start_response Headers.empty))
+           (fun _ -> Alcotest.fail "request handler called")
+       in
+       Raw.feed ~chunk t "GET / HTTP/1.1\r\nHo";
+       (match Server_connection.read_timeout t.conn with
+       | Some (`Head, reject) -> reject ()
+       | Some (`Idle, _) | None -> Alcotest.fail "expected a head timeout");
+       Alcotest.(check (list request_error))
+         (split ^ ": error")
+         [ `Request_timeout ]
+         !errors;
+       Alcotest.check
+         read_operation
+         (split ^ ": reader closed")
+         `Close
+         (Raw.read_op t);
+       Alcotest.(check bool)
+         (split ^ ": writer closed")
+         true
+         (Raw.write_all t = `Close);
+       Alcotest.(check string)
+         (split ^ ": 408 written")
+         "HTTP/1.1 408 Request Timeout\r\nconnection: close\r\n\r\n"
+         (Raw.take_output t))
+    splits
+
+let test_upgrade_wins_over_connection_close () =
+  List.iter
+    (fun (split, chunk) ->
+       List.iter
+         (fun async ->
+            let label = split ^ if async then ", async" else ", sync" in
+            let recorder = { Recorder.got = "" } in
+            let respond reqd =
+              Reqd.respond_with_upgrade
+                reqd
+                (Headers.of_list [ "connection", "upgrade"; "upgrade", "x" ])
+                (Ache.Runtime.make (module Recorder) recorder)
+            in
+            let pending = ref None in
+            let t =
+              Raw.create (fun reqd ->
+                if async then pending := Some reqd else respond reqd)
+            in
+            Raw.feed
+              ~chunk
+              t
+              "GET / HTTP/1.1\r\n\
+               Host: a\r\n\
+               Connection: close, upgrade\r\n\
+               Upgrade: x\r\n\
+               \r\n\
+               ping";
+            Alcotest.(check bool)
+              (label ^ ": reader not closed before the 101")
+              true
+              (Raw.read_op t <> `Close);
+            Option.iter respond !pending;
+            ignore (Raw.write_all t);
+            Alcotest.(check string)
+              (label ^ ": 101 written")
+              "HTTP/1.1 101 Switching Protocols\r\n\
+               connection: upgrade\r\n\
+               upgrade: x\r\n\
+               \r\n"
+              (Raw.take_output t);
+            Raw.feed ~chunk t "";
+            Alcotest.(check string)
+              (label ^ ": new protocol gets the bytes")
+              "ping"
+              recorder.got)
+         [ false; true ])
+    splits
+
 let tests =
   [ "initial reader state", `Quick, test_initial_reader_state
   ; "shutdown reader closed", `Quick, test_reader_is_closed_after_eof
@@ -3530,6 +3613,10 @@ let tests =
   ; ( "respond after an upgrade, before the 101 is written"
     , `Quick
     , test_respond_after_upgrade_before_flush )
+  ; "head timeout answers 408", `Quick, test_head_timeout_is_408
+  ; ( "upgrade wins over Connection: close"
+    , `Quick
+    , test_upgrade_wins_over_connection_close )
   ; ( "flush answered `Closed when the write fails"
     , `Quick
     , test_flush_closed_when_write_fails )

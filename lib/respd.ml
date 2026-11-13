@@ -3,6 +3,7 @@ module Writer = Serialize.Writer
 type error =
   [ `Malformed_response of string
   | `Invalid_response_body_length of Response.t
+  | `Connection_closed
   | `Exn of exn
   ]
 
@@ -35,11 +36,13 @@ let create ~error_handler ~writer ~response_handler request request_body =
       t.persistent <-
         Response.persistent_connection response
         && not
-             (Headers.mem response.headers "content-length"
+             (Headers.mem response.headers "transfer-encoding"
+             && (Headers.mem response.headers "content-length"
+                || Version.compare response.version Version.v1_1 < 0)
              && Response.body_length
                   ~request_method:request.Request.meth
                   response
-                = `Chunked);
+                <> `No_body);
     let next_request_state =
       match request.Request.meth, response.status with
       (* From RFC9110§6.4.1: * 2xx (Successful) responses to a CONNECT request
@@ -86,7 +89,7 @@ let report_error t error =
   | Received_response (_, response_body), `Ok ->
     t.error_code <- (error :> [ `Ok | error ]);
     t.error_handler error;
-    Body.Reader.close response_body
+    Body.Reader.fail response_body
   | ( ( Uninitialized | Awaiting_response | Received_response _ | Closed
       | Upgraded _ )
     , _ ) ->
@@ -97,10 +100,10 @@ let report_error t error =
 let persistent_connection t = t.persistent
 let close_request_body t = Body.Writer.close t.request_body
 
-let close_response_body t =
+let fail_response_body t =
   match t.state with
   | Uninitialized | Awaiting_response | Closed -> ()
-  | Received_response (_, response_body) -> Body.Reader.close response_body
+  | Received_response (_, response_body) -> Body.Reader.fail response_body
   | Upgraded _ -> t.state <- Closed
 
 let input_state t : Io_state.t =
