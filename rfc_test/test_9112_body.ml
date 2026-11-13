@@ -901,8 +901,7 @@ let client_request_tests =
   ]
 
 let incomplete_tests =
-  [ known_failure
-      ~ticket:"21"
+  [ test
       "§8 server MAY: EOF in the head closes without calling the handler"
       (fun () ->
          List.iter
@@ -954,8 +953,7 @@ let incomplete_tests =
            ; "3\r\nabc\r\n0\r\nX-T: 1\r\n"
            ; "3"
            ])
-  ; known_failure
-      ~ticket:"25"
+  ; test
       "§8 server MUST: an incomplete request body is not reported as complete"
       (fun () ->
          List.iter

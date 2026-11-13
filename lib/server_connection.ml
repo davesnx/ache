@@ -103,7 +103,7 @@ let default_error_handler ?request:_ error handle =
   Body.Writer.close body
 
 let shutdown_reader t =
-  if is_active t then Reqd.close_request_body (current_reqd_exn t);
+  if is_active t then Reqd.fail_request_body (current_reqd_exn t);
   Reader.force_close t.reader;
   wakeup_reader t
 
@@ -114,7 +114,7 @@ let shutdown_writer t =
     (* XXX(dpatti): I'm not sure I understand why we close the *request* body
        here. Maybe we can write a test such that removing this line causes it to
        fail? *)
-    Reqd.close_request_body reqd;
+    Reqd.fail_request_body reqd;
     Reqd.flush_response_body reqd);
   Writer.close t.writer;
   wakeup_writer t
@@ -188,38 +188,47 @@ let set_error_and_handle ?request t error =
     match t.error_code with
     | No_error ->
       t.error_code <- Error { request; response_state = Waiting };
-      t.error_handler ?request error (fun headers ->
-        let response, encoding =
-          (* If we haven't parsed the request method, just use GET as a standard
-             placeholder. The method is only used for edge cases, like HEAD or
-             CONNECT. *)
-          let request_method, request_version =
-            match request with
-            | None -> `GET, Version.v1_1
-            | Some (request : Request.t) -> request.meth, request.version
-          in
-          Response.frame
-            ~fn:"ache.Server_connection.error_handler"
-            ~proxy:t.config.proxy
-            ~request_method
-            ~request_version
-            ~persistent:false
-            ~length:None
-            (Response.create ~headers status)
-        in
-        let response_body =
-          (* The (shared) response body buffer can be used in this case *
-             because in this conditional branch we're not sending a response *
-             (is_active t == false), and are therefore not making use of that *
-             buffer. *)
-          Body.Writer.create t.response_body_buffer ~encoding ~writer:t.writer
-        in
-        Writer.write_response writer response;
-        t.error_code <-
-          Error
-            { request; response_state = Streaming (response, response_body) };
-        wakeup_writer t;
-        response_body)
+      (match
+         t.error_handler ?request error (fun headers ->
+           let response, encoding =
+             (* If we haven't parsed the request method, just use GET as a
+                standard placeholder. The method is only used for edge cases,
+                like HEAD or CONNECT. *)
+             let request_method, request_version =
+               match request with
+               | None -> `GET, Version.v1_1
+               | Some (request : Request.t) -> request.meth, request.version
+             in
+             Response.frame
+               ~fn:"ache.Server_connection.error_handler"
+               ~proxy:t.config.proxy
+               ~request_method
+               ~request_version
+               ~persistent:false
+               ~length:None
+               (Response.create ~headers status)
+           in
+           let response_body =
+             (* The (shared) response body buffer can be used in this case *
+                because in this conditional branch we're not sending a response
+                * (is_active t == false), and are therefore not making use of
+                that * buffer. *)
+             Body.Writer.create
+               t.response_body_buffer
+               ~encoding
+               ~writer:t.writer
+           in
+           Writer.write_response writer response;
+           t.error_code <-
+             Error
+               { request; response_state = Streaming (response, response_body) };
+           wakeup_writer t;
+           response_body)
+       with
+      | () -> ()
+      | exception _ ->
+        Writer.close_and_drain t.writer;
+        shutdown t)
     | Error _ ->
       (* When reading, this should be impossible: even if we try to read more, *
          the parser does not ingest it, and even if someone attempts to feed *
@@ -235,32 +244,30 @@ let report_exn t exn = set_error_and_handle t (`Exn exn)
 
 let advance_request_queue t =
   ignore (Queue.take t.request_queue);
+  if Queue.is_empty t.request_queue then Reader.resume t.reader;
   if not (Queue.is_empty t.request_queue)
   then t.request_handler (Queue.peek t.request_queue)
 
 let rec _next_read_operation t =
   if not (is_active t)
   then (
-    let next = Reader.next t.reader in
-    (match next with
-    | `Error _ ->
-      (* Don't tear down the whole connection if we saw an unrecoverable *
-         parsing error, as we might be in the process of streaming back the *
-         error response body to the client. *)
-      shutdown_reader t
-    | `Close ->
-      (match t.error_code with No_error -> shutdown t | Error _ -> ())
-    | _ -> ());
-    next)
+    match t.error_code with
+    | Error _ -> `Close
+    | No_error ->
+      let next = Reader.next t.reader in
+      (match next with
+      | `Error _ -> shutdown_reader t
+      | `Close -> shutdown t
+      | _ -> ());
+      next)
   else
     let reqd = current_reqd_exn t in
     match Reqd.input_state reqd with
     | Wait ->
       (match Reqd.output_state reqd with
       | Complete ->
-        (* this branch happens if the writer has completed sending the response
-           and there are still bytes remaining to be read in the request
-           body. *)
+        if Option.is_some (Reqd.response reqd)
+        then Body.Reader.discard (Reqd.request_body reqd);
         Reader.next t.reader
       | Wait | Ready ->
         (* `Wait` signals that we should add backpressure to the read channel, *
@@ -331,9 +338,12 @@ let rec _next_write_operation t =
   if not (is_active t)
   then
     match t.error_code with
-    | No_error ->
-      if Reader.is_closed t.reader then shutdown t;
-      Writer.next t.writer
+    | No_error when Reader.is_closed t.reader ->
+      ignore (next_read_operation t : [ `Read | `Yield | `Close ]);
+      (match t.error_code with
+      | No_error -> Writer.next t.writer
+      | Error _ -> _next_write_operation t)
+    | No_error -> Writer.next t.writer
     | Error { request; response_state } ->
       (match
          let request_method =
@@ -388,7 +398,17 @@ and _final_write_operation_for t reqd =
       _next_write_operation t
 
 let next_write_operation t = _next_write_operation t
-let report_write_result t result = Writer.report_result t.writer result
+
+let report_write_result t result =
+  Writer.report_result t.writer result;
+  match result with
+  | `Ok _ -> ()
+  | `Closed ->
+    if is_active t then Reqd.flush_response_body (current_reqd_exn t);
+    (match t.error_code with
+    | Error { response_state; _ } ->
+      Response_state.flush_response_body response_state
+    | No_error -> ())
 
 let next_read_operation t =
   match t.upgraded with

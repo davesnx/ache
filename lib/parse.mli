@@ -42,6 +42,9 @@ module Reader : sig
      max_header_size:int
     -> (Request.t -> Body.Reader.t -> unit)
     -> request
+  (** After a request that may switch protocols (CONNECT, or an [Upgrade]
+      field with the [upgrade] connection option), the reader consumes nothing
+      past the end of that message until {!resume}. *)
 
   val response : max_header_size:int -> Respd.t Queue.t -> response
 
@@ -61,6 +64,11 @@ module Reader : sig
   (** Closes the reader and cancels a suspended parse. *)
 
   val is_closed : (_, _) t -> bool
+
+  val resume : (_, _) t -> unit
+  (** Continues parsing after a request that may switch protocols, once its
+      response does not switch. *)
+
   val next : (_, 'error) t -> [> `Read | `Start | `Close | `Error of 'error ]
   val on_wakeup : (_, _) t -> (unit -> unit) -> unit
   val wakeup : (_, _) t -> unit

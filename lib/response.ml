@@ -129,9 +129,7 @@ let frame ~fn ~proxy ~request_method ~request_version ~persistent ~length t =
   then
     reject
       "content-length or transfer-encoding in a 1xx, a 204, or a 2xx to CONNECT";
-  let close t =
-    (if persists t then add "connection" "close" t else t), `Close_delimited
-  in
+  let close t = t, `Close_delimited in
   let t, encoding =
     match body_length ~proxy ~request_method t with
     | `Error (`Bad_gateway | `Internal_server_error) ->
@@ -162,7 +160,14 @@ let frame ~fn ~proxy ~request_method ~request_version ~persistent ~length t =
         add "transfer-encoding" "chunked" t, `Chunked
       | None -> close t)
   in
-  if (not http_1_1) && persists t && not (Headers.mem t.headers "connection")
+  let closes =
+    (not tunnel) && (encoding = `Close_delimited || not (persists t))
+  in
+  (* RFC 9112 §9.6 *)
+  if closes && not (Message.has_option t.headers "close")
+  then add "connection" "close" t, encoding
+  else if
+    (not http_1_1) && persists t && not (Headers.mem t.headers "connection")
   then add "connection" "keep-alive" t, encoding
   else t, encoding
 

@@ -135,6 +135,14 @@ let frame ~fn ~length t (response : Response.t) =
     ~length
     response
 
+let write_response t response =
+  if Writer.is_closed t.writer
+  then Serialize.check_response response
+  else Writer.write_response t.writer response
+
+let has_body t encoding =
+  encoding <> `No_body && not (Writer.is_closed t.writer)
+
 let respond_with_string t response str =
   if t.error_code <> `Ok
   then
@@ -149,8 +157,8 @@ let respond_with_string t response str =
         t
         response
     in
-    Writer.write_response t.writer response;
-    if encoding <> `No_body then Writer.write_string t.writer str;
+    write_response t response;
+    if has_body t encoding then Writer.write_string t.writer str;
     if t.persistent then t.persistent <- Response.persistent_connection response;
     t.response_state <- Fixed response;
     Writer.wakeup t.writer
@@ -174,8 +182,8 @@ let respond_with_bigstring t response (bstr : Bigstringaf.t) =
         t
         response
     in
-    Writer.write_response t.writer response;
-    if encoding <> `No_body then Writer.schedule_bigstring t.writer bstr;
+    write_response t response;
+    if has_body t encoding then Writer.schedule_bigstring t.writer bstr;
     if t.persistent then t.persistent <- Response.persistent_connection response;
     t.response_state <- Fixed response;
     Writer.wakeup t.writer
@@ -207,7 +215,7 @@ let respond_with_informational t (response : Response.t) =
   | Waiting ->
     if Version.compare t.request.version Version.v1_1 >= 0
     then (
-      Writer.write_response t.writer response;
+      write_response t response;
       Writer.wakeup t.writer)
   | Streaming _ | Upgrade _ ->
     failwith "ache.Reqd.respond_with_informational: response already started"
@@ -223,7 +231,8 @@ let unsafe_respond_with_streaming ~flush_headers_immediately t response =
     let response_body =
       Body.Writer.create t.response_body_buffer ~encoding ~writer:t.writer
     in
-    Writer.write_response t.writer response;
+    write_response t response;
+    if Writer.is_closed t.writer then Body.Writer.close_and_drain response_body;
     if t.persistent then t.persistent <- Response.persistent_connection response;
     t.response_state <- Streaming (response, response_body);
     if flush_headers_immediately then Writer.wakeup t.writer;
@@ -245,12 +254,13 @@ let unsafe_respond_with_upgrade t headers impl =
   match t.response_state with
   | Waiting ->
     let response = Response.create ~headers `Switching_protocols in
-    Writer.write_response t.writer response;
+    let closed = Writer.is_closed t.writer in
+    write_response t response;
     if t.persistent then t.persistent <- Response.persistent_connection response;
     t.response_state <- Upgrade response;
     Writer.flush t.writer (function
-      | `Written -> t.upgrade impl
-      | `Closed ->
+      | `Written when not closed -> t.upgrade impl
+      | `Written | `Closed ->
         Reader.force_close t.reader;
         Reader.wakeup t.reader);
     Body.Reader.close t.request_body;
@@ -278,22 +288,30 @@ let report_error t error =
       | `Exn _ -> `Internal_server_error
       | #Status.standard as status -> status
     in
-    t.error_handler ~request:t.request error (fun headers ->
-      let response_body =
-        unsafe_respond_with_streaming
-          t
-          ~flush_headers_immediately:true
-          (Response.create ~headers status)
-      in
-      (* NOTE(anmonteiro): When reporting an error that calls the error handler,
-         we can only deliver an EOF to the request body once the error response
-         has started. Otherwise, the request body `on_eof` handler could
-         erroneously send a successful response instead of letting us handle the
-         error. *)
-      Body.Reader.close t.request_body;
-      response_body)
+    (match
+       t.error_handler ~request:t.request error (fun headers ->
+         let response_body =
+           unsafe_respond_with_streaming
+             t
+             ~flush_headers_immediately:true
+             (Response.create ~headers status)
+         in
+         (* NOTE(anmonteiro): When reporting an error that calls the error
+            handler, we can only deliver an EOF to the request body once the
+            error response has started. Otherwise, the request body `on_eof`
+            handler could erroneously send a successful response instead of
+            letting us handle the error. *)
+         Body.Reader.fail t.request_body;
+         response_body)
+     with
+    | () -> ()
+    | exception _ ->
+      Body.Reader.fail t.request_body;
+      Writer.close_and_drain t.writer;
+      Reader.force_close t.reader;
+      Reader.wakeup t.reader)
   | other ->
-    Body.Reader.close t.request_body;
+    Body.Reader.fail t.request_body;
     (match other with
     | Waiting, `Exn _ ->
       (* XXX(seliopou): Decide what to do in this unlikely case. There is an *
@@ -302,10 +320,11 @@ let report_error t error =
       failwith "ache.Reqd.report_exn: NYI"
     | Streaming (_response, response_body), `Ok ->
       Body.Writer.force_close response_body;
+      Body.Writer.close_and_drain response_body;
       Reader.wakeup t.reader
     | Streaming (_response, response_body), `Exn _ ->
-      Body.Writer.close response_body;
       Writer.close_and_drain t.writer;
+      Body.Writer.close_and_drain response_body;
       Reader.wakeup t.reader
     | (Fixed _ | Streaming _ | Upgrade _ | Waiting), _ ->
       (* XXX(seliopou): Once additional logging support is added, log the error
@@ -325,7 +344,7 @@ let try_with t f : (unit, exn) result =
 
 (* Private API, not exposed to the user through ache.mli *)
 
-let close_request_body { request_body; _ } = Body.Reader.close request_body
+let fail_request_body { request_body; _ } = Body.Reader.fail request_body
 
 let error_code t =
   match t.error_code with #error as error -> Some error | `Ok -> None

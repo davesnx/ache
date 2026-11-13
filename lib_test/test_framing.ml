@@ -167,7 +167,46 @@ let cases =
   ; ( "HTTP/1.0 GET 200, string, no CL"
     , req ~version:"HTTP/1.0" "GET"
     , with_string `OK "hello"
-    , "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello"
+    , "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello"
+    , "closed" )
+  ; ( "GET 200, string, request Connection: close"
+    , req ~headers:[ "Connection", "close" ] "GET"
+    , with_string `OK "hello"
+    , "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello"
+    , "closed" )
+  ; ( "HEAD 200, string, app CL, request Connection: close"
+    , req ~headers:[ "Connection", "close" ] "HEAD"
+    , with_string ~headers:[ "content-length", "5" ] `OK "hello"
+    , "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\n"
+    , "closed" )
+  ; ( "GET 204, string, request Connection: close"
+    , req ~headers:[ "Connection", "close" ] "GET"
+    , with_string `No_content ""
+    , "HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n"
+    , "closed" )
+  ; ( "GET 200, string, app Connection: keep-alive, Close"
+    , req "GET"
+    , with_string ~headers:[ "connection", "keep-alive, Close" ] `OK "hello"
+    , "HTTP/1.1 200 OK\r\n\
+       connection: keep-alive, Close\r\n\
+       content-length: 5\r\n\
+       \r\n\
+       hello"
+    , "closed" )
+  ; ( "GET 200, string, app Connection: x-a, request Connection: close"
+    , req ~headers:[ "Connection", "close" ] "GET"
+    , with_string ~headers:[ "connection", "x-a" ] `OK "hello"
+    , "HTTP/1.1 200 OK\r\n\
+       connection: x-a\r\n\
+       content-length: 5\r\n\
+       connection: close\r\n\
+       \r\n\
+       hello"
+    , "closed" )
+  ; ( "HTTP/1.0 GET 200, string, app Connection: close"
+    , req ~version:"HTTP/1.0" "GET"
+    , with_string ~headers:[ "connection", "close" ] `OK "hello"
+    , "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 5\r\n\r\nhello"
     , "closed" )
   ; ( "GET 200, streaming, app CL"
     , req "GET"
@@ -188,12 +227,12 @@ let cases =
   ; ( "GET 200, streaming, no CL, HTTP/1.0"
     , req ~version:"HTTP/1.0" "GET"
     , streaming `OK "hello"
-    , "HTTP/1.1 200 OK\r\n\r\nhello"
+    , "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nhello"
     , "closed" )
   ; ( "GET 200, streaming, no CL, request Connection: close"
     , req ~headers:[ "Connection", "close" ] "GET"
     , streaming `OK "hello"
-    , "HTTP/1.1 200 OK\r\n\r\nhello"
+    , "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nhello"
     , "closed" )
   ; ( "GET 200, streaming, no CL, app Connection: close"
     , req "GET"
@@ -237,7 +276,7 @@ let cases =
   ; ( "HTTP/1.0 GET 200, streaming, app chunked"
     , req ~version:"HTTP/1.0" "GET"
     , streaming ~headers:[ "transfer-encoding", "chunked" ] `OK "hello"
-    , "HTTP/1.1 200 OK\r\n\r\nhello"
+    , "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nhello"
     , "closed" )
   ; ( "HTTP/1.0 keep-alive GET 200, streaming, app chunked"
     , req ~version:"HTTP/1.0" ~headers:[ "Connection", "keep-alive" ] "GET"
@@ -346,7 +385,7 @@ let test_head_error_response () =
   in
   Alcotest.(check string)
     "head only"
-    "HTTP/1.1 400 Bad Request\r\n\r\n"
+    "HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n"
     (Buffer.contents s.out)
 
 let test_pipelined_head_get () =
@@ -560,7 +599,7 @@ let test_continue_http_1_0 () =
   in
   Alcotest.(check string)
     "only the final response"
-    "HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\ngot hello"
+    "HTTP/1.1 200 OK\r\ncontent-length: 9\r\nconnection: close\r\n\r\ngot hello"
     (Buffer.contents s.out)
 
 let test_several_informational () =

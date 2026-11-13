@@ -80,16 +80,25 @@ module Body : sig
     type t
 
     val schedule_read :
-       t
+       ?on_error:(unit -> unit)
+      -> t
       -> on_eof:(unit -> unit)
       -> on_read:(Bigstringaf.t -> off:int -> len:int -> unit)
       -> unit
-    (** [schedule_read t ~on_eof ~on_read] will setup [on_read] and [on_eof] as
-        callbacks for when bytes are available in [t] for the application to
-        consume, or when the input channel has been closed and no further bytes
-        will be received by the application.
+    (** [schedule_read t ~on_error ~on_eof ~on_read] will setup [on_read],
+        [on_eof] and [on_error] as callbacks for when bytes are available in
+        [t] for the application to consume, when the body is complete, or when
+        the body ends before it is complete.
 
-        Once either of these callbacks have been called, they become inactive.
+        [on_eof] is called only for a complete body, or after {!close}.
+        [on_error] is called instead when the body ends before its framing
+        ends: the connection reached end of input or closed in the middle of
+        the body, or the body's framing is invalid. Such a body is incomplete
+        (RFC 9112 §8). The cause goes to the connection's error handler (and
+        {!Reqd.error_code} on a server). Without [on_error], nothing is called
+        for an incomplete body.
+
+        Once one of these callbacks has been called, they become inactive.
         The application is responsible for scheduling subsequent reads, either
         within the [on_read] callback or by some other mechanism.
 
@@ -312,8 +321,12 @@ module Reqd : sig
       - [Transfer-Encoding: chunked] to a streaming response that has neither
         field, for an HTTP/1.1 request on a persistent connection. Otherwise
         the body ends when the connection closes;
-      - [Connection: close] when a body that ends with the connection is sent
-        on a connection that was persistent;
+      - [Connection: close] to a final response after which the connection
+        closes (the request has [Connection: close], an HTTP/1.0 request has
+        no [keep-alive], the body ends with the connection, or the response is
+        an error response), unless the response's [Connection] field already
+        has the [close] option (RFC 9112 §9.6). A 2xx response to [CONNECT]
+        does not get it;
       - [Connection: keep-alive] to a response to an HTTP/1.0 request when the
         connection stays open and the response has no [Connection] field.
 
@@ -342,7 +355,15 @@ module Reqd : sig
         bigstring body;
       - an invalid head, naming the offending field: a field name that is
         not a token (RFC 9110 §5.1), a field value with CR, LF or NUL (§5.5),
-        or a reason phrase with CR, LF or NUL. *)
+        or a reason phrase with CR, LF or NUL.
+
+      When the connection can no longer write, for example because the peer
+      closed it, the [respond_with_*] functions do not raise: the response is
+      recorded and its bytes are dropped. The body writer of a streaming
+      response is then closed, and {!Body.Writer.flush} answers [`Closed].
+      When the connection closes during a streaming response, or
+      {!report_exn} is called for it, the bytes of its body that are not
+      written yet are dropped and every pending flush gets [`Closed]. *)
 
   val respond_with_string : t -> Response.t -> string -> unit
   val respond_with_bigstring : t -> Response.t -> Bigstringaf.t -> unit
@@ -454,7 +475,21 @@ module Server_connection : sig
 
       The error response follows the framing rules of {!Reqd}: it has no body
       in a response to [HEAD], and a body without [Content-Length] ends when
-      the connection closes. *)
+      the connection closes. When [error_handler] raises, for example because
+      the head it gives is invalid, the connection drops its pending output
+      and closes.
+
+      After a request that may switch protocols ([CONNECT], or an [Upgrade]
+      field with the [upgrade] connection option), the connection reads
+      nothing past the end of that request until its response is decided
+      (RFC 9110 §7.8, §9.3.6). After a 101 response, or a 2xx response to
+      [CONNECT], those bytes are not read as HTTP: a 101 hands them to the
+      new protocol. After any other response, they are read as the next
+      request.
+
+      When the response is complete and no read is scheduled on the request
+      body, the connection reads the rest of the body to find the next
+      request and drops its bytes, also the bytes that the body holds. *)
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
   (** [next_read_operation t] returns a value describing the next operation that

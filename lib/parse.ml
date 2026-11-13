@@ -271,6 +271,7 @@ module Reader = struct
     ; on_head : ('head, 'error) t -> 'head -> unit
     ; fail : [ `Parse of string | `Header_too_large ] -> 'error
     ; mutable state : ('head, 'error) state
+    ; mutable paused : bool
     ; mutable closed : bool
     ; mutable wakeup : Optional_thunk.t
     }
@@ -345,11 +346,13 @@ module Reader = struct
     ; on_head
     ; fail
     ; state = Done
+    ; paused = false
     ; closed = false
     ; wakeup = Optional_thunk.none
     }
 
   let is_closed t = t.closed
+  let resume t = t.paused <- false
 
   let on_wakeup t k =
     if is_closed t
@@ -367,9 +370,17 @@ module Reader = struct
     Body.Reader.create
       ~when_ready_to_read:(Optional_thunk.some (fun () -> wakeup t))
 
+  (* RFC 9110 §7.8, §9.3.6: the connection may stop carrying HTTP/1.1 after the
+     response to this request. *)
+  let may_switch_protocols (request : Request.t) =
+    request.meth = `CONNECT
+    || (Headers.mem request.headers "upgrade"
+       && Message.has_option request.headers "upgrade")
+
   let request ~max_header_size handler =
     let line = ref `Method in
     let on_head t request =
+      t.paused <- may_switch_protocols request;
       match Request.received_body_length request with
       | Error error -> t.state <- Fail (`Invalid_request (request, error))
       | Ok (`Fixed 0L) ->
@@ -514,7 +525,7 @@ module Reader = struct
     match t.state with
     | Fail _ | Head_done -> 0
     | Cancelled_parse -> len
-    | Done when len = 0 -> 0
+    | Done when len = 0 || t.paused -> 0
     | Done ->
       parse
         t

@@ -349,8 +349,7 @@ let server_tests =
          check_status "one response" [ 200 ] s;
          check_targets "only the first dispatched" [ "/1" ] s;
          check_closed "connection closed" s)
-  ; known_failure
-      ~ticket:"26"
+  ; test
       "§9.6 server SHOULD: close option in the response to a request with \
        Connection: close"
       (fun () ->
@@ -359,20 +358,16 @@ let server_tests =
          in
          check_closed "connection closed" s;
          check_close_option "Connection: close in the response" s)
-  ; known_failure
-      ~ticket:"26"
+  ; test
       "§9.6 server SHOULD: close option in the response to an HTTP/1.0 request"
       (fun () ->
          let s = Server.run (req ~version:"HTTP/1.0" ~headers:[] "GET" "/") in
          check_closed "connection closed" s;
          check_close_option "Connection: close in the response" s)
-  ; known_failure
-      ~ticket:"26"
-      "§9.6 server SHOULD: close option in a 400 response"
-      (fun () ->
-         let s = Server.run "GET / HTTP/1.1\r\nHost: a\r\nBad Header\r\n\r\n" in
-         check_bad_request s;
-         check_close_option "Connection: close in the 400" s)
+  ; test "§9.6 server SHOULD: close option in a 400 response" (fun () ->
+      let s = Server.run "GET / HTTP/1.1\r\nHost: a\r\nBad Header\r\n\r\n" in
+      check_bad_request s;
+      check_close_option "Connection: close in the 400" s)
   ; test
       "§9.6 server MUST NOT: no request processed after a 400 on the connection"
       (fun () ->

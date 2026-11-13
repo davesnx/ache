@@ -37,12 +37,16 @@ module Reader = struct
     ; mutable closed : bool
     ; mutable read_scheduled : bool
     ; mutable on_eof : unit -> unit
+    ; mutable on_error : unit -> unit
+    ; mutable failed : bool
+    ; mutable discarding : bool
     ; mutable eof_has_been_called : bool
     ; mutable on_read : Bigstringaf.t -> off:int -> len:int -> unit
     ; when_ready_to_read : Optional_thunk.t
     }
 
   let default_on_eof = Sys.opaque_identity (fun () -> ())
+  let default_on_error = Sys.opaque_identity (fun () -> ())
   let default_on_read = Sys.opaque_identity (fun _ ~off:_ ~len:_ -> ())
 
   let create ~when_ready_to_read =
@@ -53,6 +57,9 @@ module Reader = struct
     ; read_scheduled = false
     ; eof_has_been_called = false
     ; on_eof = default_on_eof
+    ; on_error = default_on_error
+    ; failed = false
+    ; discarding = false
     ; on_read = default_on_read
     ; when_ready_to_read
     }
@@ -67,7 +74,7 @@ module Reader = struct
 
   (* The application may keep bytes passed to [on_read]: never reuse them. *)
   let write t bs ~off ~len =
-    if (not t.closed) && len > 0
+    if (not t.closed) && (not t.discarding) && len > 0
     then (
       if Bigstringaf.length t.buffer - (t.off + t.len) < len
       then (
@@ -78,12 +85,16 @@ module Reader = struct
       Bigstringaf.blit bs ~src_off:off t.buffer ~dst_off:(t.off + t.len) ~len;
       t.len <- t.len + len)
 
-  let rec do_execute_read t on_eof on_read =
+  let reset_callbacks t =
+    t.read_scheduled <- false;
+    t.on_eof <- default_on_eof;
+    t.on_error <- default_on_error;
+    t.on_read <- default_on_read
+
+  let rec do_execute_read t ~on_error on_eof on_read =
     if t.len > 0
     then (
-      t.read_scheduled <- false;
-      t.on_eof <- default_on_eof;
-      t.on_read <- default_on_read;
+      reset_callbacks t;
       let off = t.off
       and len = t.len in
       t.off <- off + len;
@@ -92,32 +103,44 @@ module Reader = struct
       execute_read t)
     else if t.closed
     then (
-      t.read_scheduled <- false;
-      t.on_eof <- default_on_eof;
-      t.on_read <- default_on_read;
+      reset_callbacks t;
       if not t.eof_has_been_called
       then (
         t.eof_has_been_called <- true;
-        on_eof ()))
+        if t.failed then on_error () else on_eof ()))
 
   and execute_read t =
-    if t.read_scheduled then do_execute_read t t.on_eof t.on_read
+    if t.read_scheduled
+    then do_execute_read t ~on_error:t.on_error t.on_eof t.on_read
 
-  let schedule_read t ~on_eof ~on_read =
+  let schedule_read ?(on_error = default_on_error) t ~on_eof ~on_read =
     if t.read_scheduled
     then failwith "Body.schedule_read: reader already scheduled";
     if not (is_closed t)
     then (
       t.read_scheduled <- true;
       t.on_eof <- on_eof;
+      t.on_error <- on_error;
       t.on_read <- on_read);
-    do_execute_read t on_eof on_read;
+    do_execute_read t ~on_error on_eof on_read;
     ready_to_read t
 
   let close t =
     t.closed <- true;
     execute_read t;
     ready_to_read t
+
+  let discard t =
+    t.discarding <- true;
+    t.buffer <- Bigstringaf.empty;
+    t.off <- 0;
+    t.len <- 0
+
+  let fail t =
+    if not t.closed
+    then (
+      t.failed <- true;
+      close t)
 
   let has_pending_output t = t.len > 0
   let is_read_scheduled t = t.read_scheduled

@@ -275,6 +275,7 @@ let test_pipelined () =
        \r\n\
        /aHTTP/1.1 200 OK\r\n\
        content-length: 2\r\n\
+       connection: close\r\n\
        \r\n\
        /b"
       output;

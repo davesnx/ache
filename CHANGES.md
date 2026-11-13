@@ -172,6 +172,37 @@ ache Unreleased
   method: `*` is only for OPTIONS, authority-form only for CONNECT, and other
   methods need origin-form or absolute-form (RFC 9112 §3.2). httpun passed
   `GET *` and `GET 127.0.0.1:80` to the handler.
+- Server: a head cut by end of input gets its 400 response whether the
+  runtime asks for the next write or the next read first. httpun raised
+  `Failure "cannot write to closed writer"` when the write came first.
+- `Body.Reader.schedule_read` takes an optional `~on_error`. A request body
+  cut by end of input, by a framing error or by the connection closing calls
+  `on_error`, not `on_eof` (RFC 9112 §8); the cause goes to the error handler
+  and `Reqd.error_code`. httpun called `on_eof` as for a complete body.
+- Server: once the response is complete, a request body with no read
+  scheduled is read to its end and its bytes are dropped. httpun kept every
+  byte of the unread body in memory.
+- Server: when the error handler raises, for example on an invalid head given
+  to its response function, the connection drops its pending output and
+  closes. httpun let the exception escape and left the connection open.
+- Server: every final response after which the connection closes carries
+  `connection: close`, unless its `Connection` field already has `close`:
+  after a request with `Connection: close`, an HTTP/1.0 request without
+  `keep-alive`, a close-delimited body, and error responses (RFC 9112 §9.6).
+  httpun added it only to a close-delimited body on a persistent connection.
+- Server: after a `CONNECT` request or a request with `Upgrade` and
+  `Connection: upgrade`, the server reads nothing past the end of that request
+  until the response is decided. A 101 hands the bytes that followed it to the
+  new protocol; a 2xx to `CONNECT` leaves them unread; another response reads
+  them as HTTP. httpun parsed them as HTTP before the response: a complete
+  line failed the connection, and an HTTP/2 preface became a second request.
+- Server: when the connection writer closes, or an exception is reported
+  during a streaming response, the unwritten bytes of the response body are
+  dropped and every pending `Body.Writer.flush` callback gets `` `Closed ``.
+  httpun never called these callbacks. `respond_with_*` on a closed
+  connection no longer raises `Failure "cannot write to closed writer"`: the
+  response is recorded, its bytes are dropped, and a streaming body writer is
+  returned closed.
 
 httpun history
 ==============

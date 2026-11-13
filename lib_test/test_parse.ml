@@ -19,9 +19,10 @@ let read_body body ~on_done =
   let buf = Buffer.create 64 in
   let rec on_read bs ~off ~len =
     Buffer.add_string buf (Bigstringaf.substring bs ~off ~len);
-    Body.Reader.schedule_read body ~on_read ~on_eof
-  and on_eof () = on_done (Buffer.contents buf) in
-  Body.Reader.schedule_read body ~on_read ~on_eof
+    Body.Reader.schedule_read body ~on_error ~on_read ~on_eof
+  and on_eof () = on_done (Buffer.contents buf)
+  and on_error () = on_done ("incomplete: " ^ Buffer.contents buf) in
+  Body.Reader.schedule_read body ~on_error ~on_read ~on_eof
 
 module Feeder = struct
   type t =
@@ -437,7 +438,9 @@ let test_chunk_size_overflow () =
   Alcotest.(check (list string)) "400" [ "Bad_request" ] s.errors;
   Alcotest.(check (list request_body))
     "no body bytes"
-    [ {|"POST" "/" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}, "" ]
+    [ ( {|"POST" "/" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}
+      , "incomplete: " )
+    ]
     s.requests
 
 let chunked_head =
@@ -467,7 +470,7 @@ let test_chunk_size_leading_zeros () =
             Alcotest.(check (list string)) size [ "Bad_request" ] s.errors;
             Alcotest.(check (list request_body))
               (size ^ ": no body bytes")
-              [ chunked_summary, "" ]
+              [ chunked_summary, "incomplete: " ]
               s.requests)
          (all_splits (chunked_head ^ size ^ "\r\nhello\r\n0\r\n\r\n")))
     [ "10000000000000000"; "7fffffffffffffff"; "ffffffffffffffff" ]
