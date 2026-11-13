@@ -1,0 +1,9 @@
+(executables
+ (libraries ache ache-eio ache_examples eio_main)
+ (names eio_echo_post eio_get eio_connect_server eio_connect_client)
+ (flags :standard -warn-error -A))
+
+(alias
+ (name examples)
+ (deps
+  (glob_files *.exe)))

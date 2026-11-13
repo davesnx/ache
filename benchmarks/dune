@@ -1,0 +1,9 @@
+(executable
+ (name wrk_lwt_benchmark)
+ (modules Wrk_lwt_benchmark)
+ (libraries ache ache_examples ache-lwt lwt.unix))
+
+(alias
+ (name benchmarks)
+ (deps
+  (glob_files *.exe)))

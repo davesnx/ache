@@ -1,0 +1,3 @@
+(library
+ (name ache_examples)
+ (libraries ache gluten))

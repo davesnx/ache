@@ -1,0 +1,15 @@
+(test
+ (package ache)
+ (libraries bigstringaf ache alcotest)
+ (modules
+  helpers
+  test_client_connection
+  test_headers
+  test_ache
+  test_iovec
+  test_method
+  test_request
+  test_response
+  test_server_connection
+  test_version)
+ (name test_ache))
