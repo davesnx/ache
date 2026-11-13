@@ -1,6 +1,12 @@
 (executables
  (libraries ache ache-lwt ache_examples lwt lwt.unix)
- (names lwt_get lwt_get_pipelined lwt_post lwt_echo_post))
+ (names
+  lwt_get
+  lwt_get_pipelined
+  lwt_post
+  lwt_echo_post
+  lwt_hello_server
+  lwt_hello_client))
 
 (alias
  (name examples)

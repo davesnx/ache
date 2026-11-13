@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  DUNE_PROFILE: release
+  OCAMLRUNPARAM: b
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+jobs:
+  build:
+    name: Build and test
+
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
+        ocaml-compiler:
+          - 5.3.0
+          - 5.5.2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup OCaml and dependencies
+        uses: ml-in-barcelona/gh-ci-action@v1.2.0
+        with:
+          ocaml-compiler: ${{ matrix.ocaml-compiler }}
+          with-doc: true
+          with-dev-setup: true
+
+      - name: Load dune cache
+        uses: ml-in-barcelona/gh-ci-action/dune-cache/load@v1.2.0
+
+      - name: Build
+        run: make build
+
+      - name: Check formatting
+        run: make format-check
+
+      - name: Run tests
+        run: make test
+
+      - name: Save dune cache
+        uses: ml-in-barcelona/gh-ci-action/dune-cache/save@v1.2.0
+
+  docs:
+    name: Build documentation
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup OCaml and dependencies
+        uses: ml-in-barcelona/gh-ci-action@v1.2.0
+        with:
+          ocaml-compiler: 5.3.0
+          with-doc: true
+          with-dev-setup: true
+
+      - name: Build documentation
+        run: make docs
+
+  release:
+    name: Release to opam
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup OCaml and dependencies
+        uses: ml-in-barcelona/gh-ci-action@v1.2.0
+        with:
+          ocaml-compiler: 5.3.0
+          with-doc: true
+          with-dev-setup: true
+          extra-packages: dune-release
+
+      - name: Release
+        uses: davesnx/dune-release-action@v0.6.0
+        with:
+          packages: 'ache,ache-eio,ache-lwt'
+          changelog: './CHANGES.md'
+          github-token: ${{ secrets.GH_TOKEN }}

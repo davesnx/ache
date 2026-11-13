@@ -64,33 +64,23 @@ let main port =
       Printf.printf "Listening on port %i and echoing POST requests.\n" port;
       Printf.printf "To send a POST request, try one of the following\n\n";
       Printf.printf
-        "  echo \"Testing echo POST\" | dune exec examples/async/async_post.exe\n";
-      Printf.printf
         "  echo \"Testing echo POST\" | dune exec examples/lwt/lwt_post.exe\n";
       Printf.printf
         "  echo \"Testing echo POST\" | curl -XPOST --data @- \
          http://localhost:%d\n\n\
          %!"
         port;
-      let domain_mgr = Eio.Stdenv.domain_mgr env in
-      let p, _ = Eio.Promise.create () in
-      for _i = 1 to Stdlib.Domain.recommended_domain_count () do
-        Eio.Fiber.fork_daemon ~sw (fun () ->
-          Eio.Domain_manager.run domain_mgr (fun () ->
-            Eio.Switch.run (fun sw ->
-              while true do
-                Eio.Net.accept_fork
-                  socket
-                  ~sw
-                  ~on_error:log_connection_error
-                  (fun client_sock client_addr ->
-                     let p, u = Eio.Promise.create () in
-                     handler ~sw ~u client_addr client_sock;
-                     Eio.Promise.await_exn p)
-              done;
-              `Stop_daemon)))
-      done;
-      Eio.Promise.await p))
+      Eio.Net.run_server
+        socket
+        ~additional_domains:
+          ( Eio.Stdenv.domain_mgr env
+          , Stdlib.Domain.recommended_domain_count () - 1 )
+        ~on_error:log_connection_error
+        (fun client_sock client_addr ->
+           Eio.Switch.run @@ fun sw ->
+           let p, u = Eio.Promise.create () in
+           handler ~sw ~u client_addr client_sock;
+           Eio.Promise.await_exn p)))
 
 let () =
   let port = ref 8080 in
