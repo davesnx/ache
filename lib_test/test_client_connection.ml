@@ -129,8 +129,8 @@ let test_commit_parse_after_every_header () =
   let bs = Bigstringaf.of_string r ~off:0 ~len:(String.length r) in
   let c = read t bs ~off:0 ~len:(String.length response_line + 15) in
   Alcotest.(check int)
-    "only reads the response line"
-    (String.length response_line)
+    "an incomplete head consumes all input"
+    (String.length response_line + 15)
     c;
 
   let c' = read t bs ~off:c ~len:(String.length single_header) in
@@ -547,7 +547,7 @@ let test_input_shrunk () =
   writer_yielded t;
   reader_ready t;
   let c = feed_string t "HTTP/1.1 200 OK\r\nDate" in
-  Alcotest.(check int) "read the status line" c 17;
+  Alcotest.(check int) "read the incomplete head" 21 c;
   report_exn t (Failure "something went wrong");
   connection_is_shutdown t;
   Alcotest.(check (option string))
@@ -578,8 +578,8 @@ let test_partial_input () =
   Body.Writer.close body;
   reader_ready t;
   let len = feed_string t "HTTP/1.1 200 OK\r\nC" in
-  Alcotest.(check int) "partial read" 17 len;
-  read_string t "Connection: close\r\n\r\n";
+  Alcotest.(check int) "partial read" 18 len;
+  read_string t "onnection: close\r\n\r\n";
   let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   shutdown t;
@@ -1261,7 +1261,10 @@ let test_failed_response_parse () =
       !error
   in
 
-  test "HTTP/1.1 200\r\n\r\n" 12 (`Malformed_response ": char ' '");
+  test
+    "HTTP/1.1 200\r\n\r\n"
+    16
+    (`Malformed_response "expected ' ', found '\\r'");
 
   let response = Response.create `OK ~headers:(Headers.encoding_fixed (-1)) in
   test (response_to_string response) 39 (`Invalid_response_body_length response)

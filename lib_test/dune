@@ -3,6 +3,9 @@
  (libraries bigstringaf ache alcotest)
  (modules
   helpers
+  grammar_corpus
+  test_grammar
+  test_parse
   test_client_connection
   test_headers
   test_ache

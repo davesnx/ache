@@ -63,7 +63,8 @@ let wakeup_writer t = Writer.wakeup t.writer
 let create ?(config = Config.default) () =
   let request_queue = Queue.create () in
   { config
-  ; reader = Reader.response request_queue
+  ; reader =
+      Reader.response ~max_header_size:config.max_header_size request_queue
   ; writer = Writer.create ()
   ; request_queue
   }
@@ -227,9 +228,11 @@ and _final_read_operation_for t respd =
 
 let next_read_operation t =
   match _next_read_operation t with
-  | `Error (`Parse (marks, message)) ->
-    let message = String.concat "" [ String.concat ">" marks; ": "; message ] in
+  | `Error (`Parse message) ->
     set_error_and_handle t (`Malformed_response message);
+    `Close
+  | `Error `Header_too_large ->
+    set_error_and_handle t (`Malformed_response "header fields too large");
     `Close
   | `Error (`Invalid_response_body_length _ as error) ->
     set_error_and_handle t error;

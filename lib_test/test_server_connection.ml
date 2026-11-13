@@ -7,6 +7,8 @@ let request_error_pp_hum fmt = function
   | `Bad_request -> Format.fprintf fmt "Bad_request"
   | `Bad_gateway -> Format.fprintf fmt "Bad_gateway"
   | `Internal_server_error -> Format.fprintf fmt "Internal_server_error"
+  | `Request_header_fields_too_large ->
+    Format.fprintf fmt "Request_header_fields_too_large"
   | `Exn exn -> Format.fprintf fmt "Exn (%s)" (Printexc.to_string exn)
 
 module Alcotest = struct
@@ -386,10 +388,7 @@ let test_commit_parse_after_every_header () =
   in
   let bs = Bigstringaf.of_string r ~off:0 ~len:(String.length r) in
   let c = read t bs ~off:0 ~len:30 in
-  Alcotest.(check int)
-    "only reads the request line"
-    (String.length request_line)
-    c;
+  Alcotest.(check int) "an incomplete head consumes all input" 30 c;
 
   let c' = read t bs ~off:c ~len:(String.length single_header) in
   Alcotest.(check int)
@@ -884,7 +883,7 @@ let test_chunked_encoding_for_error () =
   in
   let t = create ~error_handler (fun _ -> assert false) in
   let c = feed_string t "  X\r\n\r\n" in
-  Alcotest.(check int) "Partial read" 2 c;
+  Alcotest.(check int) "A failed head consumes the bytes it was given" 7 c;
   write_response
     t
     (Response.create `Bad_request ~headers:Headers.encoding_chunked);
@@ -996,10 +995,10 @@ let test_input_shrunk () =
     on_writer_unyield t (fun () -> write_response t (Response.create `OK))
   in
   let len = feed_string t "GET /v1/b HTTP/1.1\r\nH" in
-  Alcotest.(check int) "partial read" 20 len;
+  Alcotest.(check int) "partial read" 21 len;
   read_string
     t
-    "Host: example.com\r\n\
+    "ost: example.com\r\n\
      Connection: close\r\n\
      Accept: application/json, text/plain, */*\r\n\
      Accept-Language: en-US,en;q=0.5\r\n\
@@ -1031,10 +1030,7 @@ let test_malformed conn =
   let len = String.length malformed_request_string in
   let input = Bigstringaf.of_string malformed_request_string ~off:0 ~len in
   let c = read conn input ~off:0 ~len in
-  Alcotest.(check bool)
-    "read doesn't consume all input"
-    true
-    (c < String.length malformed_request_string);
+  Alcotest.(check int) "a failed head consumes the bytes it was given" len c;
   reader_errored conn;
   Alcotest.(check bool) "Writer woken up" true !writer_woken_up
 
@@ -1388,19 +1384,19 @@ let test_input_shrunk_chunked () =
     on_writer_unyield t (fun () -> write_response t (Response.create `OK))
   in
   let len = feed_string t "GET /v1/b HTTP/1.1\r\nH" in
-  Alcotest.(check int) "partial read" 20 len;
-  read_string t "Host: example.com\r\nTransfer-Encoding: chunked\r\n\r\n";
+  Alcotest.(check int) "partial read" 21 len;
+  read_string t "ost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n";
 
   let str = "5\r\ninput\r\n" in
   let len = String.length str in
   let input = Bigstringaf.of_string str ~off:0 ~len in
   let just_read = force_read t input ~off:0 ~len in
-  Alcotest.(check int) "partial read" (len - 2) just_read;
+  Alcotest.(check int) "chunk and its CRLF read" len just_read;
 
-  let just_read = force_read_eof t input ~off:(len - 2) ~len:2 in
+  let just_read = force_read_eof t input ~off:len ~len:0 in
   Alcotest.(check int)
     "eof partial read, doesn't get terminating chunk"
-    2
+    0
     just_read;
 
   writer_yielded t
@@ -1609,8 +1605,7 @@ let test_failed_request_parse () =
   writer_yielded t;
   let writer_woken_up = on_writer_unyield t ignore in
   let len = feed_string t "GET /v1/b HTTP/1.1\r\nHost : example.com\r\n\r\n" in
-  (* Reads through the end of "Host" *)
-  Alcotest.(check int) "partial read" 24 len;
+  Alcotest.(check int) "a failed head consumes the bytes it was given" 42 len;
   reader_closed t;
   Alcotest.(check bool) "Error handler fired" true !error_handler_fired;
   Alcotest.(check bool) "Writer woken up" true !writer_woken_up;
@@ -2007,7 +2002,7 @@ let test_parse_failure_after_checkpoint () =
   reader_ready t;
   read_string t "GET index.html HTTP/1.1\r\n";
   let result = feed_string t " index.html HTTP/1.1\r\n\r\n" in
-  Alcotest.(check int) "Bad header not consumed" result 0;
+  Alcotest.(check int) "Bad header consumed" 24 result;
   reader_closed t;
   match !error_queue with
   | None -> Alcotest.fail "Expected error"
@@ -2031,7 +2026,7 @@ let test_parse_failure_at_eof () =
   reader_ready t;
   read_string t "GET index.html HTTP/1.1\r\n";
   let result = feed_string ~eof:true t " index.html HTTP/1.1\r\n\r\n" in
-  Alcotest.(check int) "Bad header not consumed" result 0;
+  Alcotest.(check int) "Bad header consumed" 24 result;
   reader_closed t;
   (match !error_queue with
   | None -> Alcotest.fail "Expected error"
@@ -2495,10 +2490,7 @@ let test_write_response_after_read_eof () =
   in
   let bs = Bigstringaf.of_string r ~off:0 ~len:(String.length r) in
   let c = read t bs ~off:0 ~len:30 in
-  Alcotest.(check int)
-    "only reads the request line"
-    (String.length request_line)
-    c;
+  Alcotest.(check int) "an incomplete head consumes all input" 30 c;
 
   let c' = read t bs ~off:c ~len:(String.length single_header) in
   Alcotest.(check int)

@@ -38,6 +38,7 @@ type error =
   [ `Bad_gateway
   | `Bad_request
   | `Internal_server_error
+  | `Request_header_fields_too_large
   | `Exn of exn
   ]
 
@@ -135,7 +136,8 @@ let create
   let writer = Writer.create ~buffer_size:response_buffer_size () in
   let request_queue = Queue.create () in
   let response_body_buffer = Bigstringaf.create response_body_buffer_size in
-  let rec reader = lazy (Reader.request handler)
+  let rec reader =
+    lazy (Reader.request ~max_header_size:config.max_header_size handler)
   and handler request request_body =
     let reqd =
       Reqd.create
@@ -304,6 +306,9 @@ let next_read_operation t =
   match _next_read_operation t with
   | `Error (`Parse _) ->
     set_error_and_handle t `Bad_request;
+    `Close
+  | `Error `Header_too_large ->
+    set_error_and_handle t `Request_header_fields_too_large;
     `Close
   | `Error (`Bad_request request) ->
     set_error_and_handle ~request t `Bad_request;

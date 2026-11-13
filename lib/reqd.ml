@@ -33,6 +33,7 @@ type error =
   [ `Bad_request
   | `Bad_gateway
   | `Internal_server_error
+  | `Request_header_fields_too_large
   | `Exn of exn
   ]
 

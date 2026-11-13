@@ -4,4 +4,4 @@
 (library
  (name ache)
  (public_name ache)
- (libraries angstrom bigstringaf))
+ (libraries bigstringaf parseff))

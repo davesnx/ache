@@ -3,6 +3,7 @@ type t =
   ; request_body_buffer_size : int
   ; response_buffer_size : int
   ; response_body_buffer_size : int
+  ; max_header_size : int
   ; proxy : bool
   }
 
@@ -11,5 +12,6 @@ let default =
   ; request_body_buffer_size = 0x1000
   ; response_buffer_size = 0x400
   ; response_body_buffer_size = 0x1000
+  ; max_header_size = 0x4000
   ; proxy = false
   }

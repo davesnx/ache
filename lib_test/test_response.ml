@@ -7,9 +7,7 @@ let body_length = Alcotest.of_pp Response.Body_length.pp_hum
 let check =
   let alco = Alcotest.result (Alcotest.of_pp pp_hum) Alcotest.string in
   fun message ~expect input ->
-    let actual =
-      Angstrom.parse_string ~consume:All Ache_private.Parse.response input
-    in
+    let actual = Ache_private.Parse.Grammar.response input in
     Alcotest.check alco message expect actual
 
 let test_parse_valid () =
@@ -21,15 +19,15 @@ let test_parse_valid () =
 let test_parse_invalid_error () =
   check
     "OK response without a status message"
-    ~expect:(Error ": char ' '")
+    ~expect:(Error "expected ' ', found '\\r'")
     "HTTP/1.1 200\r\n\r\n";
   check
     "OK response without a status message"
-    ~expect:(Error ": status-code empty")
+    ~expect:(Error "status-code empty")
     "HTTP/1.1 OK\r\n\r\n";
   check
     "OK response without a status message"
-    ~expect:(Error ": status-code too long: \"999999937377999999999200\"")
+    ~expect:(Error "status-code too long: \"999999937377999999999200\"")
     "HTTP/1.1 999999937377999999999200\r\n\r\n"
 
 let test_body_length () =

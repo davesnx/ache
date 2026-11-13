@@ -7,9 +7,7 @@ let body_length = Alcotest.of_pp Request.Body_length.pp_hum
 let check =
   let alco = Alcotest.result (Alcotest.of_pp pp_hum) Alcotest.string in
   fun message ~expect input ->
-    let actual =
-      Angstrom.parse_string ~consume:All Ache_private.Parse.request input
-    in
+    let actual = Ache_private.Parse.Grammar.request input in
     Alcotest.check alco message expect actual
 
 let test_parse_valid () =
@@ -32,14 +30,17 @@ let test_parse_valid () =
     "GET / HTTP/1.1\r\nLink: /path/to/some/website\r\n\r\n"
 
 let test_parse_invalid_errors () =
-  check "doesn't end" ~expect:(Error ": not enough input") "GET / HTTP/1.1\r\n";
+  check
+    "doesn't end"
+    ~expect:(Error "unexpected end of input")
+    "GET / HTTP/1.1\r\n";
   check
     "invalid version"
-    ~expect:(Error "eol: string")
+    ~expect:(Error "expected \"\\r\\n\", found '2'")
     "GET / HTTP/1.22\r\n\r\n";
   check
     "malformed header"
-    ~expect:(Error "header: char ':'")
+    ~expect:(Error "expected ':', found ' '")
     "GET / HTTP/1.1\r\nLink : /path/to/some/website\r\n\r\n"
 
 let test_body_length () =

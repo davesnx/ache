@@ -263,6 +263,7 @@ module Reqd : sig
     [ `Bad_request
     | `Bad_gateway
     | `Internal_server_error
+    | `Request_header_fields_too_large
     | `Exn of exn
     ]
 
@@ -311,6 +312,10 @@ module Config : sig
     ; request_body_buffer_size : int  (** Default is [4096] *)
     ; response_buffer_size : int  (** Default is [1024] *)
     ; response_body_buffer_size : int  (** Default is [4096] *)
+    ; max_header_size : int
+      (** Largest request or response head, chunk-size line or trailer
+              section, in bytes. Default is [16384]. A larger request head gets
+              a [431] response. *)
     ; proxy : bool
     }
 
@@ -525,8 +530,12 @@ module Ache_private : sig
   end
 
   module Parse : sig
-    val request : Request.t Angstrom.t
-    val response : Response.t Angstrom.t
+    module Grammar : sig
+      val request : string -> (Request.t, string) result
+      val response : string -> (Response.t, string) result
+      val chunk_size : string -> (int64, string) result
+      val trailers : string -> (Headers.t, string) result
+    end
   end
 
   module Serialize : sig

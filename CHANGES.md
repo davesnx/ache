@@ -25,6 +25,33 @@ ache Unreleased
 - Vendor Faraday 0.8.2 in `vendor/faraday`. It compiles as `Ache__Faraday`
   inside `ache`, so `ache` no longer depends on the opam `faraday` package and
   links with it in the same program. `Ache.IOVec.t` is unchanged.
+- Replace Angstrom with parseff (`>= 0.5.0 & < 0.6.0`) for message heads,
+  chunk-size lines and trailer sections. Bodies are framed without a parser
+  combinator. `Ache_private.Parse` exposes `Grammar` (string parsers) in place
+  of Angstrom parsers.
+- Add `Config.max_header_size` (default 16384 bytes). A request or response
+  head, chunk-size line or trailer section larger than this fails. The server
+  answers `431 Request Header Fields Too Large` and reports the new
+  `` `Request_header_fields_too_large `` case of `Reqd.error`. The client
+  reports `` `Malformed_response "header fields too large" ``. The size of a
+  head no longer depends on `read_buffer_size`: a 6 KiB header line read in
+  4096-byte reads is accepted.
+- Chunk extensions are accepted and ignored. httpun rejected them.
+- Trailer fields after the last chunk are accepted and discarded. httpun
+  rejected them.
+- A chunk size with more than 15 hex digits after its leading zeros is
+  rejected; leading zeros are accepted, as RFC 9112 §7.1 allows. httpun
+  accepted 16-digit sizes up to `7fffffffffffffff`, and wrapped larger sizes to
+  negative values.
+- A status code below 100 or with a leading zero, such as `HTTP/1.1 99 x`, is
+  a malformed response. httpun raised `Failure` from the parser.
+- Parse errors carry one message: `` `Malformed_response "expected ' ', found
+  '\r'" `` in place of Angstrom marks such as `": char ' '"`.
+- `read` and `read_eof` consume every byte of an incomplete head, chunk-size
+  line or trailer section, and every byte given to a head that fails to
+  parse. httpun consumed up to the last complete header line, or up to the
+  failure position. An incomplete head that follows a complete message in the
+  same read is still not consumed.
 
 httpun history
 ==============
