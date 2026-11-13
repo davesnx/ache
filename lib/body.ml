@@ -31,7 +31,10 @@
 
 module Reader = struct
   type t =
-    { faraday : Faraday.t
+    { mutable buffer : Bigstringaf.t
+    ; mutable off : int
+    ; mutable len : int
+    ; mutable closed : bool
     ; mutable read_scheduled : bool
     ; mutable on_eof : unit -> unit
     ; mutable eof_has_been_called : bool
@@ -42,8 +45,11 @@ module Reader = struct
   let default_on_eof = Sys.opaque_identity (fun () -> ())
   let default_on_read = Sys.opaque_identity (fun _ ~off:_ ~len:_ -> ())
 
-  let create buffer ~when_ready_to_read =
-    { faraday = Faraday.of_bigstring buffer
+  let create ~when_ready_to_read =
+    { buffer = Bigstringaf.empty
+    ; off = 0
+    ; len = 0
+    ; closed = false
     ; read_scheduled = false
     ; eof_has_been_called = false
     ; on_eof = default_on_eof
@@ -52,35 +58,47 @@ module Reader = struct
     }
 
   let create_empty () =
-    let t = create Bigstringaf.empty ~when_ready_to_read:Optional_thunk.none in
-    Faraday.close t.faraday;
+    let t = create ~when_ready_to_read:Optional_thunk.none in
+    t.closed <- true;
     t
 
-  let is_closed t = Faraday.is_closed t.faraday
-  let unsafe_faraday t = t.faraday
+  let is_closed t = t.closed
   let ready_to_read t = Optional_thunk.call_if_some t.when_ready_to_read
 
+  (* The application may keep bytes passed to [on_read]: never reuse them. *)
+  let write t bs ~off ~len =
+    if (not t.closed) && len > 0
+    then (
+      if Bigstringaf.length t.buffer - (t.off + t.len) < len
+      then (
+        let buffer = Bigstringaf.create (max 0x1000 ((2 * t.len) + len)) in
+        Bigstringaf.blit t.buffer ~src_off:t.off buffer ~dst_off:0 ~len:t.len;
+        t.buffer <- buffer;
+        t.off <- 0);
+      Bigstringaf.blit bs ~src_off:off t.buffer ~dst_off:(t.off + t.len) ~len;
+      t.len <- t.len + len)
+
   let rec do_execute_read t on_eof on_read =
-    match Faraday.operation t.faraday with
-    | `Yield -> ()
-    | `Close ->
+    if t.len > 0
+    then (
+      t.read_scheduled <- false;
+      t.on_eof <- default_on_eof;
+      t.on_read <- default_on_read;
+      let off = t.off
+      and len = t.len in
+      t.off <- off + len;
+      t.len <- 0;
+      on_read t.buffer ~off ~len;
+      execute_read t)
+    else if t.closed
+    then (
       t.read_scheduled <- false;
       t.on_eof <- default_on_eof;
       t.on_read <- default_on_read;
       if not t.eof_has_been_called
       then (
         t.eof_has_been_called <- true;
-        on_eof ())
-    (* [Faraday.operation] never returns an empty list of iovecs *)
-    | `Writev [] -> assert false
-    | `Writev (iovec :: _) ->
-      t.read_scheduled <- false;
-      t.on_eof <- default_on_eof;
-      t.on_read <- default_on_read;
-      let { IOVec.buffer; off; len } = iovec in
-      Faraday.shift t.faraday len;
-      on_read buffer ~off ~len;
-      execute_read t
+        on_eof ()))
 
   and execute_read t =
     if t.read_scheduled then do_execute_read t t.on_eof t.on_read
@@ -97,11 +115,11 @@ module Reader = struct
     ready_to_read t
 
   let close t =
-    Faraday.close t.faraday;
+    t.closed <- true;
     execute_read t;
     ready_to_read t
 
-  let has_pending_output t = Faraday.has_pending_output t.faraday
+  let has_pending_output t = t.len > 0
   let is_read_scheduled t = t.read_scheduled
 end
 

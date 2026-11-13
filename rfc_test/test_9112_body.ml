@@ -713,7 +713,7 @@ let client_framing_tests =
          in
          check_client_ok "TE wins" ~body:"abc" ex)
   ; known_failure
-      ~ticket:"05"
+      ~ticket:"27"
       "§6.3 client MUST: connection not reused after a response with both \
        Content-Length and Transfer-Encoding"
       (fun () ->
@@ -816,7 +816,7 @@ let client_framing_tests =
          check_client_ok "close-delimited" ~body:"abcdef" ex;
          Alcotest.(check bool) "closed" true (Client.is_closed c))
   ; known_failure
-      ~ticket:"05"
+      ~ticket:"27"
       "§6.1 client MUST: HTTP/1.0 response with Transfer-Encoding closes the \
        connection"
       (fun () ->

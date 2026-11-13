@@ -734,10 +734,10 @@ let splitting_header =
    evil"
 
 let integrity_tests =
-  [ known_failure
-      ~ticket:"17"
+  [ test
       "§11.1 server DEF: app field value cannot split the response"
       (fun () ->
+         let raised = ref false in
          let handler ex =
            match
              Server.respond
@@ -748,11 +748,17 @@ let integrity_tests =
            with
            | () -> ()
            | exception Invalid_argument _ ->
+             raised := true;
              Server.respond ~body:"" `Internal_server_error ex
          in
          let s = Server.run ~handler (get "/") in
+         Alcotest.(check bool)
+           "Invalid_argument at the application's call"
+           true
+           !raised;
          match Wire.parse_responses (Server.output s) with
-         | [ _ ], "" -> ()
+         | [ r ], "" ->
+           Alcotest.(check int) "only the fallback 500" 500 (Wire.status r)
          | rs, rest ->
            Alcotest.failf
              "a client parses %d responses (unparsed %S) from %S"

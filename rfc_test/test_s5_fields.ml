@@ -179,29 +179,25 @@ let invalid_generated_values =
   ]
 
 let tests =
-  [ known_failure
-      ~ticket:"17"
+  [ test
       "§2.2 server MUST NOT: no invalid field-name from the app on the wire"
       (fun () ->
          List.iter
            (fun h -> check_generated_head (server_generates [ h ]))
            invalid_generated_names)
-  ; known_failure
-      ~ticket:"17"
+  ; test
       "§2.2 server MUST NOT: no CR, LF or NUL from the app in a field value"
       (fun () ->
          List.iter
            (fun h -> check_generated_head (server_generates [ h ]))
            invalid_generated_values)
-  ; known_failure
-      ~ticket:"17"
+  ; test
       "§2.2 client MUST NOT: no invalid field-name from the app on the wire"
       (fun () ->
          List.iter
            (fun h -> check_generated_head (client_generates [ h ]))
            invalid_generated_names)
-  ; known_failure
-      ~ticket:"17"
+  ; test
       "§2.2 client MUST NOT: no CR, LF or NUL from the app in a field value"
       (fun () ->
          List.iter

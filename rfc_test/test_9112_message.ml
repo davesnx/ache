@@ -80,6 +80,7 @@ let only_response (ex : Client.exchange) =
   | rs -> Alcotest.failf "expected one response, got %d" (List.length rs)
 
 let server_writes headers ?(reason = "OK") () =
+  let raised = ref false in
   let s =
     Server.run
       ~handler:(fun ex ->
@@ -92,16 +93,24 @@ let server_writes headers ?(reason = "OK") () =
                `OK)
             ""
         with
-        | _ -> ())
+        | Invalid_argument _ -> raised := true)
       (get "/")
   in
-  head_of (Server.output s)
+  !raised, head_of (Server.output s)
 
 let client_writes ?(headers = []) target =
   let c = Client.create () in
-  (try ignore (client_request ~headers:(("Host", "a") :: headers) c target) with
-  | _ -> ());
-  Client.written c
+  let raised =
+    match client_request ~headers:(("Host", "a") :: headers) c target with
+    | _ -> false
+    | exception Invalid_argument _ -> true
+  in
+  raised, Client.written c
+
+let check_app_rejected what bad (raised, out) =
+  if not raised
+  then Alcotest.failf "%s: no Invalid_argument at the application's call" what;
+  if bad out then Alcotest.failf "%s: invalid bytes on the wire: %S" what out
 
 let host_request ?(version = "HTTP/1.1") fields =
   "GET / " ^ version ^ "\r\n" ^ fields ^ "\r\n"
@@ -177,8 +186,7 @@ let tests =
            ; "HTTP/1.1 200 OK\nContent-Length: 0\r\n\r\n"
            ; "HTTP/1.1 200 OK\r\nContent-Length: 0\n\r\n"
            ])
-  ; known_failure
-      ~ticket:"17"
+  ; test
       "§2.2 both MUST NOT: no bare CR from the app in a protocol element"
       (fun () ->
          let checks =
@@ -189,9 +197,7 @@ let tests =
            ]
          in
          List.iter
-           (fun (what, out) ->
-              if has_bare_cr out
-              then Alcotest.failf "%s: bare CR in %S" what out)
+           (fun (what, result) -> check_app_rejected what has_bare_cr result)
            checks)
   ; test "§2.2 server MUST: bare CR before a line end gets 400" (fun () ->
       check_rejected_each
@@ -288,16 +294,14 @@ let tests =
             Content-Length: 2\r\n\
             \r\n\
             ok")
-  ; known_failure
-      ~ticket:"17"
+  ; test
       "§2.2 both MUST NOT: no whitespace from the app before the first field"
       (fun () ->
-         let check what out =
-           if contains out "\r\n " || contains out "\r\n\t"
-           then Alcotest.failf "%s: whitespace-led line in %S" what out
-         in
-         check "server" (server_writes [ " X-A", "1" ] ());
-         check "client" (client_writes ~headers:[ "\tX-A", "1" ] "/"))
+         check_app_rejected "server" has_fold (server_writes [ " X-A", "1" ] ());
+         check_app_rejected
+           "client"
+           has_fold
+           (client_writes ~headers:[ "\tX-A", "1" ] "/"))
   ; test
       "§2.2 server SHOULD: 400 and close for octets that are not HTTP"
       (fun () ->
@@ -522,7 +526,7 @@ let tests =
       "§4 server MUST: the SP after the status-code is sent with an empty \
        reason"
       (fun () ->
-         let out = server_writes [] ~reason:"" () in
+         let _, out = server_writes [] ~reason:"" () in
          Alcotest.(check string)
            "status-line"
            "HTTP/1.1 200 \r\n"
@@ -585,14 +589,15 @@ let tests =
                      (String.sub v 1 (String.length v - 2)) ->
            ()
          | vs -> Alcotest.failf "X-A values: [%s]" (String.concat "; " vs))
-  ; known_failure
-      ~ticket:"17"
+  ; test
       "§5.2 both MUST NOT: no obs-fold from the app in a field value"
       (fun () ->
-         let server = server_writes [ "X-A", "a\r\n b" ] () in
-         if has_fold server
-         then Alcotest.failf "server wrote obs-fold: %S" server;
-         let client = client_writes ~headers:[ "X-A", "a\r\n\tb" ] "/" in
-         if has_fold client
-         then Alcotest.failf "client wrote obs-fold: %S" client)
+         check_app_rejected
+           "server"
+           has_fold
+           (server_writes [ "X-A", "a\r\n b" ] ());
+         check_app_rejected
+           "client"
+           has_fold
+           (client_writes ~headers:[ "X-A", "a\r\n\tb" ] "/"))
   ]

@@ -88,6 +88,16 @@ ache Unreleased
 - Connection options are matched case-insensitively in every list member of
   every Connection field line: `Connection: Close` and
   `Connection: keep-alive, close` close the connection.
+- `Body.Reader`: `on_read` receives every byte available in one call, in place
+  of one call per received slice. A body of many small chunks is delivered in
+  linear time; httpun took quadratic time (100,000 one-byte chunks in one
+  read: 64 s, now 14 ms). Body bytes are copied into a buffer per body, not
+  one new buffer per slice. Bytes passed to `on_read` are never overwritten.
+- The server and the client raise `Invalid_argument`, naming the field, and
+  write nothing, when the application gives a head with a field name that is
+  not a token, a field value with CR, LF or NUL, a method that is not a token,
+  a request target with CR, LF, NUL or space, or a reason phrase with CR, LF
+  or NUL. httpun wrote them as given.
 
 httpun history
 ==============

@@ -85,8 +85,55 @@ let test_body_length () =
     ~expect:`Chunked
     (req `GET Headers.(of_list [ "transfer-encoding", "CHUNKED" ]))
 
+let check_rejected name ~expect request =
+  let f = Faraday.create 0x100 in
+  Alcotest.check_raises name (Invalid_argument expect) (fun () ->
+    Ache_private.Serialize.write_request f request);
+  Alcotest.(check int) (name ^ ": nothing written") 0 (Faraday.pending_bytes f)
+
+let test_serialize_rejects_invalid_head () =
+  List.iter
+    (fun target ->
+       check_rejected
+         (Printf.sprintf "target %S" target)
+         ~expect:(Printf.sprintf "ache: invalid request target %S" target)
+         (Request.create `GET target))
+    [ "/a b"; "/a\r\nInjected: 1"; "/a\n"; "/a\r"; "/a\000" ];
+  List.iter
+    (fun meth ->
+       check_rejected
+         (Printf.sprintf "method %S" meth)
+         ~expect:(Printf.sprintf "ache: invalid method %S" meth)
+         (Request.create (`Other meth) "/"))
+    [ "GET /evil HTTP/1.1\r\n"; "A B"; "A\nB"; "A\rB"; "" ];
+  check_rejected
+    "field name"
+    ~expect:{|ache: invalid field name "X\r\nInjected"|}
+    (Request.create
+       ~headers:(Headers.of_list [ "Host", "a"; "X\r\nInjected", "v" ])
+       `GET
+       "/");
+  check_rejected
+    "field value"
+    ~expect:{|ache: invalid value for field "X-A"|}
+    (Request.create
+       ~headers:(Headers.of_list [ "Host", "a"; "X-A", "a\r\nInjected: 1" ])
+       `GET
+       "/");
+  Alcotest.(check string)
+    "valid head is written"
+    "PURGE /a?b=c%20d HTTP/1.1\r\nHost: a\r\nX-A: 1\t2\r\n\r\n"
+    (request_to_string
+       (Request.create
+          ~headers:(Headers.of_list [ "Host", "a"; "X-A", "1\t2" ])
+          (`Other "PURGE")
+          "/a?b=c%20d"))
+
 let tests =
   [ "parse valid", `Quick, test_parse_valid
   ; "parse invalid errors", `Quick, test_parse_invalid_errors
   ; "body length", `Quick, test_body_length
+  ; ( "serialize rejects an invalid head"
+    , `Quick
+    , test_serialize_rejects_invalid_head )
   ]

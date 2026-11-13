@@ -2553,6 +2553,82 @@ let test_connect_method () =
   Alcotest.(check bool) "Upgraded protocol was called" true upgraded.driven;
   reader_yielded t
 
+let test_invalid_response_head_writes_nothing () =
+  let output conn =
+    let b = Buffer.create 64 in
+    let rec go () =
+      match Server_connection.next_write_operation conn with
+      | `Write iovecs ->
+        let s = Write_operation.iovecs_to_string iovecs in
+        Buffer.add_string b s;
+        Server_connection.report_write_result conn (`Ok (String.length s));
+        go ()
+      | `Yield | `Close _ -> ()
+    in
+    go ();
+    Buffer.contents b
+  in
+  let bad =
+    Response.create ~headers:(Headers.of_list [ "X-A", "a\r\nB: 1" ]) `OK
+  in
+  let request = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
+  let bs = Bigstringaf.of_string request ~off:0 ~len:(String.length request) in
+  let raised = ref [] in
+  let conn =
+    Server_connection.create (fun reqd ->
+      List.iter
+        (fun respond ->
+           match respond reqd with
+           | () -> ()
+           | exception Invalid_argument msg -> raised := msg :: !raised)
+        [ (fun reqd -> Reqd.respond_with_string reqd bad "body")
+        ; (fun reqd ->
+            Reqd.respond_with_bigstring
+              reqd
+              bad
+              (Bigstringaf.of_string "x" ~off:0 ~len:1))
+        ; (fun reqd ->
+            ignore (Reqd.respond_with_streaming reqd bad : Body.Writer.t))
+        ];
+      Alcotest.(check bool)
+        "no response started"
+        true
+        (Reqd.response reqd = None);
+      Reqd.respond_with_string reqd (Response.create `OK) "")
+  in
+  ignore
+    (Server_connection.read conn bs ~off:0 ~len:(String.length request) : int);
+  Alcotest.(check (list string))
+    "each respond_with_* raises"
+    (List.init 3 (fun _ -> {|ache: invalid value for field "X-A"|}))
+    !raised;
+  Alcotest.(check string)
+    "only the valid response is written"
+    "HTTP/1.1 200 OK\r\n\r\n"
+    (output conn);
+  let error_output = ref [] in
+  let conn =
+    Server_connection.create
+      ~error_handler:(fun ?request:_ error start_response ->
+        error_output :=
+          (match error with `Exn (Invalid_argument msg) -> msg | _ -> "other")
+          :: !error_output;
+        Body.Writer.close (start_response Headers.empty))
+      (fun reqd -> Reqd.respond_with_string reqd bad "")
+  in
+  (match Server_connection.read conn bs ~off:0 ~len:(String.length request) with
+  | (_ : int) -> Alcotest.fail "expected the request handler to raise"
+  | exception (Invalid_argument _ as exn) ->
+    Server_connection.report_exn conn exn);
+  Alcotest.(check (list string))
+    "error handler sees the exception"
+    [ {|ache: invalid value for field "X-A"|} ]
+    !error_output;
+  Alcotest.(check string)
+    "only the error response is written"
+    "HTTP/1.1 500 Internal Server Error\r\n\r\n"
+    (output conn)
+
 let tests =
   [ "initial reader state", `Quick, test_initial_reader_state
   ; "shutdown reader closed", `Quick, test_reader_is_closed_after_eof
@@ -2741,6 +2817,9 @@ let tests =
     , `Quick
     , test_write_response_after_read_eof )
   ; "CONNECT method", `Quick, test_connect_method
+  ; ( "invalid response head writes nothing"
+    , `Quick
+    , test_invalid_response_head_writes_nothing )
   ]
 
 (* https://httpwg.org/specs/rfc9110.html For example, a CONNECT request (Section
