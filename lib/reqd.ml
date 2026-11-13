@@ -33,6 +33,7 @@ type error =
   [ `Bad_request
   | `Not_implemented
   | `Http_version_not_supported
+  | `Uri_too_long
   | `Bad_gateway
   | `Internal_server_error
   | `Request_header_fields_too_large

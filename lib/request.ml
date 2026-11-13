@@ -134,6 +134,27 @@ let is_connect_target target =
     && int_of_string port <= 65535
   | Some (_, None) | None -> false
 
+let is_scheme_char = function
+  | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '+' | '-' | '.' -> true
+  | _ -> false
+
+(* RFC 3986 §3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ). *)
+let is_absolute_form target =
+  match String.index_opt target ':' with
+  | Some i when i > 0 ->
+    (match target.[0] with
+    | 'a' .. 'z' | 'A' .. 'Z' ->
+      String.for_all is_scheme_char (String.sub target 0 i)
+    | _ -> false)
+  | _ -> false
+
+(* RFC 9112 §3.2. *)
+let target_fits_method meth target =
+  match meth with
+  | `CONNECT -> is_connect_target target
+  | `OPTIONS when target = "*" -> true
+  | _ -> String.starts_with ~prefix:"/" target || is_absolute_form target
+
 let transfer_coding_error { version; headers; _ } =
   if not (Headers.mem headers "transfer-encoding")
   then None
@@ -157,8 +178,7 @@ let received_body_length ({ meth; target; version; headers } as t) =
     | [] when Version.compare version Version.v1_1 >= 0 -> Error `Bad_request
     | _ :: _ :: _ -> Error `Bad_request
     | [ host ] when Option.is_none (authority host) -> Error `Bad_request
-    | _ when meth = `CONNECT && not (is_connect_target target) ->
-      Error `Bad_request
+    | _ when not (target_fits_method meth target) -> Error `Bad_request
     | _ ->
       (match transfer_coding_error t with
       | Some error -> Error error

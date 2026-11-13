@@ -365,15 +365,13 @@ let tests =
              (req name "/")
          in
          check_status "501" [ 501 ] s)
-  ; known_failure
-      ~ticket:"23"
+  ; test
       "§3 server SHOULD: 501 for a method longer than the head limit"
       (fun () ->
          check_rejected
            ~allowed:[ 501 ]
            (serve (req (String.make 20000 'M') "/")))
-  ; known_failure
-      ~ticket:"23"
+  ; test
       "§3 server MUST: 414 for a request-target longer than the head limit"
       (fun () ->
          let config = { Config.default with max_header_size = 1024 } in
@@ -431,8 +429,7 @@ let tests =
          check_status "200" [ 200 ] s;
          Alcotest.check meth "method" `OPTIONS (only_request s).meth;
          Alcotest.check strings "target" [ "*" ] (targets s))
-  ; known_failure
-      ~ticket:"23"
+  ; test
       "§3.2 server SHOULD: 400 for asterisk-form or authority-form outside \
        OPTIONS and CONNECT"
       (fun () ->

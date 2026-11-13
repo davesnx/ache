@@ -164,6 +164,14 @@ ache Unreleased
 - Client: bytes that follow a response after which the connection is not
   reused (for example `Connection: close`) are dropped. httpun parsed them as
   the response to the next pipelined request.
+- A request head that reaches `Config.max_header_size` inside the method gets
+  501 (`` `Not_implemented ``), inside the request-target or the rest of the
+  request line gets 414 (new `` `Uri_too_long `` case of `Reqd.error`), and
+  later gets 431 as before (RFC 9112 §3).
+- The server answers 400 to a request-target form that does not fit the
+  method: `*` is only for OPTIONS, authority-form only for CONNECT, and other
+  methods need origin-form or absolute-form (RFC 9112 §3.2). httpun passed
+  `GET *` and `GET 127.0.0.1:80` to the handler.
 
 httpun history
 ==============
