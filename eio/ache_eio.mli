@@ -51,19 +51,33 @@ module Server : sig
 
       Timeouts are in seconds and are off by default:
       - [idle_timeout]: when no request is in progress and no byte arrives
-        for [idle_timeout], the connection closes without a response. After
-        the connection stops reading, it waits at most [idle_timeout] for the
-        peer to close.
+        for [idle_timeout], the connection closes without a response.
       - [head_timeout]: when a request head is not complete [head_timeout]
-        after its first bytes were read, [error_handler] is called with
+        after its first byte was read, [error_handler] is called with
         [`Request_timeout] (408) and the connection closes after the error
-        response.
+        response. Each request head, pipelined or not, has its own limit.
 
       A request body or a response in progress is never timed out.
+
+      Closing: when the connection stops reading (after a response with
+      [Connection: close], an error response, or a timeout), it reads and
+      discards input until the peer closes, so that unread input does not
+      make the kernel reset the connection before the peer has read the
+      response (RFC 9112 §9.6). With [clock], it waits at most
+      [idle_timeout], or {!linger_without_idle_timeout} without
+      [idle_timeout], after its last write. Without [clock] it does not wait:
+      it shuts down the flow at once, and the handler returns.
+
+      A [shutdown] of [flow] that raises is ignored, so a flow without
+      half-close (for example some TLS flows) ends the connection normally.
 
       @raise Invalid_argument
         when applied to a flow, if a timeout is given without [clock] or a
         timeout is not positive. *)
+
+  val linger_without_idle_timeout : float
+  (** Seconds a connection with [clock] and no [idle_timeout] waits for the
+      peer to close after its last write: 2.0. *)
 end
 
 module Client : sig

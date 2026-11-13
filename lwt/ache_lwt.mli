@@ -31,9 +31,27 @@
   ----------------------------------------------------------------------------*)
 
 module type IO = Ache_lwt_intf.IO
-(** A socket type that the IO loop can drive. [read socket buffer ~off ~len]
-    reads into [buffer] in the region [\[off, off + len)] and fails with
-    [End_of_file] when the peer has closed the connection. *)
+(** A socket type that the IO loop can drive. The loop runs one read and one
+    write at a time on a socket.
+
+    - [read socket buffer ~off ~len] reads into [buffer] in the region
+      [\[off, off + len)] and returns the number of bytes read, at least 1.
+      [len] is always positive. At end of input, and when the peer is gone (a
+      reset, a socket that is not connected), it fails with [End_of_file].
+      Any other failure ends the connection through the error path
+      ([error_handler] with [`Exn]).
+    - [writev socket iovecs] writes the start of [iovecs] and returns
+      [`Ok n], where [n] is the number of bytes written. [n] can be smaller
+      than the total: the loop gives the remaining bytes again in the next
+      call. When the peer is gone ([EPIPE], [ECONNRESET], [ENOTCONN], or the
+      socket was closed) it returns [`Closed] and does not fail; pending
+      [Body.Writer.flush] callbacks then get [`Closed]. Any other failure ends
+      the connection through the error path.
+    - [shutdown_receive socket] is called once, when the connection stops
+      reading. An exception from it is ignored.
+    - [close socket] is called once per socket, when both directions are
+      done, also when [Client.shutdown] closes it first. A failure of the
+      returned promise is ignored. *)
 
 module type Server = Ache_lwt_intf.Server
 
@@ -58,7 +76,15 @@ end
       [`Request_timeout] (408) and the connection closes after the error
       response.
 
-    A request body or a response in progress is never timed out.
+    A request body or a response in progress is never timed out. Each request
+    head, pipelined or not, has its own limit.
+
+    Closing: when the connection stops reading it calls [shutdown_receive]
+    and does not wait for the peer to close; it closes the socket once the
+    response is written. Input that the peer sent and the connection did not
+    read can make the kernel reset the connection. [Ache_eio] with a clock
+    instead reads and discards input for a bounded time first.
+
     [create_connection_handler] raises [Invalid_argument] when applied to a
     socket if a timeout is not positive.
 

@@ -160,6 +160,9 @@ let with_server
   server_errors := [];
   requests_seen := 0;
   Eio_main.run (fun env ->
+    while Option.is_some (Eio.Stream.take_nonblocking connections_done) do
+      ()
+    done;
     real_sleep := Eio.Time.sleep (Eio.Stdenv.clock env);
     Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 10.0 (fun () ->
       Eio.Switch.run (fun sw ->
@@ -381,10 +384,13 @@ module Failing_flow = struct
 
   let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
   let shutdowns : Eio.Flow.shutdown_command list ref = ref []
+  let failing_shutdowns : Eio.Flow.shutdown_command list ref = ref []
 
   let shutdown t cmd =
     shutdowns := cmd :: !shutdowns;
-    Eio.Flow.shutdown t.inner cmd
+    if List.mem cmd !failing_shutdowns
+    then failwith "shutdown failed"
+    else Eio.Flow.shutdown t.inner cmd
 
   let wrap ~fail_read ~fail_write socket =
     Eio.Resource.T
@@ -769,6 +775,138 @@ let test_run_server () =
              Eio.Flow.close socket;
              Eio.Promise.resolve resolve_stop ()))))
 
+let test_pipelined_head_deadline () =
+  let clock = Eio_mock.Clock.make () in
+  with_server ~clock ~head_timeout:0.5 (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string "GET /a HTTP/1.1\r\n" socket;
+    !real_sleep 0.05;
+    Eio_mock.Clock.set_time clock 0.4;
+    Eio.Flow.copy_string "host: x\r\n\r\nGET /b HTTP/1.1\r\n" socket;
+    let first = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n/a" in
+    Alcotest.(check string)
+      "first response"
+      first
+      (Eio.Buf_read.take (String.length first) reader);
+    advance clock;
+    Alcotest.(check (float 0.))
+      "second head times out 0.5 s after its own first byte"
+      0.9
+      (Eio.Time.now clock);
+    Alcotest.(check string)
+      "second response"
+      "HTTP/1.1 408 Request Timeout"
+      (status_line (Eio.Buf_read.take_all reader));
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
+let close_without_reading_eof ?clock ?head_timeout () =
+  with_server ?clock ?head_timeout (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string
+      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+      socket;
+    Alcotest.(check string)
+      "response"
+      hello_response_close
+      (Eio.Buf_read.take (String.length hello_response_close) reader);
+    Option.iter
+      (fun clock ->
+         advance clock;
+         Alcotest.(check (float 0.))
+           "linger bound"
+           Ache_eio.Server.linger_without_idle_timeout
+           (Eio.Time.now clock))
+      clock;
+    Eio.Stream.take connections_done;
+    Eio.Flow.close socket)
+
+let test_no_linger_without_clock () = close_without_reading_eof ()
+
+let test_linger_bounded_without_idle_timeout () =
+  close_without_reading_eof ~clock:(Eio_mock.Clock.make ()) ~head_timeout:5. ()
+
+let with_failing_shutdown cmd f =
+  Failing_flow.failing_shutdowns := [ cmd ];
+  Fun.protect ~finally:(fun () -> Failing_flow.failing_shutdowns := []) f
+
+let test_failing_shutdown cmd () =
+  with_failing_shutdown cmd (fun () ->
+    with_server ~flow:counting_flow (fun ~sw ~net addr ->
+      let socket = Eio.Net.connect ~sw net addr in
+      Eio.Flow.copy_string
+        "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+        socket;
+      Alcotest.(check string) "response" hello_response_close (read_all socket);
+      Eio.Flow.close socket;
+      Eio.Stream.take connections_done))
+
+let test_failing_shutdown_all () =
+  with_failing_shutdown `All (fun () ->
+    with_server
+      ~flow:(Failing_flow.wrap ~fail_read:true ~fail_write:false)
+      (fun ~sw ~net addr ->
+         get_until_closed ~sw ~net addr;
+         Eio.Stream.take connections_done))
+
+module Raising = struct
+  type t = { mutable sent : bool }
+
+  let next_read_operation _ = `Read
+  let read _ _ ~off:_ ~len:_ = failwith "read"
+  let read_eof _ _ ~off:_ ~len:_ = failwith "read_eof"
+  let yield_reader _ _ = ()
+
+  let next_write_operation t =
+    if t.sent
+    then `Yield
+    else
+      `Write
+        [ { IOVec.buffer = Bigstringaf.of_string "ping" ~off:0 ~len:4
+          ; off = 0
+          ; len = 4
+          }
+        ]
+
+  let report_write_result t _ = t.sent <- true
+  let yield_writer _ _ = ()
+  let report_exn _ _ = failwith "report_exn"
+  let is_closed _ = false
+  let shutdown _ = ()
+end
+
+let test_report_exn_raises () =
+  with_server (fun ~sw ~net addr ->
+    let client =
+      Ache_eio.Client.create_connection ~sw (Eio.Net.connect ~sw net addr)
+    in
+    let upgraded, resolve_upgraded = Eio.Promise.create () in
+    let request_body =
+      Ache_eio.Client.request
+        client
+        (Request.create
+           ~headers:
+             (Headers.of_list
+                [ "host", "localhost"
+                ; "connection", "upgrade"
+                ; "upgrade", "echo"
+                ; "content-length", "0"
+                ])
+           `GET
+           "/upgrade")
+        ~error_handler:client_error_handler
+        ~response_handler:(fun response _body ->
+          Eio.Promise.resolve resolve_upgraded response)
+    in
+    Body.Writer.close request_body;
+    let (_ : Response.t) = Eio.Promise.await upgraded in
+    Ache_eio.Client.upgrade
+      client
+      (Runtime.make (module Raising) { Raising.sent = false });
+    Eio.Promise.await (Ache_eio.Client.shutdown client))
+
 let () =
   Alcotest.run
     "ache-eio loopback"
@@ -797,6 +935,24 @@ let () =
         ; ( "cancelling the connection fiber is not an error"
           , `Quick
           , test_cancel_is_not_an_error )
+        ; ( "without a clock the handler returns while the peer stays open"
+          , `Quick
+          , test_no_linger_without_clock )
+        ; ( "without idle_timeout lingering is bounded"
+          , `Quick
+          , test_linger_bounded_without_idle_timeout )
+        ; ( "a failing Send shutdown ends the connection"
+          , `Quick
+          , test_failing_shutdown `Send )
+        ; ( "a failing Receive shutdown ends the connection"
+          , `Quick
+          , test_failing_shutdown `Receive )
+        ; ( "a failing All shutdown ends the connection"
+          , `Quick
+          , test_failing_shutdown_all )
+        ; ( "an exception from report_exn ends the connection"
+          , `Quick
+          , test_report_exn_raises )
         ] )
     ; ( "timeouts"
       , [ "idle connection is closed", `Quick, test_idle_timeout
@@ -813,5 +969,8 @@ let () =
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
         ; "a timeout needs a clock", `Quick, test_timeout_needs_clock
+        ; ( "a pipelined head gets its own deadline"
+          , `Quick
+          , test_pipelined_head_deadline )
         ] )
     ]

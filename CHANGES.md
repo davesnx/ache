@@ -226,6 +226,23 @@ ache Unreleased
 - `ache-lwt`: the socket is closed once, also when the peer reset the
   connection (the close was skipped when `shutdown` failed) and when
   `Client.shutdown` and the IO loop both close it.
+- Server timeouts: each request head has its own `head_timeout`, counted
+  from its first byte. A pipelined head that followed a request in the same
+  read used the deadline of the earlier head and got 408 too early. In
+  `ache-lwt` the head timer ends with the connection; it kept the connection
+  in memory until it fired.
+- `ache-eio`: the server waits for the peer to close (and discards its input)
+  only when it has a `clock`: at most `idle_timeout`, or
+  `Server.linger_without_idle_timeout` (2 s) without one. Without a clock it
+  shuts down the flow at once, as `ache-lwt` does. The handler waited for ever
+  for a peer that kept its socket open.
+- `ache-eio`, `ache-lwt`: a `shutdown` or `close` of the flow that raises, and
+  an exception from `Runtime.S.report_exn`, end the connection; the handler
+  returns normally. `ache-eio` raised from the handler; `ache-lwt` sent the
+  exception to `Lwt.async_exception_hook`, which exits the process by
+  default.
+- `ache-lwt`: `Make (Io)` documents the `IO` contract. The default `Io.read`
+  no longer closes the socket on an error; the loop closes it once.
 - Client: add `` `Connection_closed `` to `Client_connection.error`. Every
   request without any byte of its response when the connection stops reading
   (end of input, a response that closes the connection, `shutdown`, or an

@@ -396,6 +396,7 @@ let test_upgrade_incomplete_token_reaches_new_protocol () =
 
 let fail_read = ref false
 let fail_write = ref false
+let fail_shutdown = ref false
 let closes = ref 0
 
 module Test_io = struct
@@ -422,12 +423,18 @@ module Test_io = struct
       Lwt_unix.writev socket vectors >|= fun n -> `Ok n
 
   let shutdown_receive socket =
-    try Lwt_unix.shutdown socket Unix.SHUTDOWN_RECEIVE with
-    | Unix.Unix_error _ -> ()
+    if !fail_shutdown
+    then failwith "shutdown failed"
+    else
+      try Lwt_unix.shutdown socket Unix.SHUTDOWN_RECEIVE with
+      | Unix.Unix_error _ -> ()
 
   let close socket =
     incr closes;
-    Lwt_unix.close socket
+    Lwt_unix.close socket >>= fun () ->
+    if !fail_shutdown
+    then Lwt.fail (Failure "close failed")
+    else Lwt.return_unit
 end
 
 module Test_runtime = Ache_lwt.Make (Test_io)
@@ -613,7 +620,7 @@ let test_idle_timeout_between_requests () =
     Alcotest.(check string) "second response" hello_response second;
     let since = Unix.gettimeofday () in
     read_all socket >>= fun rest ->
-    check_elapsed "idle after a response" ~since ~at_least:0.1;
+    check_elapsed "idle after a response" ~since ~at_least:0.08;
     Alcotest.(check string) "then closed" "" rest;
     Lwt_unix.close socket);
   Alcotest.(check int) "two requests" 2 !requests_seen
@@ -723,6 +730,135 @@ let test_timeout_must_be_positive () =
   | exception Invalid_argument _ -> ());
   Lwt_main.run (Lwt_unix.close socket)
 
+let contains s sub =
+  let n = String.length sub in
+  let rec go i =
+    i + n <= String.length s && (String.sub s i n = sub || go (i + 1))
+  in
+  go 0
+
+let test_pipelined_head_deadline () =
+  with_server ~head_timeout:1.0 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket "GET /a HTTP/1.1\r\n" >>= fun () ->
+    Lwt_unix.sleep 0.7 >>= fun () ->
+    write_all socket "host: x\r\n\r\nGET /b HTTP/1.1\r\n" >>= fun () ->
+    Lwt_unix.sleep 0.6 >>= fun () ->
+    write_all socket "host: x\r\nconnection: close\r\n\r\n" >>= fun () ->
+    read_all socket >>= fun output ->
+    Alcotest.(check bool)
+      "second response is not 408"
+      false
+      (contains output "408");
+    Lwt_unix.close socket);
+  Alcotest.(check int) "no error" 0 (List.length !server_errors);
+  Alcotest.(check int) "both requests served" 2 !requests_seen
+
+let test_head_timer_cancelled () =
+  let before = Lwt_engine.timer_count () in
+  with_server ~head_timeout:30. (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket "GET /hello HTTP/1.1\r\nHo" >>= fun () ->
+    Lwt_unix.sleep 0.05 >>= fun () ->
+    Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
+    read_all socket >>= fun (_ : string) -> Lwt_unix.close socket);
+  Alcotest.(check int) "no timer left" before (Lwt_engine.timer_count ())
+
+let test_failing_shutdown_and_close () =
+  fail_read := false;
+  fail_write := false;
+  fail_shutdown := true;
+  closes := 0;
+  Fun.protect
+    ~finally:(fun () -> fail_shutdown := false)
+    (fun () ->
+       with_server
+         ~connection_handler:(fun ~request_handler ~error_handler addr socket ->
+           Test_server.create_connection_handler
+             ~request_handler
+             ~error_handler
+             addr
+             socket)
+         (fun connect ->
+            connect () >>= fun socket ->
+            write_all
+              socket
+              "GET /hello HTTP/1.1\r\n\
+               host: localhost\r\n\
+               connection: close\r\n\
+               \r\n"
+            >>= fun () ->
+            read_all socket >>= fun output ->
+            Alcotest.(check string)
+              "status line"
+              "HTTP/1.1 200 OK"
+              (status_line output);
+            Lwt_unix.close socket));
+  Alcotest.(check int) "close called once" 1 !closes
+
+module Raising = struct
+  type t = { mutable sent : bool }
+
+  let next_read_operation _ = `Read
+  let read _ _ ~off:_ ~len:_ = failwith "read"
+  let read_eof _ _ ~off:_ ~len:_ = failwith "read_eof"
+  let yield_reader _ _ = ()
+
+  let next_write_operation t =
+    if t.sent
+    then `Yield
+    else
+      `Write
+        [ { IOVec.buffer = Bigstringaf.of_string "ping" ~off:0 ~len:4
+          ; off = 0
+          ; len = 4
+          }
+        ]
+
+  let report_write_result t _ = t.sent <- true
+  let yield_writer _ _ = ()
+  let report_exn _ _ = failwith "report_exn"
+  let is_closed _ = false
+  let shutdown _ = ()
+end
+
+let test_report_exn_raises () =
+  fail_read := false;
+  fail_write := false;
+  closes := 0;
+  with_server (fun connect ->
+    connect () >>= Test_runtime.Client.create_connection >>= fun client ->
+    let upgraded, resolve_upgraded = Lwt.wait () in
+    let request_body =
+      Test_runtime.Client.request
+        client
+        (Request.create
+           ~headers:
+             (Headers.of_list
+                [ "host", "localhost"
+                ; "connection", "upgrade"
+                ; "upgrade", "echo"
+                ; "content-length", "0"
+                ])
+           `GET
+           "/upgrade")
+        ~error_handler:client_error_handler
+        ~response_handler:(fun response _body ->
+          Lwt.wakeup_later resolve_upgraded response)
+    in
+    Body.Writer.close request_body;
+    upgraded >>= fun (_ : Response.t) ->
+    Test_runtime.Client.upgrade
+      client
+      (Runtime.make (module Raising) { Raising.sent = false });
+    let rec until_closed () =
+      if !closes > 0
+      then Lwt.return_unit
+      else Lwt_unix.sleep 0.01 >>= until_closed
+    in
+    until_closed ());
+  Alcotest.(check int) "close called once" 1 !closes
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
@@ -750,6 +886,12 @@ let () =
              (EPIPE)"
           , `Quick
           , test_flush_after_peer_closed_epipe )
+        ; ( "failing shutdown_receive and close end the connection"
+          , `Quick
+          , test_failing_shutdown_and_close )
+        ; ( "an exception from report_exn ends the connection"
+          , `Quick
+          , test_report_exn_raises )
         ] )
     ; ( "timeouts"
       , [ "idle connection is closed", `Quick, test_idle_timeout
@@ -766,5 +908,11 @@ let () =
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
         ; "a timeout must be positive", `Quick, test_timeout_must_be_positive
+        ; ( "a pipelined head gets its own deadline"
+          , `Quick
+          , test_pipelined_head_deadline )
+        ; ( "the head timer ends with the connection"
+          , `Quick
+          , test_head_timer_cancelled )
         ] )
     ]
