@@ -384,6 +384,7 @@ module Reader = struct
 
   let is_closed t = t.closed
   let resume t = t.paused <- false
+  let pause t = t.paused <- true
 
   let on_wakeup t k =
     if is_closed t

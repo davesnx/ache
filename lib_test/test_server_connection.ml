@@ -2059,11 +2059,12 @@ let test_multiple_requests_in_single_read_with_close () =
     Response.create `OK ~headers:Headers.(connection_close @ encoding_fixed 0)
   in
   let t = create (fun reqd -> Reqd.respond_with_string reqd response "") in
-  let reqs =
-    request_to_string (Request.create `GET "/")
-    ^ request_to_string (Request.create `GET "/")
-  in
-  read_string t reqs;
+  let request = request_to_string (Request.create `GET "/") in
+  let consumed = feed_string t (request ^ request) in
+  Alcotest.(check int)
+    "only the first request is read"
+    (String.length request)
+    consumed;
   write_response t response;
   connection_is_shutdown t
 
@@ -2597,7 +2598,7 @@ let test_input_consumed_before_closing_req_body () =
   read_string t "\r\n";
   write_string t "0\r\n\r\n"
 
-let test_can_read_more_requests_after_write_eof () =
+let test_no_request_dispatched_after_write_eof () =
   let request = Request.create `GET "/" ~headers:(Headers.encoding_fixed 0) in
   let reqd = ref None in
   let request_handler reqd' = reqd := Some reqd' in
@@ -2610,31 +2611,16 @@ let test_can_read_more_requests_after_write_eof () =
     ~flush_headers_immediately:true
   |> (ignore : Body.Writer.t -> unit);
   write_eof t;
-  (* In many runtimes, there are separate reader and writer threads that drive
-     the reading and writing from httpaf independently. So just because the
-     writer thread has told us that the socket is closed doesn't mean we won't
-     get a bunch more requests delivered to us from the reader thread. We should
-     be ready to receive them, and call the request handler for them, even if
-     there is no possibility of writing responses (e.g. those requests might be
-     side-effecting requests like POST requests). *)
   reqd := None;
   writer_closed ~unread:47 t;
-  reader_ready t;
-  read_request t request;
-  let body =
-    Reqd.respond_with_streaming
-      (Option.get !reqd)
-      response
-      ~flush_headers_immediately:true
-  in
-  Alcotest.(check bool)
-    "body writer on a closed connection is closed"
-    true
-    (Body.Writer.is_closed body);
-  Alcotest.(check bool) "request handler fired" true (Option.is_some !reqd)
+  reader_closed t;
+  let consumed = force_feed_string t (request_to_string request) in
+  Alcotest.(check int) "later request not read" 0 consumed;
+  Alcotest.(check bool) "request handler not fired" true (Option.is_none !reqd)
 
-let test_can_read_more_requests_after_write_eof_before_send_response () =
+let test_no_request_dispatched_after_write_eof_before_send_response () =
   let request = Request.create `GET "/" ~headers:(Headers.encoding_fixed 0) in
+  let first = ref None in
   let reqd = ref None in
   let request_handler reqd' = reqd := Some reqd' in
   let t = create request_handler in
@@ -2646,19 +2632,22 @@ let test_can_read_more_requests_after_write_eof_before_send_response () =
     Server_connection.report_write_result t `Closed;
     write_op := Server_connection.next_write_operation t);
   Alcotest.check write_operation "Writer is closed" (`Close 0) !write_op;
-  reader_ready t;
-  read_request t request;
+  first := !reqd;
+  reqd := None;
+  reader_closed t;
+  let consumed = force_feed_string t (request_to_string request) in
+  Alcotest.(check int) "later request not read" 0 consumed;
+  Alcotest.(check bool) "request handler not fired" true (Option.is_none !reqd);
   let body =
     Reqd.respond_with_streaming
-      (Option.get !reqd)
+      (Option.get !first)
       response
       ~flush_headers_immediately:true
   in
   Alcotest.(check bool)
     "body writer on a closed connection is closed"
     true
-    (Body.Writer.is_closed body);
-  Alcotest.(check bool) "request handler fired" true (Option.is_some !reqd)
+    (Body.Writer.is_closed body)
 
 let test_write_response_after_read_eof () =
   let reqd = ref None in
@@ -3588,54 +3577,115 @@ let test_switching_request_then_eof () =
          switching_requests)
     splits
 
-let test_requests_after_write_closed () =
+let test_after_write_closed () =
+  let post n =
+    Printf.sprintf "POST / HTTP/1.1\r\nHost: a\r\ncontent-length: %d\r\n\r\n" n
+  in
+  let get = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
   List.iter
     (fun (split, chunk) ->
-       let reqds = ref [] in
-       let t = Raw.create (fun reqd -> reqds := reqd :: !reqds) in
-       let request = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
-       Raw.feed ~chunk t request;
+       let calls = ref 0 in
+       let received = ref "" in
+       let ended = ref "" in
+       let reading_handler reqd =
+         incr calls;
+         let body = Reqd.request_body reqd in
+         let rec loop () =
+           Body.Reader.schedule_read
+             body
+             ~on_eof:(fun () -> ended := "eof")
+             ~on_error:(fun () -> ended := "error")
+             ~on_read:(fun bs ~off ~len ->
+               received := !received ^ Bigstringaf.substring bs ~off ~len;
+               loop ())
+         in
+         loop ()
+       in
+       let t = Raw.create reading_handler in
+       Raw.feed ~chunk t (post 10 ^ "hello");
        Server_connection.report_write_result t.conn `Closed;
-       Raw.feed ~chunk t (request ^ request);
-       Alcotest.(check int)
-         (split ^ ": handler called for each request")
-         3
-         (List.length !reqds);
-       List.iter
-         (fun reqd ->
-            match Reqd.respond_with_streaming reqd (Response.create `OK) with
-            | body ->
-              Alcotest.(check bool)
-                (split ^ ": body writer closed")
-                true
-                (Body.Writer.is_closed body);
-              let result = ref None in
-              Body.Writer.flush body (fun r -> result := Some r);
-              Alcotest.(check (option flush_result))
-                (split ^ ": flush")
-                (Some `Closed)
-                !result;
-              Body.Writer.close body
-            | exception exn ->
-              Alcotest.failf
-                "%s: respond raised %s"
-                split
-                (Printexc.to_string exn))
-         !reqds;
-       Alcotest.(check bool)
-         (split ^ ": writer closed")
-         true
-         (Raw.write_all t = `Close);
-       Raw.feed ~eof:true ~chunk t "";
+       Raw.feed ~chunk t ("world" ^ get);
+       Alcotest.(check string)
+         (split ^ ": in-flight body complete")
+         "helloworld"
+         !received;
+       Alcotest.(check string)
+         (split ^ ": in-flight body ends with on_eof")
+         "eof"
+         !ended;
+       Alcotest.(check int) (split ^ ": no new request dispatched") 1 !calls;
        Alcotest.check
          read_operation
-         (split ^ ": reader closed at EOF")
+         (split ^ ": reader closed")
          `Close
          (Raw.read_op t);
-       Alcotest.(check string)
-         (split ^ ": nothing written")
-         ""
-         (Raw.take_output t))
+       calls := 0;
+       let t = Raw.create (fun _ -> incr calls) in
+       Raw.feed ~chunk t get;
+       Server_connection.report_write_result t.conn `Closed;
+       Raw.feed ~chunk t (get ^ get);
+       Alcotest.(check int) (split ^ ": idle: nothing more dispatched") 1 !calls;
+       Alcotest.check
+         read_operation
+         (split ^ ": idle: reader closed")
+         `Close
+         (Raw.read_op t))
+    splits
+
+let test_pipelined_request_not_dispatched_after_write_closed () =
+  List.iter
+    (fun (split, chunk) ->
+       let calls = ref 0 in
+       let t = Raw.create (fun _ -> incr calls) in
+       let get = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
+       Raw.feed ~chunk t (get ^ get);
+       Server_connection.report_write_result t.conn `Closed;
+       ignore (Raw.write_all t);
+       Raw.feed ~chunk t "";
+       Alcotest.(check int) (split ^ ": second request not dispatched") 1 !calls;
+       Alcotest.check
+         read_operation
+         (split ^ ": reader closed")
+         `Close
+         (Raw.read_op t))
+    splits
+
+let test_streaming_response_when_write_fails () =
+  List.iter
+    (fun (split, chunk) ->
+       let calls = ref 0 in
+       let body = ref None in
+       let t =
+         Raw.create (fun reqd ->
+           incr calls;
+           body :=
+             Some
+               (Reqd.respond_with_streaming
+                  ~flush_headers_immediately:true
+                  reqd
+                  (Response.create `OK)))
+       in
+       let get = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
+       Raw.feed ~chunk t get;
+       ignore (Raw.write_all t);
+       let body = Option.get !body in
+       Body.Writer.write_string body "chunk";
+       let results = ref [] in
+       Body.Writer.flush body (fun r -> results := r :: !results);
+       (match Server_connection.next_write_operation t.conn with
+       | `Write _ -> Server_connection.report_write_result t.conn `Closed
+       | `Yield | `Close _ -> Alcotest.fail "expected a write");
+       Raw.feed ~chunk t (get ^ get);
+       Alcotest.(check (list flush_result))
+         (split ^ ": flush")
+         [ `Closed ]
+         !results;
+       Alcotest.(check int) (split ^ ": handler not called again") 1 !calls;
+       Alcotest.check
+         read_operation
+         (split ^ ": reader closed")
+         `Close
+         (Raw.read_op t))
     splits
 
 let test_error_handler_respond_twice () =
@@ -3987,12 +4037,12 @@ let tests =
   ; ( "input consumed before closing request body"
     , `Quick
     , test_input_consumed_before_closing_req_body )
-  ; ( "can read more requests after write eof"
+  ; ( "no request dispatched after write eof"
     , `Quick
-    , test_can_read_more_requests_after_write_eof )
-  ; ( "can read more requests after write eof (before response sent)"
+    , test_no_request_dispatched_after_write_eof )
+  ; ( "no request dispatched after write eof (before response sent)"
     , `Quick
-    , test_can_read_more_requests_after_write_eof_before_send_response )
+    , test_no_request_dispatched_after_write_eof_before_send_response )
   ; ( "write response after reader EOF"
     , `Quick
     , test_write_response_after_read_eof )
@@ -4032,9 +4082,15 @@ let tests =
   ; ( "upgrade or CONNECT request, then EOF"
     , `Quick
     , test_switching_request_then_eof )
-  ; ( "requests after the write side closed"
+  ; ( "after the write side closed: in-flight body, no new request"
     , `Quick
-    , test_requests_after_write_closed )
+    , test_after_write_closed )
+  ; ( "pipelined request not dispatched after the write side closed"
+    , `Quick
+    , test_pipelined_request_not_dispatched_after_write_closed )
+  ; ( "streaming response when the write fails"
+    , `Quick
+    , test_streaming_response_when_write_fails )
   ; ( "error handler response function called twice"
     , `Quick
     , test_error_handler_respond_twice )

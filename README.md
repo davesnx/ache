@@ -353,9 +353,8 @@ httpun rejected chunk extensions and trailers.
   that waits for a request. `?head_timeout` answers 408 to a request head
   that is not complete in time. A request body or a response in progress is
   never timed out.
-- The server still reads and dispatches requests after its write side has
-  closed. Use `?idle_timeout` to limit the time an idle peer can keep a
-  connection open.
+- Once its write side has closed, the server reads and dispatches no new
+  request; the request in progress still gets its body.
 - The API is not stable before 1.0.
 
 ## Runtime notes
@@ -438,6 +437,7 @@ yet, and CI does not run it.
 | `Client_connection.request` sends the head as given | Raises `Invalid_argument` for an invalid head |
 | HTTP/1.1 requests without `Host` are served | 400: send `Host` from clients |
 | `Config.t` with four buffer sizes | Also `proxy` and `max_header_size`. Write `{ Config.default with ... }` |
+| Requests after a failed write are still dispatched | Not dispatched: the reader closes after the request in progress |
 
 ## License
 

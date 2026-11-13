@@ -96,6 +96,11 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - When the write side is closed, `respond_with_*` record the response and
   drop its bytes, and pending `Body.Writer.flush` callbacks get
   `` `Closed ``.
+- Once the write side has closed, no new request is read or dispatched; the
+  request in progress still gets its body, then the reader closes. This
+  reverses httpun #136: a client cannot tell a processed but unanswered
+  request from an unprocessed one, so its retries would duplicate side
+  effects.
 - When the error handler raises, the connection drops its pending output and
   closes. Its response function raises `Failure` when called twice.
 - `Reqd.report_exn` before the error handler has responded closes the

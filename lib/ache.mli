@@ -493,8 +493,9 @@ module Server_connection : sig
       request. When the input ends before a 101 is written, the new protocol
       gets end of input after the switch.
 
-      Requests are still read and dispatched after the write side has
-      closed; use [?idle_timeout] in the runtimes to bound an idle peer.
+      Once the write side has closed (a failed write or a closing
+      response), no new request is read or dispatched: the request in
+      progress still receives its body, then the reader closes.
 
       When the response is complete and no read is scheduled on the request
       body, the connection reads the rest of the body to find the next
