@@ -59,7 +59,14 @@ end
 
     A request body or a response in progress is never timed out.
     [create_connection_handler] raises [Invalid_argument] when applied to a
-    socket if a timeout is not positive. *)
+    socket if a timeout is not positive.
+
+    The application must ignore [SIGPIPE], for example with
+    [Sys.set_signal Sys.sigpipe Sys.Signal_ignore], before it serves
+    connections. Otherwise a write to a peer that closed the connection kills
+    the process. With [SIGPIPE] ignored, that write ends the connection and
+    pending [Body.Writer.flush] callbacks get [`Closed]. ache does not install
+    signal handlers. *)
 module Server :
   Server with type socket = Lwt_unix.file_descr and type addr = Unix.sockaddr
 

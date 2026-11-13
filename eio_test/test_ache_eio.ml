@@ -207,6 +207,7 @@ let client_error_handler error =
   match error with
   | `Malformed_response msg -> Alcotest.failf "malformed response: %s" msg
   | `Invalid_response_body_length _ -> Alcotest.fail "invalid body length"
+  | `Connection_closed -> Alcotest.fail "connection closed"
   | `Exn exn -> raise exn
 
 let request client ?(body = "") request =

@@ -196,6 +196,33 @@ ache Unreleased
 - `ache-lwt`: the socket is closed once, also when the peer reset the
   connection (the close was skipped when `shutdown` failed) and when
   `Client.shutdown` and the IO loop both close it.
+- Client: add `` `Connection_closed `` to `Client_connection.error`. Every
+  request without any byte of its response when the connection stops reading
+  (end of input, a response that closes the connection, `shutdown`, or an
+  error on an earlier response) gets it once. httpun called no handler for
+  pipelined requests behind a closing response, and gave
+  `` `Malformed_response "unexpected eof" `` to every request at end of input.
+  An end of input inside a response head or inside a body framed by
+  Content-Length or chunked coding is still `` `Malformed_response ``.
+- Client: response bytes with no request waiting for a response close the
+  connection. httpun raised `Assert_failure` from `read`.
+- Client: a request is not pipelined behind a request with a non-idempotent
+  method until that request's response is complete (RFC 9112 §9.3.2).
+- Client: a response that closes the connection also stops the request body
+  being sent (RFC 9112 §9.5). httpun kept writing it.
+- Client: `Client_connection.request` checks the request head before it
+  queues the request, so an invalid request raises `Invalid_argument` and
+  later requests are still sent. httpun left the invalid request at the head
+  of the queue and sent nothing after it.
+- Client: an HTTP/1.0 response with Transfer-Encoding closes the connection
+  after it (RFC 9112 §6.1).
+- Client: empty lines before a response are discarded (RFC 9112 §2.2).
+- Client: an obs-fold in a response field value is replaced with one space
+  (RFC 9112 §5.2). Requests with obs-fold still get 400.
+- Client: after a 101 response, and after a 2xx response to CONNECT, the
+  connection stops reading HTTP; the bytes after the head are not consumed,
+  so `upgrade` gives them to the new protocol. httpun parsed them as the next
+  response or as the CONNECT response body.
 
 httpun history
 ==============

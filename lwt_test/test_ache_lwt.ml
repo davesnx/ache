@@ -73,6 +73,19 @@ let echo_server () =
 
 let server_errors : Server_connection.error list ref = ref []
 let stream_flush_closed : unit Lwt.u option ref = ref None
+let stream_start : unit Lwt.t ref = ref Lwt.return_unit
+
+let stream response_body =
+  let chunk = String.make 65536 'x' in
+  let rec loop () =
+    Body.Writer.write_string response_body chunk;
+    Body.Writer.flush response_body (function
+      | `Written -> loop ()
+      | `Closed ->
+        Option.iter (fun u -> Lwt.wakeup_later u ()) !stream_flush_closed)
+  in
+  loop ()
+
 let requests_seen = ref 0
 
 let request_handler (_ : Unix.sockaddr) reqd =
@@ -114,18 +127,14 @@ let request_handler (_ : Unix.sockaddr) reqd =
       (echo_server ())
   | `GET, "/stream" ->
     Body.Reader.close body;
-    let response_body =
-      Reqd.respond_with_streaming reqd (Response.create `OK)
-    in
-    let chunk = String.make 65536 'x' in
-    let rec loop () =
-      Body.Writer.write_string response_body chunk;
-      Body.Writer.flush response_body (function
-        | `Written -> loop ()
-        | `Closed ->
-          Option.iter (fun u -> Lwt.wakeup_later u ()) !stream_flush_closed)
-    in
-    loop ()
+    stream (Reqd.respond_with_streaming reqd (Response.create `OK))
+  | `GET, "/stream-late" ->
+    Body.Reader.close body;
+    Lwt.async (fun () ->
+      Lwt.map
+        (fun () ->
+           stream (Reqd.respond_with_streaming reqd (Response.create `OK)))
+        !stream_start)
   | `GET, "/raise" -> failwith "handler failed"
   | `POST, "/partial" ->
     let rec on_read _ ~off:_ ~len:_ =
@@ -208,6 +217,7 @@ let client_error_handler error =
   match error with
   | `Malformed_response msg -> Alcotest.failf "malformed response: %s" msg
   | `Invalid_response_body_length _ -> Alcotest.fail "invalid body length"
+  | `Connection_closed -> Alcotest.fail "connection closed"
   | `Exn exn -> raise exn
 
 let request client ?(body = "") request =
@@ -555,6 +565,23 @@ let test_flush_after_peer_closed () =
   stream_flush_closed := None;
   check_server_sockets_closed ()
 
+let test_flush_after_peer_closed_epipe () =
+  let flushed, resolve_flushed = Lwt.wait () in
+  let start, resolve_start = Lwt.wait () in
+  stream_flush_closed := Some resolve_flushed;
+  stream_start := start;
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket "GET /stream-late HTTP/1.1\r\nhost: localhost\r\n\r\n"
+    >>= fun () ->
+    Lwt_unix.close socket >>= fun () ->
+    Lwt_unix.sleep 0.05 >>= fun () ->
+    Lwt.wakeup_later resolve_start ();
+    flushed);
+  stream_flush_closed := None;
+  stream_start := Lwt.return_unit;
+  check_server_sockets_closed ()
+
 let known_failure ~ticket name f =
   ( Printf.sprintf "%s [known failure: ticket %s]" name ticket
   , `Quick
@@ -736,6 +763,10 @@ let () =
         ; ( "flush calls back with `Closed after the peer closes"
           , `Quick
           , test_flush_after_peer_closed )
+        ; ( "flush calls back with `Closed after writing to a closed peer \
+             (EPIPE)"
+          , `Quick
+          , test_flush_after_peer_closed_epipe )
         ] )
     ; ( "timeouts"
       , [ "idle connection is closed", `Quick, test_idle_timeout

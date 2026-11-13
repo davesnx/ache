@@ -18,7 +18,7 @@ let http_handler ~on_eof response response_body =
 let proxy_handler _env ~sw ~headers flow ~on_eof response _response_body =
   Format.eprintf "CONNECT response: %a@." Response.pp_hum response;
   match response with
-  | { Response.status = `OK; _ } as response ->
+  | { Response.status = `OK; _ } ->
     (* This means we can now communicate via any protocol on the socket since
        the server approved the tunnel.
 

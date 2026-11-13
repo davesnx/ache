@@ -136,7 +136,7 @@ let tests =
          Client.close_input c;
          Alcotest.(check (list string))
            "error reported"
-           [ "Malformed_response" ]
+           [ "Connection_closed" ]
            ex.errors;
          Alcotest.(check string) "nothing written again" "" (Client.written c))
   ; test

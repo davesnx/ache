@@ -32,6 +32,7 @@ module Reader : sig
     [ `Invalid_response_body_length of Response.t
     | `Parse of string
     | `Header_too_large
+    | `Unsolicited_response
     ]
 
   type ('head, 'error) t

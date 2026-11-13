@@ -228,7 +228,7 @@ let tests =
       let c = Client.create () in
       let _ =
         client_request
-          ~meth:`POST
+          ~meth:`PUT
           ~headers:[ "Host", "a"; "Content-Length", "3" ]
           ~body:"abc"
           c
@@ -237,7 +237,7 @@ let tests =
       let _ = client_request c "/q" in
       Alcotest.(check string)
         "bytes written"
-        "POST /p HTTP/1.1\r\n\
+        "PUT /p HTTP/1.1\r\n\
          Host: a\r\n\
          Content-Length: 3\r\n\
          \r\n\
@@ -568,8 +568,7 @@ let tests =
            \r\n\
            abc"
         ])
-  ; known_failure
-      ~ticket:"24"
+  ; test
       "§5.2 client MUST: obs-fold in a response is replaced with SP"
       (fun () ->
          let ex =

@@ -544,8 +544,26 @@ module Client_connection : sig
   type error =
     [ `Malformed_response of string
     | `Invalid_response_body_length of Response.t
+    | `Connection_closed
     | `Exn of exn
     ]
+  (** The error given to a request's [error_handler]. Each request gets at most
+      one error, and no error after its response is complete.
+
+      - [`Malformed_response]: the response to this request is not valid
+        HTTP/1.1, or it ended early: the connection closed inside its head, or
+        before the end of a body framed by [Content-Length] or chunked coding
+        (RFC 9112 §8). A body without framing ends normally when the connection
+        closes.
+      - [`Invalid_response_body_length]: the response has an invalid
+        [Content-Length].
+      - [`Connection_closed]: the connection stopped reading responses before
+        any byte of the response to this request arrived: end of input, a
+        previous response that closes the connection, {!shutdown}, or an error
+        on an earlier response. RFC 9112 §9.3.1 lets the application send the
+        request again on a new connection.
+      - [`Exn]: an exception from the application or reported with
+        {!report_exn}. *)
 
   type response_handler = Response.t -> Body.Reader.t -> unit
   type error_handler = error -> unit
@@ -566,10 +584,27 @@ module Client_connection : sig
       Interim 1xx responses other than [101 Switching Protocols] (for example
       [100 Continue] or [103 Early Hints]) are parsed and dropped; they are
       not given to [response_handler] (RFC 9110 §15.2). A [101] is final: it is
-      given to [response_handler].
+      given to [response_handler]. After a [101] response, and after a 2xx
+      response to [CONNECT], the connection stops reading HTTP: the bytes that
+      follow the head are left unconsumed for the protocol that takes over
+      (the body given with a 2xx response to [CONNECT] receives none of them).
+      An obs-fold in a response field value is replaced with one space
+      (RFC 9112 §5.2).
+
+      A request is written right away, or after the requests before it: it is
+      pipelined behind a request with an idempotent method (RFC 9110 §9.2.2)
+      whose request has been sent, and it waits behind any other request until
+      that request's response is complete (RFC 9112 §9.3.2). When a response
+      ends the connection ([Connection: close], an HTTP/1.0 response without
+      keep-alive or with [Transfer-Encoding], or both [Content-Length] and
+      [Transfer-Encoding]), the connection stops writing, also in the middle of
+      a request body, and the later requests get [`Connection_closed].
+
+      Response bytes that arrive when no request waits for a response close the
+      connection. Empty lines before a response are discarded.
 
       Raises [Invalid_argument], naming the offending field, when the head of
-      [req] is invalid: a method or field name that is not a token (RFC 9110
+      [req] is invalid, before the request is queued: a method or field name that is not a token (RFC 9110
       §9.1, §5.1), a field value with CR, LF or NUL (§5.5), or a request target
       with CR, LF, NUL or space. *)
 

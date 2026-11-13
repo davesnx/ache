@@ -36,6 +36,7 @@ module Writer = Serialize.Writer
 type error =
   [ `Malformed_response of string
   | `Invalid_response_body_length of Response.t
+  | `Connection_closed
   | `Exn of exn
   ]
 
@@ -87,6 +88,7 @@ let request
       ~error_handler
       ~response_handler
   =
+  Serialize.check_request request;
   let request_body = create_request_body ~request t in
   let respd =
     Respd.create
@@ -108,9 +110,19 @@ let request
   wakeup_writer t;
   request_body
 
+let fail_unanswered t =
+  Queue.iter
+    (fun respd ->
+       match respd.Respd.state with
+       | Uninitialized | Awaiting_response ->
+         Respd.report_error respd `Connection_closed
+       | Received_response _ | Upgraded _ | Closed -> ())
+    t.request_queue
+
 let shutdown_reader t =
   if is_active t then Respd.close_response_body (current_respd_exn t);
   Reader.force_close t.reader;
+  fail_unanswered t;
   wakeup_reader t
 
 let shutdown_writer t =
@@ -123,18 +135,17 @@ let shutdown t =
   shutdown_writer t
 
 let set_error_and_handle t error =
-  Queue.iter
-    (fun respd ->
-       match Respd.input_state respd with
-       | Wait | Ready -> Respd.report_error respd error
-       | Complete ->
-         (match Reader.next t.reader with
-         | `Error _ | `Read -> Respd.report_error respd error
-         | _ ->
-           (* Don't bother reporting errors to responses that have already *
-              completed. *)
-           ()))
-    t.request_queue;
+  let reading respd =
+    match respd.Respd.state, Respd.input_state respd with
+    | (Awaiting_response | Upgraded _), _ -> true
+    | Received_response _, (Wait | Ready) -> true
+    | Received_response _, Complete ->
+      (match Reader.next t.reader with `Error _ | `Read -> true | _ -> false)
+    | (Uninitialized | Closed), _ -> false
+  in
+  (match List.find_opt reading (List.of_seq (Queue.to_seq t.request_queue)) with
+  | Some respd -> Respd.report_error respd error
+  | None -> ());
   (* From RFC7230§6.5: * A client sending a message body SHOULD monitor the
      network connection * for an error response while it is transmitting the
      request. If the * client sees a response that indicates the server does not
@@ -143,12 +154,14 @@ let set_error_and_handle t error =
      of the * connection. *)
   shutdown t
 
-let unexpected_eof t =
-  set_error_and_handle t (`Malformed_response "unexpected eof")
-
 let report_exn t exn = set_error_and_handle t (`Exn exn)
 
 exception Local
+
+let idempotent respd =
+  match (Respd.request respd).meth with
+  | #Method.standard as meth -> Method.is_idempotent meth
+  | `Other _ -> false
 
 let maybe_pipeline_queued_requests t =
   (* Don't bother trying to pipeline if there aren't multiple requests in the *
@@ -163,7 +176,7 @@ let maybe_pipeline_queued_requests t =
              | None -> ()
              | Some prev ->
                (match respd.Respd.state, Respd.output_state prev with
-               | Uninitialized, Complete ->
+               | Uninitialized, Complete when idempotent prev ->
                  Respd.write_request respd;
                  Respd.flush_request_body respd
                | _ ->
@@ -208,7 +221,7 @@ and _final_read_operation_for t respd =
   let next =
     if not (Respd.persistent_connection respd)
     then (
-      shutdown_reader t;
+      shutdown t;
       Reader.next t.reader)
     else
       match Respd.output_state respd with
@@ -226,16 +239,17 @@ and _final_read_operation_for t respd =
   wakeup_writer t;
   next
 
+let report_reader_error t = function
+  | `Parse message -> set_error_and_handle t (`Malformed_response message)
+  | `Header_too_large ->
+    set_error_and_handle t (`Malformed_response "header fields too large")
+  | `Invalid_response_body_length _ as error -> set_error_and_handle t error
+  | `Unsolicited_response -> shutdown t
+
 let next_read_operation t =
   match _next_read_operation t with
-  | `Error (`Parse message) ->
-    set_error_and_handle t (`Malformed_response message);
-    `Close
-  | `Error `Header_too_large ->
-    set_error_and_handle t (`Malformed_response "header fields too large");
-    `Close
-  | `Error (`Invalid_response_body_length _ as error) ->
-    set_error_and_handle t error;
+  | `Error error ->
+    report_reader_error t error;
     `Close
   | `Start -> `Read
   | (`Read | `Yield | `Close) as operation -> operation
@@ -249,7 +263,9 @@ let read t bs ~off ~len = read_with_more t bs ~off ~len Incomplete
 
 let read_eof t bs ~off ~len =
   let bytes_read = read_with_more t bs ~off ~len Complete in
-  if is_active t then unexpected_eof t;
+  (match Reader.next t.reader with
+  | `Error error -> report_reader_error t error
+  | _ -> if is_active t then shutdown t);
   bytes_read
 
 let rec _next_write_operation t =

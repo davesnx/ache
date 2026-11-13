@@ -1,7 +1,12 @@
 (executables
  (libraries ache ache-eio ache_examples eio_main)
- (names eio_echo_post eio_get eio_connect_server eio_connect_client)
- (flags :standard -warn-error -A))
+ (names
+  eio_echo_post
+  eio_get
+  eio_connect_server
+  eio_connect_client
+  eio_hello_server
+  eio_hello_client))
 
 (alias
  (name examples)

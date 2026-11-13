@@ -9,6 +9,7 @@ let response_error_pp_hum fmt = function
       fmt
       "Invalid_response_body_length: %s"
       (response_to_string resp)
+  | `Connection_closed -> Format.pp_print_string fmt "Connection_closed"
   | `Exn exn -> Format.fprintf fmt "Exn (%s)" (Printexc.to_string exn)
 
 module Response = struct
@@ -317,7 +318,7 @@ let test_response_eof () =
       ~flush_headers_immediately:true
       ~response_handler:(default_response_handler response)
       ~error_handler:(function
-      | `Malformed_response msg -> error_message := Some msg
+      | `Connection_closed -> error_message := Some "connection closed"
       | _ -> assert false)
   in
   Body.Writer.close body;
@@ -327,8 +328,8 @@ let test_response_eof () =
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   connection_is_shutdown t;
   Alcotest.(check (option string))
-    "unexpected eof"
-    (Some "unexpected eof")
+    "connection closed before the response"
+    (Some "connection closed")
     !error_message
 
 let test_persistent_connection_requests () =
@@ -1858,18 +1859,23 @@ let test_flush_response_before_shutdown () =
   let request' = Request.create `GET "/" ~headers:Headers.encoding_chunked in
   let response_handler _response _body = assert false in
   let t = create () in
+  let errors = ref [] in
   let body =
     request
       t
       request'
       ~flush_headers_immediately:true
       ~response_handler
-      ~error_handler:no_error_handler
+      ~error_handler:(fun error -> errors := error :: !errors)
   in
   write_request t request';
 
   Body.Writer.write_string body "hello world";
   shutdown t;
+  Alcotest.(check (list response_error))
+    "unanswered request gets Connection_closed"
+    [ `Connection_closed ]
+    !errors;
   Alcotest.(check bool)
     "Shutting down closes the request body"
     true

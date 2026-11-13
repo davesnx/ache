@@ -1,0 +1,28 @@
+{0 ache}
+
+ache is an HTTP/1.1 client and server library for OCaml 5, forked from
+{{:https://github.com/anmonteiro/httpun}httpun} and
+{{:https://github.com/inhabitedtype/httpaf}httpaf}.
+
+{1 Packages}
+
+{ul
+{- [ache]: {!Ache}, the core. It parses and serializes HTTP/1.1 messages and
+   keeps the state of a server or client connection, with no I/O. Start with
+   {!Ache.Server_connection}, {!Ache.Client_connection}, {!Ache.Reqd} and
+   {!Ache.Body}.}
+{- [ache-eio]: {{:https://ocaml.org/p/ache-eio/latest/doc/Ache_eio/index.html}[Ache_eio]}, which runs ache on any Eio two-way flow.}
+{- [ache-lwt]: {{:https://ocaml.org/p/ache-lwt/latest/doc/Ache_lwt/index.html}[Ache_lwt]}, which runs ache on [Lwt_unix] sockets, or on
+   any other socket through [Ache_lwt.Make].}}
+
+{1 Examples}
+
+The README and the [examples/] directory of the repository have complete
+servers and clients for Eio and Lwt.
+
+{1 Strict parsing and limits}
+
+The server answers 400, 431, 501 or 505 to requests that RFC 9110 and
+RFC 9112 do not allow, and closes the connection. {!Ache.Server_connection.create}
+lists the cases. {!Ache.Config.t} sets the buffer sizes and
+[max_header_size], the largest head that ache reads (16 KiB by default).
