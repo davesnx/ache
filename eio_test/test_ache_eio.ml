@@ -200,7 +200,14 @@ let test_get () =
     let client =
       Ache_eio.Client.create_connection ~sw (Eio.Net.connect ~sw net addr)
     in
-    let response, body = request client (Request.create `GET "/hello") in
+    let response, body =
+      request
+        client
+        (Request.create
+           ~headers:(Headers.of_list [ "host", "localhost" ])
+           `GET
+           "/hello")
+    in
     Alcotest.(check int) "status" 200 (Status.to_code response.status);
     Alcotest.(check string) "body" "hello world" body;
     Eio.Promise.await (Ache_eio.Client.shutdown client))
@@ -217,7 +224,9 @@ let test_post_echo () =
     in
     let headers =
       Headers.of_list
-        [ "content-length", string_of_int (String.length payload) ]
+        [ "host", "localhost"
+        ; "content-length", string_of_int (String.length payload)
+        ]
     in
     let response, body =
       request client ~body:payload (Request.create ~headers `POST "/echo")
@@ -266,7 +275,8 @@ let test_upgrade () =
         (Request.create
            ~headers:
              (Headers.of_list
-                [ "connection", "upgrade"
+                [ "host", "localhost"
+                ; "connection", "upgrade"
                 ; "upgrade", "echo"
                 ; "content-length", "0"
                 ])
@@ -299,6 +309,7 @@ let test_upgrade_incomplete_token_reaches_new_protocol () =
     let socket = Eio.Net.connect ~sw net addr in
     Eio.Flow.copy_string
       "GET /upgrade HTTP/1.1\r\n\
+       host: localhost\r\n\
        connection: upgrade\r\n\
        upgrade: echo\r\n\
        \r\n\

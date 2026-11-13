@@ -35,7 +35,6 @@ type more =
 
 module Grammar = struct
   let is_space = function ' ' | '\t' -> true | _ -> false
-  let is_space_or_colon = function ' ' | '\t' | ':' -> true | _ -> false
   let is_digit = function '0' .. '9' -> true | _ -> false
 
   let is_hex = function
@@ -63,21 +62,32 @@ module Grammar = struct
     | '\t' | ' ' | '\x21' .. '\x7e' | '\x80' .. '\xff' -> true
     | _ -> false
 
-  let eol () = ignore (Parseff.consume "\r\n")
+  let is_target_char c = c > ' ' && c <> '\x7f'
+
+  let is_field_char = function
+    | '\t' | ' ' .. '\x7e' | '\x80' .. '\xff' -> true
+    | _ -> false
+
+  (* [Parseff.consume] reads the whole literal before it compares any byte. *)
+  let literal s =
+    Parseff.expect (Printf.sprintf "%S" s) (fun () ->
+      String.iter (fun c -> ignore (Parseff.char c)) s)
+
+  let eol () = literal "\r\n"
   let digit () = Char.code (Parseff.satisfy is_digit ~label:"digit") - 48
 
   let version () =
-    ignore (Parseff.consume "HTTP/");
+    literal "HTTP/";
     let major = digit () in
     ignore (Parseff.char '.');
     let minor = digit () in
     { Version.major; minor }
 
   let header () =
-    let name = Parseff.take_while (fun c -> not (is_space_or_colon c)) in
+    let name = Parseff.take_while ~at_least:1 ~label:"field-name" is_tchar in
     ignore (Parseff.char ':');
     Parseff.skip_while is_space;
-    let value = Parseff.take_while (fun c -> c <> '\r') in
+    let value = Parseff.take_while is_field_char in
     eol ();
     name, String.trim value
 
@@ -90,10 +100,14 @@ module Grammar = struct
     in
     loop []
 
+  (* RFC 9112 §2.2: ignore one empty line before the request-line. *)
   let request_head () =
-    let meth = Parseff.take_while (fun c -> not (is_space c)) in
+    if Parseff.peek_char () = Some '\r' then eol ();
+    let meth = Parseff.take_while ~at_least:1 ~label:"method" is_tchar in
     ignore (Parseff.char ' ');
-    let target = Parseff.take_while (fun c -> not (is_space c)) in
+    let target =
+      Parseff.take_while ~at_least:1 ~label:"request-target" is_target_char
+    in
     ignore (Parseff.char ' ');
     let version = version () in
     eol ();
@@ -113,10 +127,17 @@ module Grammar = struct
 
   let response_head () =
     let version = version () in
+    if version.major <> 1
+    then
+      Parseff.fail
+        (Printf.sprintf
+           "unsupported HTTP-version: %d.%d"
+           version.major
+           version.minor);
     ignore (Parseff.char ' ');
     let status = status () in
     ignore (Parseff.char ' ');
-    let reason = Parseff.take_while (fun c -> c <> '\r') in
+    let reason = Parseff.take_while is_field_char in
     eol ();
     let headers = headers () in
     eol ();
@@ -190,7 +211,7 @@ end
 
 module Reader = struct
   type request_error =
-    [ `Bad_request of Request.t
+    [ `Invalid_request of Request.t * Request.error
     | `Parse of string
     | `Header_too_large
     ]
@@ -339,17 +360,16 @@ module Reader = struct
 
   let create_body t =
     Body.Reader.create
-      Bigstringaf.empty
       ~when_ready_to_read:(Optional_thunk.some (fun () -> wakeup t))
 
   let request ~max_header_size handler =
     let on_head t request =
-      match Request.body_length request with
-      | `Error `Bad_request -> t.state <- Fail (`Bad_request request)
-      | `Fixed 0L ->
+      match Request.received_body_length request with
+      | Error error -> t.state <- Fail (`Invalid_request (request, error))
+      | Ok (`Fixed 0L) ->
         handler request (Body.Reader.create_empty ());
         t.state <- Done
-      | (`Fixed _ | `Chunked) as encoding ->
+      | Ok ((`Fixed _ | `Chunked) as encoding) ->
         let body = create_body t in
         let framing =
           match encoding with
@@ -462,9 +482,7 @@ module Reader = struct
       then Int64.to_int remaining
       else len
     in
-    let faraday = Body.Reader.unsafe_faraday body in
-    if not (Faraday.is_closed faraday)
-    then Faraday.schedule_bigstring faraday (Bigstringaf.copy bs ~off ~len:n);
+    Body.Reader.write body bs ~off ~len:n;
     n
 
   let finish t body =

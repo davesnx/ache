@@ -4,6 +4,8 @@ let iovecs_to_string = Helpers.Write_operation.iovecs_to_string
 
 let error_to_string = function
   | `Bad_request -> "Bad_request"
+  | `Not_implemented -> "Not_implemented"
+  | `Http_version_not_supported -> "Http_version_not_supported"
   | `Bad_gateway -> "Bad_gateway"
   | `Internal_server_error -> "Internal_server_error"
   | `Request_header_fields_too_large -> "Request_header_fields_too_large"
@@ -225,11 +227,15 @@ let test_get () = check_server ~expect:[ get_summary, "" ] get
 
 let test_post_fixed () =
   check_server
-    ~expect:[ {|"POST" "/p" HTTP/1.1 ["Content-Length":"11"]|}, "hello world" ]
-    "POST /p HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world"
+    ~expect:
+      [ ( {|"POST" "/p" HTTP/1.1 ["Host":"a";"Content-Length":"11"]|}
+        , "hello world" )
+      ]
+    "POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 11\r\n\r\nhello world"
 
 let chunked_post =
   "POST /c HTTP/1.1\r\n\
+   Host: a\r\n\
    Transfer-Encoding: chunked\r\n\
    \r\n\
    5;name=value;flag\r\n\
@@ -244,7 +250,8 @@ let chunked_post =
 let test_post_chunked () =
   check_server
     ~expect:
-      [ {|"POST" "/c" HTTP/1.1 ["Transfer-Encoding":"chunked"]|}, "hello world"
+      [ ( {|"POST" "/c" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}
+        , "hello world" )
       ]
     chunked_post
 
@@ -252,9 +259,9 @@ let test_pipelined () =
   check_server
     ~expect:
       [ get_summary, ""
-      ; {|"POST" "/p" HTTP/1.1 ["Content-Length":"3"]|}, "abc"
+      ; {|"POST" "/p" HTTP/1.1 ["Host":"a";"Content-Length":"3"]|}, "abc"
       ]
-    (get ^ "POST /p HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc")
+    (get ^ "POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc")
 
 let test_pipelined_incomplete_head_unconsumed () =
   let s = server () in
@@ -269,10 +276,10 @@ let test_pipelined_incomplete_head_unconsumed () =
   in
   Alcotest.(check int) "consumed" (String.length get) consumed;
   s.feeder.pending <- "GET /b";
-  Feeder.feed s.feeder " HTTP/1.1\r\n\r\n";
+  Feeder.feed s.feeder " HTTP/1.1\r\nHost: a\r\n\r\n";
   Alcotest.(check (list request_body))
     "both requests"
-    [ get_summary, ""; {|"GET" "/b" HTTP/1.1 []|}, "" ]
+    [ get_summary, ""; {|"GET" "/b" HTTP/1.1 ["Host":"a"]|}, "" ]
     (List.rev s.requests)
 
 let test_response_fixed () =
@@ -321,9 +328,9 @@ let test_crlf_across_reads () =
        (List.init (String.length head) Fun.id))
 
 let head_of_size n =
-  let base = "GET / HTTP/1.1\r\nX: \r\n\r\n" in
+  let base = "GET / HTTP/1.1\r\nHost: a\r\nX: \r\n\r\n" in
   let pad = n - String.length base in
-  "GET / HTTP/1.1\r\nX: " ^ String.make pad 'v' ^ "\r\n\r\n"
+  "GET / HTTP/1.1\r\nHost: a\r\nX: " ^ String.make pad 'v' ^ "\r\n\r\n"
 
 let test_head_limit () =
   let config = { Config.default with max_header_size = 100 } in
@@ -363,7 +370,9 @@ let test_head_limit_client () =
 
 let test_chunk_line_limit () =
   let config = { Config.default with max_header_size = 64 } in
-  let head = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" in
+  let head =
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+  in
   let request line_size =
     head ^ "5;" ^ String.make (line_size - 4) 'x' ^ "\r\nhello\r\n0\r\n\r\n"
   in
@@ -373,7 +382,9 @@ let test_chunk_line_limit () =
        Alcotest.(check (list string)) "line at the limit" [] s.errors;
        Alcotest.(check (list request_body))
          "body"
-         [ {|"POST" "/" HTTP/1.1 ["Transfer-Encoding":"chunked"]|}, "hello" ]
+         [ ( {|"POST" "/" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}
+           , "hello" )
+         ]
          s.requests)
     (all_splits (request 64));
   List.iter
@@ -387,7 +398,7 @@ let test_chunk_line_limit () =
 
 let test_large_header_small_reads () =
   let value = String.make (6 * 1024) 'v' in
-  let input = "GET / HTTP/1.1\r\nX-Big: " ^ value ^ "\r\n\r\n" in
+  let input = "GET / HTTP/1.1\r\nHost: a\r\nX-Big: " ^ value ^ "\r\n\r\n" in
   let s = server () in
   List.iter
     (fun chunk ->
@@ -396,7 +407,7 @@ let test_large_header_small_reads () =
     (sized 4096 input);
   Alcotest.(check (list request_body))
     "6 KiB header through 4096-byte reads"
-    [ Printf.sprintf {|"GET" "/" HTTP/1.1 ["X-Big":%S]|} value, "" ]
+    [ Printf.sprintf {|"GET" "/" HTTP/1.1 ["Host":"a";"X-Big":%S]|} value, "" ]
     s.requests;
   Alcotest.(check int) "consumed" (String.length input) s.feeder.consumed
 
@@ -413,6 +424,7 @@ let test_chunk_size_overflow () =
   let s =
     run_server
       [ "POST / HTTP/1.1\r\n\
+         Host: a\r\n\
          Transfer-Encoding: chunked\r\n\
          \r\n\
          7fffffffffffffff\r\n\
@@ -424,11 +436,14 @@ let test_chunk_size_overflow () =
   Alcotest.(check (list string)) "400" [ "Bad_request" ] s.errors;
   Alcotest.(check (list request_body))
     "no body bytes"
-    [ {|"POST" "/" HTTP/1.1 ["Transfer-Encoding":"chunked"]|}, "" ]
+    [ {|"POST" "/" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}, "" ]
     s.requests
 
-let chunked_head = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
-let chunked_summary = {|"POST" "/" HTTP/1.1 ["Transfer-Encoding":"chunked"]|}
+let chunked_head =
+  "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+let chunked_summary =
+  {|"POST" "/" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}
 
 let test_chunk_size_leading_zeros () =
   check_server
@@ -457,7 +472,9 @@ let test_chunk_size_leading_zeros () =
     [ "10000000000000000"; "7fffffffffffffff"; "ffffffffffffffff" ]
 
 let test_eof_states () =
-  let chunked = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" in
+  let chunked =
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+  in
   List.iter
     (fun (name, input) ->
        List.iter
@@ -466,7 +483,8 @@ let test_eof_states () =
             Alcotest.(check (list string)) name [ "Bad_request" ] s.errors)
          (all_splits input))
     [ "mid-head", "GET / HTTP/1.1\r\nHost: a\r\n"
-    ; "mid-fixed-body", "POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nhello"
+    ; ( "mid-fixed-body"
+      , "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nhello" )
     ; "mid-chunk-size", chunked ^ "5;ext"
     ; "mid-chunk-data", chunked ^ "5\r\nhel"
     ; "mid-chunk-crlf", chunked ^ "5\r\nhello\r"
@@ -516,7 +534,9 @@ let test_interleaved_connections () =
   done;
   Alcotest.(check (list request_body))
     "a"
-    [ {|"POST" "/c" HTTP/1.1 ["Transfer-Encoding":"chunked"]|}, "hello world" ]
+    [ ( {|"POST" "/c" HTTP/1.1 ["Host":"a";"Transfer-Encoding":"chunked"]|}
+      , "hello world" )
+    ]
     a.requests;
   Alcotest.(check (list request_body))
     "b"
@@ -534,10 +554,210 @@ let test_shutdown_suspended () =
   let b = server () in
   Feeder.feed
     b.feeder
-    "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5;e";
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;e";
   Server_connection.shutdown b.conn;
   Alcotest.(check (list string)) "no error" [] (a.errors @ b.errors);
   check_server ~expect:[ get_summary, "" ] get
+
+let body_bytes n =
+  String.init n (fun i -> Char.chr (Char.code 'a' + (i * 7 mod 26)))
+
+let chunked_of_sizes body sizes =
+  let b = Buffer.create (String.length body * 2) in
+  let rec go off = function
+    | [] -> ()
+    | size :: rest ->
+      let size = min size (String.length body - off) in
+      if size > 0
+      then (
+        Buffer.add_string b (Printf.sprintf "%x\r\n" size);
+        Buffer.add_string b (String.sub body off size);
+        Buffer.add_string b "\r\n";
+        go (off + size) (if rest = [] then [ size ] else rest))
+  in
+  go 0 sizes;
+  Buffer.add_string b "0\r\n\r\n";
+  Buffer.contents b
+
+let check_body_splits ~summary ~body input =
+  List.iter
+    (fun chunks ->
+       let s = run_server chunks in
+       Alcotest.(check (list string)) "errors" [] s.errors;
+       Alcotest.(check (list request_body))
+         (Printf.sprintf "%d reads" (List.length chunks))
+         [ summary, body ]
+         s.requests)
+    [ [ input ]
+    ; every_byte input
+    ; sized 7 input
+    ; sized 4096 input
+    ; sized 4097 input
+    ]
+
+let test_large_body_every_split () =
+  let body = body_bytes 10_000 in
+  check_body_splits
+    ~summary:{|"POST" "/" HTTP/1.1 ["Host":"a";"Content-Length":"10000"]|}
+    ~body
+    ("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10000\r\n\r\n" ^ body);
+  check_body_splits
+    ~summary:chunked_summary
+    ~body
+    (chunked_head ^ chunked_of_sizes body [ 1; 2; 3; 1000; 5000; 17 ]);
+  let body = body_bytes 300 in
+  List.iter
+    (fun (summary, input) ->
+       List.iter
+         (fun chunks ->
+            let s = run_server chunks in
+            Alcotest.(check (list request_body))
+              "two reads"
+              [ summary, body ]
+              s.requests)
+         (two_way input))
+    [ ( {|"POST" "/" HTTP/1.1 ["Host":"a";"Content-Length":"300"]|}
+      , "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 300\r\n\r\n" ^ body )
+    ; chunked_summary, chunked_head ^ chunked_of_sizes body [ 1; 2; 3; 50 ]
+    ]
+
+let test_many_small_chunks () =
+  let n = 100_000 in
+  let input =
+    chunked_head
+    ^ String.concat "" (List.init n (fun _ -> "1\r\nx\r\n"))
+    ^ "0\r\n\r\n"
+  in
+  let on_read_calls = ref 0 in
+  let received = Buffer.create n in
+  let eof = ref false in
+  let handler reqd =
+    let body = Reqd.request_body reqd in
+    let rec on_read bs ~off ~len =
+      incr on_read_calls;
+      Buffer.add_string received (Bigstringaf.substring bs ~off ~len);
+      Body.Reader.schedule_read body ~on_read ~on_eof
+    and on_eof () =
+      eof := true;
+      Reqd.respond_with_string reqd (Response.create `OK) ""
+    in
+    Body.Reader.schedule_read body ~on_read ~on_eof
+  in
+  let conn = Server_connection.create handler in
+  let bs = Bigstringaf.of_string input ~off:0 ~len:(String.length input) in
+  let consumed =
+    Server_connection.read conn bs ~off:0 ~len:(String.length input)
+  in
+  Alcotest.(check int) "consumed" (String.length input) consumed;
+  Alcotest.(check bool) "eof" true !eof;
+  Alcotest.(check string) "bytes" (String.make n 'x') (Buffer.contents received);
+  Alcotest.(check int) "on_read calls" 1 !on_read_calls
+
+let collect_body body =
+  let buf = Buffer.create 16 in
+  let done_ = ref false in
+  let rec on_read bs ~off ~len =
+    Buffer.add_string buf (Bigstringaf.substring bs ~off ~len);
+    Body.Reader.schedule_read body ~on_read ~on_eof
+  and on_eof () = done_ := true in
+  Body.Reader.schedule_read body ~on_read ~on_eof;
+  buf, done_
+
+let test_pipelined_body_read_late () =
+  let bodies = ref [] in
+  let handler reqd =
+    bodies := Reqd.request_body reqd :: !bodies;
+    Reqd.respond_with_string reqd (Response.create `OK) ""
+  in
+  let conn = Server_connection.create handler in
+  let input =
+    "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\n\r\naaaa"
+    ^ "POST / HTTP/1.1\r\n\
+       Host: a\r\n\
+       Transfer-Encoding: chunked\r\n\
+       \r\n\
+       4\r\n\
+       bbbb\r\n\
+       0\r\n\
+       \r\n"
+    ^ "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\n\r\ncccc"
+  in
+  let rec drain () =
+    match Server_connection.next_write_operation conn with
+    | `Write iovecs ->
+      Server_connection.report_write_result conn (`Ok (IOVec.lengthv iovecs));
+      drain ()
+    | `Yield | `Close _ -> ()
+  in
+  let feeder =
+    { Feeder.pending = ""
+    ; consumed = 0
+    ; next_read_operation =
+        (fun () -> Server_connection.next_read_operation conn)
+    ; read = Server_connection.read conn
+    ; read_eof = Server_connection.read_eof conn
+    ; drain
+    }
+  in
+  Feeder.feed feeder input;
+  Alcotest.(check int) "consumed" (String.length input) feeder.consumed;
+  Alcotest.(check int) "three requests" 3 (List.length !bodies);
+  let read = List.rev_map collect_body !bodies in
+  List.iter2
+    (fun expected (buf, done_) ->
+       Alcotest.(check string) "body" expected (Buffer.contents buf);
+       Alcotest.(check bool) "eof" true !done_)
+    [ "aaaa"; "bbbb"; "cccc" ]
+    read
+
+let test_unread_body_backpressure () =
+  let body = body_bytes 20_000 in
+  let input =
+    "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 20000\r\n\r\n" ^ body
+  in
+  let request_body = ref None in
+  let conn =
+    Server_connection.create (fun reqd ->
+      request_body := Some (Reqd.request_body reqd))
+  in
+  let bs = Bigstringaf.of_string input ~off:0 ~len:(String.length input) in
+  let fed = ref 0 in
+  let read_some () =
+    let len = min 4096 (String.length input - !fed) in
+    fed := !fed + Server_connection.read conn bs ~off:!fed ~len
+  in
+  read_some ();
+  Alcotest.(check bool)
+    "reader yields while the body is unread"
+    true
+    (Server_connection.next_read_operation conn = `Yield);
+  let held = ref [] in
+  let received = Buffer.create 16 in
+  let eof = ref false in
+  let body_reader = Option.get !request_body in
+  let on_read bs ~off ~len =
+    held := (bs, off, len, Bigstringaf.substring bs ~off ~len) :: !held;
+    Buffer.add_string received (Bigstringaf.substring bs ~off ~len)
+  and on_eof () = eof := true in
+  let rec loop rounds =
+    if rounds > 100 then Alcotest.fail "body not read to the end";
+    if not !eof
+    then (
+      Body.Reader.schedule_read body_reader ~on_read ~on_eof;
+      (match Server_connection.next_read_operation conn with
+      | `Read when !fed < String.length input -> read_some ()
+      | _ -> ());
+      loop (rounds + 1))
+  in
+  loop 0;
+  Alcotest.(check string) "bytes" body (Buffer.contents received);
+  List.iter
+    (fun (bs, off, len, copy) ->
+       Alcotest.(check bool)
+         "delivered bytes are not overwritten"
+         true
+         (String.equal copy (Bigstringaf.substring bs ~off ~len)))
+    !held
 
 let tests =
   [ "GET at every split", `Quick, test_get
@@ -564,4 +784,8 @@ let tests =
     , test_invalid_status_then_valid )
   ; "interleaved connections", `Quick, test_interleaved_connections
   ; "shutdown with a suspended parse", `Quick, test_shutdown_suspended
+  ; "10 KB bodies in many splits", `Quick, test_large_body_every_split
+  ; "100,000 one-byte chunks in one read", `Quick, test_many_small_chunks
+  ; "pipelined bodies read late", `Quick, test_pipelined_body_read_late
+  ; "unread body: backpressure", `Quick, test_unread_body_backpressure
   ]

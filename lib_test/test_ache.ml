@@ -13,4 +13,5 @@ let () =
     ; "parse", Test_parse.tests
     ; "client connection", Test_client_connection.tests
     ; "server connection", Test_server_connection.tests
+    ; "request syntax", Test_request_syntax.tests
     ]

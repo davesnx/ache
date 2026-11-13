@@ -2006,6 +2006,27 @@ let test_client_connect () =
   Alcotest.(check bool) "Writer woken up" true !writer_woken_up;
   connection_is_shutdown t
 
+let test_invalid_request_head_writes_nothing () =
+  let t = create () in
+  Alcotest.check_raises
+    "request raises"
+    (Invalid_argument {|ache: invalid request target "/a HTTP/1.1\r\nX: y"|})
+    (fun () ->
+       ignore
+         (request
+            t
+            ~flush_headers_immediately:true
+            (Request.create `GET "/a HTTP/1.1\r\nX: y")
+            ~response_handler:(fun _ _ -> ())
+            ~error_handler:no_error_handler
+          : Body.Writer.t));
+  Alcotest.(check bool)
+    "nothing written"
+    true
+    (match next_write_operation t with
+    | `Write _ -> false
+    | `Yield | `Close _ -> true)
+
 let tests =
   [ ( "commit parse after every header line"
     , `Quick
@@ -2118,4 +2139,7 @@ let tests =
     , `Quick
     , test_can_read_response_after_write_eof )
   ; "Client support for CONNECT", `Quick, test_client_connect
+  ; ( "invalid request head writes nothing"
+    , `Quick
+    , test_invalid_request_head_writes_nothing )
   ]

@@ -91,7 +91,11 @@ module Body : sig
 
         Once either of these callbacks have been called, they become inactive.
         The application is responsible for scheduling subsequent reads, either
-        within the [on_read] callback or by some other mechanism. *)
+        within the [on_read] callback or by some other mechanism.
+
+        [on_read] receives every byte available at the time of the call. The
+        library does not reuse the bytes it passes to [on_read], so the
+        application may keep them after [on_read] returns. *)
 
     val close : t -> unit
     (** [close t] closes [t], indicating that any subsequent input received
@@ -183,6 +187,11 @@ module Request : sig
   val body_length : t -> Body_length.t
   (** [body_length t] is the length of the message body accompanying [t]. It is
       an error to generate a request with a close-delimited message body.
+      [`Error `Bad_request] when [t] has both Content-Length and
+      Transfer-Encoding, when chunked is not the final transfer coding, or when
+      the Content-Length field lines do not all hold the same [1*DIGIT] value
+      (RFC 9110 §8.6). {!Client_connection.request} raises [Failure] for such a
+      request.
 
       See {{:https://tools.ietf.org/html/rfc7230#section-3.3.3} RFC7230§3.3.3}
       for more details. *)
@@ -190,7 +199,9 @@ module Request : sig
   val persistent_connection : ?proxy:bool -> t -> bool
   (** [persistent_connection ?proxy t] indicates whether the connection for [t]
       can be reused for multiple requests and responses. If the calling code
-      is acting as a proxy, it should pass [~proxy:true].
+      is acting as a proxy, it should pass [~proxy:true]. Connection options
+      are read case-insensitively from every member of every Connection field
+      line.
 
       See {{:https://tools.ietf.org/html/rfc7230#section-6.3} RFC7230§6.3 for
       more details. *)
@@ -253,7 +264,9 @@ module Response : sig
   val persistent_connection : ?proxy:bool -> t -> bool
   (** [persistent_connection ?proxy t] indicates whether the connection for [t]
       can be reused for multiple requests and responses. If the calling code
-      is acting as a proxy, it should pass [~proxy:true].
+      is acting as a proxy, it should pass [~proxy:true]. Connection options
+      are read case-insensitively from every member of every Connection field
+      line.
 
       See {{:https://tools.ietf.org/html/rfc7230#section-6.3} RFC7230§6.3 for
       more details. *)
@@ -267,6 +280,8 @@ module Reqd : sig
 
   type error =
     [ `Bad_request
+    | `Not_implemented
+    | `Http_version_not_supported
     | `Bad_gateway
     | `Internal_server_error
     | `Request_header_fields_too_large
@@ -323,7 +338,10 @@ module Reqd : sig
         response to [CONNECT] (RFC 9110 §8.6);
       - [Transfer-Encoding] in a string or bigstring response with a body;
       - a [Content-Length] that differs from the length of the string or
-        bigstring body. *)
+        bigstring body;
+      - an invalid head, naming the offending field: a field name that is
+        not a token (RFC 9110 §5.1), a field value with CR, LF or NUL (§5.5),
+        or a reason phrase with CR, LF or NUL. *)
 
   val respond_with_string : t -> Response.t -> string -> unit
   val respond_with_bigstring : t -> Response.t -> Bigstringaf.t -> unit
@@ -400,7 +418,33 @@ module Server_connection : sig
     -> request_handler
     -> t
   (** [create ?config ?error_handler ~request_handler] creates a connection
-      handler that will service individual requests with [request_handler]. *)
+      handler that will service individual requests with [request_handler].
+
+      The connection rejects a request before [request_handler] runs, calls
+      [error_handler] and closes after the error response:
+      - [`Bad_request] (400): the request line or a field line does not match
+        RFC 9112 §3 and §5 (lines end with CRLF; a bare LF is an error;
+        obs-fold is an error); an HTTP/1.1 request has no Host field; a request
+        has more than one Host field or a Host value that is not
+        [uri-host [":" port]] (RFC 3986 §3.2); a CONNECT target is not
+        [host:port] with a port of 0 to 65535; Content-Length is not a list of one
+        repeated [1*DIGIT] value; the request has both Content-Length and
+        Transfer-Encoding; an HTTP/1.0 request has Transfer-Encoding; chunked
+        is not the final transfer coding or is applied twice.
+      - [`Not_implemented] (501): a transfer coding other than chunked.
+      - [`Http_version_not_supported] (505): a major version other than 1.
+
+      A request with version HTTP/1.x, x > 1, is processed as HTTP/1.1. Its
+      [version] field keeps the received minor version. Request-target bytes
+      0x80 to 0xFF are accepted, because clients send them unencoded.
+
+      A request that is rejected after earlier pipelined requests gets its
+      error response after the responses to those requests. A request that
+      follows a request with [Connection: close] is not read.
+
+      The error response follows the framing rules of {!Reqd}: it has no body
+      in a response to [HEAD], and a body without [Content-Length] ends when
+      the connection closes. *)
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
   (** [next_read_operation t] returns a value describing the next operation that
@@ -494,14 +538,19 @@ module Client_connection : sig
     -> error_handler:error_handler
     -> response_handler:response_handler
     -> Body.Writer.t
-  (** [request t req ~error_handler ~response_handler] sends [req] and returns
-      the writer for its body. [response_handler] is called once, with the
-      final response.
+  (** [request t req ~error_handler ~response_handler] sends [req] on [t] and
+      returns the writer for its body. [response_handler] is called once, with
+      the final response.
 
       Interim 1xx responses other than [101 Switching Protocols] (for example
       [100 Continue] or [103 Early Hints]) are parsed and dropped; they are
       not given to [response_handler] (RFC 9110 §15.2). A [101] is final: it is
-      given to [response_handler]. *)
+      given to [response_handler].
+
+      Raises [Invalid_argument], naming the offending field, when the head of
+      [req] is invalid: a method or field name that is not a token (RFC 9110
+      §9.1, §5.1), a field value with CR, LF or NUL (§5.5), or a request target
+      with CR, LF, NUL or space. *)
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
   (** [next_read_operation t] returns a value describing the next operation that

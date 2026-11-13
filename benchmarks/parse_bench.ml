@@ -22,6 +22,20 @@ let chunked_post =
   ^ String.concat "" (List.init 16 (fun _ -> chunk))
   ^ "0\r\n\r\n"
 
+let small_chunks_post n =
+  "POST /upload HTTP/1.1\r\n\
+   Host: example.com\r\n\
+   Transfer-Encoding: chunked\r\n\
+   \r\n"
+  ^ String.concat "" (List.init n (fun _ -> "1\r\nx\r\n"))
+  ^ "0\r\n\r\n"
+
+let fixed_post size =
+  Printf.sprintf
+    "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: %d\r\n\r\n"
+    size
+  ^ String.make size 'x'
+
 let response = Response.create `OK
 
 let request_handler reqd =
@@ -66,7 +80,7 @@ let reads_of_size size total =
 let bench name input reads iterations =
   let bs = Bigstringaf.of_string input ~off:0 ~len:(String.length input) in
   let conn = Server_connection.create request_handler in
-  for _ = 1 to 1000 do
+  for _ = 1 to min 1000 iterations do
     feed conn bs reads
   done;
   Gc.full_major ();
@@ -84,6 +98,26 @@ let bench name input reads iterations =
     ((t1 -. t0) *. 1e9 /. n)
     (words /. n)
 
+let bench_serialize name write iterations =
+  let f = Ache_private.Faraday.create 0x1000 in
+  let run () =
+    write f;
+    ignore (Ache_private.Faraday.operation f);
+    Ache_private.Faraday.shift f (Ache_private.Faraday.pending_bytes f)
+  in
+  for _ = 1 to 1000 do
+    run ()
+  done;
+  let t0 = Sys.time () in
+  for _ = 1 to iterations do
+    run ()
+  done;
+  let t1 = Sys.time () in
+  Printf.printf
+    "%-40s %8.0f ns/head\n%!"
+    name
+    ((t1 -. t0) *. 1e9 /. float_of_int iterations)
+
 let () =
   let head = String.length get_head in
   bench
@@ -100,4 +134,39 @@ let () =
     (Printf.sprintf "POST, 16 KiB chunked body, 4096-byte reads")
     chunked_post
     (reads_of_size 4096 (String.length chunked_post))
-    100_000
+    100_000;
+  let input = small_chunks_post 10_000 in
+  bench "POST, 10,000 1-byte chunks, 1 read" input [ 0, String.length input ] 20;
+  let input = fixed_post (1024 * 1024) in
+  bench
+    "POST, 1 MiB fixed body, 64 KiB reads"
+    input
+    (reads_of_size 65536 (String.length input))
+    2_000;
+  let headers =
+    Headers.of_list
+      [ "Date", "Fri, 13 Nov 2026 12:00:00 GMT"
+      ; "Server", "ache"
+      ; "Content-Type", "text/html; charset=utf-8"
+      ; "Content-Length", "1234"
+      ; "Cache-Control", "public, max-age=3600"
+      ; "ETag", "\"33a64df551425fcc55e4d42a148795d9f25f89d4\""
+      ; "Vary", "Accept-Encoding"
+      ; "Connection", "keep-alive"
+      ]
+  in
+  let response = Response.create ~headers `OK in
+  bench_serialize
+    "serialize response head, 8 fields"
+    (fun f -> Ache_private.Serialize.write_response f response)
+    5_000_000;
+  let request =
+    Request.create
+      ~headers
+      `GET
+      "/wp-content/uploads/2010/03/hello-kitty-darth-vader-pink.jpg"
+  in
+  bench_serialize
+    "serialize request head, 8 fields"
+    (fun f -> Ache_private.Serialize.write_request f request)
+    5_000_000

@@ -1,10 +1,23 @@
 open Ache
 open Helpers
 
+let request_to_string ?body (r : Request.t) =
+  let r =
+    if
+      Version.compare r.version Version.v1_1 >= 0
+      && not (Headers.mem r.headers "host")
+    then { r with headers = Headers.add r.headers "host" "example.com" }
+    else r
+  in
+  request_to_string ?body r
+
 let trace fmt = Format.ksprintf (Format.printf "%s\n%!") fmt
 
 let request_error_pp_hum fmt = function
   | `Bad_request -> Format.fprintf fmt "Bad_request"
+  | `Not_implemented -> Format.fprintf fmt "Not_implemented"
+  | `Http_version_not_supported ->
+    Format.fprintf fmt "Http_version_not_supported"
   | `Bad_gateway -> Format.fprintf fmt "Bad_gateway"
   | `Internal_server_error -> Format.fprintf fmt "Internal_server_error"
   | `Request_header_fields_too_large ->
@@ -384,7 +397,10 @@ let test_commit_parse_after_every_header () =
   let single_header = "Links: /path/to/some/website\r\n" in
   let r =
     (* Each header is 30 bytes *)
-    request_line ^ single_header ^ single_header ^ "connection: close\r\n\r\n"
+    request_line
+    ^ single_header
+    ^ single_header
+    ^ "host: a\r\nconnection: close\r\n\r\n"
   in
   let bs = Bigstringaf.of_string r ~off:0 ~len:(String.length r) in
   let c = read t bs ~off:0 ~len:30 in
@@ -1621,7 +1637,11 @@ let test_bad_request () =
   (* A `Bad_request is returned in a number of cases surrounding
      transfer-encoding or content-length headers. *)
   let request =
-    Request.create `GET "/" ~headers:(Headers.encoding_fixed (-1))
+    Request.create
+      `GET
+      "/"
+      ~headers:
+        (Headers.of_list [ "host", "example.com"; "content-length", "-1" ])
   in
   let error_handler_fired = ref false in
   let error_handler ?request:request' error start_response =
@@ -2494,7 +2514,10 @@ let test_write_response_after_read_eof () =
   let single_header = "Links: /path/to/some/website\r\n" in
   let r =
     (* Each header is 30 bytes *)
-    request_line ^ single_header ^ single_header ^ "connection: close\r\n\r\n"
+    request_line
+    ^ single_header
+    ^ single_header
+    ^ "host: a\r\nconnection: close\r\n\r\n"
   in
   let bs = Bigstringaf.of_string r ~off:0 ~len:(String.length r) in
   let c = read t bs ~off:0 ~len:30 in
@@ -2530,13 +2553,89 @@ let test_connect_method () =
     (Request.create
        ~headers:(Headers.of_list [ "host", "example.com:80" ])
        `CONNECT
-       "/");
+       "example.com:80");
   write_response
     ~msg:"Upgrade response written"
     t
     (Response.create `Switching_protocols);
   Alcotest.(check bool) "Upgraded protocol was called" true upgraded.driven;
   reader_yielded t
+
+let test_invalid_response_head_writes_nothing () =
+  let output conn =
+    let b = Buffer.create 64 in
+    let rec go () =
+      match Server_connection.next_write_operation conn with
+      | `Write iovecs ->
+        let s = Write_operation.iovecs_to_string iovecs in
+        Buffer.add_string b s;
+        Server_connection.report_write_result conn (`Ok (String.length s));
+        go ()
+      | `Yield | `Close _ -> ()
+    in
+    go ();
+    Buffer.contents b
+  in
+  let bad =
+    Response.create ~headers:(Headers.of_list [ "X-A", "a\r\nB: 1" ]) `OK
+  in
+  let request = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
+  let bs = Bigstringaf.of_string request ~off:0 ~len:(String.length request) in
+  let raised = ref [] in
+  let conn =
+    Server_connection.create (fun reqd ->
+      List.iter
+        (fun respond ->
+           match respond reqd with
+           | () -> ()
+           | exception Invalid_argument msg -> raised := msg :: !raised)
+        [ (fun reqd -> Reqd.respond_with_string reqd bad "body")
+        ; (fun reqd ->
+            Reqd.respond_with_bigstring
+              reqd
+              bad
+              (Bigstringaf.of_string "x" ~off:0 ~len:1))
+        ; (fun reqd ->
+            ignore (Reqd.respond_with_streaming reqd bad : Body.Writer.t))
+        ];
+      Alcotest.(check bool)
+        "no response started"
+        true
+        (Reqd.response reqd = None);
+      Reqd.respond_with_string reqd (Response.create `OK) "")
+  in
+  ignore
+    (Server_connection.read conn bs ~off:0 ~len:(String.length request) : int);
+  Alcotest.(check (list string))
+    "each respond_with_* raises"
+    (List.init 3 (fun _ -> {|ache: invalid value for field "X-A"|}))
+    !raised;
+  Alcotest.(check string)
+    "only the valid response is written"
+    "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
+    (output conn);
+  let error_output = ref [] in
+  let conn =
+    Server_connection.create
+      ~error_handler:(fun ?request:_ error start_response ->
+        error_output :=
+          (match error with `Exn (Invalid_argument msg) -> msg | _ -> "other")
+          :: !error_output;
+        Body.Writer.close (start_response Headers.empty))
+      (fun reqd -> Reqd.respond_with_string reqd bad "")
+  in
+  (match Server_connection.read conn bs ~off:0 ~len:(String.length request) with
+  | (_ : int) -> Alcotest.fail "expected the request handler to raise"
+  | exception (Invalid_argument _ as exn) ->
+    Server_connection.report_exn conn exn);
+  Alcotest.(check (list string))
+    "error handler sees the exception"
+    [ {|ache: invalid value for field "X-A"|} ]
+    !error_output;
+  Alcotest.(check string)
+    "only the error response is written"
+    "HTTP/1.1 500 Internal Server Error\r\n\r\n"
+    (output conn)
 
 let tests =
   [ "initial reader state", `Quick, test_initial_reader_state
@@ -2726,6 +2825,9 @@ let tests =
     , `Quick
     , test_write_response_after_read_eof )
   ; "CONNECT method", `Quick, test_connect_method
+  ; ( "invalid response head writes nothing"
+    , `Quick
+    , test_invalid_response_head_writes_nothing )
   ]
 
 (* https://httpwg.org/specs/rfc9110.html For example, a CONNECT request (Section

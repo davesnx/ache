@@ -65,8 +65,9 @@ let server ?(error_handler = fun ?request:_ _ _ -> ()) handler input =
 
 let req ?(version = "HTTP/1.1") ?(headers = []) meth =
   Printf.sprintf
-    "%s / %s\r\nHost: a\r\n%s\r\n"
+    "%s %s %s\r\nHost: a\r\n%s\r\n"
     meth
+    (if meth = "CONNECT" then "a:443" else "/")
     version
     (String.concat "" (List.map (fun (n, v) -> n ^ ": " ^ v ^ "\r\n") headers))
 

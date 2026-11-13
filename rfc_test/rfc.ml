@@ -532,3 +532,24 @@ let check_bad_request ?(msg = "400 then close") s =
 
 let check_closed msg s = Alcotest.(check bool) msg true (Server.is_closed s)
 let check_open msg s = Alcotest.check read_op msg `Read (Server.read_op s)
+let targets s = List.map (fun (r : Request.t) -> r.target) (Server.requests s)
+
+let check_rejected ?(allowed = [ 400 ]) s =
+  (match Server.statuses s with
+  | [ code ] when List.mem code allowed -> ()
+  | codes ->
+    Alcotest.failf
+      "expected one response with a status in [%s], got [%s] in %S"
+      (String.concat "; " (List.map string_of_int allowed))
+      (String.concat "; " (List.map string_of_int codes))
+      (Server.output s));
+  Alcotest.(check int) "request handler not called" 0 (Server.handler_calls s);
+  check_closed "connection closed" s
+
+let check_not_dispatched target s =
+  if List.mem target (targets s)
+  then
+    Alcotest.failf
+      "%s reached the request handler; targets: [%s]"
+      target
+      (String.concat "; " (targets s))

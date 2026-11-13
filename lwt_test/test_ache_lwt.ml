@@ -222,7 +222,13 @@ let read_all socket =
 let test_get () =
   with_server (fun connect ->
     connect () >>= Ache_lwt.Client.create_connection >>= fun client ->
-    request client (Request.create `GET "/hello") >>= fun (response, body) ->
+    request
+      client
+      (Request.create
+         ~headers:(Headers.of_list [ "host", "localhost" ])
+         `GET
+         "/hello")
+    >>= fun (response, body) ->
     Alcotest.(check int) "status" 200 (Status.to_code response.status);
     Alcotest.(check string) "body" "hello world" body;
     Ache_lwt.Client.shutdown client)
@@ -237,7 +243,9 @@ let test_post_echo () =
     in
     let headers =
       Headers.of_list
-        [ "content-length", string_of_int (String.length payload) ]
+        [ "host", "localhost"
+        ; "content-length", string_of_int (String.length payload)
+        ]
     in
     request client ~body:payload (Request.create ~headers `POST "/echo")
     >>= fun (response, body) ->
@@ -282,7 +290,8 @@ let test_upgrade () =
         (Request.create
            ~headers:
              (Headers.of_list
-                [ "connection", "upgrade"
+                [ "host", "localhost"
+                ; "connection", "upgrade"
                 ; "upgrade", "echo"
                 ; "content-length", "0"
                 ])
@@ -329,6 +338,7 @@ let test_upgrade_incomplete_token_reaches_new_protocol () =
     write_all
       socket
       "GET /upgrade HTTP/1.1\r\n\
+       host: localhost\r\n\
        connection: upgrade\r\n\
        upgrade: echo\r\n\
        \r\n\

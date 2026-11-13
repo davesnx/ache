@@ -21,7 +21,7 @@ end
 
 module Reader : sig
   type request_error =
-    [ `Bad_request of Request.t
+    [ `Invalid_request of Request.t * Request.error
     | `Parse of string
     | `Header_too_large
     ]

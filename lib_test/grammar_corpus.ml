@@ -72,6 +72,17 @@ let requests =
   ; ""
   ; "\r\n"
   ; "GET / HTTP/1.1\r\n\r\nextra"
+  ; "GET / \r\n\r\n"
+  ; " / HTTP/1.1\r\n\r\n"
+  ; "GET  HTTP/1.1\r\n\r\n"
+  ; "GE(T / HTTP/1.1\r\n\r\n"
+  ; "GET /\127 HTTP/1.1\r\n\r\n"
+  ; "GET / HTTP/1.2\r\n\r\n"
+  ; "GET / HTTP/1.1\r\nX-Invalid[]: t\r\n\r\n"
+  ; "GET / HTTP/1.1\r\nX: a\nb\r\n\r\n"
+  ; "GET / HTTP/1.1\r\nX: a\007b\r\n\r\n"
+  ; "GET / HTTP/1.1\r\nX: a\127b\r\n\r\n"
+  ; "GET / HTTP/1.1\r\nX:\t a b \t\r\n\r\n"
   ]
 
 let responses =
@@ -108,6 +119,11 @@ let responses =
   ; "HTTP/1.1 099 x\r\n\r\n"
   ; "HTTP/1.1 1 x\r\n\r\n"
   ; "HTTP/1.1 20a OK\r\n\r\n"
+  ; "HTTP/1.2 200 OK\r\n\r\n"
+  ; "HTTP/2.0 200 OK\r\n\r\n"
+  ; "HTTP/1.1 200 OK\r\nX(y): 1\r\n\r\n"
+  ; "HTTP/1.1 200 O\nK\r\n\r\n"
+  ; "HTTP/1.1 200 OK\r\nX: a\000b\r\n\r\n"
   ]
 
 let all =

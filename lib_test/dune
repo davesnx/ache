@@ -12,6 +12,7 @@
   test_iovec
   test_method
   test_request
+  test_request_syntax
   test_response
   test_status
   test_framing

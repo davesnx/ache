@@ -33,14 +33,23 @@
    responses, which are collectively referred to in the HTTP 1.1 specifications
    as 'messages'. *)
 
+let list_members values =
+  List.concat_map
+    (fun value -> List.map String.trim (String.split_on_char ',' value))
+    values
+
+let has_option headers option =
+  List.exists
+    (Headers.ci_equal option)
+    (list_members (Headers.get_multi headers "connection"))
+
 let persistent_connection ?(proxy = false) version headers =
   let _ = proxy in
   (* XXX(seliopou): use proxy argument in the case of HTTP/1.0 as per
      https://tools.ietf.org/html/rfc7230#section-6.3 *)
-  match Headers.get headers "connection" with
-  | Some "close" -> false
-  | Some "keep-alive" -> Version.(compare version v1_0) >= 0
-  | _ -> Version.(compare version v1_1) >= 0
+  if has_option headers "close"
+  then false
+  else Version.(compare version v1_1) >= 0 || has_option headers "keep-alive"
 
 let sort_uniq xs =
   (* Though {!List.sort_uniq} performs a check on the input length and returns *
@@ -52,7 +61,12 @@ let sort_uniq xs =
   | _ -> List.sort_uniq String.compare xs
 
 let unique_content_length_values headers =
-  (* XXX(seliopou): perform proper content-length parsing *)
-  sort_uniq (Headers.get_multi headers "content-length")
+  sort_uniq (list_members (Headers.get_multi headers "content-length"))
 
-let content_length_of_string s = try Int64.of_string s with _ -> -1L
+let is_digit = function '0' .. '9' -> true | _ -> false
+
+(* RFC 9110 §8.6: Content-Length = 1*DIGIT. [-1L] marks an invalid value. *)
+let content_length_of_string s =
+  if s <> "" && String.for_all is_digit s
+  then Option.value (Int64.of_string_opt s) ~default:(-1L)
+  else -1L

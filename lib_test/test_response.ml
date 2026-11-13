@@ -106,8 +106,45 @@ let test_body_length () =
     `GET
     (res `OK Headers.(of_list [ "transfer-encoding", "CHUNKED" ]))
 
+let test_serialize_rejects_invalid_head () =
+  let check_rejected name ~expect response =
+    let f = Faraday.create 0x100 in
+    Alcotest.check_raises name (Invalid_argument expect) (fun () ->
+      Ache_private.Serialize.write_response f response);
+    Alcotest.(check int)
+      (name ^ ": nothing written")
+      0
+      (Faraday.pending_bytes f)
+  in
+  List.iter
+    (fun reason ->
+       check_rejected
+         (Printf.sprintf "reason %S" reason)
+         ~expect:(Printf.sprintf "ache: invalid reason phrase %S" reason)
+         (Response.create ~reason `OK))
+    [ "OK\r\nInjected: 1"; "OK\n"; "OK\r"; "OK\000" ];
+  check_rejected
+    "field name"
+    ~expect:{|ache: invalid field name "Bad Name"|}
+    (Response.create ~headers:(Headers.of_list [ "Bad Name", "v" ]) `OK);
+  check_rejected
+    "field value"
+    ~expect:{|ache: invalid value for field "X-A"|}
+    (Response.create ~headers:(Headers.of_list [ "X-A", "a\000b" ]) `OK);
+  Alcotest.(check string)
+    "valid head is written"
+    "HTTP/1.1 200 All good\tthanks\r\nX-A: a, \"b\"\r\n\r\n"
+    (response_to_string
+       (Response.create
+          ~reason:"All good\tthanks"
+          ~headers:(Headers.of_list [ "X-A", "a, \"b\"" ])
+          `OK))
+
 let tests =
   [ "parse valid", `Quick, test_parse_valid
   ; "parse invalid error", `Quick, test_parse_invalid_error
   ; "body length", `Quick, test_body_length
+  ; ( "serialize rejects an invalid head"
+    , `Quick
+    , test_serialize_rejects_invalid_head )
   ]

@@ -179,29 +179,25 @@ let invalid_generated_values =
   ]
 
 let tests =
-  [ known_failure
-      ~ticket:"17"
+  [ test
       "§2.2 server MUST NOT: no invalid field-name from the app on the wire"
       (fun () ->
          List.iter
            (fun h -> check_generated_head (server_generates [ h ]))
            invalid_generated_names)
-  ; known_failure
-      ~ticket:"17"
+  ; test
       "§2.2 server MUST NOT: no CR, LF or NUL from the app in a field value"
       (fun () ->
          List.iter
            (fun h -> check_generated_head (server_generates [ h ]))
            invalid_generated_values)
-  ; known_failure
-      ~ticket:"17"
+  ; test
       "§2.2 client MUST NOT: no invalid field-name from the app on the wire"
       (fun () ->
          List.iter
            (fun h -> check_generated_head (client_generates [ h ]))
            invalid_generated_names)
-  ; known_failure
-      ~ticket:"17"
+  ; test
       "§2.2 client MUST NOT: no CR, LF or NUL from the app in a field value"
       (fun () ->
          List.iter
@@ -231,15 +227,13 @@ let tests =
            "client writes X-B unchanged"
            true
            (contains written "\r\nX-B: a, \"b\" (c)\r\n"))
-  ; known_failure
-      ~ticket:"02"
+  ; test
       "§2.3 server SHOULD: 400 for field lines that do not match the grammar"
       (fun () ->
          List.iter
            check_server_rejects
            [ "NoColon\r\n"; "\x00\xff\x01garbage\r\n"; "X: 1\r\nNoColon\r\n" ])
-  ; known_failure
-      ~ticket:"02"
+  ; test
       "§2.3 client SHOULD: Malformed_response for field lines off the grammar"
       (fun () ->
          List.iter
@@ -285,26 +279,21 @@ let tests =
   ; test "§5.1 client DEF: field-name may use every tchar" (fun () ->
       let ex = client_receive (ok_response (all_tchar_name ^ ": v\r\n")) in
       Alcotest.check strings "value" [ "v" ] (client_values ex all_tchar_name))
-  ; known_failure
-      ~ticket:"02"
+  ; test
       "§5.1 server DEF: 400 for a field-name that contains a delimiter"
       (fun () ->
          List.iter
            (fun n -> check_server_rejects (n ^ ": v\r\n"))
            delimiter_names)
-  ; known_failure
-      ~ticket:"02"
+  ; test
       "§5.1 server DEF: 400 for a field-name with a CTL, DEL or non-ASCII byte"
       (fun () ->
          List.iter
            (fun n -> check_server_rejects (n ^ ": v\r\n"))
            non_tchar_names)
-  ; known_failure
-      ~ticket:"02"
-      "§5.1 server DEF: 400 for an empty field-name"
-      (fun () -> check_server_rejects ": v\r\n")
-  ; known_failure
-      ~ticket:"02"
+  ; test "§5.1 server DEF: 400 for an empty field-name" (fun () ->
+      check_server_rejects ": v\r\n")
+  ; test
       "§5.1 client DEF: Malformed_response for an invalid field-name"
       (fun () ->
          List.iter
@@ -471,16 +460,14 @@ let tests =
            "value"
            [ "caf\xc3\xa9 \x80\xff" ]
            (client_values ex "x"))
-  ; known_failure
-      ~ticket:"02"
+  ; test
       "§5.5 server MUST: NUL in a value gives 400 or is replaced with SP"
       (fun () ->
          check_server_rejects_or_replaces
            ~name:"x"
            ~replaced:"a b"
            "X: a\000b\r\n")
-  ; known_failure
-      ~ticket:"02"
+  ; test
       "§5.5 server MUST: bare LF in a value gives 400 or is replaced with SP"
       (fun () ->
          check_server_rejects_or_replaces
@@ -494,16 +481,14 @@ let tests =
            ~name:"x"
            ~replaced:"a b"
            "X: a\rb\r\n")
-  ; known_failure
-      ~ticket:"02"
+  ; test
       "§5.5 client MUST: NUL in a value is rejected or replaced with SP"
       (fun () ->
          check_client_rejects_or_replaces
            ~name:"x"
            ~replaced:"a b"
            "X: a\000b\r\n")
-  ; known_failure
-      ~ticket:"02"
+  ; test
       "§5.5 client MUST: bare LF in a value is rejected or replaced with SP"
       (fun () ->
          check_client_rejects_or_replaces

@@ -10,7 +10,9 @@ let outcome =
     | Reject -> Format.pp_print_string fmt "Reject")
 
 (* Results of the head parsers of httpun 37fdcd8 on [Grammar_corpus.all], except
-   four status codes that made httpun raise [Failure]. *)
+   four status codes that made httpun raise [Failure] and the rows where httpun
+   accepted a method, field-name or field value outside RFC 9110 §9.1, §5.1 and
+   §5.5. *)
 let expected =
   [ Accept "\"GET\" \"/\" HTTP/1.1 []"
   ; Accept "\"some-other-verb\" \"/\" HTTP/1.1 []"
@@ -30,10 +32,10 @@ let expected =
   ; Accept "\"GET\" \"/\" HTTP/1.1 [\"X\":\"val\"]"
   ; Accept "\"GET\" \"/\" HTTP/1.1 [\"X\":\"1\";\"X\":\"2\";\"Y\":\"3\"]"
   ; Accept "\"GET\" \"/\" HTTP/1.1 [\"X\":\"a:b\"]"
-  ; Accept "\"GET\" \"/\" HTTP/1.1 [\"\":\"empty-name\"]"
+  ; Reject
   ; Accept "\"get\" \"/\" HTTP/1.1 []"
   ; Accept "\"GET\" \"/\" HTTP/2.0 []"
-  ; Accept "\"\\r\\nGET\" \"/\" HTTP/1.1 []"
+  ; Accept "\"GET\" \"/\" HTTP/1.1 []"
   ; Reject
   ; Reject
   ; Reject
@@ -63,14 +65,25 @@ let expected =
   ; Accept "md5:6d36e436a7519fc9b1d1d86508dbe3ff"
   ; Accept "\"GET\" \"/\\195\\169\" HTTP/1.1 []"
   ; Accept "\"GET\" \"/\" HTTP/1.1 [\"X\":\"caf\\195\\169\"]"
-  ; Accept "\"GET\" \"/\" HTTP/1.1 [\"X\\255\":\"y\"]"
-  ; Accept "\"GET\" \"/\" HTTP/1.1 [\"X\":\"a\\000b\"]"
   ; Reject
   ; Reject
   ; Reject
   ; Reject
   ; Reject
   ; Reject
+  ; Reject
+  ; Reject
+  ; Reject
+  ; Reject
+  ; Reject
+  ; Reject
+  ; Reject
+  ; Accept "\"GET\" \"/\" HTTP/1.2 []"
+  ; Reject
+  ; Reject
+  ; Reject
+  ; Reject
+  ; Accept "\"GET\" \"/\" HTTP/1.1 [\"X\":\"a b\"]"
   ; Accept "HTTP/1.1 200 \"OK\" []"
   ; Accept "HTTP/1.1 404 \"Not Found\" [\"Content-Length\":\"0\"]"
   ; Accept "HTTP/1.0 200 \"OK\" []"
@@ -99,6 +112,11 @@ let expected =
   ; Reject
   ; Reject
   ; Reject
+  ; Reject
+  ; Reject
+  ; Reject
+  ; Reject
+  ; Accept "HTTP/1.2 200 \"OK\" []"
   ; Reject
   ; Reject
   ; Reject
