@@ -339,7 +339,6 @@ module Reader = struct
 
   let create_body t =
     Body.Reader.create
-      Bigstringaf.empty
       ~when_ready_to_read:(Optional_thunk.some (fun () -> wakeup t))
 
   let request ~max_header_size handler =
@@ -456,9 +455,7 @@ module Reader = struct
       then Int64.to_int remaining
       else len
     in
-    let faraday = Body.Reader.unsafe_faraday body in
-    if not (Faraday.is_closed faraday)
-    then Faraday.schedule_bigstring faraday (Bigstringaf.copy bs ~off ~len:n);
+    Body.Reader.write body bs ~off ~len:n;
     n
 
   let finish t body =

@@ -91,7 +91,11 @@ module Body : sig
 
         Once either of these callbacks have been called, they become inactive.
         The application is responsible for scheduling subsequent reads, either
-        within the [on_read] callback or by some other mechanism. *)
+        within the [on_read] callback or by some other mechanism.
+
+        [on_read] receives every byte available at the time of the call. The
+        library does not reuse the bytes it passes to [on_read], so the
+        application may keep them after [on_read] returns. *)
 
     val close : t -> unit
     (** [close t] closes [t], indicating that any subsequent input received
@@ -280,7 +284,12 @@ module Reqd : sig
       to persist for reuse by the client.
 
       See {{:https://tools.ietf.org/html/rfc7230#section-6.3} RFC7230§6.3} for
-      more details. *)
+      more details.
+
+      They raise [Invalid_argument], name the offending field, and write
+      nothing when the response head is invalid: a field name that is not a
+      token (RFC 9110 §5.1), a field value with CR, LF or NUL (§5.5), or a
+      reason phrase with CR, LF or NUL. The response is then not started. *)
 
   val respond_with_string : t -> Response.t -> string -> unit
   val respond_with_bigstring : t -> Response.t -> Bigstringaf.t -> unit
@@ -434,6 +443,12 @@ module Client_connection : sig
     -> error_handler:error_handler
     -> response_handler:response_handler
     -> Body.Writer.t
+  (** [request t req ~error_handler ~response_handler] sends [req] on [t].
+
+      Raises [Invalid_argument], naming the offending field, when the head of
+      [req] is invalid: a method or field name that is not a token (RFC 9110
+      §9.1, §5.1), a field value with CR, LF or NUL (§5.5), or a request target
+      with CR, LF, NUL or space. *)
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
   (** [next_read_operation t] returns a value describing the next operation that

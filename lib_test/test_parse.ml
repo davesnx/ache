@@ -539,6 +539,203 @@ let test_shutdown_suspended () =
   Alcotest.(check (list string)) "no error" [] (a.errors @ b.errors);
   check_server ~expect:[ get_summary, "" ] get
 
+let body_bytes n =
+  String.init n (fun i -> Char.chr (Char.code 'a' + (i * 7 mod 26)))
+
+let chunked_of_sizes body sizes =
+  let b = Buffer.create (String.length body * 2) in
+  let rec go off = function
+    | [] -> ()
+    | size :: rest ->
+      let size = min size (String.length body - off) in
+      if size > 0
+      then (
+        Buffer.add_string b (Printf.sprintf "%x\r\n" size);
+        Buffer.add_string b (String.sub body off size);
+        Buffer.add_string b "\r\n";
+        go (off + size) (if rest = [] then [ size ] else rest))
+  in
+  go 0 sizes;
+  Buffer.add_string b "0\r\n\r\n";
+  Buffer.contents b
+
+let check_body_splits ~summary ~body input =
+  List.iter
+    (fun chunks ->
+       let s = run_server chunks in
+       Alcotest.(check (list string)) "errors" [] s.errors;
+       Alcotest.(check (list request_body))
+         (Printf.sprintf "%d reads" (List.length chunks))
+         [ summary, body ]
+         s.requests)
+    [ [ input ]
+    ; every_byte input
+    ; sized 7 input
+    ; sized 4096 input
+    ; sized 4097 input
+    ]
+
+let test_large_body_every_split () =
+  let body = body_bytes 10_000 in
+  check_body_splits
+    ~summary:{|"POST" "/" HTTP/1.1 ["Content-Length":"10000"]|}
+    ~body
+    ("POST / HTTP/1.1\r\nContent-Length: 10000\r\n\r\n" ^ body);
+  check_body_splits
+    ~summary:chunked_summary
+    ~body
+    (chunked_head ^ chunked_of_sizes body [ 1; 2; 3; 1000; 5000; 17 ]);
+  let body = body_bytes 300 in
+  List.iter
+    (fun (summary, input) ->
+       List.iter
+         (fun chunks ->
+            let s = run_server chunks in
+            Alcotest.(check (list request_body))
+              "two reads"
+              [ summary, body ]
+              s.requests)
+         (two_way input))
+    [ ( {|"POST" "/" HTTP/1.1 ["Content-Length":"300"]|}
+      , "POST / HTTP/1.1\r\nContent-Length: 300\r\n\r\n" ^ body )
+    ; chunked_summary, chunked_head ^ chunked_of_sizes body [ 1; 2; 3; 50 ]
+    ]
+
+let test_many_small_chunks () =
+  let n = 100_000 in
+  let input =
+    chunked_head
+    ^ String.concat "" (List.init n (fun _ -> "1\r\nx\r\n"))
+    ^ "0\r\n\r\n"
+  in
+  let on_read_calls = ref 0 in
+  let received = Buffer.create n in
+  let eof = ref false in
+  let handler reqd =
+    let body = Reqd.request_body reqd in
+    let rec on_read bs ~off ~len =
+      incr on_read_calls;
+      Buffer.add_string received (Bigstringaf.substring bs ~off ~len);
+      Body.Reader.schedule_read body ~on_read ~on_eof
+    and on_eof () =
+      eof := true;
+      Reqd.respond_with_string reqd (Response.create `OK) ""
+    in
+    Body.Reader.schedule_read body ~on_read ~on_eof
+  in
+  let conn = Server_connection.create handler in
+  let bs = Bigstringaf.of_string input ~off:0 ~len:(String.length input) in
+  let consumed =
+    Server_connection.read conn bs ~off:0 ~len:(String.length input)
+  in
+  Alcotest.(check int) "consumed" (String.length input) consumed;
+  Alcotest.(check bool) "eof" true !eof;
+  Alcotest.(check string) "bytes" (String.make n 'x') (Buffer.contents received);
+  Alcotest.(check int) "on_read calls" 1 !on_read_calls
+
+let collect_body body =
+  let buf = Buffer.create 16 in
+  let done_ = ref false in
+  let rec on_read bs ~off ~len =
+    Buffer.add_string buf (Bigstringaf.substring bs ~off ~len);
+    Body.Reader.schedule_read body ~on_read ~on_eof
+  and on_eof () = done_ := true in
+  Body.Reader.schedule_read body ~on_read ~on_eof;
+  buf, done_
+
+let test_pipelined_body_read_late () =
+  let bodies = ref [] in
+  let handler reqd =
+    bodies := Reqd.request_body reqd :: !bodies;
+    Reqd.respond_with_string reqd (Response.create `OK) ""
+  in
+  let conn = Server_connection.create handler in
+  let input =
+    "POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\naaaa"
+    ^ "POST / HTTP/1.1\r\n\
+       Transfer-Encoding: chunked\r\n\
+       \r\n\
+       4\r\n\
+       bbbb\r\n\
+       0\r\n\
+       \r\n"
+    ^ "POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\ncccc"
+  in
+  let rec drain () =
+    match Server_connection.next_write_operation conn with
+    | `Write iovecs ->
+      Server_connection.report_write_result conn (`Ok (IOVec.lengthv iovecs));
+      drain ()
+    | `Yield | `Close _ -> ()
+  in
+  let feeder =
+    { Feeder.pending = ""
+    ; consumed = 0
+    ; next_read_operation =
+        (fun () -> Server_connection.next_read_operation conn)
+    ; read = Server_connection.read conn
+    ; read_eof = Server_connection.read_eof conn
+    ; drain
+    }
+  in
+  Feeder.feed feeder input;
+  Alcotest.(check int) "consumed" (String.length input) feeder.consumed;
+  Alcotest.(check int) "three requests" 3 (List.length !bodies);
+  let read = List.rev_map collect_body !bodies in
+  List.iter2
+    (fun expected (buf, done_) ->
+       Alcotest.(check string) "body" expected (Buffer.contents buf);
+       Alcotest.(check bool) "eof" true !done_)
+    [ "aaaa"; "bbbb"; "cccc" ]
+    read
+
+let test_unread_body_backpressure () =
+  let body = body_bytes 20_000 in
+  let input = "POST / HTTP/1.1\r\nContent-Length: 20000\r\n\r\n" ^ body in
+  let request_body = ref None in
+  let conn =
+    Server_connection.create (fun reqd ->
+      request_body := Some (Reqd.request_body reqd))
+  in
+  let bs = Bigstringaf.of_string input ~off:0 ~len:(String.length input) in
+  let fed = ref 0 in
+  let read_some () =
+    let len = min 4096 (String.length input - !fed) in
+    fed := !fed + Server_connection.read conn bs ~off:!fed ~len
+  in
+  read_some ();
+  Alcotest.(check bool)
+    "reader yields while the body is unread"
+    true
+    (Server_connection.next_read_operation conn = `Yield);
+  let held = ref [] in
+  let received = Buffer.create 16 in
+  let eof = ref false in
+  let body_reader = Option.get !request_body in
+  let on_read bs ~off ~len =
+    held := (bs, off, len, Bigstringaf.substring bs ~off ~len) :: !held;
+    Buffer.add_string received (Bigstringaf.substring bs ~off ~len)
+  and on_eof () = eof := true in
+  let rec loop rounds =
+    if rounds > 100 then Alcotest.fail "body not read to the end";
+    if not !eof
+    then (
+      Body.Reader.schedule_read body_reader ~on_read ~on_eof;
+      (match Server_connection.next_read_operation conn with
+      | `Read when !fed < String.length input -> read_some ()
+      | _ -> ());
+      loop (rounds + 1))
+  in
+  loop 0;
+  Alcotest.(check string) "bytes" body (Buffer.contents received);
+  List.iter
+    (fun (bs, off, len, copy) ->
+       Alcotest.(check bool)
+         "delivered bytes are not overwritten"
+         true
+         (String.equal copy (Bigstringaf.substring bs ~off ~len)))
+    !held
+
 let tests =
   [ "GET at every split", `Quick, test_get
   ; "POST fixed body at every split", `Quick, test_post_fixed
@@ -564,4 +761,8 @@ let tests =
     , test_invalid_status_then_valid )
   ; "interleaved connections", `Quick, test_interleaved_connections
   ; "shutdown with a suspended parse", `Quick, test_shutdown_suspended
+  ; "10 KB bodies in many splits", `Quick, test_large_body_every_split
+  ; "100,000 one-byte chunks in one read", `Quick, test_many_small_chunks
+  ; "pipelined bodies read late", `Quick, test_pipelined_body_read_late
+  ; "unread body: backpressure", `Quick, test_unread_body_backpressure
   ]

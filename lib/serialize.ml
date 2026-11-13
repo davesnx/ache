@@ -34,11 +34,54 @@ open Faraday
 let write_space t = write_char t ' '
 let write_crlf t = write_string t "\r\n"
 let write_version t version = write_string t (Version.to_string version)
-let write_method t meth = write_string t (Method.to_string meth)
 let write_status t status = write_string t (Status.to_string status)
 
+(* RFC 9110 §5.6.2 tchar *)
+let is_tchar = function
+  | '0' .. '9'
+  | 'a' .. 'z'
+  | 'A' .. 'Z'
+  | '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`'
+  | '|' | '~' ->
+    true
+  | _ -> false
+
+let tchars =
+  Bytes.init 256 (fun i -> if is_tchar (Char.chr i) then '\001' else '\000')
+
+let is_token s =
+  let rec go i =
+    i = String.length s
+    || (Bytes.unsafe_get tchars (Char.code (String.unsafe_get s i)) = '\001'
+       && go (i + 1))
+  in
+  s <> "" && go 0
+
+let rec has_cr_lf_nul s i =
+  i < String.length s
+  &&
+  let c = String.unsafe_get s i in
+  (c <= '\r' && (c = '\r' || c = '\n' || c = '\000')) || has_cr_lf_nul s (i + 1)
+
+let rec has_cr_lf_nul_space s i =
+  i < String.length s
+  &&
+  let c = String.unsafe_get s i in
+  (c <= ' ' && (c = ' ' || c = '\r' || c = '\n' || c = '\000'))
+  || has_cr_lf_nul_space s (i + 1)
+
+let invalid_argf fmt = Printf.ksprintf invalid_arg fmt
+
+let check_headers headers =
+  List.iter
+    (fun (name, value) ->
+       if not (is_token name)
+       then invalid_argf "ache: invalid field name %S" name;
+       if has_cr_lf_nul value 0
+       then invalid_argf "ache: invalid value for field %S" name)
+    (Headers.to_rev_list headers)
+
 let write_headers t headers =
-  (* XXX(seliopou): escape these thigns *)
   List.iter
     (fun (name, value) ->
        write_string t name;
@@ -48,8 +91,16 @@ let write_headers t headers =
     (Headers.to_list headers);
   write_crlf t
 
-let write_request t { Request.meth; target; version; headers } =
-  write_method t meth;
+let check_request { Request.meth; target; headers; _ } =
+  let meth = Method.to_string meth in
+  if not (is_token meth) then invalid_argf "ache: invalid method %S" meth;
+  if has_cr_lf_nul_space target 0
+  then invalid_argf "ache: invalid request target %S" target;
+  check_headers headers
+
+let write_request t ({ Request.meth; target; version; headers } as request) =
+  check_request request;
+  write_string t (Method.to_string meth);
   write_space t;
   write_string t target;
   write_space t;
@@ -57,7 +108,14 @@ let write_request t { Request.meth; target; version; headers } =
   write_crlf t;
   write_headers t headers
 
-let write_response t { Response.version; status; reason; headers } =
+let check_response { Response.reason; headers; _ } =
+  if has_cr_lf_nul reason 0
+  then invalid_argf "ache: invalid reason phrase %S" reason;
+  check_headers headers
+
+let write_response t ({ Response.version; status; reason; headers } as response)
+  =
+  check_response response;
   write_version t version;
   write_space t;
   write_status t status;
