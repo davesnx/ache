@@ -2,12 +2,7 @@ open Ache
 
 let request_handler _client_address reqd =
   let body = "Hello, world!\n" in
-  let headers =
-    Headers.of_list
-      [ "content-type", "text/plain"
-      ; "content-length", Int.to_string (String.length body)
-      ]
-  in
+  let headers = Headers.of_list [ "content-type", "text/plain" ] in
   Reqd.respond_with_string reqd (Response.create ~headers `OK) body
 
 let error_handler _client_address ?request:_ error start_response =

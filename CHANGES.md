@@ -1,305 +1,211 @@
 ache Unreleased
 --------------
 
-- Fork of httpun at 37fdcd8. Packages: `ache`, `ache-eio`, `ache-lwt`.
-  `httpun-types` merges into `ache`; `httpun-lwt` and `httpun-lwt-unix` merge
-  into `ache-lwt`. The Lwt `TLS` and `SSL` modules, `httpun-async` and
-  `httpun-mirage` are removed.
-- Remove the gluten dependency. `ache-eio` and `ache-lwt` have their own IO
-  loops.
-- Add `Ache.Runtime`: `module type S` is the interface a runtime drives,
-  `Runtime.make` packs a protocol as a `Runtime.impl`.
-  `Server_connection` and `Client_connection` implement `Runtime.S`.
-- Upgrade API: `Reqd.respond_with_upgrade : t -> Headers.t -> Runtime.impl ->
-  unit` replaces the `unit -> unit` callback. When the 101 response is
-  written, the server connection hands the socket to the given protocol,
-  including input it has not consumed. Request handlers take `Reqd.t` in
-  place of `Reqd.t Gluten.reqd`. `Ache_eio.Client.upgrade` and
+Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
+
+### Breaking
+
+- Packages: `httpun` and `httpun-types` become `ache`, `httpun-eio` becomes
+  `ache-eio`, and `httpun-lwt` and `httpun-lwt-unix` become `ache-lwt`.
+  `httpun-async` and `httpun-mirage` are removed.
+- No gluten dependency. Request handlers in the runtimes take `Reqd.t` in
+  place of `Reqd.t Gluten.reqd`. The new `Ache.Runtime` has `module type S`,
+  the interface a runtime drives, and `Runtime.make` to pack a protocol as a
+  `Runtime.impl`.
+- `Reqd.respond_with_upgrade` takes a `Runtime.impl` in place of a
+  `unit -> unit` callback. When the 101 is written, the connection hands the
+  socket and its unread input to that protocol. `Ache_eio.Client.upgrade` and
   `Ache_lwt.Client.upgrade` take a `Runtime.impl`.
-- `ache-lwt`: add `module type IO` and `Make (Io)`. `Server` and `Client` run
-  on `Lwt_unix.file_descr`. The Lwt `TLS` and `SSL` modules are removed; write
-  an `IO` for a TLS socket instead. `Client.t` is abstract.
-- `ache-eio`: `Server.create_connection_handler` and
-  `Client.create_connection` accept any `_ Eio.Flow.two_way`, for example a
-  TLS flow. `Client.t` is abstract.
-- Vendor Faraday 0.8.2 in `vendor/faraday`. It compiles as `Ache__Faraday`
-  inside `ache`, so `ache` no longer depends on the opam `faraday` package and
-  links with it in the same program. `Ache.IOVec.t` is unchanged.
-- Replace Angstrom with parseff (`>= 0.5.0 & < 0.6.0`) for message heads,
-  chunk-size lines and trailer sections. Bodies are framed without a parser
-  combinator. `Ache_private.Parse` exposes `Grammar` (string parsers) in place
-  of Angstrom parsers.
-- Add `Config.max_header_size` (default 16384 bytes). A request or response
-  head, chunk-size line or trailer section larger than this fails. The server
-  answers `431 Request Header Fields Too Large` and reports the new
-  `` `Request_header_fields_too_large `` case of `Reqd.error`. The client
-  reports `` `Malformed_response "header fields too large" ``. The size of a
-  head no longer depends on `read_buffer_size`: a 6 KiB header line read in
-  4096-byte reads is accepted.
-- Chunk extensions are accepted and ignored. httpun rejected them.
-- Trailer fields after the last chunk are accepted and discarded. httpun
-  rejected them.
-- A chunk size with more than 15 hex digits after its leading zeros is
-  rejected; leading zeros are accepted, as RFC 9112 §7.1 allows. httpun
-  accepted 16-digit sizes up to `7fffffffffffffff`, and wrapped larger sizes to
-  negative values.
-- A status code below 100 or with a leading zero, such as `HTTP/1.1 99 x`, is
-  a malformed response. httpun raised `Failure` from the parser.
-- Parse errors carry one message: `` `Malformed_response "expected ' ', found
-  '\r'" `` in place of Angstrom marks such as `": char ' '"`.
-- `read` and `read_eof` consume every byte of an incomplete head, chunk-size
-  line or trailer section, and every byte given to a head that fails to
-  parse. httpun consumed up to the last complete header line, or up to the
-  failure position.
-- Request line: the method is a non-empty token, the request-target is
-  non-empty with no CTL. A request line without a version gets 400; httpun
-  waited for more input. HTTP/1.x with x > 1 is processed as HTTP/1.1 and
-  keeps its minor version in `Request.t`. Other major versions get the new
-  `` `Http_version_not_supported `` case of `Reqd.error` (505). A response
-  with a major version other than 1 is a malformed response. One CRLF before
-  the request line is ignored (RFC 9112 §2.2).
-- Field lines in requests, responses and trailers: the field name is a
-  non-empty token directly followed by `:`; the value and the reason phrase
-  accept only HTAB, SP, VCHAR and obs-text. httpun accepted any name byte
-  except whitespace and `:`, and NUL, bare LF and other CTLs in values.
-- The server answers 400 to an HTTP/1.1 request without Host, a request with
-  more than one Host field line, and a Host value that is not
-  `uri-host [":" port]`: a reg-name or IPv4 address, or an IP-literal in
-  brackets, then an optional `:` and digits (RFC 9112 §3.2, RFC 3986 §3.2).
-- The server answers 400 to a CONNECT request whose target is not
-  `host:port` with a non-empty host and a port of 0 to 65535 (RFC 9110
-  §9.3.6).
-- A request that the server rejects after earlier pipelined requests gets its
-  error response after the responses to those requests, and the connection
-  closes, also when both requests arrive in one read. httpun's
-  `Server_connection` asserts that no parsed request comes with an error while
-  an earlier request is active.
-- Request body framing: Content-Length is a list of `1*DIGIT` values that must
-  all be equal; httpun accepted `+3`, `0x3`, `1_0` and `0o3`. This applies to
-  responses too. A request with both Content-Length and Transfer-Encoding, or
-  an HTTP/1.0 request with Transfer-Encoding, gets 400 and the connection
-  closes. chunked must be the final transfer coding, read across all
-  Transfer-Encoding field lines, and appear once; otherwise 400. Any other
-  transfer coding gets the new `` `Not_implemented `` case of `Reqd.error`
-  (501). `Request.body_length` returns `` `Error `Bad_request `` for a request
-  with both Content-Length and Transfer-Encoding, so
-  `Client_connection.request` raises `Failure` for it.
-- Connection options are matched case-insensitively in every list member of
-  every Connection field line: `Connection: Close` and
-  `Connection: keep-alive, close` close the connection.
-- `Body.Reader`: `on_read` receives every byte available in one call, in place
-  of one call per received slice. A body of many small chunks is delivered in
-  linear time; httpun took quadratic time (100,000 one-byte chunks in one
-  read: 64 s, now 14 ms). Body bytes are copied into a buffer per body, not
-  one new buffer per slice. Bytes passed to `on_read` are never overwritten.
-- The server and the client raise `Invalid_argument`, naming the field, and
-  write nothing, when the application gives a head with a field name that is
-  not a token, a field value with CR, LF or NUL, a method that is not a token,
-  a request target with CR, LF, NUL or space, or a reason phrase with CR, LF
-  or NUL. httpun wrote them as given.
-- `Status`: add the codes of the IANA registry that were missing: 102, 103,
-  207, 208, 226, 308, 421, 422, 423, 424, 425, 451, 506, 507, 508 (not 104,
-  which is temporary, and not 510, which is obsolete). `of_code` returns the
-  named constructor for them, such as `` `Permanent_redirect ``, in place of
-  `` `Code n ``.
-- `Status`: rename `` `Payload_too_large `` to `` `Content_too_large ``, with
-  reason phrase "Content Too Large" (RFC 9110 §15.5.14).
-- `Status.is_server_error` (and `is_error`) is true for a code outside
-  100..599, such as a received `600` (RFC 9110 §15: treat an invalid status
-  code as 5xx).
-- `Response.body_length` returns the new `` `No_body `` for a response to
-  `HEAD` and for status 1xx, 204 and 304, in place of `` `Fixed 0L ``.
-- Server: a response to `HEAD` or with status 204 or 304 has no body bytes.
-  `respond_with_string` and `respond_with_bigstring` drop the body, and the
-  writer of `respond_with_streaming` drops what is written and answers
-  `flush` with `` `Written ``. The error response to a `HEAD` request has no
-  body. httpun sent the body, which a client reads as the start of the next
-  response.
-- Server: `respond_with_string` and `respond_with_bigstring` add
-  `content-length` when the response has neither `Content-Length` nor
-  `Transfer-Encoding`, and raise `Invalid_argument` when its `Content-Length`
-  differs from the body length. httpun sent a close-delimited body and kept
-  the connection open.
-- Server: `respond_with_streaming` without `Content-Length` or
-  `Transfer-Encoding` adds `transfer-encoding: chunked` for an HTTP/1.1
-  request on a persistent connection. Otherwise the body is close-delimited:
-  the connection closes after it, and `connection: close` is added if the
-  connection was persistent. A 2xx response to `CONNECT` gets no framing
-  fields.
-- Server: add `Reqd.respond_with_informational` to send interim 1xx
-  responses, such as `100 Continue` for `Expect: 100-continue` or
-  `103 Early Hints`, before the final response. It sends nothing to an
-  HTTP/1.0 request. `respond_with_string`, `respond_with_bigstring` and
-  `respond_with_streaming` raise `Invalid_argument` for a 1xx status. httpun
-  treated a 1xx as the final response.
-- Client: interim 1xx responses other than 101 are parsed and dropped; the
-  response handler gets the final response. httpun gave the 1xx to the
-  response handler, and the final response failed an assertion.
-- Server: ache owns the response framing (rules in the `Reqd` docs). The
-  `respond_with_*` functions raise `Invalid_argument`, before writing, for a
-  response with both `Content-Length` and `Transfer-Encoding`, for either
-  field in a 1xx, a 204 or a 2xx response to `CONNECT` (also in
-  `respond_with_informational`), and for `Transfer-Encoding` in a string or
-  bigstring response with a body. httpun sent these fields as given.
-- Server: a streaming response with `Transfer-Encoding` to an HTTP/1.0
-  request loses the field and ends with the connection. With a final coding
-  other than `chunked`, the body ends with the connection; `gzip, chunked` is
-  chunked by ache.
-- Server: a response to an HTTP/1.0 request on a connection that stays open
-  gets `connection: keep-alive` unless it has a `Connection` field.
-- `Body.Writer` with a `Content-Length` counts bytes: a write past the length
-  raises `Invalid_argument` and writes nothing. A response body closed short
-  of its `Content-Length` closes the connection after the bytes written.
-  httpun sent extra bytes into the next response, or kept the connection
-  open after a short body.
-- `Response.body_length` reads the final transfer coding of a list such as
-  `gzip, chunked`. httpun read only a field value equal to `chunked`.
-- Server: only a 2xx response to `CONNECT` starts a tunnel (RFC 9110 §9.3.6).
-  A non-2xx response to `CONNECT` completes like any other response, and the
-  connection serves the next request. httpun treated every response to
-  `CONNECT` as a tunnel, so the connection hung.
-- Client: after a response with both `Content-Length` and
-  `Transfer-Encoding: chunked`, the connection is not reused (RFC 9112 §6.3).
-- Client: bytes that follow a response after which the connection is not
-  reused (for example `Connection: close`) are dropped. httpun parsed them as
-  the response to the next pipelined request.
-- A request head that reaches `Config.max_header_size` inside the method gets
-  501 (`` `Not_implemented ``), inside the request-target or the rest of the
-  request line gets 414 (new `` `Uri_too_long `` case of `Reqd.error`), and
-  later gets 431 as before (RFC 9112 §3).
-- The server answers 400 to a request-target form that does not fit the
-  method: `*` is only for OPTIONS, authority-form only for CONNECT, and other
-  methods need origin-form or absolute-form (RFC 9112 §3.2). httpun passed
-  `GET *` and `GET 127.0.0.1:80` to the handler.
-- Server: a head cut by end of input gets its 400 response whether the
-  runtime asks for the next write or the next read first. httpun raised
-  `Failure "cannot write to closed writer"` when the write came first.
-- `Body.Reader.schedule_read` takes an optional `~on_error`. A request body
-  cut by end of input, by a framing error or by the connection closing calls
-  `on_error`, not `on_eof` (RFC 9112 §8); the cause goes to the error handler
-  and `Reqd.error_code`. httpun called `on_eof` as for a complete body.
-- Server: once the response is complete, a request body with no read
-  scheduled is read to its end and its bytes are dropped. httpun kept every
-  byte of the unread body in memory.
-- Server: when the error handler raises, for example on an invalid head given
-  to its response function, the connection drops its pending output and
-  closes. httpun let the exception escape and left the connection open.
-- Server: every final response after which the connection closes carries
-  `connection: close`, unless its `Connection` field already has `close`:
-  after a request with `Connection: close`, an HTTP/1.0 request without
-  `keep-alive`, a close-delimited body, and error responses (RFC 9112 §9.6).
-  httpun added it only to a close-delimited body on a persistent connection.
-- Server: after a `CONNECT` request or a request with `Upgrade` and
-  `Connection: upgrade`, the server reads nothing past the end of that request
-  until the response is decided. A 101 hands the bytes that followed it to the
-  new protocol; a 2xx to `CONNECT` leaves them unread; another response reads
-  them as HTTP. httpun parsed them as HTTP before the response: a complete
-  line failed the connection, and an HTTP/2 preface became a second request.
-- Server: when the connection writer closes, or an exception is reported
-  during a streaming response, the unwritten bytes of the response body are
-  dropped and every pending `Body.Writer.flush` callback gets `` `Closed ``.
-  httpun never called these callbacks. `respond_with_*` on a closed
-  connection no longer raises `Failure "cannot write to closed writer"`: the
-  response is recorded, its bytes are dropped, and a streaming body writer is
-  returned closed.
-- `ache-eio`, `ache-lwt`: a write that fails because the peer is gone
-  (`EPIPE`, `ECONNRESET`, `ENOTCONN`, Eio `Connection_reset`) reports
-  `` `Closed ``, so a pending `Body.Writer.flush` callback gets `` `Closed ``
-  and the connection ends. httpun reported `ECONNRESET` as an exception and
-  the flush callback was never called (httpun #155). A read that fails with
-  `ECONNRESET` or `ENOTCONN` is end of input in `ache-lwt`, as in `ache-eio`.
+- `ache-lwt`: `Make (Io)` over the new `module type IO` replaces the functors
+  over gluten runtimes. `Server` and `Client` run on `Lwt_unix.file_descr`.
+  The `TLS` and `SSL` modules are removed: implement `IO` for a TLS socket.
 - `ache-eio`: `Server.create_connection_handler` takes the flow before the
-  address and no longer takes `~sw`, so
-  `create_connection_handler ~request_handler ~error_handler` can be passed
-  to `Eio.Net.run_server` or `Eio.Net.accept_fork` (httpun #154).
-- Server timeouts, off by default: `?idle_timeout` closes a connection that
-  has no request in progress and receives nothing for that many seconds;
-  `?head_timeout` rejects a request head that is not complete that many
-  seconds after its first bytes (408 through `error_handler`). A request body
-  or a response in progress is never timed out. `Ache_eio` also takes
-  `?clock`, which a timeout requires. Added to both
-  `create_connection_handler`; the runtimes use the new
-  `Server_connection.read_timeout`.
-- `ache-eio`: cancelling the connection fiber no longer reports
-  `Cancelled` to the error handler. Each direction of the flow is shut down
-  once; after a failure httpun shut down the sending side twice.
-- `ache-lwt`: the socket is closed once, also when the peer reset the
-  connection (the close was skipped when `shutdown` failed) and when
-  `Client.shutdown` and the IO loop both close it.
-- Server timeouts: each request head has its own `head_timeout`, counted
-  from its first byte. A pipelined head that followed a request in the same
-  read used the deadline of the earlier head and got 408 too early. In
-  `ache-lwt` the head timer ends with the connection; it kept the connection
-  in memory until it fired.
-- `ache-eio`: the server waits for the peer to close (and discards its input)
-  only when it has a `clock`: at most `idle_timeout`, or
-  `Server.linger_without_idle_timeout` (2 s) without one. Without a clock it
-  shuts down the flow at once, as `ache-lwt` does. The handler waited for ever
-  for a peer that kept its socket open.
-- `ache-eio`, `ache-lwt`: a `shutdown` or `close` of the flow that raises, and
-  an exception from `Runtime.S.report_exn`, end the connection; the handler
-  returns normally. `ache-eio` raised from the handler; `ache-lwt` sent the
-  exception to `Lwt.async_exception_hook`, which exits the process by
-  default.
-- `ache-lwt`: `Make (Io)` documents the `IO` contract. The default `Io.read`
-  no longer closes the socket on an error; the loop closes it once.
-- Client: add `` `Connection_closed `` to `Client_connection.error`. Every
-  request without any byte of its response when the connection stops reading
-  (end of input, a response that closes the connection, `shutdown`, or an
-  error on an earlier response) gets it once. httpun called no handler for
-  pipelined requests behind a closing response, and gave
-  `` `Malformed_response "unexpected eof" `` to every request at end of input.
-  An end of input inside a response head or inside a body framed by
-  Content-Length or chunked coding is still `` `Malformed_response ``.
-- Client: response bytes with no request waiting for a response close the
-  connection. httpun raised `Assert_failure` from `read`.
-- Client: a request is not pipelined behind a request with a non-idempotent
-  method until that request's response is complete (RFC 9112 §9.3.2).
-- Client: a response that closes the connection also stops the request body
-  being sent (RFC 9112 §9.5). httpun kept writing it.
-- Client: `Client_connection.request` checks the request head before it
-  queues the request, so an invalid request raises `Invalid_argument` and
-  later requests are still sent. httpun left the invalid request at the head
-  of the queue and sent nothing after it.
-- Client: an HTTP/1.0 response with Transfer-Encoding closes the connection
-  after it (RFC 9112 §6.1).
-- Client: empty lines before a response are discarded (RFC 9112 §2.2).
-- Client: an obs-fold in a response field value is replaced with one space
-  (RFC 9112 §5.2). Requests with obs-fold still get 400.
-- Client: after a 101 response, and after a 2xx response to CONNECT, the
-  connection stops reading HTTP; the bytes after the head are not consumed,
-  so `upgrade` gives them to the new protocol. httpun parsed them as the next
-  response or as the CONNECT response body.
-- Client: a response body cut by end of input, by a framing error, by an
-  exception or by `shutdown` calls the `on_error` given to
-  `Body.Reader.schedule_read`, not `on_eof`. A close-delimited body still ends
-  with `on_eof` at end of input. httpun called `on_eof` in every case.
-- Server: a request with `Connection: close` and `Upgrade` that gets a 101
-  switches protocols: the reader is not shut down while the response is
-  pending, and the bytes after the request go to the new protocol.
-- Server: end of input while a `CONNECT` or `Upgrade` request waits for its
-  response closes the reader. Before, the reader yielded and `yield_reader`
-  raised `Failure "on_wakeup on closed reader"`. A 101 written
-  after end of input still switches, and the new protocol gets end of input.
-- Server: the error handler's response function raises `Failure` when called
-  a second time; it wrote a second response. Body flushes of an error
-  response are answered `` `Closed `` when the error handler raises.
-- Client: a request is not pipelined behind a `CONNECT` or `Upgrade` request.
-  After a 101 or a 2xx to `CONNECT` the requests behind it get
-  `` `Connection_closed `` when the connection is handed over, and the
-  switching request gets no error after its response handler ran.
-- Client: request body flushes are answered `` `Closed `` when the
-  connection closes or a write fails; they were never answered.
-- Server: `report_exn` while the error handler has not responded closes the
-  connection; it raised `Failure "ache.Reqd.report_exn: NYI"`.
-  `yield_reader` and `yield_writer` on a closed side call their callback
-  at once instead of raising, in both connections. A response to `CONNECT`
-  after end of input no longer leaves the reader yielding.
-- Client: `request` after the connection stopped writing calls the request's
-  error handler with `` `Connection_closed ``; it raised
-  `Failure "cannot write to closed writer"`.
-- Server: add `` `Request_timeout `` to `Reqd.error`. A request head that
-  `?head_timeout` cuts gets 408 Request Timeout in place of 400.
+  address and no longer takes `~sw`, so that
+  `create_connection_handler ~request_handler ~error_handler` can be given to
+  `Eio.Net.run_server`. The server and `Client.create_connection` accept any
+  `_ Eio.Flow.two_way`.
+- `Client.t` is abstract in `ache-eio` and `ache-lwt`.
+- New cases in `Reqd.error`: `` `Not_implemented `` (501),
+  `` `Http_version_not_supported `` (505), `` `Uri_too_long `` (414),
+  `` `Request_header_fields_too_large `` (431) and `` `Request_timeout ``
+  (408).
+- New case in `Client_connection.error`: `` `Connection_closed ``.
+- New case in `Response.Body_length.t`: `` `No_body ``, for a response to
+  `HEAD` and for status 1xx, 204 and 304, in place of `` `Fixed 0L ``.
+- `Status`: `` `Payload_too_large `` is renamed `` `Content_too_large ``
+  ("Content Too Large", RFC 9110 §15.5.14). The IANA codes 102, 103, 207, 208,
+  226, 308, 421, 422 (`` `Unprocessable_content ``), 423, 424, 425, 451, 506,
+  507 and 508 have constructors, and `of_code` returns them in place of
+  `` `Code n ``.
+- New field `Config.max_header_size`.
+- The `respond_with_*` functions and `Client_connection.request` raise
+  `Invalid_argument` for heads and framing they cannot send correctly (see
+  Server and Client below). httpun sent them as given.
+
+### Server
+
+- Request line: the method is a token and the target is not empty and has no
+  CTL. A request line without a version gets 400. HTTP/1.x with x > 1 is
+  handled as HTTP/1.1; another major version gets 505. One empty line before
+  the request line is ignored (RFC 9112 §2.2).
+- The target form must fit the method: `*` only with OPTIONS, authority-form
+  only with CONNECT, and a `host:port` CONNECT target with a port of 0 to
+  65535. Otherwise 400 (RFC 9112 §3.2, RFC 9110 §9.3.6).
+- An HTTP/1.1 request without `Host`, with more than one `Host`, or with a
+  `Host` value that is not `uri-host [":" port]` gets 400 (RFC 9112 §3.2).
+- Body framing: `Content-Length` must be one repeated `1*DIGIT` value. Both
+  `Content-Length` and `Transfer-Encoding`, `Transfer-Encoding` in an HTTP/1.0
+  request, and `chunked` that is not the final coding or is there twice get
+  400. Another transfer coding gets 501.
+- `Config.max_header_size` (default 16384 bytes) limits a request head
+  independently of `read_buffer_size`. A head that reaches it in the method
+  gets 501, in the rest of the request line 414, and later 431.
+- A rejected request gets its error response after the responses to earlier
+  pipelined requests, and the connection closes.
+- Response framing: `respond_with_string` and `respond_with_bigstring` add
+  `Content-Length`. `respond_with_streaming` adds `Transfer-Encoding: chunked`
+  on an HTTP/1.1 persistent connection; otherwise the body ends when the
+  connection closes. A final coding of `chunked` in a list such as
+  `gzip, chunked` is chunked by ache.
+- No body is sent in a response to `HEAD` or with status 1xx, 204 or 304.
+- Every final response after which the connection closes has
+  `connection: close` (RFC 9112 §9.6). A response to an HTTP/1.0 request on a
+  connection that stays open has `connection: keep-alive`.
+- `respond_with_*` raise `Invalid_argument` before writing for a 1xx status,
+  both `Content-Length` and `Transfer-Encoding`, either field in a 1xx, 204 or
+  2xx-to-`CONNECT` response, `Transfer-Encoding` in a string or bigstring
+  response with a body, a `Content-Length` that differs from the body, and an
+  invalid field name, field value or reason phrase.
+- A streaming body with `Content-Length` raises `Invalid_argument` for a
+  write past the length. A body closed short of it closes the connection.
+- Add `Reqd.respond_with_informational` for interim responses such as
+  `100 Continue` and `103 Early Hints`. Nothing is sent to an HTTP/1.0
+  request.
+- Only a 2xx response to `CONNECT` starts a tunnel. After `CONNECT` or an
+  `Upgrade` request, the server reads nothing more until the response is
+  decided; a 101 gives the following bytes to the new protocol, and a
+  response that does not switch reads them as HTTP.
+- A request body that the application did not read is read to its end and
+  dropped once the response is complete.
+- When the write side is closed, `respond_with_*` record the response and
+  drop its bytes, and pending `Body.Writer.flush` callbacks get
+  `` `Closed ``.
+- When the error handler raises, the connection drops its pending output and
+  closes. Its response function raises `Failure` when called twice.
+- `Reqd.report_exn` before the error handler has responded closes the
+  connection; httpun raised `Failure "httpun.Reqd.report_exn: NYI"`.
+- A head cut by end of input gets its 400 whether the runtime asks to write
+  or to read first.
+- Timeouts, off by default: `?idle_timeout` closes a connection that waits
+  for a request; `?head_timeout` answers 408 to a request head that is not
+  complete in time, counted per head from its first byte. A request body or
+  a response in progress is never timed out. `Server_connection.read_timeout`
+  tells a runtime which timeout applies.
+
+### Client
+
+- Each request that gets no byte of its response before the connection
+  stops reading gets `` `Connection_closed `` once. A request made after the
+  connection stopped writing gets it before `request` returns.
+- A request is pipelined only behind requests with an idempotent method, and
+  never behind `CONNECT` or an `Upgrade` request (RFC 9112 §9.3.2).
+- A response that closes the connection also stops the request body being
+  sent (RFC 9112 §9.5), and the bytes after it are dropped. This includes an
+  HTTP/1.0 response with `Transfer-Encoding` and a response with both
+  `Content-Length` and `Transfer-Encoding`.
+- Interim 1xx responses other than 101 are dropped; the response handler gets
+  the final response.
+- After a 101, or a 2xx response to `CONNECT`, the client stops reading HTTP
+  and `upgrade` gives the bytes after the head to the new protocol.
+- An obs-fold in a response field value becomes one space (RFC 9112 §5.2).
+  Empty lines before a response are ignored.
+- Response bytes when no request waits for a response close the connection.
+- `request` checks the head before it queues the request and raises
+  `Invalid_argument` for an invalid method, field or target; later requests
+  are still sent.
+- `request` raises `Failure` for a request with both `Content-Length` and
+  `Transfer-Encoding` (`Request.body_length` is `` `Error `Bad_request ``).
+- Request body flushes get `` `Closed `` when the connection closes or a
+  write fails.
+
+### Bodies
+
+- `Body.Reader.schedule_read` takes `?on_error`. A body cut by end of input,
+  a framing error, an exception or `shutdown` calls it in place of `on_eof`,
+  and the cause goes to the error handler (RFC 9112 §8). A close-delimited
+  response body still ends with `on_eof`.
+- `on_read` gets all the available bytes in one call, so a body of many
+  small chunks is delivered in linear time. Body bytes are copied into one
+  buffer per body, and bytes given to `on_read` are never overwritten.
+
+### Parsing
+
+- parseff (`>= 0.5.0 & < 0.6.0`) replaces Angstrom for message heads,
+  chunk-size lines and trailer sections. Bodies are framed by hand.
+  `Ache_private.Parse.Grammar` exposes the head grammars.
+- Faraday 0.8.2 is vendored in `vendor/faraday` and compiled inside `ache`,
+  which can be linked with the opam `faraday` package.
+- Field lines in requests, responses and trailers: the name is a token
+  directly followed by `:`, and values and reason phrases accept only HTAB,
+  SP, VCHAR and obs-text. A bare LF or bare CR line end and an obs-fold in a
+  request get 400.
+- Chunk extensions are ignored and trailer fields are discarded; httpun
+  rejected both. A chunk size with more than 15 hex digits after its leading
+  zeros is rejected.
+- A response status below 100 or with a leading zero, and a response major
+  version other than 1, are malformed responses. A received status outside
+  100..599 counts as a server error in `Status.is_server_error`.
+- `Content-Length` rules apply to responses too. A response head larger than
+  `max_header_size` is `` `Malformed_response "header fields too large" ``.
+- Connection options are matched case-insensitively in every member of every
+  `Connection` field.
+- `read` and `read_eof` consume every byte of an incomplete head, chunk-size
+  line or trailer section, and of a head that fails to parse.
+
+### Runtimes
+
+- A write that fails because the peer is gone (`EPIPE`, `ECONNRESET`,
+  `ENOTCONN`, Eio `Connection_reset`) reports `` `Closed ``. In `ache-lwt` a
+  read that fails with `ECONNRESET` or `ENOTCONN` is end of input.
+- A `shutdown` or `close` of the flow that raises, and an exception from
+  `Runtime.S.report_exn`, end the connection; the handler returns normally.
+- `yield_reader` and `yield_writer` on a closed side call their callback at
+  once in place of raising.
+- `ache-eio`: with `?clock`, a server that stops reading drops input until
+  the peer closes, for at most `idle_timeout` or
+  `Server.linger_without_idle_timeout` (2 s). Without a clock it shuts down
+  the flow at once. Cancelling the connection fiber is not reported to the
+  error handler.
+- `ache-lwt`: the socket is closed exactly once. The application must ignore
+  `SIGPIPE`; ache installs no signal handlers.
+
+### Fixes of upstream issues
+
+- httpun #95: line ends must be CRLF; a bare LF gets 400 (the issue asked
+  for tolerance; ache follows RFC 9112 §2.2 strictly).
+- httpun #143: a 101 that is not written because the connection closed does
+  not start the new protocol.
+- httpun #150: `Reqd.respond_with_informational` sends `100 Continue`.
+- httpun #151: the opam files have `x-maintenance-intent: ["(latest)"]`.
+- httpun #154: `ache-eio` handler argument order.
+- httpun #155: `Body.Writer.flush` callbacks get `` `Closed `` when the peer
+  is gone.
+- httpun #156: `conformance/` holds h1spec echo servers and a runner. It has
+  not been run with h1spec yet.
+- httpun #157, #159: invalid field names and control characters in field
+  values get 400.
+- httpun #158, #162: missing or repeated `Host` gets 400.
+- httpun #160, #161: unsupported versions get 505 and request lines without
+  a version get 400.
+- httpun #163: body bytes are copied into one buffer per body.
+- httpun #164: `Content-Length` with `Transfer-Encoding` gets 400.
+- httpun #165: no body in a response to `HEAD`.
+- httpaf #18: the head limit no longer depends on `read_buffer_size`.
+- httpaf #38: chunk sizes are parsed by the parseff grammar with a length
+  limit.
+- httpaf #86: idle and head timeouts.
+- httpaf #191: 422 `` `Unprocessable_content ``.
+- httpaf #192: `respond_with_string` adds `Content-Length`.
 
 httpun history
 ==============

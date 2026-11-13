@@ -1,6 +1,6 @@
 # RFC 9112 known failures
 
-No known failure remains. On 2026-11-13, at commit a4ddd5d, every test in
+No known failure remains. On 2026-11-13, every test in
 `rfc_test/test_9112_*.ml` passes with no `known_failure` marker; `COVERAGE_9112.md` lists the
 requirements each test covers.
 

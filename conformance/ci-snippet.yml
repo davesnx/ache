@@ -1,3 +1,8 @@
+# Not run yet. Once conformance/run.sh has passed against h1spec, add this
+# job under `jobs:` in .github/workflows/ci.yml, between `docs` and
+# `release`, with `needs: build`. run.sh needs Deno 2. h1spec has no licence
+# file: it is fetched at the pinned commit when the job runs and must not be
+# vendored.
 h1spec:
   runs-on: ubuntu-latest
   strategy:

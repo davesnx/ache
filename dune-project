@@ -20,7 +20,7 @@
  (name ache)
  (synopsis "High-performance, memory-efficient HTTP/1.1 for OCaml")
  (description
-  "ache is an HTTP/1.1 client and server library. It parses and serializes messages and keeps the state of a connection, without doing I/O itself; the ache-eio and ache-lwt packages run it on sockets. ache is a fork of httpun and httpaf with a parseff parser, strict RFC 9110 and RFC 9112 parsing, and limits on head size.")
+  "ache is an HTTP/1.1 client and server library. It parses and serializes messages and keeps the state of a connection, without doing I/O itself; the ache-eio and ache-lwt packages run it on sockets. ache is a fork of httpun and httpaf: it rejects requests that RFC 9110 and RFC 9112 do not allow, sets the framing of each response, limits head size, and parses heads with parseff.")
  (documentation "https://ocaml.org/p/ache/latest/doc/index.html")
  (tags
   (http http-server http-client web))
@@ -62,7 +62,7 @@
  (name ache-lwt)
  (synopsis "Lwt runtime for ache")
  (description
-  "Runs ache HTTP/1.1 servers and clients on Lwt_unix sockets. A functor accepts any other socket type, such as a TLS socket.")
+  "Runs ache HTTP/1.1 servers and clients on Lwt_unix sockets. The Make functor accepts any other socket type, such as a TLS socket. The application must ignore SIGPIPE.")
  (documentation "https://ocaml.org/p/ache-lwt/latest/doc/index.html")
  (tags
   (http http-server http-client web lwt))

@@ -196,7 +196,7 @@ val is_server_error : t -> bool
 
 val is_error : t -> bool
 (** [is_error t] is true iff [t] belongs to the Client Error or Server Error
-    class of status codes. *)
+    class of status codes, or is outside 100..599 (see {!is_server_error}). *)
 
 val to_string : t -> string
 val of_string : string -> t

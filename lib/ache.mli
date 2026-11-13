@@ -152,7 +152,7 @@ module Body : sig
         actually been received by the intended recipient. *)
 
     val close : t -> unit
-    (** [close t] closes [t], causing subsequent write calls to raise. If [t] is
+    (** [close t] closes [t]. Later writes to [t] are ignored. If [t] is
         writable, this will cause any pending output to become available to the
         output channel. *)
 
@@ -555,7 +555,7 @@ module Server_connection : sig
   val is_closed : t -> bool
   (** [is_closed t] is [true] if both the read and write processors have been
       shutdown. When this is the case {!next_read_operation} will return
-      [`Close _] and {!next_write_operation} will return [`Write _] until all
+      [`Close] and {!next_write_operation} will return [`Write _] until all
       buffered output has been flushed. *)
 
   val error_code : t -> error option
@@ -708,7 +708,7 @@ module Client_connection : sig
   val is_closed : t -> bool
   (** [is_closed t] is [true] if both the read and write processors have been
       shutdown. When this is the case {!next_read_operation} will return
-      [`Close _] and {!next_write_operation} will return [`Write _] until all
+      [`Close] and {!next_write_operation} will return [`Write _] until all
       buffered output has been flushed, at which point it will also return
       `Close. *)
 

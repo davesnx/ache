@@ -2,70 +2,27 @@
 
 ache is an HTTP/1.1 client and server library for OCaml 5. The core package,
 `ache`, does no I/O: it parses and serializes messages and keeps the state of
-a connection. Two runtimes drive it on real sockets:
+a connection. Two runtimes drive it on sockets:
 
 - `ache-eio`, for [Eio](https://github.com/ocaml-multicore/eio)
 - `ache-lwt`, for [Lwt](https://github.com/ocsigen/lwt)
 
-Status: not released yet. The API can change before 1.0.
+ache is a fork of [httpun](https://github.com/anmonteiro/httpun), which is a
+fork of [httpaf](https://github.com/inhabitedtype/httpaf). It keeps their
+`Reqd`, `Body` and connection API, and changes this:
 
-## Lineage
+- Requests that RFC 9110 and RFC 9112 do not allow get an error response
+  (400, 408, 414, 431, 501 or 505), and the connection closes.
+- ache sets the framing of each response (`Content-Length`,
+  `Transfer-Encoding`, `Connection: close`) and raises `Invalid_argument` for
+  a response it cannot send correctly.
+- The client reports every request that gets no response, and pipelines only
+  behind idempotent requests.
+- Message heads are parsed with [parseff](https://github.com/davesnx/parseff).
+  There is no gluten and no Angstrom; Faraday is vendored.
 
-ache is a fork of [httpun](https://github.com/anmonteiro/httpun) at commit
-`37fdcd8`. httpun is a fork of
-[httpaf](https://github.com/inhabitedtype/httpaf). The connection state
-machines, the `Reqd` and `Body` API, and most types come from them. The
-changes are:
-
-- **Parser.** Message heads, chunk-size lines and trailer sections are parsed
-  with [parseff](https://github.com/davesnx/parseff) in place of Angstrom.
-  Bodies are framed by a small state machine, and a body of many small chunks
-  is delivered in linear time.
-- **Serializer.** [Faraday](https://github.com/inhabitedtype/faraday) 0.8.2
-  is vendored in `vendor/faraday` and compiled inside `ache`, so a program can
-  also link the opam `faraday` package.
-- **No gluten.** `ache-eio` and `ache-lwt` have their own I/O loops. The
-  interface that a runtime drives is `Ache.Runtime.S`. An HTTP upgrade hands
-  the connection to any protocol packed with `Ache.Runtime.make`.
-- **Packages.** `httpun-types` is part of `ache`; `httpun-lwt` and
-  `httpun-lwt-unix` are one package, `ache-lwt`. The async and mirage
-  runtimes are removed.
-- **Strict parsing.** The server rejects requests that RFC 9110 and RFC 9112
-  do not allow, and the connection closes after the error response:
-  - 400 for a bare LF or bare CR as a line end, obs-fold, a field name that
-    is not a token, a CTL in a field value, and a request line without a
-    version;
-  - 400 for an HTTP/1.1 request without `Host`, more than one `Host` field,
-    or a `Host` value that is not `uri-host [":" port]`;
-  - 400 for a CONNECT target that is not `host:port`;
-  - 400 for a `Content-Length` that is not one repeated `1*DIGIT` value
-    (httpun accepted `+3` and `0x3`), for both `Content-Length` and
-    `Transfer-Encoding`, for `Transfer-Encoding` in an HTTP/1.0 request, and
-    for `chunked` that is not the final coding or appears twice;
-  - 501 for a transfer coding other than `chunked`, as in
-    `Transfer-Encoding: gzip, chunked`;
-  - 505 for a major HTTP version other than 1.
-
-  The client applies the same head grammar and `Content-Length` rules to
-  responses, and reports a violation as `` `Malformed_response `` or
-  `` `Invalid_response_body_length ``. The server and the client raise
-  `Invalid_argument` and write nothing when the application gives a head with
-  an invalid field name, method or target, or a CR, LF or NUL in a value.
-- **Limits.** `Config.max_header_size` (default 16 KiB) limits a request or
-  response head, a chunk-size line and a trailer section. A larger request
-  head gets `431 Request Header Fields Too Large`. A chunk size with more than
-  15 hex digits is rejected. The head limit does not depend on
-  `read_buffer_size`.
-- **Accepted.** Chunk extensions are ignored and trailer fields are
-  discarded; httpun rejected both.
-- **Conformance tests.** `rfc_test/` has one test suite for RFC 9110 and one
-  for RFC 9112. `rfc_test/COVERAGE.md` and `rfc_test/COVERAGE_9112.md` map
-  each requirement sentence of the RFC to its tests, or give the reason it is
-  out of scope. `rfc_test/KNOWN_FAILURES.md` and
-  `rfc_test/KNOWN_FAILURES_9112.md` list the requirements that ache does not
-  meet yet.
-
-[CHANGES.md](CHANGES.md) has the full list.
+Status: not released. The API can change before 1.0. Users of httpun 0.2
+can read [Migrating from httpun](#migrating-from-httpun-02).
 
 ## Install
 
@@ -81,7 +38,7 @@ ache needs OCaml 5.3 or later.
 ## Quick start with Eio
 
 A server that answers every request with `Hello, world!`. It takes the port
-as its first argument.
+as its first argument. ache adds the `Content-Length` field.
 
 <!-- example: examples/eio/eio_hello_server.ml -->
 ```ocaml
@@ -89,12 +46,7 @@ open Ache
 
 let request_handler _client_address reqd =
   let body = "Hello, world!\n" in
-  let headers =
-    Headers.of_list
-      [ "content-type", "text/plain"
-      ; "content-length", Int.to_string (String.length body)
-      ]
-  in
+  let headers = Headers.of_list [ "content-type", "text/plain" ] in
   Reqd.respond_with_string reqd (Response.create ~headers `OK) body
 
 let error_handler _client_address ?request:_ error start_response =
@@ -124,8 +76,8 @@ let () =
     (Ache_eio.Server.create_connection_handler ~request_handler ~error_handler)
 ```
 
-A client that sends `GET /` to that server and prints the response. HTTP/1.1
-requires a `Host` header; without it the server answers 400.
+A client that sends `GET /` to that server and prints the response. An
+HTTP/1.1 request must have a `Host` field; without it the server answers 400.
 
 <!-- example: examples/eio/eio_hello_client.ml -->
 ```ocaml
@@ -199,12 +151,7 @@ open Ache
 
 let request_handler _client_address reqd =
   let body = "Hello, world!\n" in
-  let headers =
-    Headers.of_list
-      [ "content-type", "text/plain"
-      ; "content-length", Int.to_string (String.length body)
-      ]
-  in
+  let headers = Headers.of_list [ "content-type", "text/plain" ] in
   Reqd.respond_with_string reqd (Response.create ~headers `OK) body
 
 let error_handler _client_address ?request:_ error start_response =
@@ -280,21 +227,206 @@ let () =
      Ache_lwt.Client.shutdown client)
 ```
 
-`examples/` has more: streaming request and response bodies, pipelined
-requests, and a CONNECT proxy.
+The output is the same as with Eio. `examples/` has more: streaming request
+and response bodies, pipelined requests, and a CONNECT proxy.
 
-## Limits of this version
+## Differences from httpun
+
+ache forks httpun at commit `37fdcd8` (httpun 0.2.0 and 10 commits).
+[CHANGES.md](CHANGES.md) has the full list, with the httpun and httpaf issues
+that each change fixes.
+
+### Packages and internals
+
+- `httpun-types` is part of `ache`. `httpun-lwt` and `httpun-lwt-unix` are
+  one package, `ache-lwt`. The async and mirage runtimes are removed.
+- Message heads, chunk-size lines and trailer sections are parsed with
+  parseff in place of Angstrom. Bodies are framed by a small state machine.
+- [Faraday](https://github.com/inhabitedtype/faraday) 0.8.2 is vendored in
+  `vendor/faraday` and compiled inside `ache`. A program can also link the
+  opam `faraday` package.
+- There is no gluten. `ache-eio` and `ache-lwt` have their own I/O loops.
+  `Ache.Runtime.S` is the interface that a runtime drives, and
+  `Ache.Runtime.make` packs a protocol so that an HTTP upgrade can hand the
+  connection to it.
+
+### Requests the server rejects
+
+The server calls the error handler, sends the error response with
+`connection: close`, and closes the connection. Requests that came before it
+on the same connection get their responses first.
+
+| Request | Response |
+|---|---|
+| A bare LF or a bare CR as a line end, obs-fold, a field name that is not a token, a CTL (for example NUL) in a field value | 400 |
+| A request line without a version | 400 |
+| An HTTP/1.1 request without `Host`, two `Host` fields, a `Host` value that is not `uri-host [":" port]` | 400 |
+| A target form that does not fit the method: `*` with a method other than OPTIONS, authority-form with a method other than CONNECT | 400 |
+| A CONNECT target that is not `host:port` with a port of 0 to 65535 | 400 |
+| A `Content-Length` that is not one repeated `1*DIGIT` value, such as `+3` or `3, 4` | 400 |
+| Both `Content-Length` and `Transfer-Encoding`; `Transfer-Encoding` in an HTTP/1.0 request; `chunked` that is not the final coding or is there twice | 400 |
+| A transfer coding other than `chunked`, as in `gzip, chunked` | 501 |
+| A method longer than `Config.max_header_size` | 501 |
+| A target that makes the request line longer than `max_header_size` | 414 |
+| A head longer than `max_header_size` (default 16 KiB) | 431 |
+| A head that is not complete when `?head_timeout` expires (off by default) | 408 |
+| A major version other than 1 | 505 |
+
+ache accepts HTTP/1.x with x > 1 as HTTP/1.1, one empty line before the
+request line, chunk extensions (ignored) and trailer fields (discarded).
+httpun rejected chunk extensions and trailers.
+
+### Responses
+
+- ache adds `Content-Length` to a string or bigstring response, and
+  `Transfer-Encoding: chunked` to a streaming response on an HTTP/1.1
+  persistent connection. Otherwise a streaming body ends when the connection
+  closes.
+- A response to `HEAD`, and a 1xx, 204 or 304 response, has no body.
+- Each final response after which the connection closes has
+  `connection: close`. A response to an HTTP/1.0 request on a connection that
+  stays open has `connection: keep-alive`.
+- The `respond_with_*` functions raise `Invalid_argument`, before they write
+  anything, for: a 1xx status; both `Content-Length` and `Transfer-Encoding`;
+  either field in a 1xx, a 204 or a 2xx response to `CONNECT`;
+  `Transfer-Encoding` in a string or bigstring response with a body; a
+  `Content-Length` that differs from the string or bigstring; a field name
+  that is not a token, or a CR, LF or NUL in a field value or reason phrase.
+  The body writer of a streaming response raises `Invalid_argument` for a
+  write past its `Content-Length`.
+- `Reqd.respond_with_informational` sends `100 Continue`, `103 Early Hints`
+  or another interim response before the final response.
+- Only a 2xx response to `CONNECT` starts a tunnel. Another response to
+  `CONNECT` lets the connection serve the next request.
+- `Status` has the codes of the IANA registry that httpun did not have (102,
+  103, 207, 208, 226, 308, 421, 422, 423, 424, 425, 451, 506, 507, 508).
+  `` `Payload_too_large `` is now `` `Content_too_large ``, and 422 is
+  `` `Unprocessable_content ``.
+
+### Bodies
+
+- `Body.Reader.schedule_read` takes `?on_error`. A body cut by the end of the
+  input, by a framing error or by a closed connection calls `on_error`, not
+  `on_eof`. httpun called `on_eof`, as for a complete body.
+- `on_read` gets all the bytes that are available in one call, so a body of
+  many small chunks is delivered in linear time. ache does not reuse the
+  bytes it gives to `on_read`.
+- When the response is complete, the server reads and drops the rest of a
+  request body that the application did not read.
+
+### Client
+
+- The new error `` `Connection_closed `` goes to each request that got no
+  byte of its response before the connection stopped reading. httpun called
+  no handler for these requests, or gave them
+  `` `Malformed_response "unexpected eof" ``.
+- A request is pipelined only behind requests with an idempotent method. It
+  waits behind other requests, and behind `CONNECT` and `Upgrade` requests,
+  until their responses are complete.
+- Interim 1xx responses other than 101 are dropped. After a 101, or a 2xx
+  response to `CONNECT`, the client stops reading HTTP and `upgrade` gives
+  the bytes after the head to the new protocol.
+- An obs-fold in a response field value becomes one space. Empty lines
+  before a response are ignored.
+- `Client_connection.request` raises `Invalid_argument` for a method or field
+  name that is not a token, a CR, LF or NUL in a field value, and a CR, LF,
+  NUL or space in the target. Later requests are still sent.
+
+## Limits
 
 - HTTP/1.0 and HTTP/1.1 only. There is no HTTP/2 or HTTP/3.
-- `ache-lwt` has no TLS module. `Ache_lwt.Make` takes any socket type that
-  implements `Ache_lwt.IO`, so you can give it a TLS socket. `ache-eio`
-  accepts any `Eio.Flow.two_way`, for example a flow from `tls-eio`.
-- Trailer fields are read and discarded; the API does not expose them.
+- `ache-lwt` has no TLS module (see [Runtime notes](#runtime-notes)).
+- Trailer fields are read and discarded. The API does not give them to the
+  application.
 - Server timeouts are off by default. `?idle_timeout` closes a connection
-  that waits for a request; `?head_timeout` answers 408 to a request head
+  that waits for a request. `?head_timeout` answers 408 to a request head
   that is not complete in time. A request body or a response in progress is
-  never timed out. `Ache_eio` also needs `?clock` for either timeout.
+  never timed out.
+- The server still reads and dispatches requests after its write side has
+  closed. Use `?idle_timeout` to limit the time an idle peer can keep a
+  connection open.
 - The API is not stable before 1.0.
+
+## Runtime notes
+
+- **Eio.** `Ache_eio.Server.create_connection_handler ~request_handler
+  ~error_handler` can be given to `Eio.Net.run_server`. The server and the
+  client accept any `_ Eio.Flow.two_way`, for example a TLS flow. Timeouts
+  need `?clock`. With a clock, when the server stops reading (after a
+  response that closes the connection) it reads and drops input until the
+  peer closes, for at most `idle_timeout` (2 s without
+  one), so that the peer can read the response before the connection is
+  reset. Without a clock it closes at once.
+- **Lwt.** The application must ignore `SIGPIPE`. `Ache_lwt.Server` and
+  `Ache_lwt.Client` use `Lwt_unix.file_descr`. For another socket type, such
+  as a TLS socket, implement `Ache_lwt.IO` and apply `Ache_lwt.Make`: `read`
+  fails with `End_of_file` at the end of the input or when the peer is gone,
+  and `writev` returns `` `Closed `` when the peer is gone. The `Ache_lwt.IO`
+  documentation has the full contract. The Lwt server does not wait for the
+  peer to close after the last response.
+
+## Testing
+
+`dune test` runs these suites (counts from `dune test --force` on
+2026-11-13):
+
+| Suite | Tests |
+|---|---|
+| `lib_test`: core unit tests | 256 |
+| `rfc_test`: RFC 9110 | 159 |
+| `rfc_test`: RFC 9112 | 178 |
+| `eio_test`: Eio on loopback sockets | 28 |
+| `lwt_test`: Lwt on loopback sockets | 24 |
+
+The RFC suites start from each sentence of RFC 9110 and RFC 9112 §2–§11 that
+has a requirement keyword (MUST, SHOULD, MAY and others), plus definitions
+that a parser must follow. `rfc_test/COVERAGE.md` and
+`rfc_test/COVERAGE_9112.md` give each requirement its tests, or the reason it
+is out of scope:
+
+| RFC | Requirements | Tested | Out of scope |
+|---|---|---|---|
+| 9110 | 445 | 93 | 352 |
+| 9112 | 173 | 115 | 58 |
+
+No test is marked as a known failure (`rfc_test/KNOWN_FAILURES*.md`). The
+README check makes sure that the code in this file is the same as the
+compiled examples.
+
+`conformance/` runs the [h1spec](https://github.com/uNetworking/h1spec)
+requests against an Eio and a Lwt echo server. It has not been run with h1spec
+yet, and CI does not run it.
+
+## Migrating from httpun 0.2
+
+| httpun 0.2 | ache |
+|---|---|
+| Packages `httpun`, `httpun-types` | `ache` |
+| Package `httpun-eio` | `ache-eio` |
+| Packages `httpun-lwt`, `httpun-lwt-unix` | `ache-lwt` |
+| Packages `httpun-async`, `httpun-mirage` | Removed |
+| Modules `Httpun`, `Httpun_types` | `Ache` |
+| `Httpun_eio` | `Ache_eio` |
+| `Httpun_lwt_unix.Server`, `Httpun_lwt_unix.Client` | `Ache_lwt.Server`, `Ache_lwt.Client` |
+| `Httpun_lwt.Server (Gluten_lwt.Server)`, `Httpun_lwt.Client (...)` | `Ache_lwt.Make (Io)`, with `Io : Ache_lwt.IO` |
+| `Httpun_lwt_unix.Server.TLS`, `.SSL`, `Client.TLS`, `.SSL` | Removed. Implement `Ache_lwt.IO` for the TLS socket |
+| Runtime `request_handler : addr -> Reqd.t Gluten.reqd -> unit` | `addr -> Reqd.t -> unit` |
+| `Reqd.respond_with_upgrade : t -> Headers.t -> (unit -> unit) -> unit` | `t -> Headers.t -> Ache.Runtime.impl -> unit`; make the `impl` with `Ache.Runtime.make` |
+| `Client.upgrade : t -> Gluten.impl -> unit` | `t -> Ache.Runtime.impl -> unit` |
+| `Httpun_eio.Server.create_connection_handler ?config ~request_handler ~error_handler ~sw addr socket` | `Ache_eio.Server.create_connection_handler ?config ?clock ?idle_timeout ?head_timeout ~request_handler ~error_handler flow addr`: no `~sw`, the flow comes first |
+| `Httpun_eio.Client.create_connection ~sw (_ Eio.Net.stream_socket)` | `~sw (_ Eio.Flow.two_way)` |
+| `Client.t = { connection; runtime }` (Eio and Lwt) | Abstract |
+| `Reqd.error`: `` `Bad_request ``, `` `Bad_gateway ``, `` `Internal_server_error ``, `` `Exn `` | Also `` `Not_implemented ``, `` `Http_version_not_supported ``, `` `Uri_too_long ``, `` `Request_header_fields_too_large ``, `` `Request_timeout `` |
+| `Client_connection.error`: `` `Malformed_response ``, `` `Invalid_response_body_length ``, `` `Exn `` | Also `` `Connection_closed `` |
+| `Response.Body_length.t` | Also `` `No_body `` (response to `HEAD`, 1xx, 204, 304) |
+| `` `Payload_too_large `` | `` `Content_too_large `` |
+| `Status.of_code 422` is `` `Code 422 `` (also 102, 103, 207, 208, 226, 308, 421, 423, 424, 425, 451, 506, 507, 508) | A named constructor, such as `` `Unprocessable_content ``. Exhaustive matches on the `Status` subtypes must handle them |
+| `Body.Reader.schedule_read t ~on_eof ~on_read` | Also `?on_error`, called for a cut body; without it nothing is called |
+| `respond_with_string` with a 1xx status | `Reqd.respond_with_informational` |
+| `respond_with_*` sends the head as given | Raises `Invalid_argument` in the cases listed in [Responses](#responses) |
+| `Client_connection.request` sends the head as given | Raises `Invalid_argument` for an invalid head |
+| HTTP/1.1 requests without `Host` are served | 400: send `Host` from clients |
+| `Config.t` with four buffer sizes | Also `proxy` and `max_header_size`. Write `{ Config.default with ... }` |
 
 ## License
 
