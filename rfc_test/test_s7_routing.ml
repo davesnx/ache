@@ -48,6 +48,53 @@ let client_closes_after connection () =
     true
     (Client.is_closed c)
 
+module Tunnel = struct
+  type t =
+    { mutable received : string
+    ; mutable closed : bool
+    }
+
+  let next_read_operation t = if t.closed then `Close else `Read
+
+  let read t bs ~off ~len =
+    t.received <- t.received ^ Bigstringaf.substring bs ~off ~len;
+    len
+
+  let read_eof t bs ~off ~len =
+    t.closed <- true;
+    read t bs ~off ~len
+
+  let yield_reader _ _ = ()
+  let next_write_operation t = if t.closed then `Close 0 else `Yield
+  let report_write_result _ _ = ()
+  let yield_writer _ _ = ()
+  let report_exn t _ = t.closed <- true
+  let is_closed t = t.closed
+  let shutdown t = t.closed <- true
+end
+
+let upgrade_headers = [ "Upgrade", "echo"; "Connection", "Upgrade" ]
+
+let upgrade ?(before = ignore) tunnel (ex : Server.exchange) =
+  before ex;
+  Reqd.respond_with_upgrade
+    ex.reqd
+    (Headers.of_list upgrade_headers)
+    (Runtime.make (module Tunnel) tunnel)
+
+let upgrade_request ?(headers = []) () =
+  req
+    ~headers:
+      ([ "Host", "a"; "Connection", "upgrade"; "Upgrade", "echo" ] @ headers)
+    "GET"
+    "/chat"
+
+let switching_head =
+  "HTTP/1.1 101 Switching Protocols\r\n\
+   Upgrade: echo\r\n\
+   Connection: Upgrade\r\n\
+   \r\n"
+
 let long_target = "/" ^ String.make 7999 'a'
 
 let tests =
@@ -220,4 +267,39 @@ let tests =
            "request bytes"
            ("GET " ^ long_target ^ " HTTP/1.1\r\nHost: a\r\n\r\n")
            (Client.written c))
+  ; test
+      "§7.8 server MUST: the 101 carries the Upgrade field and later bytes go \
+       to the new protocol"
+      (fun () ->
+         let tunnel = { Tunnel.received = ""; closed = false } in
+         let s =
+           Server.run ~handler:(upgrade tunnel) (upgrade_request () ^ "ping")
+         in
+         Alcotest.(check string)
+           "response bytes"
+           switching_head
+           (Server.output s);
+         Server.feed s "pong";
+         Alcotest.(check string)
+           "bytes after the request reach the new protocol"
+           "pingpong"
+           tunnel.received;
+         Alcotest.(check int) "one request handled" 1 (Server.handler_calls s))
+  ; test
+      "§7.8 server MUST: 100 Continue is sent before the 101 when the request \
+       has Expect: 100-continue"
+      (fun () ->
+         let tunnel = { Tunnel.received = ""; closed = false } in
+         let before (ex : Server.exchange) =
+           Reqd.respond_with_informational ex.reqd (Response.create `Continue)
+         in
+         let s =
+           Server.run
+             ~handler:(upgrade ~before tunnel)
+             (upgrade_request ~headers:[ "Expect", "100-continue" ] ())
+         in
+         Alcotest.(check string)
+           "response bytes"
+           ("HTTP/1.1 100 Continue\r\n\r\n" ^ switching_head)
+           (Server.output s))
   ]
