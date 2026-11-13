@@ -5,6 +5,7 @@ let error_handler error =
     match error with
     | `Malformed_response message -> message
     | `Invalid_response_body_length _ -> "invalid response body length"
+    | `Connection_closed -> "connection closed before the response"
     | `Exn exn -> Printexc.to_string exn
   in
   prerr_endline ("request failed: " ^ message);
