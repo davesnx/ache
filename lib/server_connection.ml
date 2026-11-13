@@ -65,6 +65,7 @@ type t =
     (* Represents an unrecoverable error that will cause the connection to *
        shutdown. Holds on to the response body created by the error handler *
        that might be streaming to the client. *)
+  ; mutable upgraded : Runtime.impl option
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
@@ -97,44 +98,6 @@ let default_error_handler ?request:_ error handle =
   Body.Writer.write_string body message;
   Body.Writer.close body
 
-let create
-      ?(config = Config.default)
-      ?(error_handler = default_error_handler)
-      request_handler
-  =
-  let { Config.response_buffer_size; response_body_buffer_size; _ } = config in
-  let writer = Writer.create ~buffer_size:response_buffer_size () in
-  let request_queue = Queue.create () in
-  let response_body_buffer = Bigstringaf.create response_body_buffer_size in
-  let rec reader = lazy (Reader.request handler)
-  and handler request request_body =
-    let reqd =
-      Reqd.create
-        ~error_handler
-        ~reader:(Lazy.force reader)
-        ~writer
-        ~response_body_buffer
-        ~proxy:config.proxy
-        request
-        request_body
-    in
-    let call_handler = Queue.is_empty request_queue in
-    Queue.push reqd request_queue;
-    if call_handler then request_handler reqd
-  and t =
-    lazy
-      { reader = Lazy.force reader
-      ; writer
-      ; response_body_buffer
-      ; request_handler
-      ; error_handler
-      ; request_queue
-      ; error_code = No_error
-      ; config
-      }
-  in
-  Lazy.force t
-
 let shutdown_reader t =
   if is_active t then Reqd.close_request_body (current_reqd_exn t);
   Reader.force_close t.reader;
@@ -158,6 +121,50 @@ let error_code t =
 let shutdown t =
   shutdown_reader t;
   shutdown_writer t
+
+let upgrade t impl =
+  t.upgraded <- Some impl;
+  shutdown t
+
+let create
+      ?(config = Config.default)
+      ?(error_handler = default_error_handler)
+      request_handler
+  =
+  let { Config.response_buffer_size; response_body_buffer_size; _ } = config in
+  let writer = Writer.create ~buffer_size:response_buffer_size () in
+  let request_queue = Queue.create () in
+  let response_body_buffer = Bigstringaf.create response_body_buffer_size in
+  let rec reader = lazy (Reader.request handler)
+  and handler request request_body =
+    let reqd =
+      Reqd.create
+        ~error_handler
+        ~upgrade:(upgrade (Lazy.force t))
+        ~reader:(Lazy.force reader)
+        ~writer
+        ~response_body_buffer
+        ~proxy:config.proxy
+        request
+        request_body
+    in
+    let call_handler = Queue.is_empty request_queue in
+    Queue.push reqd request_queue;
+    if call_handler then request_handler reqd
+  and t =
+    lazy
+      { reader = Lazy.force reader
+      ; writer
+      ; response_body_buffer
+      ; request_handler
+      ; error_handler
+      ; request_queue
+      ; error_code = No_error
+      ; config
+      ; upgraded = None
+      }
+  in
+  Lazy.force t
 
 let set_error_and_handle ?request t error =
   if is_active t
@@ -380,3 +387,53 @@ and _final_write_operation_for t reqd =
 
 let next_write_operation t = _next_write_operation t
 let report_write_result t result = Writer.report_result t.writer result
+
+let next_read_operation t =
+  match t.upgraded with
+  | None -> next_read_operation t
+  | Some (Runtime.Impl ((module P), p)) -> P.next_read_operation p
+
+let read t bs ~off ~len =
+  match t.upgraded with
+  | None -> read t bs ~off ~len
+  | Some (Runtime.Impl ((module P), p)) -> P.read p bs ~off ~len
+
+let read_eof t bs ~off ~len =
+  match t.upgraded with
+  | None -> read_eof t bs ~off ~len
+  | Some (Runtime.Impl ((module P), p)) -> P.read_eof p bs ~off ~len
+
+let yield_reader t k =
+  match t.upgraded with
+  | None -> yield_reader t k
+  | Some (Runtime.Impl ((module P), p)) -> P.yield_reader p k
+
+let next_write_operation t =
+  match t.upgraded with
+  | None -> next_write_operation t
+  | Some (Runtime.Impl ((module P), p)) -> P.next_write_operation p
+
+let report_write_result t result =
+  match t.upgraded with
+  | None -> report_write_result t result
+  | Some (Runtime.Impl ((module P), p)) -> P.report_write_result p result
+
+let yield_writer t k =
+  match t.upgraded with
+  | None -> yield_writer t k
+  | Some (Runtime.Impl ((module P), p)) -> P.yield_writer p k
+
+let report_exn t exn =
+  match t.upgraded with
+  | None -> report_exn t exn
+  | Some (Runtime.Impl ((module P), p)) -> P.report_exn p exn
+
+let is_closed t =
+  match t.upgraded with
+  | None -> is_closed t
+  | Some (Runtime.Impl ((module P), p)) -> P.is_closed p
+
+let shutdown t =
+  match t.upgraded with
+  | None -> shutdown t
+  | Some (Runtime.Impl ((module P), p)) -> P.shutdown p

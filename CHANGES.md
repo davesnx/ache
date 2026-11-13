@@ -5,6 +5,23 @@ ache Unreleased
   `httpun-types` merges into `ache`; `httpun-lwt` and `httpun-lwt-unix` merge
   into `ache-lwt`. The Lwt `TLS` and `SSL` modules, `httpun-async` and
   `httpun-mirage` are removed.
+- Remove the gluten dependency. `ache-eio` and `ache-lwt` have their own IO
+  loops.
+- Add `Ache.Runtime`: `module type S` is the interface a runtime drives,
+  `Runtime.make` packs a protocol as a `Runtime.impl`.
+  `Server_connection` and `Client_connection` implement `Runtime.S`.
+- Upgrade API: `Reqd.respond_with_upgrade : t -> Headers.t -> Runtime.impl ->
+  unit` replaces the `unit -> unit` callback. When the 101 response is
+  written, the server connection hands the socket to the given protocol,
+  including input it has not consumed. Request handlers take `Reqd.t` in
+  place of `Reqd.t Gluten.reqd`. `Ache_eio.Client.upgrade` and
+  `Ache_lwt.Client.upgrade` take a `Runtime.impl`.
+- `ache-lwt`: add `module type IO` and `Make (Io)`. `Server` and `Client` run
+  on `Lwt_unix.file_descr`. The Lwt `TLS` and `SSL` modules are removed; write
+  an `IO` for a TLS socket instead. `Client.t` is abstract.
+- `ache-eio`: `Server.create_connection_handler` and
+  `Client.create_connection` accept any `_ Eio.Flow.two_way`, for example a
+  TLS flow. `Client.t` is abstract.
 
 httpun history
 ==============

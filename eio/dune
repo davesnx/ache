@@ -1,4 +1,4 @@
 (library
  (name ache_eio)
  (public_name ache-eio)
- (libraries ache eio gluten gluten-eio))
+ (libraries ache bigstringaf cstruct eio eio.unix unix))

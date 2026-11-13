@@ -14,10 +14,11 @@ depends: [
   "dune" {>= "3.17"}
   "ocaml" {>= "5.3"}
   "ache" {= version}
+  "bigstringaf"
+  "cstruct"
   "eio"
-  "gluten"
-  "gluten-eio"
   "eio_main" {with-test}
+  "alcotest" {with-test}
   "odoc" {with-doc}
 ]
 build: [

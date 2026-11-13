@@ -42,6 +42,37 @@ module Method : module type of Method
 module Status : module type of Status
 module Headers : module type of Headers
 
+(** {2 Runtime Interface} *)
+
+module Runtime : sig
+  (** The interface that a runtime (such as [ache-eio] or [ache-lwt]) drives.
+      {!Server_connection} and {!Client_connection} implement it. A protocol
+      that takes over a connection after an HTTP upgrade implements it too. *)
+  module type S = sig
+    type t
+
+    val next_read_operation : t -> [ `Read | `Yield | `Close ]
+    val read : t -> Bigstringaf.t -> off:int -> len:int -> int
+    val read_eof : t -> Bigstringaf.t -> off:int -> len:int -> int
+    val yield_reader : t -> (unit -> unit) -> unit
+
+    val next_write_operation :
+       t
+      -> [ `Write of Bigstringaf.t IOVec.t list | `Yield | `Close of int ]
+
+    val report_write_result : t -> [ `Ok of int | `Closed ] -> unit
+    val yield_writer : t -> (unit -> unit) -> unit
+    val report_exn : t -> exn -> unit
+    val is_closed : t -> bool
+    val shutdown : t -> unit
+  end
+
+  type impl
+  (** A value of some type together with its {!S} implementation. *)
+
+  val make : (module S with type t = 't) -> 't -> impl
+end
+
 (** {2 Message Body} *)
 
 module Body : sig
@@ -259,7 +290,12 @@ module Reqd : sig
     -> Response.t
     -> Body.Writer.t
 
-  val respond_with_upgrade : t -> Headers.t -> (unit -> unit) -> unit
+  val respond_with_upgrade : t -> Headers.t -> Runtime.impl -> unit
+  (** [respond_with_upgrade t headers impl] responds with
+      [101 Switching Protocols] and [headers]. When the response has been
+      written, the connection shuts down its HTTP state and hands reading and
+      writing to [impl]. Input that the connection has not consumed goes to
+      [impl]. *)
 
   (** {3 Exception Handling} *)
 
@@ -458,6 +494,34 @@ end
 (**/**)
 
 module Ache_private : sig
+  module Runtime : sig
+    module Upgradable : sig
+      include Runtime.S
+
+      val create : Runtime.impl -> t
+      val upgrade : t -> Runtime.impl -> unit
+    end
+
+    module Buffer : sig
+      type t
+
+      val create : int -> t
+      val get : t -> f:(Bigstringaf.t -> off:int -> len:int -> int) -> int
+
+      val unread : t -> bool
+      (** [unread t] is [true] when the last {!get} consumed some bytes and
+          left others. The runtime offers the rest again before it reads more
+          input, so that a protocol that took over the connection receives
+          them. *)
+
+      val put :
+         t
+        -> f:(Bigstringaf.t -> off:int -> len:int -> (int -> unit) -> unit)
+        -> (int -> unit)
+        -> unit
+    end
+  end
+
   module Parse : sig
     val request : Request.t Angstrom.t
     val response : Response.t Angstrom.t

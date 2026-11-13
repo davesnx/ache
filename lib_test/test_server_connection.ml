@@ -917,19 +917,55 @@ let test_blocked_write_on_chunked_encoding () =
   in
   write_string t ~msg:"second write" second_write
 
+module Upgraded = struct
+  type t = { mutable driven : bool }
+
+  let next_read_operation t =
+    t.driven <- true;
+    `Yield
+
+  let read _ _ ~off:_ ~len:_ = 0
+  let read_eof _ _ ~off:_ ~len:_ = 0
+  let yield_reader _ _ = ()
+  let next_write_operation _ = `Yield
+  let report_write_result _ _ = ()
+  let yield_writer _ _ = ()
+  let report_exn _ _ = ()
+  let is_closed _ = false
+  let shutdown _ = ()
+end
+
+let upgrade_handler upgraded reqd =
+  Reqd.respond_with_upgrade
+    reqd
+    Headers.empty
+    (Ache.Runtime.make (module Upgraded) upgraded)
+
 let test_respond_with_upgrade () =
-  let upgraded = ref false in
-  let upgrade_handler reqd =
-    Reqd.respond_with_upgrade reqd Headers.empty (fun () -> upgraded := true)
-  in
-  let t = create ~error_handler upgrade_handler in
+  let upgraded = { Upgraded.driven = false } in
+  let t = create ~error_handler (upgrade_handler upgraded) in
   read_request t (Request.create `GET "/");
+  Alcotest.(check bool) "Not upgraded before the response" false upgraded.driven;
   write_response
     ~msg:"Upgrade response written"
     t
     (Response.create `Switching_protocols);
-  Alcotest.(check bool) "Callback was called" true !upgraded;
+  Alcotest.(check bool) "Upgraded protocol was called" true upgraded.driven;
   reader_yielded t
+
+let test_upgrade_write_closed () =
+  let upgraded = { Upgraded.driven = false } in
+  let t = create ~error_handler (upgrade_handler upgraded) in
+  read_request t (Request.create `GET "/");
+  write_eof t;
+  Alcotest.(check bool) "Upgraded protocol was not called" false upgraded.driven;
+  connection_is_closed t;
+  reader_closed t;
+  writer_closed
+    t
+    ~unread:
+      (String.length
+         (response_to_string (Response.create `Switching_protocols)))
 
 let test_unexpected_eof () =
   let t = create default_request_handler in
@@ -2487,11 +2523,8 @@ let test_write_response_after_read_eof () =
   connection_is_shutdown t
 
 let test_connect_method () =
-  let upgraded = ref false in
-  let upgrade_handler reqd =
-    Reqd.respond_with_upgrade reqd Headers.empty (fun () -> upgraded := true)
-  in
-  let t = create ~error_handler upgrade_handler in
+  let upgraded = { Upgraded.driven = false } in
+  let t = create ~error_handler (upgrade_handler upgraded) in
   read_request
     t
     (Request.create
@@ -2502,7 +2535,7 @@ let test_connect_method () =
     ~msg:"Upgrade response written"
     t
     (Response.create `Switching_protocols);
-  Alcotest.(check bool) "Callback was called" true !upgraded;
+  Alcotest.(check bool) "Upgraded protocol was called" true upgraded.driven;
   reader_yielded t
 
 let tests =
@@ -2555,6 +2588,7 @@ let tests =
     , `Quick
     , test_blocked_write_on_chunked_encoding )
   ; "respond with upgrade", `Quick, test_respond_with_upgrade
+  ; "upgrade response write fails", `Quick, test_upgrade_write_closed
   ; "writer unexpected eof", `Quick, test_unexpected_eof
   ; "input shrunk", `Quick, test_input_shrunk
   ; "malformed request", `Quick, test_malformed_request

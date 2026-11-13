@@ -5,14 +5,7 @@ open Ache
 let error_handler (_ : Eio.Net.Sockaddr.stream) =
   Ache_examples.Server.error_handler
 
-let request_handler
-      env
-      ~sw
-      ~u
-      flow
-      (_ : Eio.Net.Sockaddr.stream)
-      { Gluten.reqd; _ }
-  =
+let request_handler env ~sw ~u flow (_ : Eio.Net.Sockaddr.stream) reqd =
   match Reqd.request reqd with
   | { Request.meth = `CONNECT; headers; _ } ->
     Stdlib.Format.eprintf "x: %a@." Request.pp_hum (Reqd.request reqd);

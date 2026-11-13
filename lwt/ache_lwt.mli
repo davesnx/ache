@@ -1,6 +1,6 @@
 (*----------------------------------------------------------------------------
   Copyright (c) 2018 Inhabited Type LLC. Copyright (c) 2018 Anton Bachin
-  Copyright (c) 2019 António Nuno Monteiro
+  Copyright (c) 2019-2020 António Nuno Monteiro
 
   All rights reserved.
 
@@ -30,17 +30,25 @@
   EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   ----------------------------------------------------------------------------*)
 
+module type IO = Ache_lwt_intf.IO
+(** A socket type that the IO loop can drive. [read socket buffer ~off ~len]
+    reads into [buffer] in the region [\[off, off + len)] and fails with
+    [End_of_file] when the peer has closed the connection. *)
+
 module type Server = Ache_lwt_intf.Server
+
 module type Client = Ache_lwt_intf.Client
+(** [Client.upgrade t impl] shuts down the HTTP state of [t] and hands reading
+    and writing on its socket to [impl]. *)
 
-(* The function that results from [create_connection_handler] should be passed
-   to [Lwt_io.establish_server_with_client_socket]. For an example, see
-   [examples/lwt_echo_server.ml]. *)
+module Make (Io : IO) : sig
+  module Server : Server with type socket = Io.socket and type addr = Io.addr
+  module Client : Client with type socket = Io.socket
+end
+
+(** The function that results from [create_connection_handler] can be passed to
+    [Lwt_io.establish_server_with_client_socket]. *)
 module Server :
-  Server with type socket = Lwt_unix.file_descr and type addr := Unix.sockaddr
+  Server with type socket = Lwt_unix.file_descr and type addr = Unix.sockaddr
 
-(* For an example, see [examples/lwt_get.ml]. *)
-module Client :
-  Client
-  with type socket = Lwt_unix.file_descr
-   and type runtime = Gluten_lwt_unix.Client.t
+module Client : Client with type socket = Lwt_unix.file_descr

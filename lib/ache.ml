@@ -1,5 +1,6 @@
 module Headers = Headers
 module IOVec = IOVec
+module Runtime = Runtime
 module Method = Method
 module Reqd = Reqd
 module Request = Request
@@ -12,6 +13,11 @@ module Server_connection = Server_connection
 module Client_connection = Client_connection
 
 module Ache_private = struct
+  module Runtime = struct
+    module Upgradable = Runtime.Upgradable
+    module Buffer = Runtime.Buffer
+  end
+
   module Parse = Parse
   module Serialize = Serialize
 end

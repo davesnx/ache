@@ -14,10 +14,9 @@ depends: [
   "dune" {>= "3.17"}
   "ocaml" {>= "5.3"}
   "ache" {= version}
+  "bigstringaf"
   "lwt"
-  "gluten"
-  "gluten-lwt"
-  "gluten-lwt-unix"
+  "alcotest" {with-test}
   "odoc" {with-doc}
 ]
 build: [

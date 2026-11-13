@@ -4,7 +4,7 @@ open Ache
 let error_handler (_ : Eio.Net.Sockaddr.stream) =
   Ache_examples.Server.error_handler
 
-let request_handler ~u (_ : Eio.Net.Sockaddr.stream) { Gluten.reqd; _ } =
+let request_handler ~u (_ : Eio.Net.Sockaddr.stream) reqd =
   match Reqd.request reqd with
   | { Request.meth = `POST; headers; _ } ->
     let response =

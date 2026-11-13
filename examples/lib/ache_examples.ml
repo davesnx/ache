@@ -59,7 +59,7 @@ module Client = struct
 end
 
 module Server = struct
-  let echo_post { Gluten.reqd; _ } =
+  let echo_post reqd =
     match Reqd.request reqd with
     | { Request.meth = `POST; headers; _ } ->
       let response =
@@ -93,7 +93,7 @@ module Server = struct
       Headers.of_list
         [ "content-length", Int.to_string (Bigstringaf.length text) ]
     in
-    let handler { Gluten.reqd; _ } =
+    let handler reqd =
       let { Request.target; _ } = Reqd.request reqd in
       let request_body = Reqd.request_body reqd in
       Body.Reader.close request_body;

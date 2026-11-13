@@ -1,6 +1,7 @@
 (*----------------------------------------------------------------------------
   Copyright (c) 2018 Inhabited Type LLC. Copyright (c) 2018 Anton Bachin
-  Copyright (c) 2019 António Nuno Monteiro
+  Copyright (c) 2019 António Nuno Monteiro. Copyright (c) 2022 António Nuno
+  Monteiro
 
   All rights reserved.
 
@@ -33,26 +34,22 @@
 module Server : sig
   val create_connection_handler :
      ?config:Ache.Config.t
-    -> request_handler:
-         (Eio.Net.Sockaddr.stream -> Ache.Reqd.t Gluten.reqd -> unit)
+    -> request_handler:(Eio.Net.Sockaddr.stream -> Ache.Reqd.t -> unit)
     -> error_handler:
          (Eio.Net.Sockaddr.stream -> Ache.Server_connection.error_handler)
     -> sw:Eio.Switch.t
     -> Eio.Net.Sockaddr.stream
-    -> _ Eio.Net.stream_socket
+    -> _ Eio.Flow.two_way
     -> unit
 end
 
 module Client : sig
-  type t =
-    { connection : Ache.Client_connection.t
-    ; runtime : Gluten_eio.Client.t
-    }
+  type t
 
   val create_connection :
      ?config:Ache.Config.t
     -> sw:Eio.Switch.t
-    -> _ Eio.Net.stream_socket
+    -> _ Eio.Flow.two_way
     -> t
 
   val request :
@@ -65,5 +62,8 @@ module Client : sig
 
   val shutdown : t -> unit Eio.Promise.t
   val is_closed : t -> bool
-  val upgrade : t -> Gluten.impl -> unit
+
+  val upgrade : t -> Ache.Runtime.impl -> unit
+  (** [upgrade t impl] shuts down the HTTP state of [t] and hands reading and
+      writing on its flow to [impl]. *)
 end

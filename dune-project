@@ -35,10 +35,11 @@
    (>= 5.3))
   (ache
    (= :version))
+  bigstringaf
+  cstruct
   eio
-  gluten
-  gluten-eio
-  (eio_main :with-test)))
+  (eio_main :with-test)
+  (alcotest :with-test)))
 
 (package
  (name ache-lwt)
@@ -48,7 +49,6 @@
    (>= 5.3))
   (ache
    (= :version))
+  bigstringaf
   lwt
-  gluten
-  gluten-lwt
-  gluten-lwt-unix))
+  (alcotest :with-test)))

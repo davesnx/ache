@@ -72,6 +72,7 @@ type t =
   ; writer : Writer.t
   ; response_body_buffer : Bigstringaf.t
   ; error_handler : error_handler
+  ; upgrade : Runtime.impl -> unit
   ; mutable persistent : bool
   ; mutable response_state : Response_state.t
   ; mutable error_code : [ `Ok | error ]
@@ -80,6 +81,7 @@ type t =
 
 let create
       ~error_handler
+      ~upgrade
       ~reader
       ~writer
       ~response_body_buffer
@@ -93,6 +95,7 @@ let create
   ; writer
   ; response_body_buffer
   ; error_handler
+  ; upgrade
   ; persistent = Request.persistent_connection request
   ; response_state = Waiting
   ; error_code = `Ok
@@ -185,16 +188,18 @@ let respond_with_streaming ?(flush_headers_immediately = false) t response =
        error";
   unsafe_respond_with_streaming ~flush_headers_immediately t response
 
-let unsafe_respond_with_upgrade t headers upgrade_handler =
+let unsafe_respond_with_upgrade t headers impl =
   match t.response_state with
   | Waiting ->
     let response = Response.create ~headers `Switching_protocols in
     Writer.write_response t.writer response;
     if t.persistent then t.persistent <- Response.persistent_connection response;
     t.response_state <- Upgrade response;
-    Writer.flush t.writer (fun _reason ->
-      (* TODO(anmonteiro): probably need to check `Closed here? *)
-      upgrade_handler ());
+    Writer.flush t.writer (function
+      | `Written -> t.upgrade impl
+      | `Closed ->
+        Reader.force_close t.reader;
+        Reader.wakeup t.reader);
     Body.Reader.close t.request_body;
     Writer.wakeup t.writer
   | Streaming _ | Upgrade _ ->
@@ -202,13 +207,13 @@ let unsafe_respond_with_upgrade t headers upgrade_handler =
   | Fixed _ ->
     failwith "ache.Reqd.unsafe_respond_with_upgrade: response already complete"
 
-let respond_with_upgrade t response upgrade_handler =
+let respond_with_upgrade t headers impl =
   if t.error_code <> `Ok
   then
     failwith
       "ache.Reqd.respond_with_streaming: invalid state, currently handling \
        error";
-  unsafe_respond_with_upgrade t response upgrade_handler
+  unsafe_respond_with_upgrade t headers impl
 
 let report_error t error =
   t.persistent <- false;
@@ -276,6 +281,7 @@ let persistent_connection t = t.persistent
 
 let input_state t : Io_state.t =
   match t.response_state, t.request.meth with
+  | Upgrade _, _ when Reader.is_closed t.reader -> Complete
   | Upgrade _, _ | _, `CONNECT -> Wait
   | _ ->
     if Body.Reader.is_closed t.request_body

@@ -1,5 +1,5 @@
 (*---------------------------------------------------------------------------- *
-  Copyright (c) 2019 António Nuno Monteiro * * All rights reserved. * *
+  Copyright (c) 2019-2020 António Nuno Monteiro * * All rights reserved. * *
   Redistribution and use in source and binary forms, with or without *
   modification, are permitted provided that the following conditions are met: *
   * 1. Redistributions of source code must retain the above copyright notice, *
@@ -22,16 +22,29 @@
   ADVISED OF THE * POSSIBILITY OF SUCH DAMAGE.
   *---------------------------------------------------------------------------*)
 
-open Ache
+module type IO = sig
+  type socket
+  type addr
+
+  val read : socket -> Bigstringaf.t -> off:int -> len:int -> int Lwt.t
+
+  val writev :
+     socket
+    -> Bigstringaf.t Ache.IOVec.t list
+    -> [ `Closed | `Ok of int ] Lwt.t
+
+  val shutdown_receive : socket -> unit
+  val close : socket -> unit Lwt.t
+end
 
 module type Server = sig
   type socket
   type addr
 
   val create_connection_handler :
-     ?config:Config.t
-    -> request_handler:(addr -> Ache.Reqd.t Gluten.reqd -> unit)
-    -> error_handler:(addr -> Server_connection.error_handler)
+     ?config:Ache.Config.t
+    -> request_handler:(addr -> Ache.Reqd.t -> unit)
+    -> error_handler:(addr -> Ache.Server_connection.error_handler)
     -> addr
     -> socket
     -> unit Lwt.t
@@ -39,24 +52,19 @@ end
 
 module type Client = sig
   type socket
-  type runtime
+  type t
 
-  type t =
-    { connection : Ache.Client_connection.t
-    ; runtime : runtime
-    }
-
-  val create_connection : ?config:Config.t -> socket -> t Lwt.t
+  val create_connection : ?config:Ache.Config.t -> socket -> t Lwt.t
 
   val request :
      t
     -> ?flush_headers_immediately:bool
-    -> Request.t
-    -> error_handler:Client_connection.error_handler
-    -> response_handler:Client_connection.response_handler
-    -> Body.Writer.t
+    -> Ache.Request.t
+    -> error_handler:Ache.Client_connection.error_handler
+    -> response_handler:Ache.Client_connection.response_handler
+    -> Ache.Body.Writer.t
 
   val shutdown : t -> unit Lwt.t
   val is_closed : t -> bool
-  val upgrade : t -> Gluten.impl -> unit
+  val upgrade : t -> Ache.Runtime.impl -> unit
 end
