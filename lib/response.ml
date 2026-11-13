@@ -55,7 +55,8 @@ let server_error = `Error `Internal_server_error
 
 module Body_length = struct
   type t =
-    [ `Fixed of Int64.t
+    [ `No_body
+    | `Fixed of Int64.t
     | `Chunked
     | `Close_delimited
     | `Error of [ `Bad_gateway | `Internal_server_error ]
@@ -63,6 +64,7 @@ module Body_length = struct
 
   let pp_hum fmt (len : t) =
     match len with
+    | `No_body -> Format.pp_print_string fmt "No body"
     | `Fixed n -> Format.fprintf fmt "Fixed %Li" n
     | `Chunked -> Format.pp_print_string fmt "Chunked"
     | `Close_delimited -> Format.pp_print_string fmt "Close delimited"
@@ -71,34 +73,29 @@ module Body_length = struct
       Format.pp_print_string fmt "Error: Internal server error"
 end
 
+let final_coding headers =
+  Headers.get_multi headers "transfer-encoding"
+  |> List.concat_map (String.split_on_char ',')
+  |> List.map String.trim
+  |> List.filter (fun coding -> coding <> "")
+  |> List.rev
+  |> function
+  | [] when Headers.mem headers "transfer-encoding" -> Some ""
+  | [] -> None
+  | coding :: _ -> Some coding
+
 let body_length ?(proxy = false) ~request_method { status; headers; _ } :
   Body_length.t
   =
   match status, request_method with
-  | _, `HEAD ->
-    (* From RFC7230§3.3.2: A server MAY send a Content-Length header field in a
-       response to a HEAD request (Section 4.3.2 of [RFC7231]); a server MUST
-       NOT send Content-Length in such a response unless its field-value equals
-       the decimal number of octets that would have been sent in the payload
-       body of a response if the same request had used the GET method. *)
-    `Fixed 0L
-  | (`No_content | `Not_modified), _ ->
-    (* From RFC7230§3.3.2: A server MAY send a Content-Length header field in a
-       304 (Not Modified) response to a conditional GET request (Section 4.1 of
-       [RFC7232]); a server MUST NOT send Content-Length in such a response
-       unless its field-value equals the decimal number of octets that would
-       have been sent in the payload body of a 200 (OK) response to the same
-       request. *)
-    `Fixed 0L
-  | s, _ when Status.is_informational s -> `Fixed 0L
+  | _, `HEAD | (`No_content | `Not_modified), _ -> `No_body
+  | s, _ when Status.is_informational s -> `No_body
   | s, `CONNECT when Status.is_successful s -> `Close_delimited
   | _, _ ->
-    (* The last entry in transfer-encoding is the correct entry. We only handle
-       chunked transfer-encodings. *)
-    (match List.rev (Headers.get_multi headers "transfer-encoding") with
-    | value :: _ when Headers.ci_equal value "chunked" -> `Chunked
-    | _ :: _ -> `Close_delimited
-    | [] ->
+    (match final_coding headers with
+    | Some coding when Headers.ci_equal coding "chunked" -> `Chunked
+    | Some _ -> `Close_delimited
+    | None ->
       (match Message.unique_content_length_values headers with
       | [] -> `Close_delimited
       | [ len ] ->
@@ -109,6 +106,65 @@ let body_length ?(proxy = false) ~request_method { status; headers; _ } :
         then proxy_error
         else server_error
       | _ -> if proxy then proxy_error else server_error))
+
+let frame ~fn ~proxy ~request_method ~request_version ~persistent ~length t =
+  let reject reason = invalid_arg (Printf.sprintf "%s: %s" fn reason) in
+  let add name value t =
+    { t with headers = Headers.add t.headers name value }
+  in
+  let has_length = Headers.mem t.headers "content-length" in
+  let has_coding = Headers.mem t.headers "transfer-encoding" in
+  let http_1_1 = Version.compare request_version Version.v1_1 >= 0 in
+  let tunnel = request_method = `CONNECT && Status.is_successful t.status in
+  let persists t = persistent && persistent_connection ~proxy t in
+  (* RFC 9112 §6.2 *)
+  if has_length && has_coding
+  then reject "content-length and transfer-encoding are both set";
+  (* RFC 9110 §8.6, RFC 9112 §6.1 *)
+  if
+    (has_length || has_coding)
+    && (tunnel
+       || Status.is_informational t.status
+       || Status.to_code t.status = 204)
+  then
+    reject
+      "content-length or transfer-encoding in a 1xx, a 204, or a 2xx to CONNECT";
+  let close t =
+    (if persists t then add "connection" "close" t else t), `Close_delimited
+  in
+  let t, encoding =
+    match body_length ~proxy ~request_method t with
+    | `Error (`Bad_gateway | `Internal_server_error) ->
+      failwith (fn ^ ": invalid response body length")
+    | `No_body -> t, `No_body
+    | `Fixed n ->
+      (match length with
+      | Some length when Int64.of_int length <> n ->
+        reject
+          (Printf.sprintf
+             "content-length is %Ld but the body has %d bytes"
+             n
+             length)
+      | _ -> t, `Fixed n)
+    | `Close_delimited when tunnel -> t, `Close_delimited
+    | (`Chunked | `Close_delimited) when length <> None && has_coding ->
+      reject "transfer-encoding is set on a body of known length"
+    | (`Chunked | `Close_delimited) when has_coding && not http_1_1 ->
+      close { t with headers = Headers.remove t.headers "transfer-encoding" }
+    | `Chunked -> t, `Chunked
+    | `Close_delimited when has_coding -> close t
+    | `Close_delimited ->
+      (match length with
+      | Some length ->
+        ( add "content-length" (string_of_int length) t
+        , `Fixed (Int64.of_int length) )
+      | None when http_1_1 && persists t ->
+        add "transfer-encoding" "chunked" t, `Chunked
+      | None -> close t)
+  in
+  if (not http_1_1) && persists t && not (Headers.mem t.headers "connection")
+  then add "connection" "keep-alive" t, encoding
+  else t, encoding
 
 let pp_hum fmt { version; status; reason; headers } =
   Format.fprintf

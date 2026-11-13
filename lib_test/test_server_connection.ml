@@ -401,26 +401,31 @@ let test_commit_parse_after_every_header () =
     "read_eof with the rest of the input is accepted"
     (String.length r - (c + c'))
     c'';
-  write_response t (Response.create `OK);
+  write_response t (Response.create ~headers:(Headers.encoding_fixed 0) `OK);
   connection_is_shutdown t
 
 let test_single_get () =
   (* Single GET *)
   let t = create default_request_handler in
   read_request t (Request.create `GET "/");
-  write_response t (Response.create `OK);
+  write_response t (Response.create ~headers:(Headers.encoding_fixed 0) `OK);
 
   (* Single GET, close the connection *)
   let t = create default_request_handler in
   read_request t (Request.create `GET "/" ~headers:Headers.connection_close);
-  write_response t (Response.create `OK);
+  write_response t (Response.create ~headers:(Headers.encoding_fixed 0) `OK);
   connection_is_shutdown t;
 
   (* Single GET, with reponse body *)
   let response_body = "This is a test" in
   let t = create (request_handler_with_body response_body) in
   read_request t (Request.create `GET "/" ~headers:Headers.connection_close);
-  write_response t ~body:response_body (Response.create `OK);
+  write_response
+    t
+    ~body:response_body
+    (Response.create
+       ~headers:(Headers.encoding_fixed (String.length response_body))
+       `OK);
   connection_is_shutdown t
 
 let test_asynchronous_response () =
@@ -495,7 +500,7 @@ let test_echo_post () =
 
 let test_streaming_response () =
   let request = Request.create `GET "/" in
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 12) `OK in
 
   let t = create (streaming_handler response [ "Hello "; "world!" ]) in
   read_request t request;
@@ -590,14 +595,14 @@ let test_empty_chunked_streaming_response () =
 let test_multiple_get () =
   let t = create default_request_handler in
   read_request t (Request.create `GET "/");
-  write_response t (Response.create `OK);
+  write_response t (Response.create ~headers:(Headers.encoding_fixed 0) `OK);
   read_request t (Request.create `GET "/");
-  write_response t (Response.create `OK)
+  write_response t (Response.create ~headers:(Headers.encoding_fixed 0) `OK)
 
 let test_asynchronous_streaming_response_flush_immediately () =
   let continue_response = ref (fun () -> ()) in
   let request = Request.create `GET "/" in
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 5) `OK in
   let request_handler reqd =
     let body =
       Reqd.respond_with_streaming ~flush_headers_immediately:true reqd response
@@ -621,7 +626,7 @@ let test_asynchronous_streaming_response_flush_immediately () =
 let test_asynchronous_streaming_response_writer_doesnt_yield () =
   let continue_response = ref (fun () -> ()) in
   let request = Request.create `GET "/" in
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 5) `OK in
   let request_handler reqd =
     continue_response :=
       fun () ->
@@ -970,7 +975,7 @@ let test_unexpected_eof () =
   let t = create default_request_handler in
   read_request t (Request.create `GET "/");
   write_eof t;
-  writer_closed t ~unread:19
+  writer_closed t ~unread:38
 
 let test_input_shrunk () =
   let continue_response = ref (fun () -> ()) in
@@ -992,7 +997,8 @@ let test_input_shrunk () =
   reader_ready t;
   writer_yielded t;
   let writer_woken_up =
-    on_writer_unyield t (fun () -> write_response t (Response.create `OK))
+    on_writer_unyield t (fun () ->
+      write_response t (Response.create ~headers:(Headers.encoding_fixed 0) `OK))
   in
   let len = feed_string t "GET /v1/b HTTP/1.1\r\nH" in
   Alcotest.(check int) "partial read" 21 len;
@@ -1222,7 +1228,7 @@ let test_malformed_request_double_report_exn () =
   connection_is_closed t
 
 let test_immediate_flush_empty_body () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let request_handler reqd =
     let resp_body =
       Reqd.respond_with_streaming ~flush_headers_immediately:true reqd response
@@ -1236,7 +1242,7 @@ let test_immediate_flush_empty_body () =
   write_response t response
 
 let test_empty_body_no_immediate_flush () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let request_handler reqd =
     let resp_body =
       Reqd.respond_with_streaming ~flush_headers_immediately:false reqd response
@@ -1251,7 +1257,7 @@ let test_empty_body_no_immediate_flush () =
   writer_yielded t
 
 let test_yield_before_starting_a_response () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let continue_response = ref (fun () -> ()) in
   let request_handler reqd =
     Body.Reader.close (Reqd.request_body reqd);
@@ -1273,7 +1279,7 @@ let test_yield_before_starting_a_response () =
   Alcotest.(check bool) "Reader woken up" true !reader_woken_up
 
 let test_respond_before_reading_entire_body () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let continue_response = ref (fun () -> ()) in
   let request_handler reqd =
     (* Important that we never close the request body for this test. *)
@@ -1406,7 +1412,7 @@ let test_input_shrunk_chunked () =
   writer_closed t; *)
 
 let test_respond_before_reading_entire_body_chunked_eof () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let continue_response = ref (fun () -> ()) in
   let request_handler reqd =
     (* Important that we never close the request body for this test. *)
@@ -1452,7 +1458,7 @@ let test_respond_before_reading_entire_body_chunked_eof () =
   reader_errored t
 
 let test_finish_response_after_read_eof () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let continue_response = ref (fun () -> ()) in
   let request_handler reqd =
     (* Important that we never close the request body for this test. *)
@@ -1497,7 +1503,7 @@ let test_finish_response_after_read_eof () =
   reader_closed t
 
 let test_respond_before_reading_entire_body_no_error () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let continue_response = ref (fun () -> ()) in
   let request_handler reqd =
     (* Important that we never close the request body for this test. *)
@@ -1539,7 +1545,7 @@ let test_respond_before_reading_entire_body_no_error () =
     !writer_woken_up
 
 let test_streaming_response_before_reading_entire_body_no_error () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 5) `OK in
   let continue_response = ref (fun () -> ()) in
   let request_handler reqd =
     (* Important that we never close the request body for this test. *)
@@ -1881,7 +1887,7 @@ let test_race_condition_writer_issues_yield_after_reader_eof () =
   connection_is_shutdown t
 
 let test_multiple_requests_in_single_read () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let t = create (fun reqd -> Reqd.respond_with_string reqd response "") in
   let reqs =
     request_to_string (Request.create `GET "/")
@@ -1893,7 +1899,7 @@ let test_multiple_requests_in_single_read () =
   write_string t (response_to_string response)
 
 let test_multiple_async_requests_in_single_read () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let reqs_handled = ref 0 in
   let finish_handler = ref (fun () -> assert false) in
   let t =
@@ -1930,7 +1936,9 @@ let test_errored_chunked_streaming_response () =
   connection_is_shutdown t
 
 let test_multiple_requests_in_single_read_with_close () =
-  let response = Response.create `OK ~headers:Headers.connection_close in
+  let response =
+    Response.create `OK ~headers:Headers.(connection_close @ encoding_fixed 0)
+  in
   let t = create (fun reqd -> Reqd.respond_with_string reqd response "") in
   let reqs =
     request_to_string (Request.create `GET "/")
@@ -1981,7 +1989,7 @@ let test_errored_chunked_streaming_response_async () =
   connection_is_shutdown t
 
 let test_multiple_requests_in_single_read_with_eof () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let t = create (fun reqd -> Reqd.respond_with_string reqd response "") in
   let reqs =
     request_to_string (Request.create `GET "/")
@@ -2162,7 +2170,7 @@ let test_flush_response_before_shutdown () =
   connection_is_shutdown t
 
 let test_schedule_read_with_data_available () =
-  let response = Response.create `OK in
+  let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let body = ref None in
   let continue = ref (fun () -> ()) in
   let request_handler reqd =

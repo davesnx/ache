@@ -222,7 +222,8 @@ module Response : sig
 
   module Body_length : sig
     type t =
-      [ `Fixed of Int64.t
+      [ `No_body
+      | `Fixed of Int64.t
       | `Chunked
       | `Close_delimited
       | `Error of [ `Bad_gateway | `Internal_server_error ]
@@ -241,7 +242,12 @@ module Response : sig
       [request_method]. If the calling code is acting as a proxy, it should pass
       [~proxy:true]. This optional parameter only affects error reporting.
 
-      See {{:https://tools.ietf.org/html/rfc7230#section-3.3.3} RFC7230§3.3.3}
+      [`No_body] is a response to [HEAD] or with status 1xx, 204 or 304: the
+      message ends after the header section, whatever its [Content-Length] or
+      [Transfer-Encoding]. A 2xx response to [CONNECT] is [`Close_delimited]:
+      the connection becomes a tunnel.
+
+      See {{:https://www.rfc-editor.org/rfc/rfc9112#section-6.3} RFC 9112§6.3}
       for more details. *)
 
   val persistent_connection : ?proxy:bool -> t -> bool
@@ -272,15 +278,52 @@ module Reqd : sig
   val response : t -> Response.t option
   val response_exn : t -> Response.t
 
-  (** Responding
+  (** {3 Responding}
 
-      The following functions will initiate a response for the corresponding
-      request in [t]. Depending on the state of the current connection, and the
-      header values of the response, this may cause the connection to close or
-      to persist for reuse by the client.
+      The [respond_with_*] functions start the response to the request in [t].
+      ache owns the framing of the response: the [Content-Length] and
+      [Transfer-Encoding] fields that the application sets are checked, and ache
+      adds the fields it needs.
 
-      See {{:https://tools.ietf.org/html/rfc7230#section-6.3} RFC7230§6.3} for
-      more details. *)
+      No body is sent in a response to [HEAD] or with status 1xx, 204 or 304
+      (RFC 9112 §6.3). A [HEAD] or 304 response can carry the [Content-Length]
+      of the matching [GET] response. A 2xx response to [CONNECT] starts a
+      tunnel: its body bytes are sent as they are.
+
+      ache adds:
+      - [Content-Length] to a string or bigstring response that has neither
+        field;
+      - [Transfer-Encoding: chunked] to a streaming response that has neither
+        field, for an HTTP/1.1 request on a persistent connection. Otherwise
+        the body ends when the connection closes;
+      - [Connection: close] when a body that ends with the connection is sent
+        on a connection that was persistent;
+      - [Connection: keep-alive] to a response to an HTTP/1.0 request when the
+        connection stays open and the response has no [Connection] field.
+
+      A streaming response with [Transfer-Encoding] whose final coding is
+      [chunked] (for example [gzip, chunked]) is chunked by ache; with another
+      final coding, the body ends when the connection closes. To an HTTP/1.0
+      request, the [Transfer-Encoding] field is removed and the body ends when
+      the connection closes (RFC 9112 §6.1).
+
+      The body writer of a streaming response with [Content-Length] counts
+      bytes: a write past the declared length raises [Invalid_argument] and
+      writes nothing. A body closed short of the declared length is sent as
+      it is, and the connection closes after it; the client sees an
+      incomplete message (RFC 9112 §8). The error handler is not called: the
+      response has already started.
+
+      These raise [Invalid_argument], before anything is written, so that the
+      application can still respond:
+      - a 1xx status (use {!respond_with_informational} or
+        {!respond_with_upgrade});
+      - both [Content-Length] and [Transfer-Encoding] (RFC 9112 §6.2);
+      - [Content-Length] or [Transfer-Encoding] in a 1xx, a 204 or a 2xx
+        response to [CONNECT] (RFC 9110 §8.6);
+      - [Transfer-Encoding] in a string or bigstring response with a body;
+      - a [Content-Length] that differs from the length of the string or
+        bigstring body. *)
 
   val respond_with_string : t -> Response.t -> string -> unit
   val respond_with_bigstring : t -> Response.t -> Bigstringaf.t -> unit
@@ -290,6 +333,23 @@ module Reqd : sig
     -> t
     -> Response.t
     -> Body.Writer.t
+  (** [respond_with_streaming t response] sends [response] and returns the
+      writer for its body. In a response without a body, the writer drops the
+      bytes written to it and answers [flush] with [`Written]. *)
+
+  val respond_with_informational : t -> Response.t -> unit
+  (** [respond_with_informational t response] sends the interim [response],
+      for example [100 Continue] to a request with [Expect: 100-continue]
+      (RFC 9110 §10.1.1), or [103 Early Hints]. Only the head is sent. A final
+      response must follow with one of the other [respond_with_*] functions.
+      It can be called more than once. ache never sends [100 Continue] on its
+      own: the request handler decides.
+
+      Nothing is sent to an HTTP/1.0 request (RFC 9110 §15.2).
+
+      @raise Invalid_argument
+        if the status is not 1xx, is 101, or the response has
+        [Content-Length] or [Transfer-Encoding]. *)
 
   val respond_with_upgrade : t -> Headers.t -> Runtime.impl -> unit
   (** [respond_with_upgrade t headers impl] responds with
@@ -434,6 +494,14 @@ module Client_connection : sig
     -> error_handler:error_handler
     -> response_handler:response_handler
     -> Body.Writer.t
+  (** [request t req ~error_handler ~response_handler] sends [req] and returns
+      the writer for its body. [response_handler] is called once, with the
+      final response.
+
+      Interim 1xx responses other than [101 Switching Protocols] (for example
+      [100 Continue] or [103 Early Hints]) are parsed and dropped; they are
+      not given to [response_handler] (RFC 9110 §15.2). A [101] is final: it is
+      given to [response_handler]. *)
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
   (** [next_read_operation t] returns a value describing the next operation that

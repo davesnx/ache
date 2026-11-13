@@ -368,35 +368,41 @@ module Reader = struct
   let response ~max_header_size request_queue =
     let on_head t response =
       assert (not (Queue.is_empty request_queue));
-      let exception Local of Respd.t in
-      let respd =
-        match
-          Queue.iter
-            (fun respd ->
-               if respd.Respd.state = Awaiting_response then raise (Local respd))
-            request_queue
-        with
-        | exception Local respd -> respd
-        | () -> assert false
-      in
-      let request = Respd.request respd in
-      match Response.body_length ~request_method:request.meth response with
-      | `Error `Bad_gateway -> assert false
-      | `Error `Internal_server_error ->
-        t.state <- Fail (`Invalid_response_body_length response)
-      | `Fixed 0L ->
-        respd.response_handler response (Body.Reader.create_empty ());
-        t.state <- Done
-      | (`Fixed _ | `Chunked | `Close_delimited) as encoding ->
-        let body = create_body t in
-        let framing =
-          match encoding with
-          | `Fixed n -> Fixed n
-          | `Chunked -> Chunk_line None
-          | `Close_delimited -> Close_delimited
-        in
-        t.state <- Body (body, framing);
-        respd.response_handler response body
+      let exception Local of Respd.t option in
+      match
+        Queue.iter
+          (fun respd ->
+             if respd.Respd.state = Awaiting_response
+             then raise (Local (Some respd))
+             else if not (Respd.persistent_connection respd)
+             then raise (Local None))
+          request_queue
+      with
+      | () -> assert false
+      | exception Local None -> t.state <- Cancelled_parse
+      | exception Local (Some respd) ->
+        let request = Respd.request respd in
+        (match Response.body_length ~request_method:request.meth response with
+        | `No_body
+          when Status.is_informational response.status
+               && response.status <> `Switching_protocols ->
+          t.state <- Done
+        | `Error `Bad_gateway -> assert false
+        | `Error `Internal_server_error ->
+          t.state <- Fail (`Invalid_response_body_length response)
+        | `No_body | `Fixed 0L ->
+          respd.response_handler response (Body.Reader.create_empty ());
+          t.state <- Done
+        | (`Fixed _ | `Chunked | `Close_delimited) as encoding ->
+          let body = create_body t in
+          let framing =
+            match encoding with
+            | `Fixed n -> Fixed n
+            | `Chunked -> Chunk_line None
+            | `Close_delimited -> Close_delimited
+          in
+          t.state <- Body (body, framing);
+          respd.response_handler response body)
     in
     create
       ~max_header_size

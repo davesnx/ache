@@ -36,7 +36,12 @@ let test_body_length () =
     Alcotest.check body_length message expect actual
   in
   let res status headers = Response.create status ~headers in
-  check "requested HEAD" ~expect:(`Fixed 0L) `HEAD (res `OK Headers.empty);
+  check "requested HEAD" ~expect:`No_body `HEAD (res `OK Headers.empty);
+  check
+    "requested HEAD, with content-length"
+    ~expect:`No_body
+    `HEAD
+    (res `OK Headers.(encoding_fixed 10));
   check
     "requested CONNECT"
     ~expect:`Close_delimited
@@ -44,17 +49,17 @@ let test_body_length () =
     (res `OK Headers.empty);
   check
     "status: informational"
-    ~expect:(`Fixed 0L)
+    ~expect:`No_body
     `GET
     (res `Continue Headers.empty);
   check
     "status: no content"
-    ~expect:(`Fixed 0L)
+    ~expect:`No_body
     `GET
     (res `No_content Headers.empty);
   check
     "status: not modified"
-    ~expect:(`Fixed 0L)
+    ~expect:`No_body
     `GET
     (res `Not_modified Headers.empty);
   check "no header" ~expect:`Close_delimited `GET (res `OK Headers.empty);

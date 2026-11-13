@@ -186,24 +186,23 @@ let set_error_and_handle ?request t error =
     | No_error ->
       t.error_code <- Error { request; response_state = Waiting };
       t.error_handler ?request error (fun headers ->
-        let response = Response.create ~headers status in
-        let encoding =
+        let response, encoding =
           (* If we haven't parsed the request method, just use GET as a standard
              placeholder. The method is only used for edge cases, like HEAD or
              CONNECT. *)
-          let request_method =
+          let request_method, request_version =
             match request with
-            | None -> `GET
-            | Some (request : Request.t) -> request.meth
+            | None -> `GET, Version.v1_1
+            | Some (request : Request.t) -> request.meth, request.version
           in
-          match
-            Response.body_length ~proxy:t.config.proxy ~request_method response
-          with
-          | (`Fixed _ | `Close_delimited | `Chunked) as encoding -> encoding
-          | `Error (`Bad_gateway | `Internal_server_error) ->
-            failwith
-              "ache.Server_connection.error_handler: invalid response body \
-               length"
+          Response.frame
+            ~fn:"ache.Server_connection.error_handler"
+            ~proxy:t.config.proxy
+            ~request_method
+            ~request_version
+            ~persistent:false
+            ~length:None
+            (Response.create ~headers status)
         in
         let response_body =
           (* The (shared) response body buffer can be used in this case *

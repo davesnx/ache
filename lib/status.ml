@@ -32,6 +32,8 @@
 type informational =
   [ `Continue
   | `Switching_protocols
+  | `Processing
+  | `Early_hints
   ]
 
 type successful =
@@ -42,6 +44,9 @@ type successful =
   | `No_content
   | `Reset_content
   | `Partial_content
+  | `Multi_status
+  | `Already_reported
+  | `Im_used
   ]
 
 type redirection =
@@ -52,6 +57,7 @@ type redirection =
   | `Not_modified
   | `Use_proxy
   | `Temporary_redirect
+  | `Permanent_redirect
   ]
 
 type client_error =
@@ -68,17 +74,23 @@ type client_error =
   | `Gone
   | `Length_required
   | `Precondition_failed
-  | `Payload_too_large
+  | `Content_too_large
   | `Uri_too_long
   | `Unsupported_media_type
   | `Range_not_satisfiable
   | `Expectation_failed
   | `I_m_a_teapot
   | `Enhance_your_calm
+  | `Misdirected_request
+  | `Unprocessable_content
+  | `Locked
+  | `Failed_dependency
+  | `Too_early
   | `Upgrade_required
   | `Precondition_required
   | `Too_many_requests
   | `Request_header_fields_too_large
+  | `Unavailable_for_legal_reasons
   ]
 
 type server_error =
@@ -88,6 +100,9 @@ type server_error =
   | `Service_unavailable
   | `Gateway_timeout
   | `Http_version_not_supported
+  | `Variant_also_negotiates
+  | `Insufficient_storage
+  | `Loop_detected
   | `Network_authentication_required
   ]
 
@@ -108,6 +123,8 @@ let default_reason_phrase = function
   (* Informational *)
   | `Continue -> "Continue"
   | `Switching_protocols -> "Switching Protocols"
+  | `Processing -> "Processing"
+  | `Early_hints -> "Early Hints"
   (* Successful *)
   | `OK -> "OK"
   | `Created -> "Created"
@@ -116,6 +133,9 @@ let default_reason_phrase = function
   | `No_content -> "No Content"
   | `Reset_content -> "Reset Content"
   | `Partial_content -> "Partial Content"
+  | `Multi_status -> "Multi-Status"
+  | `Already_reported -> "Already Reported"
+  | `Im_used -> "IM Used"
   (* Redirection *)
   | `Multiple_choices -> "Multiple Choices"
   | `Moved_permanently -> "Moved Permanently"
@@ -124,6 +144,7 @@ let default_reason_phrase = function
   | `Not_modified -> "Not Modified"
   | `Use_proxy -> "Use Proxy"
   | `Temporary_redirect -> "Temporary Redirect"
+  | `Permanent_redirect -> "Permanent Redirect"
   (* Client error *)
   | `Bad_request -> "Bad Request"
   | `Unauthorized -> "Unauthorized"
@@ -138,17 +159,23 @@ let default_reason_phrase = function
   | `Gone -> "Gone"
   | `Length_required -> "Length Required"
   | `Precondition_failed -> "Precondition Failed"
-  | `Payload_too_large -> "Payload Too Large"
+  | `Content_too_large -> "Content Too Large"
   | `Uri_too_long -> "URI Too Long"
   | `Unsupported_media_type -> "Unsupported Media Type"
   | `Range_not_satisfiable -> "Range Not Satisfiable"
   | `Expectation_failed -> "Expectation Failed"
   | `I_m_a_teapot -> "I'm a teapot" (* RFC 2342 *)
   | `Enhance_your_calm -> "Enhance Your Calm"
+  | `Misdirected_request -> "Misdirected Request"
+  | `Unprocessable_content -> "Unprocessable Content"
+  | `Locked -> "Locked"
+  | `Failed_dependency -> "Failed Dependency"
+  | `Too_early -> "Too Early"
   | `Upgrade_required -> "Upgrade Required"
   | `Precondition_required -> "Precondition Required"
   | `Too_many_requests -> "Too Many Requests"
   | `Request_header_fields_too_large -> "Request Header Fields Too Large"
+  | `Unavailable_for_legal_reasons -> "Unavailable For Legal Reasons"
   (* Server error *)
   | `Internal_server_error -> "Internal Server Error"
   | `Not_implemented -> "Not Implemented"
@@ -156,12 +183,17 @@ let default_reason_phrase = function
   | `Service_unavailable -> "Service Unavailable"
   | `Gateway_timeout -> "Gateway Timeout"
   | `Http_version_not_supported -> "HTTP Version Not Supported"
+  | `Variant_also_negotiates -> "Variant Also Negotiates"
+  | `Insufficient_storage -> "Insufficient Storage"
+  | `Loop_detected -> "Loop Detected"
   | `Network_authentication_required -> "Network Authentication Required"
 
 let to_code = function
   (* Informational *)
   | `Continue -> 100
   | `Switching_protocols -> 101
+  | `Processing -> 102
+  | `Early_hints -> 103
   (* Successful *)
   | `OK -> 200
   | `Created -> 201
@@ -170,6 +202,9 @@ let to_code = function
   | `No_content -> 204
   | `Reset_content -> 205
   | `Partial_content -> 206
+  | `Multi_status -> 207
+  | `Already_reported -> 208
+  | `Im_used -> 226
   (* Redirection *)
   | `Multiple_choices -> 300
   | `Moved_permanently -> 301
@@ -178,6 +213,7 @@ let to_code = function
   | `Not_modified -> 304
   | `Use_proxy -> 305
   | `Temporary_redirect -> 307
+  | `Permanent_redirect -> 308
   (* Client error *)
   | `Bad_request -> 400
   | `Unauthorized -> 401
@@ -192,17 +228,23 @@ let to_code = function
   | `Gone -> 410
   | `Length_required -> 411
   | `Precondition_failed -> 412
-  | `Payload_too_large -> 413
+  | `Content_too_large -> 413
   | `Uri_too_long -> 414
   | `Unsupported_media_type -> 415
   | `Range_not_satisfiable -> 416
   | `Expectation_failed -> 417
   | `I_m_a_teapot -> 418
   | `Enhance_your_calm -> 420
+  | `Misdirected_request -> 421
+  | `Unprocessable_content -> 422
+  | `Locked -> 423
+  | `Failed_dependency -> 424
+  | `Too_early -> 425
   | `Upgrade_required -> 426
   | `Precondition_required -> 428
   | `Too_many_requests -> 429
   | `Request_header_fields_too_large -> 431
+  | `Unavailable_for_legal_reasons -> 451
   (* Server error *)
   | `Internal_server_error -> 500
   | `Not_implemented -> 501
@@ -210,6 +252,9 @@ let to_code = function
   | `Service_unavailable -> 503
   | `Gateway_timeout -> 504
   | `Http_version_not_supported -> 505
+  | `Variant_also_negotiates -> 506
+  | `Insufficient_storage -> 507
+  | `Loop_detected -> 508
   | `Network_authentication_required -> 511
   | `Code c -> c
 
@@ -217,6 +262,8 @@ let really_unsafe_of_code = function
   (* Informational *)
   | 100 -> `Continue
   | 101 -> `Switching_protocols
+  | 102 -> `Processing
+  | 103 -> `Early_hints
   (* Successful *)
   | 200 -> `OK
   | 201 -> `Created
@@ -225,6 +272,9 @@ let really_unsafe_of_code = function
   | 204 -> `No_content
   | 205 -> `Reset_content
   | 206 -> `Partial_content
+  | 207 -> `Multi_status
+  | 208 -> `Already_reported
+  | 226 -> `Im_used
   (* Redirection *)
   | 300 -> `Multiple_choices
   | 301 -> `Moved_permanently
@@ -233,6 +283,7 @@ let really_unsafe_of_code = function
   | 304 -> `Not_modified
   | 305 -> `Use_proxy
   | 307 -> `Temporary_redirect
+  | 308 -> `Permanent_redirect
   (* Client error *)
   | 400 -> `Bad_request
   | 401 -> `Unauthorized
@@ -247,17 +298,23 @@ let really_unsafe_of_code = function
   | 410 -> `Gone
   | 411 -> `Length_required
   | 412 -> `Precondition_failed
-  | 413 -> `Payload_too_large
+  | 413 -> `Content_too_large
   | 414 -> `Uri_too_long
   | 415 -> `Unsupported_media_type
   | 416 -> `Range_not_satisfiable
   | 417 -> `Expectation_failed
   | 418 -> `I_m_a_teapot
   | 420 -> `Enhance_your_calm
+  | 421 -> `Misdirected_request
+  | 422 -> `Unprocessable_content
+  | 423 -> `Locked
+  | 424 -> `Failed_dependency
+  | 425 -> `Too_early
   | 426 -> `Upgrade_required
   | 428 -> `Precondition_required
   | 429 -> `Too_many_requests
   | 431 -> `Request_header_fields_too_large
+  | 451 -> `Unavailable_for_legal_reasons
   (* Server error *)
   | 500 -> `Internal_server_error
   | 501 -> `Not_implemented
@@ -265,6 +322,9 @@ let really_unsafe_of_code = function
   | 503 -> `Service_unavailable
   | 504 -> `Gateway_timeout
   | 505 -> `Http_version_not_supported
+  | 506 -> `Variant_also_negotiates
+  | 507 -> `Insufficient_storage
+  | 508 -> `Loop_detected
   | 511 -> `Network_authentication_required
   | c -> `Code c
 
@@ -313,7 +373,7 @@ let is_client_error t =
 let is_server_error t =
   match t with
   | #server_error -> true
-  | `Code n -> n >= 500 && n <= 599
+  | `Code n -> n < 100 || n >= 500
   | _ -> false
 
 let is_error t = is_client_error t || is_server_error t
@@ -323,6 +383,8 @@ let to_string = function
   (* Informational *)
   | `Continue -> "100"
   | `Switching_protocols -> "101"
+  | `Processing -> "102"
+  | `Early_hints -> "103"
   (* Successful *)
   | `OK -> "200"
   | `Created -> "201"
@@ -331,6 +393,9 @@ let to_string = function
   | `No_content -> "204"
   | `Reset_content -> "205"
   | `Partial_content -> "206"
+  | `Multi_status -> "207"
+  | `Already_reported -> "208"
+  | `Im_used -> "226"
   (* Redirection *)
   | `Multiple_choices -> "300"
   | `Moved_permanently -> "301"
@@ -339,6 +404,7 @@ let to_string = function
   | `Not_modified -> "304"
   | `Use_proxy -> "305"
   | `Temporary_redirect -> "307"
+  | `Permanent_redirect -> "308"
   (* Client error *)
   | `Bad_request -> "400"
   | `Unauthorized -> "401"
@@ -353,17 +419,23 @@ let to_string = function
   | `Gone -> "410"
   | `Length_required -> "411"
   | `Precondition_failed -> "412"
-  | `Payload_too_large -> "413"
+  | `Content_too_large -> "413"
   | `Uri_too_long -> "414"
   | `Unsupported_media_type -> "415"
   | `Range_not_satisfiable -> "416"
   | `Expectation_failed -> "417"
   | `I_m_a_teapot -> "418"
   | `Enhance_your_calm -> "420"
+  | `Misdirected_request -> "421"
+  | `Unprocessable_content -> "422"
+  | `Locked -> "423"
+  | `Failed_dependency -> "424"
+  | `Too_early -> "425"
   | `Upgrade_required -> "426"
   | `Precondition_required -> "428"
   | `Too_many_requests -> "429"
   | `Request_header_fields_too_large -> "431"
+  | `Unavailable_for_legal_reasons -> "451"
   (* Server error *)
   | `Internal_server_error -> "500"
   | `Not_implemented -> "501"
@@ -371,6 +443,9 @@ let to_string = function
   | `Service_unavailable -> "503"
   | `Gateway_timeout -> "504"
   | `Http_version_not_supported -> "505"
+  | `Variant_also_negotiates -> "506"
+  | `Insufficient_storage -> "507"
+  | `Loop_detected -> "508"
   | `Network_authentication_required -> "511"
   | `Code c -> string_of_int c (* except for this *)
 

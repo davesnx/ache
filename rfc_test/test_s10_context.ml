@@ -30,25 +30,22 @@ let tests =
            "only the 100 head"
            "HTTP/1.1 100 Continue\r\n\r\n"
            (Server.output s))
-  ; known_failure
-      ~ticket:"08"
-      "§10.1.1 server MUST: final response follows the 100"
-      (fun () ->
-         let s = Server.create ~handler:continue_then_final () in
-         Server.feed s (expect_head "/");
-         Server.feed s "hello";
-         let out = Server.output s in
-         check_status "100 then 200" [ 100; 200 ] s;
-         Alcotest.(check bool)
-           "200 head right after the 100 head"
-           true
-           (String.starts_with
-              ~prefix:"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n"
-              out);
-         Alcotest.(check string)
-           "final body"
-           "got hello"
-           (List.nth (fst (Wire.parse_responses out)) 1).Wire.body)
+  ; test "§10.1.1 server MUST: final response follows the 100" (fun () ->
+      let s = Server.create ~handler:continue_then_final () in
+      Server.feed s (expect_head "/");
+      Server.feed s "hello";
+      let out = Server.output s in
+      check_status "100 then 200" [ 100; 200 ] s;
+      Alcotest.(check bool)
+        "200 head right after the 100 head"
+        true
+        (String.starts_with
+           ~prefix:"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n"
+           out);
+      Alcotest.(check string)
+        "final body"
+        "got hello"
+        (List.nth (fst (Wire.parse_responses out)) 1).Wire.body)
   ; test
       "§10.1.1 server DEF: 100-CONTINUE in any case gets the same handling"
       (fun () ->

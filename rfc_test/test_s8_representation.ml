@@ -192,7 +192,7 @@ let generation_tests =
       (fun () ->
          check_no_cl
            "100 head"
-           (Server.run ~handler:(Server.respond_raw `Continue) (get "/")))
+           (Server.run ~handler:Server.send_continue (get "/")))
   ; test
       "§8.6 server MUST NOT: library adds no Content-Length to 204"
       (fun () ->
@@ -249,8 +249,7 @@ let generation_tests =
            (Some "5")
            (Wire.header m "content-length");
          Alcotest.(check string) "no body" "" m.body)
-  ; known_failure
-      ~ticket:"07"
+  ; test
       "§8.6 server SHOULD: respond_with_string adds Content-Length"
       (fun () ->
          let s =

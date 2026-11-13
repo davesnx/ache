@@ -23,6 +23,21 @@ let class_of (s : Status.t) =
     ; 5, Status.is_server_error
     ]
 
+module Idle_protocol = struct
+  type t = unit
+
+  let next_read_operation () = `Yield
+  let read () _ ~off:_ ~len:_ = 0
+  let read_eof () _ ~off:_ ~len:_ = 0
+  let yield_reader () _ = ()
+  let next_write_operation () = `Yield
+  let report_write_result () _ = ()
+  let yield_writer () _ = ()
+  let report_exn () _ = ()
+  let is_closed () = false
+  let shutdown () = ()
+end
+
 let check_registered codes =
   List.iter
     (fun (n, phrase) ->
@@ -35,11 +50,22 @@ let check_registered codes =
          (label ^ " reason")
          phrase
          (Response.create s).reason;
-       let server = Server.run ~handler:(Server.respond_raw s) (get "/") in
+       let handler ex =
+         match n with
+         | 101 ->
+           Reqd.respond_with_upgrade
+             ex.Server.reqd
+             Headers.empty
+             (Runtime.make (module Idle_protocol) ())
+         | n when n < 200 ->
+           Reqd.respond_with_informational ex.reqd (Response.create s)
+         | _ -> Server.respond_raw s ex
+       in
+       let written = Server.output (Server.run ~handler (get "/")) in
        Alcotest.(check string)
          (label ^ " status line")
          (Printf.sprintf "HTTP/1.1 %d %s" n phrase)
-         (first_line (Server.output server)))
+         (first_line written))
     codes
 
 let no_content_after_head s =
@@ -80,8 +106,7 @@ let tests =
                   (class_of r.status)
               | _ -> Alcotest.fail "one response")
            [ 299; 371; 471; 599 ])
-  ; known_failure
-      ~ticket:"08"
+  ; test
       "§15 client MUST: unrecognized 199 is interim before the final"
       (fun () ->
          let _, ex =
@@ -105,8 +130,7 @@ let tests =
          Alcotest.(check int_list) "status" [ 600 ] (Client.statuses ex);
          Alcotest.(check (list string)) "no error" [] ex.errors;
          Alcotest.(check string) "body" "ok" ex.body)
-  ; known_failure
-      ~ticket:"19"
+  ; test
       "§15 client SHOULD: received status 600 is classed as a server error"
       (fun () ->
          let _, ex =
@@ -169,10 +193,8 @@ let tests =
         ; 305, "Use Proxy"
         ; 307, "Temporary Redirect"
         ])
-  ; known_failure
-      ~ticket:"09"
-      "§15.4 both DEF: 308 Permanent Redirect"
-      (fun () -> check_registered [ 308, "Permanent Redirect" ])
+  ; test "§15.4 both DEF: 308 Permanent Redirect" (fun () ->
+      check_registered [ 308, "Permanent Redirect" ])
   ; test "§15.5 both DEF: registered 4xx codes and reason phrases" (fun () ->
       check_registered
         [ 400, "Bad Request"
@@ -194,18 +216,12 @@ let tests =
         ; 417, "Expectation Failed"
         ; 426, "Upgrade Required"
         ])
-  ; known_failure
-      ~ticket:"09"
-      "§15.5 both DEF: 413 Content Too Large"
-      (fun () -> check_registered [ 413, "Content Too Large" ])
-  ; known_failure
-      ~ticket:"09"
-      "§15.5 both DEF: 421 Misdirected Request"
-      (fun () -> check_registered [ 421, "Misdirected Request" ])
-  ; known_failure
-      ~ticket:"09"
-      "§15.5 both DEF: 422 Unprocessable Content"
-      (fun () -> check_registered [ 422, "Unprocessable Content" ])
+  ; test "§15.5 both DEF: 413 Content Too Large" (fun () ->
+      check_registered [ 413, "Content Too Large" ])
+  ; test "§15.5 both DEF: 421 Misdirected Request" (fun () ->
+      check_registered [ 421, "Misdirected Request" ])
+  ; test "§15.5 both DEF: 422 Unprocessable Content" (fun () ->
+      check_registered [ 422, "Unprocessable Content" ])
   ; test "§15.6 both DEF: registered 5xx codes and reason phrases" (fun () ->
       check_registered
         [ 500, "Internal Server Error"
@@ -215,8 +231,7 @@ let tests =
         ; 504, "Gateway Timeout"
         ; 505, "HTTP Version Not Supported"
         ])
-  ; known_failure
-      ~ticket:"08"
+  ; test
       "§15.2 server MUST NOT: no 1xx response to an HTTP/1.0 client"
       (fun () ->
          let s =
@@ -236,8 +251,7 @@ let tests =
                 "/")
          in
          check_status "only the final 200" [ 200 ] s)
-  ; known_failure
-      ~ticket:"08"
+  ; test
       "§15.2 client MUST: 100 Continue before the final response is parsed"
       (fun () ->
          let _, ex =
@@ -252,8 +266,7 @@ let tests =
          Alcotest.(check int_list) "final status" [ 200 ] (Client.statuses ex);
          Alcotest.(check (list string)) "no error" [] ex.errors;
          Alcotest.(check string) "body" "ok" ex.body)
-  ; known_failure
-      ~ticket:"08"
+  ; test
       "§15.2 client MUST: 103 and 100 before the final response are parsed"
       (fun () ->
          let _, ex =
@@ -271,16 +284,14 @@ let tests =
          Alcotest.(check int_list) "final status" [ 200 ] (Client.statuses ex);
          Alcotest.(check (list string)) "no error" [] ex.errors;
          Alcotest.(check string) "body" "ok" ex.body)
-  ; known_failure
-      ~ticket:"07"
+  ; test
       "§15.3.5 server DEF: a 204 response ends after its header section"
       (fun () ->
          no_content_after_head
            (Server.run
               ~handler:(Server.respond_raw ~body:"hello" `No_content)
               (get "/")))
-  ; known_failure
-      ~ticket:"07"
+  ; test
       "§15.4.5 server DEF: a 304 response ends after its header section"
       (fun () ->
          no_content_after_head

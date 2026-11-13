@@ -208,8 +208,7 @@ let tests =
            (Wire.header r "content-length");
          head_only s;
          check_open "connection open" s)
-  ; known_failure
-      ~ticket:"07"
+  ; test
       "§9.3.2 server MUST NOT: no content in a HEAD respond_with_string"
       (fun () ->
          let s =
@@ -218,8 +217,7 @@ let tests =
              (req "HEAD" "/")
          in
          head_only s)
-  ; known_failure
-      ~ticket:"07"
+  ; test
       "§9.3.2 server MUST NOT: no content in a streamed HEAD response"
       (fun () ->
          let flushed = ref None in
@@ -241,8 +239,7 @@ let tests =
          Alcotest.(check bool) "flush answered" true (Option.is_some !flushed);
          head_only s;
          check_open "connection open" s)
-  ; known_failure
-      ~ticket:"07"
+  ; test
       "§9.3.2 server MUST NOT: no content in an error response to HEAD"
       (fun () ->
          let module D = Server.D in
@@ -257,8 +254,7 @@ let tests =
          | Some (line, _, rest) ->
            Alcotest.(check string) "status" "HTTP/1.1 400 Bad Request" line;
            Alcotest.(check string) "no content" "" rest)
-  ; known_failure
-      ~ticket:"07"
+  ; test
       "§9.3.2 server MUST NOT: pipelined GET response follows the HEAD head"
       (fun () ->
          let s =

@@ -30,7 +30,16 @@ let create ~error_handler ~writer ~response_handler request request_body =
   let handler t =
    fun response body ->
     let t = Lazy.force t in
-    if t.persistent then t.persistent <- Response.persistent_connection response;
+    if t.persistent
+    then
+      t.persistent <-
+        Response.persistent_connection response
+        && not
+             (Headers.mem response.headers "content-length"
+             && Response.body_length
+                  ~request_method:request.Request.meth
+                  response
+                = `Chunked);
     let next_request_state =
       match request.Request.meth, response.status with
       (* From RFC9110§6.4.1: * 2xx (Successful) responses to a CONNECT request

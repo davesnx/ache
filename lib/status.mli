@@ -40,6 +40,8 @@
 type informational =
   [ `Continue
   | `Switching_protocols
+  | `Processing
+  | `Early_hints
   ]
 (** The 1xx (Informational) class of status code indicates an interim response
     for communicating connection status or request progress prior to completing
@@ -56,6 +58,9 @@ type successful =
   | `No_content
   | `Reset_content
   | `Partial_content
+  | `Multi_status
+  | `Already_reported
+  | `Im_used
   ]
 (** The 2xx (Successful) class of status code indicates that the client's
     request was successfully received, understood, and accepted.
@@ -71,6 +76,7 @@ type redirection =
   | `Not_modified
   | `Use_proxy
   | `Temporary_redirect
+  | `Permanent_redirect
   ]
 (** The 3xx (Redirection) class of status code indicates that further action
     needs to be taken by the user agent in order to fulfill the request.
@@ -92,7 +98,7 @@ type client_error =
   | `Gone
   | `Length_required
   | `Precondition_failed
-  | `Payload_too_large
+  | `Content_too_large
   | `Uri_too_long
   | `Unsupported_media_type
   | `Range_not_satisfiable
@@ -100,9 +106,15 @@ type client_error =
   | `Upgrade_required
   | `I_m_a_teapot
   | `Enhance_your_calm
+  | `Misdirected_request
+  | `Unprocessable_content
+  | `Locked
+  | `Failed_dependency
+  | `Too_early
   | `Precondition_required
   | `Too_many_requests
   | `Request_header_fields_too_large
+  | `Unavailable_for_legal_reasons
   ]
 (** The 4xx (Client Error) class of status code indicates that the client seems
     to have erred.
@@ -117,6 +129,9 @@ type server_error =
   | `Service_unavailable
   | `Gateway_timeout
   | `Http_version_not_supported
+  | `Variant_also_negotiates
+  | `Insufficient_storage
+  | `Loop_detected
   | `Network_authentication_required
   ]
 (** The 5xx (Server Error) class of status code indicates that the server is
@@ -132,7 +147,8 @@ type standard =
   | client_error
   | server_error
   ]
-(** The status codes defined in the HTTP 1.1 RFCs *)
+(** The status codes in the IANA HTTP Status Code Registry, except 104
+    (temporary) and 510 (obsolete), plus 418 and 420. *)
 
 type t =
   [ standard
@@ -141,9 +157,9 @@ type t =
 (** The standard codes along with support for custom codes. *)
 
 val default_reason_phrase : standard -> string
-(** [default_reason_phrase standard] is the example reason phrase provided by
-    RFC7231 for the [standard] status code. The RFC allows servers to use reason
-    phrases besides these in responses. *)
+(** [default_reason_phrase standard] is the reason phrase that RFC 9110 §15 or
+    the IANA registry gives for the [standard] status code. The RFC allows
+    servers to use reason phrases besides these in responses. *)
 
 val to_code : t -> int
 (** [to_code t] is the integer representation of [t]. *)
@@ -175,7 +191,8 @@ val is_client_error : t -> bool
 
 val is_server_error : t -> bool
 (** [is_server_error t] is true iff [t] belongs to the Server Error class of
-    status codes. *)
+    status codes, or is outside 100..599. RFC 9110 §15: a client treats an
+    invalid status code as 5xx. *)
 
 val is_error : t -> bool
 (** [is_error t] is true iff [t] belongs to the Client Error or Server Error

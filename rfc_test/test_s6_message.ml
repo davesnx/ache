@@ -198,40 +198,31 @@ let retain_request_tests =
   ]
 
 let content_tests =
-  [ known_failure
-      ~ticket:"07"
+  [ test
       "§6.4.1 server DEF: no body bytes in a 204 from respond_with_string"
       (fun () -> no_body_server_test ~status:204 ~streaming:false)
-  ; known_failure
-      ~ticket:"07"
+  ; test
       "§6.4.1 server DEF: no body bytes in a 304 from respond_with_string"
       (fun () -> no_body_server_test ~status:304 ~streaming:false)
-  ; known_failure
-      ~ticket:"07"
-      "§6.4.1 server DEF: no body bytes in a streamed 204"
-      (fun () -> no_body_server_test ~status:204 ~streaming:true)
-  ; known_failure
-      ~ticket:"07"
-      "§6.4.1 server DEF: no body bytes in a streamed 304"
-      (fun () -> no_body_server_test ~status:304 ~streaming:true)
-  ; known_failure
-      ~ticket:"08"
-      "§6.4.1 server DEF: no body bytes after a 100 head"
-      (fun () ->
-         let handler ex =
-           match
-             Reqd.respond_with_string
-               ex.Server.reqd
-               (Response.create `Continue)
-               "hello"
-           with
-           | () -> ()
-           | exception (Invalid_argument _ | Failure _) -> ()
-         in
-         let s = Server.run ~handler (get "/") in
-         let out = Server.output s in
-         if contains out "hello"
-         then Alcotest.failf "body bytes sent after a 100 head: %S" out)
+  ; test "§6.4.1 server DEF: no body bytes in a streamed 204" (fun () ->
+      no_body_server_test ~status:204 ~streaming:true)
+  ; test "§6.4.1 server DEF: no body bytes in a streamed 304" (fun () ->
+      no_body_server_test ~status:304 ~streaming:true)
+  ; test "§6.4.1 server DEF: no body bytes after a 100 head" (fun () ->
+      let handler ex =
+        match
+          Reqd.respond_with_string
+            ex.Server.reqd
+            (Response.create `Continue)
+            "hello"
+        with
+        | () -> ()
+        | exception (Invalid_argument _ | Failure _) -> ()
+      in
+      let s = Server.run ~handler (get "/") in
+      let out = Server.output s in
+      if contains out "hello"
+      then Alcotest.failf "body bytes sent after a 100 head: %S" out)
   ; test "§6.4.1 server DEF: a 200 response includes its content" (fun () ->
       let s =
         Server.run ~handler:(Server.respond ~body:"hello" `OK) (get "/")
@@ -250,14 +241,11 @@ let content_tests =
            ~first_response:
              "HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\n"
            ~status:304)
-  ; known_failure
-      ~ticket:"08"
-      "§6.4.1 client DEF: 100 response ends after the head"
-      (fun () ->
-         let c = Client.create () in
-         let ex = Client.request c (client_get "/") in
-         Client.feed c ("HTTP/1.1 100 Continue\r\n\r\n" ^ next_ok);
-         check_client_ex "final response" ~status:200 ~body:"ok" ex)
+  ; test "§6.4.1 client DEF: 100 response ends after the head" (fun () ->
+      let c = Client.create () in
+      let ex = Client.request c (client_get "/") in
+      Client.feed c ("HTTP/1.1 100 Continue\r\n\r\n" ^ next_ok);
+      check_client_ex "final response" ~status:200 ~body:"ok" ex)
   ]
 
 let trailer_tests =

@@ -364,9 +364,7 @@ module Server = struct
       body
 
   let send_continue ex =
-    try respond_raw `Continue ex with
-    | Invalid_argument msg ->
-      raise (Api_changed ("respond_with_string with 100: " ^ msg))
+    Reqd.respond_with_informational ex.reqd (Response.create `Continue)
 
   let respond_after_body ?headers ?body status ex =
     read_body ex ~on_complete:(fun _ -> respond ?headers ?body status ex)

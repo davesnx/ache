@@ -116,6 +116,22 @@ let response_exn { response_state; _ } =
   | Waiting -> failwith "ache.Reqd.response_exn: response has not started"
   | Streaming (response, _) | Fixed response | Upgrade response -> response
 
+let frame ~fn ~length t (response : Response.t) =
+  if Status.is_informational response.status
+  then
+    invalid_arg
+      (fn
+      ^ ": a 1xx response is not final; use respond_with_informational, or \
+         respond_with_upgrade for 101");
+  Response.frame
+    ~fn
+    ~proxy:t.proxy
+    ~request_method:t.request.meth
+    ~request_version:t.request.version
+    ~persistent:t.persistent
+    ~length
+    response
+
 let respond_with_string t response str =
   if t.error_code <> `Ok
   then
@@ -123,9 +139,15 @@ let respond_with_string t response str =
       "ache.Reqd.respond_with_string: invalid state, currently handling error";
   match t.response_state with
   | Waiting ->
-    (* XXX(seliopou): check response body length *)
+    let response, encoding =
+      frame
+        ~fn:"ache.Reqd.respond_with_string"
+        ~length:(Some (String.length str))
+        t
+        response
+    in
     Writer.write_response t.writer response;
-    Writer.write_string t.writer str;
+    if encoding <> `No_body then Writer.write_string t.writer str;
     if t.persistent then t.persistent <- Response.persistent_connection response;
     t.response_state <- Fixed response;
     Writer.wakeup t.writer
@@ -142,9 +164,15 @@ let respond_with_bigstring t response (bstr : Bigstringaf.t) =
        error";
   match t.response_state with
   | Waiting ->
-    (* XXX(seliopou): check response body length *)
+    let response, encoding =
+      frame
+        ~fn:"ache.Reqd.respond_with_bigstring"
+        ~length:(Some (Bigstringaf.length bstr))
+        t
+        response
+    in
     Writer.write_response t.writer response;
-    Writer.schedule_bigstring t.writer bstr;
+    if encoding <> `No_body then Writer.schedule_bigstring t.writer bstr;
     if t.persistent then t.persistent <- Response.persistent_connection response;
     t.response_state <- Fixed response;
     Writer.wakeup t.writer
@@ -153,20 +181,41 @@ let respond_with_bigstring t response (bstr : Bigstringaf.t) =
   | Fixed _ ->
     failwith "ache.Reqd.respond_with_bigstring: response already complete"
 
+let respond_with_informational t (response : Response.t) =
+  if t.error_code <> `Ok
+  then
+    failwith
+      "ache.Reqd.respond_with_informational: invalid state, currently handling \
+       error";
+  if
+    (not (Status.is_informational response.status))
+    || Status.to_code response.status = 101
+  then
+    invalid_arg
+      "ache.Reqd.respond_with_informational: the status must be 1xx and not 101";
+  if
+    Headers.mem response.headers "content-length"
+    || Headers.mem response.headers "transfer-encoding"
+  then
+    invalid_arg
+      "ache.Reqd.respond_with_informational: content-length or \
+       transfer-encoding in a 1xx";
+  match t.response_state with
+  | Waiting ->
+    if Version.compare t.request.version Version.v1_1 >= 0
+    then (
+      Writer.write_response t.writer response;
+      Writer.wakeup t.writer)
+  | Streaming _ | Upgrade _ ->
+    failwith "ache.Reqd.respond_with_informational: response already started"
+  | Fixed _ ->
+    failwith "ache.Reqd.respond_with_informational: response already complete"
+
 let unsafe_respond_with_streaming ~flush_headers_immediately t response =
   match t.response_state with
   | Waiting ->
-    let encoding =
-      match
-        Response.body_length
-          ~proxy:t.proxy
-          ~request_method:t.request.meth
-          response
-      with
-      | (`Fixed _ | `Close_delimited | `Chunked) as encoding -> encoding
-      | `Error (`Bad_gateway | `Internal_server_error) ->
-        failwith
-          "ache.Reqd.respond_with_streaming: invalid response body length"
+    let response, encoding =
+      frame ~fn:"ache.Reqd.respond_with_streaming" ~length:None t response
     in
     let response_body =
       Body.Writer.create t.response_body_buffer ~encoding ~writer:t.writer
@@ -278,12 +327,21 @@ let close_request_body { request_body; _ } = Body.Reader.close request_body
 let error_code t =
   match t.error_code with #error as error -> Some error | `Ok -> None
 
-let persistent_connection t = t.persistent
+let persistent_connection t =
+  t.persistent
+  &&
+  match t.response_state with
+  | Streaming (_, response_body) ->
+    not (Body.Writer.is_incomplete response_body)
+  | Waiting | Fixed _ | Upgrade _ -> true
 
 let input_state t : Io_state.t =
   match t.response_state, t.request.meth with
   | Upgrade _, _ when Reader.is_closed t.reader -> Complete
-  | Upgrade _, _ | _, `CONNECT -> Wait
+  | Upgrade _, _ | Waiting, `CONNECT -> Wait
+  | (Fixed response | Streaming (response, _)), `CONNECT
+    when Status.is_successful response.status ->
+    Wait
   | _ ->
     if Body.Reader.is_closed t.request_body
     then Complete

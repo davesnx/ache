@@ -7,6 +7,8 @@ let () =
     ; "headers", Test_headers.tests
     ; "request", Test_request.tests
     ; "response", Test_response.tests
+    ; "status", Test_status.tests
+    ; "framing", Test_framing.tests
     ; "grammar", Test_grammar.tests
     ; "parse", Test_parse.tests
     ; "client connection", Test_client_connection.tests
