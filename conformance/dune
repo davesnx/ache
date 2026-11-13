@@ -1,0 +1,3 @@
+(executables
+ (names h1spec_eio h1spec_lwt)
+ (libraries ache ache-eio ache-lwt ache_examples eio_main lwt lwt.unix unix))
