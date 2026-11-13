@@ -18,7 +18,7 @@ depends: [
   "dune" {>= "3.17"}
   "ocaml" {>= "5.3"}
   "bigstringaf"
-  "parseff" {>= "0.5.0" & < "0.6.0"}
+  "parseff" {> "0.5.0"}
   "alcotest" {with-test}
   "faraday" {with-test}
   "ocamlformat" {= "0.29.0" & with-dev-setup}
@@ -40,3 +40,9 @@ build: [
 ]
 dev-repo: "git+https://github.com/davesnx/ache.git"
 x-maintenance-intent: ["(latest)"]
+pin-depends: [
+  [
+    "parseff.dev"
+    "git+https://github.com/davesnx/parseff#ec48b6a482fa49706a490bb3b62c290efa45ef2d"
+  ]
+]

@@ -1,1 +1,7 @@
 x-maintenance-intent: ["(latest)"]
+pin-depends: [
+  [
+    "parseff.dev"
+    "git+https://github.com/davesnx/parseff#ec48b6a482fa49706a490bb3b62c290efa45ef2d"
+  ]
+]

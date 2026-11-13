@@ -21,8 +21,10 @@ fork of [httpaf](https://github.com/inhabitedtype/httpaf). It keeps their
 - Message heads are parsed with [parseff](https://github.com/davesnx/parseff).
   There is no gluten and no Angstrom; Faraday is vendored.
 
-Status: not released. The API can change before 1.0. Users of httpun 0.2
-can read [Migrating from httpun](#migrating-from-httpun-02).
+Status: not released, and not publishable to opam until parseff releases
+`Source.of_function ?buf_size` (see [Install](#install)). The API can change
+before 1.0. Users of httpun 0.2 can read
+[Migrating from httpun](#migrating-from-httpun-02).
 
 ## Install
 
@@ -32,6 +34,12 @@ ache is not on opam yet. Pin it from GitHub:
 opam pin add ache https://github.com/davesnx/ache.git
 opam pin add ache-eio https://github.com/davesnx/ache.git  # or ache-lwt
 ```
+
+ache needs a parseff later than 0.5.0, which is not released yet. The
+`pin-depends` field of `ache.opam` pins `parseff.dev` to
+[davesnx/parseff#57](https://github.com/davesnx/parseff/pull/57), so the
+commands above fetch it. ache cannot be published to the opam repository
+until a parseff release contains that change.
 
 ache needs OCaml 5.3 or later.
 
