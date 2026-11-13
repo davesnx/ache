@@ -1,0 +1,17 @@
+(executable
+ (name gen_readme))
+
+(rule
+ (deps
+  (glob_files ../eio/*.ml)
+  (glob_files ../lwt/*.ml))
+ (action
+  (with-stdout-to
+   README.md.gen
+   (run ./gen_readme.exe ../.. %{dep:../../README.md}))))
+
+(rule
+ (alias runtest)
+ (package ache)
+ (action
+  (diff ../../README.md README.md.gen)))
