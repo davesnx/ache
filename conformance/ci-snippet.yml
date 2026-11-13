@@ -1,9 +1,5 @@
-# Not run yet. Once conformance/run.sh has passed against h1spec, add this
-# job under `jobs:` in .github/workflows/ci.yml, between `docs` and
-# `release`, with `needs: build`. run.sh needs Deno 2. h1spec has no licence
-# file: it is fetched at the pinned commit when the job runs and must not be
-# vendored.
 h1spec:
+  needs: build
   runs-on: ubuntu-latest
   strategy:
     fail-fast: false
@@ -16,13 +12,12 @@ h1spec:
         repository: uNetworking/h1spec
         ref: f0a5650a20c575fbea0f7179a3a9cfa50f20ba6e
         path: _h1spec
-    - uses: ocaml/setup-ocaml@v3
+    - uses: ml-in-barcelona/gh-ci-action@v1.2.0
       with:
-        ocaml-compiler: "5.3"
-    - uses: denoland/setup-deno@v2
+        ocaml-compiler: 5.3.0
+    - uses: actions/setup-node@v4
       with:
-        deno-version: v2.1.x
-    - run: opam install . --deps-only --with-test --yes
+        node-version: 22
     - run: opam exec -- sh conformance/run.sh "h1spec-${{ matrix.runtime }}.txt"
       env:
         RUNTIME: ${{ matrix.runtime }}
@@ -32,3 +27,4 @@ h1spec:
       with:
         name: h1spec-${{ matrix.runtime }}
         path: h1spec-${{ matrix.runtime }}.txt
+        if-no-files-found: ignore
