@@ -56,9 +56,15 @@ let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
 let is_waiting t = (not (is_closed t)) && Queue.is_empty t.request_queue
 let is_active t = not (Queue.is_empty t.request_queue)
 let current_respd_exn t = Queue.peek t.request_queue
-let yield_reader t k = Reader.on_wakeup t.reader k
+
+let yield_reader t k =
+  if Reader.is_closed t.reader then k () else Reader.on_wakeup t.reader k
+
 let wakeup_reader t = Reader.wakeup t.reader
-let yield_writer t k = Writer.on_wakeup t.writer k
+
+let yield_writer t k =
+  if Writer.is_closed t.writer then k () else Writer.on_wakeup t.writer k
+
 let wakeup_writer t = Writer.wakeup t.writer
 
 let create ?(config = Config.default) () =
@@ -128,6 +134,7 @@ let shutdown_reader t =
 let shutdown_writer t =
   if is_active t then Respd.close_request_body (current_respd_exn t);
   Writer.close t.writer;
+  Queue.iter Respd.flush_request_body t.request_queue;
   wakeup_writer t
 
 let shutdown t =
@@ -137,11 +144,11 @@ let shutdown t =
 let set_error_and_handle t error =
   let reading respd =
     match respd.Respd.state, Respd.input_state respd with
-    | (Awaiting_response | Upgraded _), _ -> true
+    | Awaiting_response, _ -> true
     | Received_response _, (Wait | Ready) -> true
     | Received_response _, Complete ->
       (match Reader.next t.reader with `Error _ | `Read -> true | _ -> false)
-    | (Uninitialized | Closed), _ -> false
+    | (Uninitialized | Upgraded _ | Closed), _ -> false
   in
   (match List.find_opt reading (List.of_seq (Queue.to_seq t.request_queue)) with
   | Some respd -> Respd.report_error respd error
@@ -158,8 +165,11 @@ let report_exn t exn = set_error_and_handle t (`Exn exn)
 
 exception Local
 
-let idempotent respd =
-  match (Respd.request respd).meth with
+let pipelinable respd =
+  let request = Respd.request respd in
+  (not (Reader.may_switch_protocols request))
+  &&
+  match request.meth with
   | #Method.standard as meth -> Method.is_idempotent meth
   | `Other _ -> false
 
@@ -176,7 +186,7 @@ let maybe_pipeline_queued_requests t =
              | None -> ()
              | Some prev ->
                (match respd.Respd.state, Respd.output_state prev with
-               | Uninitialized, Complete when idempotent prev ->
+               | Uninitialized, Complete when pipelinable prev ->
                  Respd.write_request respd;
                  Respd.flush_request_body respd
                | _ ->
@@ -305,4 +315,9 @@ and _final_write_operation_for t respd =
         _next_write_operation t))
 
 let next_write_operation t = _next_write_operation t
-let report_write_result t result = Writer.report_result t.writer result
+
+let report_write_result t result =
+  Writer.report_result t.writer result;
+  match result with
+  | `Ok _ -> ()
+  | `Closed -> Queue.iter Respd.flush_request_body t.request_queue

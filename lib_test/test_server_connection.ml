@@ -3025,15 +3025,21 @@ let test_error_handler_invalid_headers_closes () =
     splits
 
 module Recorder = struct
-  type t = { mutable got : string }
+  type t =
+    { mutable got : string
+    ; mutable eof : bool
+    }
 
-  let next_read_operation _ = `Read
+  let next_read_operation t = if t.eof then `Close else `Read
 
   let read t bs ~off ~len =
     t.got <- t.got ^ Bigstringaf.substring bs ~off ~len;
     len
 
-  let read_eof = read
+  let read_eof t bs ~off ~len =
+    t.eof <- true;
+    read t bs ~off ~len
+
   let yield_reader _ _ = ()
   let next_write_operation _ = `Yield
   let report_write_result _ _ = ()
@@ -3074,7 +3080,7 @@ let each_switching_case f =
 
 let test_bytes_after_upgrade_request_go_to_new_protocol () =
   each_switching_case (fun label ~chunk request trailing ->
-    let recorder = { Recorder.got = "" } in
+    let recorder = { Recorder.got = ""; eof = false } in
     let calls = ref 0 in
     let t =
       Raw.create (fun reqd ->
@@ -3179,7 +3185,7 @@ let test_respond_after_upgrade_before_flush () =
       Reqd.respond_with_upgrade
         r
         Headers.empty
-        (Ache.Runtime.make (module Recorder) { Recorder.got = "" }))
+        (Ache.Runtime.make (module Recorder) { Recorder.got = ""; eof = false }))
   in
   Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
   let reqd = Option.get !reqd in
@@ -3352,7 +3358,7 @@ let test_upgrade_wins_over_connection_close () =
        List.iter
          (fun async ->
             let label = split ^ if async then ", async" else ", sync" in
-            let recorder = { Recorder.got = "" } in
+            let recorder = { Recorder.got = ""; eof = false } in
             let respond reqd =
               Reqd.respond_with_upgrade
                 reqd
@@ -3392,6 +3398,244 @@ let test_upgrade_wins_over_connection_close () =
               "ping"
               recorder.got)
          [ false; true ])
+    splits
+
+type switch_timing =
+  | Before_eof
+  | After_eof
+  | Never
+
+let test_switching_request_then_eof () =
+  let forbidden =
+    Response.create
+      ~headers:(Headers.of_list [ "content-length", "0" ])
+      `Forbidden
+  in
+  List.iter
+    (fun (split, chunk) ->
+       List.iter
+         (fun (kind, request) ->
+            List.iter
+              (fun (timing, upgrade) ->
+                 let label =
+                   Printf.sprintf
+                     "%s, %s, %s, %s"
+                     kind
+                     (match timing with
+                     | Before_eof -> "responds before EOF"
+                     | After_eof -> "responds after EOF"
+                     | Never -> "never responds")
+                     (if upgrade then "101" else "403")
+                     split
+                 in
+                 let recorder = { Recorder.got = ""; eof = false } in
+                 let respond reqd =
+                   if upgrade
+                   then
+                     Reqd.respond_with_upgrade
+                       reqd
+                       Headers.empty
+                       (Ache.Runtime.make (module Recorder) recorder)
+                   else Reqd.respond_with_string reqd forbidden ""
+                 in
+                 let held = ref None in
+                 let t =
+                   Raw.create (fun reqd ->
+                     if timing = Before_eof
+                     then respond reqd
+                     else held := Some reqd)
+                 in
+                 Raw.feed ~eof:true ~chunk t request;
+                 if timing <> Before_eof
+                 then
+                   Alcotest.check
+                     read_operation
+                     (label ^ ": reader closed after EOF")
+                     `Close
+                     (Raw.read_op t);
+                 if timing = After_eof then Option.iter respond !held;
+                 ignore (Raw.write_all t);
+                 let output = Raw.take_output t in
+                 match timing, upgrade with
+                 | Never, _ ->
+                   Alcotest.(check string)
+                     (label ^ ": nothing written")
+                     ""
+                     output
+                 | _, true ->
+                   Alcotest.(check string)
+                     (label ^ ": 101 written")
+                     "HTTP/1.1 101 Switching Protocols\r\n\r\n"
+                     output;
+                   Alcotest.(check bool)
+                     (label ^ ": new protocol sees EOF")
+                     true
+                     recorder.eof
+                 | _, false ->
+                   Alcotest.(check bool)
+                     (label ^ ": 403 written")
+                     true
+                     (String.starts_with ~prefix:"HTTP/1.1 403 " output);
+                   Alcotest.(check bool)
+                     (label ^ ": closed")
+                     true
+                     (Raw.write_all t = `Close))
+              [ Before_eof, false
+              ; Before_eof, true
+              ; After_eof, false
+              ; After_eof, true
+              ; Never, false
+              ])
+         switching_requests)
+    splits
+
+let test_requests_after_write_closed () =
+  List.iter
+    (fun (split, chunk) ->
+       let reqds = ref [] in
+       let t = Raw.create (fun reqd -> reqds := reqd :: !reqds) in
+       let request = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
+       Raw.feed ~chunk t request;
+       Server_connection.report_write_result t.conn `Closed;
+       Raw.feed ~chunk t (request ^ request);
+       Alcotest.(check int)
+         (split ^ ": handler called for each request")
+         3
+         (List.length !reqds);
+       List.iter
+         (fun reqd ->
+            match Reqd.respond_with_streaming reqd (Response.create `OK) with
+            | body ->
+              Alcotest.(check bool)
+                (split ^ ": body writer closed")
+                true
+                (Body.Writer.is_closed body);
+              let result = ref None in
+              Body.Writer.flush body (fun r -> result := Some r);
+              Alcotest.(check (option flush_result))
+                (split ^ ": flush")
+                (Some `Closed)
+                !result;
+              Body.Writer.close body
+            | exception exn ->
+              Alcotest.failf
+                "%s: respond raised %s"
+                split
+                (Printexc.to_string exn))
+         !reqds;
+       Alcotest.(check bool)
+         (split ^ ": writer closed")
+         true
+         (Raw.write_all t = `Close);
+       Raw.feed ~eof:true ~chunk t "";
+       Alcotest.check
+         read_operation
+         (split ^ ": reader closed at EOF")
+         `Close
+         (Raw.read_op t);
+       Alcotest.(check string)
+         (split ^ ": nothing written")
+         ""
+         (Raw.take_output t))
+    splits
+
+let test_error_handler_respond_twice () =
+  let second = ref None in
+  let t =
+    Raw.create
+      ~error_handler:(fun ?request:_ _ respond ->
+        Body.Writer.close (respond Headers.empty);
+        match respond Headers.empty with
+        | (_ : Body.Writer.t) -> second := Some "no exception"
+        | exception Failure msg -> second := Some msg)
+      (fun _ -> Alcotest.fail "request handler called")
+  in
+  Raw.feed ~chunk:max_int t "garbage garbage\r\n\r\n";
+  ignore (Raw.write_all t);
+  Alcotest.(check (option string))
+    "second call raises"
+    (Some "ache.Server_connection.error_handler: response already started")
+    !second;
+  Alcotest.(check string)
+    "one response"
+    "HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n"
+    (Raw.take_output t)
+
+let test_error_handler_flush_then_raise () =
+  List.iter
+    (fun (case, input, handler) ->
+       let results = ref [] in
+       let t =
+         Raw.create
+           ~error_handler:(fun ?request:_ _ respond ->
+             let body = respond Headers.empty in
+             Body.Writer.write_string body "x";
+             Body.Writer.flush body (fun r -> results := r :: !results);
+             raise Exit)
+           handler
+       in
+       Raw.feed ~chunk:max_int t input;
+       ignore (Raw.write_all t);
+       ignore (Raw.read_op t);
+       Alcotest.(check (list flush_result))
+         (case ^ ": flush answered once")
+         [ `Closed ]
+         !results)
+    [ ( "parse error"
+      , "garbage garbage\r\n\r\n"
+      , fun _ -> Alcotest.fail "request handler called" )
+    ; ( "handler exception"
+      , "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+      , fun reqd -> Reqd.report_exn reqd (Failure "handler") )
+    ]
+
+let test_report_exn_while_error_handler_pending () =
+  let respond = ref None in
+  let t =
+    Raw.create
+      ~error_handler:(fun ?request:_ _ r -> respond := Some r)
+      (fun reqd -> Reqd.report_exn reqd (Failure "handler"))
+  in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  (match Server_connection.report_exn t.conn (Failure "io") with
+  | () -> ()
+  | exception exn ->
+    Alcotest.failf "report_exn raised %s" (Printexc.to_string exn));
+  Alcotest.check read_operation "reader closed" `Close (Raw.read_op t);
+  Alcotest.(check bool) "writer closed" true (Raw.write_all t = `Close);
+  (match !respond with
+  | Some r -> Body.Writer.close (r Headers.empty)
+  | None -> Alcotest.fail "error handler not called");
+  Alcotest.(check bool) "still closed" true (Raw.write_all t = `Close);
+  Alcotest.(check string) "nothing written" "" (Raw.take_output t)
+
+let test_tunnel_after_eof () =
+  List.iter
+    (fun (split, chunk) ->
+       let held = ref None in
+       let t = Raw.create (fun reqd -> held := Some reqd) in
+       Raw.feed
+         ~eof:true
+         ~chunk
+         t
+         "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n\r\n";
+       let body =
+         Reqd.respond_with_streaming (Option.get !held) (Response.create `OK)
+       in
+       Body.Writer.write_string body "tunnel";
+       Body.Writer.flush body ignore;
+       ignore (Raw.write_all t);
+       let op = Raw.read_op t in
+       (if op = `Yield
+        then
+          match Server_connection.yield_reader t.conn ignore with
+          | () -> ()
+          | exception exn ->
+            Alcotest.failf
+              "%s: yield_reader raised %s"
+              split
+              (Printexc.to_string exn));
+       Alcotest.check read_operation (split ^ ": reader closed") `Close op)
     splits
 
 let tests =
@@ -3614,6 +3858,22 @@ let tests =
     , `Quick
     , test_respond_after_upgrade_before_flush )
   ; "head timeout answers 408", `Quick, test_head_timeout_is_408
+  ; ( "upgrade or CONNECT request, then EOF"
+    , `Quick
+    , test_switching_request_then_eof )
+  ; ( "requests after the write side closed"
+    , `Quick
+    , test_requests_after_write_closed )
+  ; ( "error handler response function called twice"
+    , `Quick
+    , test_error_handler_respond_twice )
+  ; ( "error handler flushes then raises"
+    , `Quick
+    , test_error_handler_flush_then_raise )
+  ; ( "report_exn while the error handler has not responded"
+    , `Quick
+    , test_report_exn_while_error_handler_pending )
+  ; "tunnel response after EOF", `Quick, test_tunnel_after_eof
   ; ( "upgrade wins over Connection: close"
     , `Quick
     , test_upgrade_wins_over_connection_close )

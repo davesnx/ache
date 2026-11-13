@@ -446,6 +446,182 @@ let response_body_end ~bytewise =
        Alcotest.(check bool) (label ^ ": on_error") (not complete) ex.body_error)
     body_end_cases
 
+let switching_cases =
+  [ ( "Upgrade GET"
+    , `GET
+    , "/up"
+    , [ "host", "a"; "upgrade", "x"; "connection", "upgrade" ]
+    , "HTTP/1.1 101 Switching Protocols\r\n\
+       Upgrade: x\r\n\
+       Connection: upgrade\r\n\
+       \r\n"
+    , 101 )
+  ; ( "CONNECT"
+    , `CONNECT
+    , "a:443"
+    , [ "host", "a:443" ]
+    , "HTTP/1.1 200 OK\r\n\r\n"
+    , 200 )
+  ]
+
+let written_has t target =
+  let s = Buffer.contents t.written in
+  let n = String.length target in
+  let rec go i =
+    i + n <= String.length s && (String.sub s i n = target || go (i + 1))
+  in
+  go 0
+
+let no_pipelining_behind_switch ~bytewise =
+  List.iter
+    (fun (label, meth, target, headers, head, status) ->
+       let t = create () in
+       let first = send ~meth ~headers t target in
+       let second = send t "/second" in
+       Alcotest.(check bool)
+         (label ^ ": second not written before the response")
+         false
+         (written_has t "/second");
+       feed ~bytewise t head;
+       Client_connection.shutdown t.c;
+       pump t;
+       check_ex (label ^ ", first") ~statuses:[ status ] first;
+       check_ex (label ^ ", second") ~errors:[ "Connection_closed" ] second;
+       Alcotest.(check bool)
+         (label ^ ": second never written")
+         false
+         (written_has t "/second"))
+    switching_cases;
+  let t = create () in
+  let first =
+    send
+      ~headers:[ "host", "a"; "upgrade", "x"; "connection", "upgrade" ]
+      t
+      "/up"
+  in
+  let second = send t "/second" in
+  feed ~bytewise t (ok "no");
+  check_ex "Upgrade refused, first" ~statuses:[ 200 ] ~body:"no" first;
+  Alcotest.(check bool)
+    "Upgrade refused: second written"
+    true
+    (written_has t "/second");
+  feed ~bytewise t (ok "r2");
+  check_ex "Upgrade refused, second" ~statuses:[ 200 ] ~body:"r2" second
+
+let report_exn_stages ~bytewise =
+  List.iter
+    (fun (label, input, statuses, body, errors, body_error) ->
+       let t = create () in
+       let ex =
+         if label = "after 101"
+         then
+           send
+             ~headers:[ "host", "a"; "upgrade", "x"; "connection", "upgrade" ]
+             t
+             "/"
+         else send t "/"
+       in
+       feed ~bytewise t input;
+       Client_connection.report_exn t.c Exit;
+       pump t;
+       check_ex label ~statuses ~body ~errors ex;
+       Alcotest.(check bool)
+         (label ^ ": body on_error")
+         body_error
+         ex.body_error)
+    [ "before the response", "", [], "", [ "Exn Stdlib.Exit" ], false
+    ; ( "mid-body"
+      , "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe"
+      , [ 200 ]
+      , "he"
+      , [ "Exn Stdlib.Exit" ]
+      , true )
+    ; "after a complete response", ok "done", [ 200 ], "done", [], false
+    ; ( "after 101"
+      , "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: x\r\n\
+         Connection: upgrade\r\n\
+         \r\n"
+      , [ 101 ]
+      , ""
+      , []
+      , false )
+    ]
+
+let request_body_flush_on_close ~bytewise:_ =
+  List.iter
+    (fun (label, close) ->
+       let t = create () in
+       let ex =
+         send
+           ~meth:`POST
+           ~headers:[ "host", "a"; "content-length", "10" ]
+           ~close_body:false
+           t
+           "/post"
+       in
+       ignore (take_written t : string);
+       let results = ref [] in
+       Body.Writer.write_string ex.writer "abc";
+       Body.Writer.flush ex.writer (fun r -> results := r :: !results);
+       close t;
+       pump t;
+       Alcotest.(check (list string))
+         (label ^ ": flush answered once")
+         [ "Closed" ]
+         (List.map
+            (function `Written -> "Written" | `Closed -> "Closed")
+            !results))
+    [ ("shutdown", fun t -> Client_connection.shutdown t.c)
+    ; ("report_exn", fun t -> Client_connection.report_exn t.c Exit)
+    ; ( "write fails"
+      , fun t ->
+          match Client_connection.next_write_operation t.c with
+          | `Write _ -> Client_connection.report_write_result t.c `Closed
+          | `Yield | `Close _ -> Alcotest.fail "expected a write" )
+    ]
+
+let request_after_peer_closed ~bytewise =
+  let t = create () in
+  let first = send t "/1" in
+  feed ~bytewise t (ok "r1");
+  close_input t;
+  check_ex "first" ~statuses:[ 200 ] ~body:"r1" first;
+  let errors = ref [] in
+  match
+    Client_connection.request
+      t.c
+      (Request.create ~headers:(Headers.of_list [ "host", "a" ]) `GET "/2")
+      ~error_handler:(fun e -> errors := error_to_string e :: !errors)
+      ~response_handler:(fun _ _ -> Alcotest.fail "response handler called")
+  with
+  | (_ : Body.Writer.t) ->
+    Alcotest.(check (list string)) "second" [ "Connection_closed" ] !errors
+  | exception exn -> Alcotest.failf "request raised %s" (Printexc.to_string exn)
+
+let write_closed_after_101 ~bytewise =
+  let t = create () in
+  let ex =
+    send ~headers:[ "host", "a"; "upgrade", "x"; "connection", "upgrade" ] t "/"
+  in
+  feed
+    ~bytewise
+    t
+    "HTTP/1.1 101 Switching Protocols\r\n\
+     Upgrade: x\r\n\
+     Connection: upgrade\r\n\
+     \r\n";
+  Client_connection.report_write_result t.c `Closed;
+  (match Client_connection.next_write_operation t.c with
+  | `Yield ->
+    (match Client_connection.yield_writer t.c ignore with
+    | () -> ()
+    | exception exn ->
+      Alcotest.failf "yield_writer raised %s" (Printexc.to_string exn))
+  | `Write _ | `Close _ -> ());
+  check_ex "upgrade" ~statuses:[ 101 ] ex
+
 let tests =
   [ both "response body cut short calls on_error, not on_eof" response_body_end
   ; both "unsolicited response is an error, not an exception" unsolicited
@@ -465,4 +641,13 @@ let tests =
   ; "obs-fold value", `Quick, obs_fold_value
   ; "obs-fold in a request is rejected", `Quick, obs_fold_request_rejected
   ; both "reader stops after 101 and 2xx to CONNECT" stops_after_upgrade
+  ; both
+      "no pipelining behind an Upgrade or CONNECT request"
+      no_pipelining_behind_switch
+  ; both "report_exn at each stage" report_exn_stages
+  ; both
+      "request body flush answered when the connection closes"
+      request_body_flush_on_close
+  ; both "request after the peer closed" request_after_peer_closed
+  ; both "write side closed after a 101" write_closed_after_101
   ]

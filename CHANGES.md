@@ -260,6 +260,27 @@ ache Unreleased
 - Server: a request with `Connection: close` and `Upgrade` that gets a 101
   switches protocols: the reader is not shut down while the response is
   pending, and the bytes after the request go to the new protocol.
+- Server: end of input while a `CONNECT` or `Upgrade` request waits for its
+  response closes the reader. Before, the reader yielded and `yield_reader`
+  raised `Failure "on_wakeup on closed reader"`. A 101 written
+  after end of input still switches, and the new protocol gets end of input.
+- Server: the error handler's response function raises `Failure` when called
+  a second time; it wrote a second response. Body flushes of an error
+  response are answered `` `Closed `` when the error handler raises.
+- Client: a request is not pipelined behind a `CONNECT` or `Upgrade` request.
+  After a 101 or a 2xx to `CONNECT` the requests behind it get
+  `` `Connection_closed `` when the connection is handed over, and the
+  switching request gets no error after its response handler ran.
+- Client: request body flushes are answered `` `Closed `` when the
+  connection closes or a write fails; they were never answered.
+- Server: `report_exn` while the error handler has not responded closes the
+  connection; it raised `Failure "ache.Reqd.report_exn: NYI"`.
+  `yield_reader` and `yield_writer` on a closed side call their callback
+  at once instead of raising, in both connections. A response to `CONNECT`
+  after end of input no longer leaves the reader yielding.
+- Client: `request` after the connection stopped writing calls the request's
+  error handler with `` `Connection_closed ``; it raised
+  `Failure "cannot write to closed writer"`.
 - Server: add `` `Request_timeout `` to `Reqd.error`. A request head that
   `?head_timeout` cuts gets 408 Request Timeout in place of 400.
 

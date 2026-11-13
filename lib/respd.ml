@@ -71,21 +71,14 @@ let create ~error_handler ~writer ~response_handler request request_body =
 
 let request { request; _ } = request
 
-let write_request t =
-  Writer.write_request t.writer t.request;
-  t.state <- Awaiting_response
-
 let report_error t error =
   t.persistent <- false;
   Body.Writer.force_close t.request_body;
   match t.state, t.error_code with
-  | (Uninitialized | Awaiting_response | Upgraded _), `Ok ->
+  | (Uninitialized | Awaiting_response), `Ok ->
     t.state <- Closed;
     t.error_code <- (error :> [ `Ok | error ]);
     t.error_handler error
-  | Uninitialized, `Exn _ ->
-    (* TODO(anmonteiro): Not entirely sure this is possible in the client. *)
-    assert false
   | Received_response (_, response_body), `Ok ->
     t.error_code <- (error :> [ `Ok | error ]);
     t.error_handler error;
@@ -96,6 +89,13 @@ let report_error t error =
     (* XXX(seliopou): Once additional logging support is added, log the error *
        in case it is not spurious. *)
     ()
+
+let write_request t =
+  if Writer.is_closed t.writer
+  then report_error t `Connection_closed
+  else (
+    Writer.write_request t.writer t.request;
+    t.state <- Awaiting_response)
 
 let persistent_connection t = t.persistent
 let close_request_body t = Body.Writer.close t.request_body
