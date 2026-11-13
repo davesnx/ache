@@ -106,7 +106,7 @@ let tests =
          Alcotest.(check (list string)) "no error" [] ex.errors;
          Alcotest.(check string) "body" "ok" ex.body)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"19"
       "§15 client SHOULD: received status 600 is classed as a server error"
       (fun () ->
          let _, ex =
@@ -119,17 +119,12 @@ let tests =
              true
              (Status.is_server_error r.status)
          | _ -> Alcotest.fail "one response")
-  ; known_failure
-      ~ticket:"new"
-      "§15 client SHOULD: status 099 gives a response or an error"
-      (fun () ->
-         let _, ex =
-           client_exchange "HTTP/1.1 099 Odd\r\nContent-Length: 2\r\n\r\nok"
-         in
-         Alcotest.(check int)
-           "one response or one error"
-           1
-           (List.length ex.responses + List.length ex.errors))
+  ; test "§15 client SHOULD: status 099 is a malformed response" (fun () ->
+      let _, ex =
+        client_exchange "HTTP/1.1 099 Odd\r\nContent-Length: 2\r\n\r\nok"
+      in
+      Alcotest.(check (list string)) "error" [ "Malformed_response" ] ex.errors;
+      Alcotest.(check int) "no response" 0 (List.length ex.responses))
   ; test
       "§15 client DEF: four-digit status 1000 is a malformed response"
       (fun () ->
@@ -141,8 +136,7 @@ let tests =
            [ "Malformed_response" ]
            ex.errors;
          Alcotest.(check int) "no response" 0 (List.length ex.responses))
-  ; known_failure
-      ~ticket:"new"
+  ; test
       "§15 client DEF: two-digit status 20 is a malformed response"
       (fun () ->
          let _, ex =

@@ -261,8 +261,7 @@ let content_tests =
   ]
 
 let trailer_tests =
-  [ known_failure
-      ~ticket:"06"
+  [ test
       "§6.5.1 server MUST NOT: trailer not merged into request headers"
       (fun () ->
          let s =
@@ -284,8 +283,7 @@ let trailer_tests =
              None
              (Headers.get ex.request.headers "x-trailer")
          | _ -> Alcotest.fail "expected one request")
-  ; known_failure
-      ~ticket:"06"
+  ; test
       "§6.5.1 client MUST NOT: trailer not merged into response headers"
       (fun () ->
          let c = Client.create () in

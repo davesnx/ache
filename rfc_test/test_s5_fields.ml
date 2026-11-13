@@ -180,28 +180,28 @@ let invalid_generated_values =
 
 let tests =
   [ known_failure
-      ~ticket:"new"
+      ~ticket:"17"
       "§2.2 server MUST NOT: no invalid field-name from the app on the wire"
       (fun () ->
          List.iter
            (fun h -> check_generated_head (server_generates [ h ]))
            invalid_generated_names)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"17"
       "§2.2 server MUST NOT: no CR, LF or NUL from the app in a field value"
       (fun () ->
          List.iter
            (fun h -> check_generated_head (server_generates [ h ]))
            invalid_generated_values)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"17"
       "§2.2 client MUST NOT: no invalid field-name from the app on the wire"
       (fun () ->
          List.iter
            (fun h -> check_generated_head (client_generates [ h ]))
            invalid_generated_names)
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"17"
       "§2.2 client MUST NOT: no CR, LF or NUL from the app in a field value"
       (fun () ->
          List.iter
@@ -407,41 +407,35 @@ let tests =
            [ "1"; "2" ]
            (server_values s "x-late");
          check_status "200" [ 200 ] s)
-  ; known_failure
-      ~ticket:"03"
-      "§5.4 server MUST: 4xx for a header section of 1 MiB"
-      (fun () ->
-         let line i =
-           Printf.sprintf "X-Fill-%05d: %s\r\n" i (String.make 500 'f')
-         in
-         let s = serve (String.concat "" (List.init 2048 line)) in
-         let codes = Server.statuses s in
-         Alcotest.(check bool)
-           (Printf.sprintf
-              "one 4xx, got [%s]"
-              (String.concat ";" (List.map string_of_int codes)))
-           true
-           (match codes with [ c ] -> c >= 400 && c < 500 | _ -> false);
-         Alcotest.(check int)
-           "request handler not called"
-           0
-           (Server.handler_calls s))
-  ; known_failure
-      ~ticket:"03"
-      "§5.4 server MUST: 4xx for one field line of 1 MiB"
-      (fun () ->
-         let s = serve ("X-Big: " ^ String.make (1 lsl 20) 'b' ^ "\r\n") in
-         let codes = Server.statuses s in
-         Alcotest.(check bool)
-           (Printf.sprintf
-              "one 4xx, got [%s]"
-              (String.concat ";" (List.map string_of_int codes)))
-           true
-           (match codes with [ c ] -> c >= 400 && c < 500 | _ -> false);
-         Alcotest.(check int)
-           "request handler not called"
-           0
-           (Server.handler_calls s))
+  ; test "§5.4 server MUST: 4xx for a header section of 1 MiB" (fun () ->
+      let line i =
+        Printf.sprintf "X-Fill-%05d: %s\r\n" i (String.make 500 'f')
+      in
+      let s = serve (String.concat "" (List.init 2048 line)) in
+      let codes = Server.statuses s in
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "one 4xx, got [%s]"
+           (String.concat ";" (List.map string_of_int codes)))
+        true
+        (match codes with [ c ] -> c >= 400 && c < 500 | _ -> false);
+      Alcotest.(check int)
+        "request handler not called"
+        0
+        (Server.handler_calls s))
+  ; test "§5.4 server MUST: 4xx for one field line of 1 MiB" (fun () ->
+      let s = serve ("X-Big: " ^ String.make (1 lsl 20) 'b' ^ "\r\n") in
+      let codes = Server.statuses s in
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "one 4xx, got [%s]"
+           (String.concat ";" (List.map string_of_int codes)))
+        true
+        (match codes with [ c ] -> c >= 400 && c < 500 | _ -> false);
+      Alcotest.(check int)
+        "request handler not called"
+        0
+        (Server.handler_calls s))
   ; test
       "§5.5 server MUST: leading and trailing whitespace is not in the value"
       (fun () ->

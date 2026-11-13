@@ -290,7 +290,7 @@ let tests =
               Alcotest.(check string) "target" target r.target)
            [ "example.com:443"; "example.com:80"; "[::1]:8080" ])
   ; known_failure
-      ~ticket:"new"
+      ~ticket:"18"
       "§9.3.6 server MUST: 400 for CONNECT with an empty or invalid port"
       (fun () ->
          List.iter
