@@ -43,6 +43,8 @@ module type Server = sig
 
   val create_connection_handler :
      ?config:Ache.Config.t
+    -> ?idle_timeout:float
+    -> ?head_timeout:float
     -> request_handler:(addr -> Ache.Reqd.t -> unit)
     -> error_handler:(addr -> Ache.Server_connection.error_handler)
     -> addr

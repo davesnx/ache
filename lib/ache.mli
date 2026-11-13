@@ -523,6 +523,17 @@ module Server_connection : sig
   val shutdown : t -> unit
 
   (**/**)
+
+  val read_timeout : t -> ([ `Idle | `Head ] * (unit -> unit)) option
+  (** [read_timeout t] tells a runtime which read timeout applies while it
+      waits for input on [t], and the action to run when that timeout expires.
+      - [Some (`Idle, close)]: no request is in progress. [close] closes the
+        connection and writes nothing.
+      - [Some (`Head, reject)]: a request head is partly read. [reject] calls
+        [error_handler] with [`Bad_request] (400) and closes the connection
+        after the error response. The request handler is not called.
+      - [None]: a request body is being read, a response is in progress, or
+        the connection is closing or upgraded. No timeout applies. *)
 end
 
 (** {2 Client Connection} *)

@@ -57,9 +57,8 @@ let main port =
       Server.create_connection_handler
         ~request_handler
         ~error_handler
-        ~sw
-        client_addr
         socket
+        client_addr
     in
     Eio.Switch.run (fun sw ->
       let socket =

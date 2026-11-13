@@ -172,6 +172,30 @@ ache Unreleased
   method: `*` is only for OPTIONS, authority-form only for CONNECT, and other
   methods need origin-form or absolute-form (RFC 9112 §3.2). httpun passed
   `GET *` and `GET 127.0.0.1:80` to the handler.
+- `ache-eio`, `ache-lwt`: a write that fails because the peer is gone
+  (`EPIPE`, `ECONNRESET`, `ENOTCONN`, Eio `Connection_reset`) reports
+  `` `Closed ``, so a pending `Body.Writer.flush` callback gets `` `Closed ``
+  and the connection ends. httpun reported `ECONNRESET` as an exception and
+  the flush callback was never called (httpun #155). A read that fails with
+  `ECONNRESET` or `ENOTCONN` is end of input in `ache-lwt`, as in `ache-eio`.
+- `ache-eio`: `Server.create_connection_handler` takes the flow before the
+  address and no longer takes `~sw`, so
+  `create_connection_handler ~request_handler ~error_handler` can be passed
+  to `Eio.Net.run_server` or `Eio.Net.accept_fork` (httpun #154).
+- Server timeouts, off by default: `?idle_timeout` closes a connection that
+  has no request in progress and receives nothing for that many seconds;
+  `?head_timeout` rejects a request head that is not complete that many
+  seconds after its first bytes (400 through `error_handler`). A request body
+  or a response in progress is never timed out. `Ache_eio` also takes
+  `?clock`, which a timeout requires. Added to both
+  `create_connection_handler`; the runtimes use the new
+  `Server_connection.read_timeout`.
+- `ache-eio`: cancelling the connection fiber no longer reports
+  `Cancelled` to the error handler. Each direction of the flow is shut down
+  once; after a failure httpun shut down the sending side twice.
+- `ache-lwt`: the socket is closed once, also when the peer reset the
+  connection (the close was skipped when `shutdown` failed) and when
+  `Client.shutdown` and the IO loop both close it.
 
 httpun history
 ==============

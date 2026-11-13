@@ -85,7 +85,7 @@ let main port =
                   ~on_error:log_connection_error
                   (fun client_sock client_addr ->
                      let p, u = Eio.Promise.create () in
-                     handler ~sw ~u client_addr client_sock;
+                     handler ~u client_sock client_addr;
                      Eio.Promise.await_exn p)
               done;
               `Stop_daemon)))

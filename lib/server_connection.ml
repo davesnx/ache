@@ -439,3 +439,12 @@ let shutdown t =
   match t.upgraded with
   | None -> shutdown t
   | Some (Runtime.Impl ((module P), p)) -> P.shutdown p
+
+let read_timeout t =
+  match t.upgraded, t.error_code with
+  | None, No_error when not (is_active t) ->
+    (match Reader.next t.reader with
+    | `Start -> Some (`Idle, fun () -> shutdown t)
+    | `Read -> Some (`Head, fun () -> set_error_and_handle t `Bad_request)
+    | `Close | `Error _ -> None)
+  | _ -> None

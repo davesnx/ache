@@ -1,4 +1,12 @@
 (test
  (name test_ache_eio)
  (package ache-eio)
- (libraries ache ache-eio alcotest bigstringaf eio eio_main))
+ (libraries
+  ache
+  ache-eio
+  alcotest
+  bigstringaf
+  eio
+  eio.mock
+  eio.unix
+  eio_main))
