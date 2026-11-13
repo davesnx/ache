@@ -69,15 +69,22 @@ module Grammar = struct
     | _ -> false
 
   (* [Parseff.consume] reads the whole literal before it compares any byte. *)
-  let literal s =
-    Parseff.expect (Printf.sprintf "%S" s) (fun () ->
-      String.iter (fun c -> ignore (Parseff.char c)) s)
+  let crlf () =
+    ignore (Parseff.char '\r');
+    ignore (Parseff.char '\n')
 
-  let eol () = literal "\r\n"
+  let http_slash () =
+    ignore (Parseff.char 'H');
+    ignore (Parseff.char 'T');
+    ignore (Parseff.char 'T');
+    ignore (Parseff.char 'P');
+    ignore (Parseff.char '/')
+
+  let eol () = Parseff.expect {|"\r\n"|} crlf
   let digit () = Char.code (Parseff.satisfy is_digit ~label:"digit") - 48
 
   let version () =
-    literal "HTTP/";
+    Parseff.expect {|"HTTP/"|} http_slash;
     let major = digit () in
     ignore (Parseff.char '.');
     let minor = digit () in

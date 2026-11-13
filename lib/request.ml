@@ -96,43 +96,46 @@ let is_ip_literal_char = function
   | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' | ':' | '.' -> true
   | _ -> false
 
-(* RFC 3986 §3.2: uri-host [ ":" port ]. *)
-let authority s =
+let rec all_in f s i stop = i >= stop || (f s.[i] && all_in f s (i + 1) stop)
+
+let rec index_from s i c =
+  if i >= String.length s
+  then -1
+  else if s.[i] = c
+  then i
+  else index_from s (i + 1) c
+
+(* RFC 3986 §3.2.2: the end of the uri-host that starts [s], or -1. *)
+let host_end s =
   let length = String.length s in
-  let host_end =
-    if length > 0 && s.[0] = '['
-    then
-      match String.index_opt s ']' with
-      | Some j
-        when j > 1 && String.for_all is_ip_literal_char (String.sub s 1 (j - 1))
-        ->
-        Some (j + 1)
-      | _ -> None
-    else
-      let j = Option.value (String.index_opt s ':') ~default:length in
-      if String.for_all is_reg_name_char (String.sub s 0 j)
-      then Some j
-      else None
-  in
-  match host_end with
-  | None -> None
-  | Some j when j = length -> Some (s, None)
-  | Some j when s.[j] = ':' ->
-    let port = String.sub s (j + 1) (length - j - 1) in
-    if String.for_all Message.is_digit port
-    then Some (String.sub s 0 j, Some port)
-    else None
-  | Some _ -> None
+  if length > 0 && s.[0] = '['
+  then
+    let j = index_from s 0 ']' in
+    if j > 1 && all_in is_ip_literal_char s 1 j then j + 1 else -1
+  else
+    let j = index_from s 0 ':' in
+    let j = if j < 0 then length else j in
+    if all_in is_reg_name_char s 0 j then j else -1
+
+(* RFC 3986 §3.2: uri-host [ ":" port ]. *)
+let is_host_field s =
+  let length = String.length s in
+  let j = host_end s in
+  j >= 0
+  && (j = length || (s.[j] = ':' && all_in Message.is_digit s (j + 1) length))
 
 (* RFC 9110 §9.3.6: CONNECT targets uri-host ":" port. *)
 let is_connect_target target =
-  match authority target with
-  | Some (host, Some port) ->
-    host <> ""
-    && port <> ""
-    && String.length port <= 5
-    && int_of_string port <= 65535
-  | Some (_, None) | None -> false
+  let length = String.length target in
+  let j = host_end target in
+  let digits = length - j - 1 in
+  j > 0
+  && j < length
+  && target.[j] = ':'
+  && digits >= 1
+  && digits <= 5
+  && all_in Message.is_digit target (j + 1) length
+  && int_of_string (String.sub target (j + 1) digits) <= 65535
 
 let is_scheme_char = function
   | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '+' | '-' | '.' -> true
@@ -177,7 +180,7 @@ let received_body_length ({ meth; target; version; headers } as t) =
     match Headers.get_multi headers "host" with
     | [] when Version.compare version Version.v1_1 >= 0 -> Error `Bad_request
     | _ :: _ :: _ -> Error `Bad_request
-    | [ host ] when Option.is_none (authority host) -> Error `Bad_request
+    | [ host ] when not (is_host_field host) -> Error `Bad_request
     | _ when not (target_fits_method meth target) -> Error `Bad_request
     | _ ->
       (match transfer_coding_error t with

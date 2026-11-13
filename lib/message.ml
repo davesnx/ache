@@ -38,18 +38,52 @@ let list_members values =
     (fun value -> List.map String.trim (String.split_on_char ',' value))
     values
 
-let has_option headers option =
-  List.exists
-    (Headers.ci_equal option)
-    (list_members (Headers.get_multi headers "connection"))
+let is_trimmed = function
+  | ' ' | '\t' | '\n' | '\r' | '\012' -> true
+  | _ -> false
+
+let rec ci_equal_at value off token i =
+  i = String.length token
+  || (Char.lowercase_ascii value.[off + i] = Char.lowercase_ascii token.[i]
+     && ci_equal_at value off token (i + 1))
+
+let rec member_end value i =
+  if i < String.length value && value.[i] <> ','
+  then member_end value (i + 1)
+  else i
+
+let rec skip_forward value i stop =
+  if i < stop && is_trimmed value.[i]
+  then skip_forward value (i + 1) stop
+  else i
+
+let rec skip_backward value start i =
+  if i > start && is_trimmed value.[i - 1]
+  then skip_backward value start (i - 1)
+  else i
+
+let rec has_member_from value token start =
+  let stop = member_end value start in
+  let first = skip_forward value start stop in
+  let last = skip_backward value first stop in
+  (last - first = String.length token && ci_equal_at value first token 0)
+  || (stop < String.length value && has_member_from value token (stop + 1))
+
+let rec has_member values token =
+  match values with
+  | [] -> false
+  | value :: values -> has_member_from value token 0 || has_member values token
 
 let persistent_connection ?(proxy = false) version headers =
   let _ = proxy in
   (* XXX(seliopou): use proxy argument in the case of HTTP/1.0 as per
      https://tools.ietf.org/html/rfc7230#section-6.3 *)
-  if has_option headers "close"
-  then false
-  else Version.(compare version v1_1) >= 0 || has_option headers "keep-alive"
+  match Headers.get_multi headers "connection" with
+  | [] -> Version.(compare version v1_1) >= 0
+  | options ->
+    if has_member options "close"
+    then false
+    else Version.(compare version v1_1) >= 0 || has_member options "keep-alive"
 
 let sort_uniq xs =
   (* Though {!List.sort_uniq} performs a check on the input length and returns *
