@@ -325,4 +325,11 @@ let tests =
         "HTTP/1.1 500 Internal Server Error"
         r.start_line;
       Alcotest.(check bool) "explanation" true (String.length r.body > 0))
+  ; test
+      "§15.6.6 server SHOULD: library 505 carries the error handler's content"
+      (fun () ->
+         let s = Server.run "GET / HTTP/2.0\r\nHost: a\r\n\r\n" in
+         check_rejected ~allowed:[ 505 ] s;
+         let r = Server.response s in
+         Alcotest.(check string) "content from the error handler" "error" r.body)
   ]

@@ -648,7 +648,10 @@ let client_tests =
          Client.feed c (ok_response ~headers:"Connection: close\r\n" "ok");
          check_client_closed "client closed" c;
          check_client_statuses "second not answered" [] ex2;
-         check_client_errors "second request gets an error" true ex2)
+         Alcotest.(check (list string))
+           "second request gets Connection_closed"
+           [ "Connection_closed" ]
+           ex2.errors)
   ; test
       "§9.6 client MUST NOT: no request written after one with Connection: \
        close"
@@ -795,5 +798,50 @@ let integrity_tests =
          Alcotest.check strings "bodies" [ "abc"; "" ] (server_bodies s))
   ]
 
+let timeout_action s =
+  Server_connection.read_timeout s.Server.driver.Server.D.conn
+
+let timeout_tests =
+  [ test
+      "§9.5 server SHOULD: idle timeout closes gracefully and writes nothing"
+      (fun () ->
+         let s = Server.run (get "/") in
+         check_status "answered" [ 200 ] s;
+         ignore (Server.take_output s);
+         (match timeout_action s with
+         | Some (`Idle, close) -> close ()
+         | Some (`Head, _) -> Alcotest.fail "head timeout between requests"
+         | None -> Alcotest.fail "no timeout between requests");
+         Server.pump s;
+         Alcotest.(check string) "nothing written" "" (Server.output s);
+         check_closed "connection closed" s)
+  ; test
+      "§9.5 server SHOULD: head timeout answers 408 and closes without the \
+       handler"
+      (fun () ->
+         let s = Server.run "GET / HTTP/1.1\r\nHo" in
+         (match timeout_action s with
+         | Some (`Head, reject) -> reject ()
+         | Some (`Idle, _) -> Alcotest.fail "idle timeout inside a head"
+         | None -> Alcotest.fail "no timeout inside a head");
+         Server.pump s;
+         check_rejected ~allowed:[ 408 ] s)
+  ; test "§9.5 server SHOULD: no read timeout while a body is read" (fun () ->
+      let s =
+        Server.run
+          ~handler:(fun ex -> Server.read_body ex ~on_complete:ignore)
+          "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nab"
+      in
+      Alcotest.(check bool)
+        "no timeout"
+        true
+        (Option.is_none (timeout_action s)))
+  ]
+
 let tests =
-  server_tests @ eof_tests @ client_tests @ integrity_tests @ smuggling_tests
+  server_tests
+  @ eof_tests
+  @ timeout_tests
+  @ client_tests
+  @ integrity_tests
+  @ smuggling_tests
