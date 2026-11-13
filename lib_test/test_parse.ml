@@ -6,6 +6,7 @@ let error_to_string = function
   | `Bad_request -> "Bad_request"
   | `Not_implemented -> "Not_implemented"
   | `Http_version_not_supported -> "Http_version_not_supported"
+  | `Uri_too_long -> "Uri_too_long"
   | `Bad_gateway -> "Bad_gateway"
   | `Internal_server_error -> "Internal_server_error"
   | `Request_header_fields_too_large -> "Request_header_fields_too_large"

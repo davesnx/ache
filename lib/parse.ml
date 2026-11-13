@@ -101,16 +101,19 @@ module Grammar = struct
     loop []
 
   (* RFC 9112 §2.2: ignore one empty line before the request-line. *)
-  let request_head () =
+  let request_head ~on_line () =
+    on_line `Method;
     if Parseff.peek_char () = Some '\r' then eol ();
     let meth = Parseff.take_while ~at_least:1 ~label:"method" is_tchar in
     ignore (Parseff.char ' ');
+    on_line `Target;
     let target =
       Parseff.take_while ~at_least:1 ~label:"request-target" is_target_char
     in
     ignore (Parseff.char ' ');
     let version = version () in
     eol ();
+    on_line `Fields;
     let headers = headers () in
     eol ();
     Request.create ~version ~headers (Method.of_string meth) target
@@ -203,7 +206,7 @@ module Grammar = struct
     | Ok v -> Ok v
     | Error e -> Error (Parseff.error_message e)
 
-  let request = run request_head
+  let request = run (request_head ~on_line:ignore)
   let response = run response_head
   let chunk_size = run chunk_size_line
   let trailers = run trailer_section
@@ -213,6 +216,8 @@ module Reader = struct
   type request_error =
     [ `Invalid_request of Request.t * Request.error
     | `Parse of string
+    | `Method_too_long
+    | `Target_too_long
     | `Header_too_large
     ]
 
@@ -363,6 +368,7 @@ module Reader = struct
       ~when_ready_to_read:(Optional_thunk.some (fun () -> wakeup t))
 
   let request ~max_header_size handler =
+    let line = ref `Method in
     let on_head t request =
       match Request.received_body_length request with
       | Error error -> t.state <- Fail (`Invalid_request (request, error))
@@ -381,9 +387,15 @@ module Reader = struct
     in
     create
       ~max_header_size
-      ~head:(with_position Grammar.request_head)
+      ~head:(with_position (Grammar.request_head ~on_line:(( := ) line)))
       ~on_head
-      ~fail:(fun e -> (e :> request_error))
+      ~fail:(function
+        | `Header_too_large ->
+          (match !line with
+          | `Method -> `Method_too_long
+          | `Target -> `Target_too_long
+          | `Fields -> `Header_too_large)
+        | `Parse _ as e -> e)
 
   let response ~max_header_size request_queue =
     let on_head t response =

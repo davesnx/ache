@@ -23,6 +23,8 @@ module Reader : sig
   type request_error =
     [ `Invalid_request of Request.t * Request.error
     | `Parse of string
+    | `Method_too_long
+    | `Target_too_long
     | `Header_too_large
     ]
 

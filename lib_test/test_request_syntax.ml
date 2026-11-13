@@ -18,7 +18,7 @@ type mode =
   | Deferred
   | Streaming
 
-let serve ?(chunk = max_int) ?(mode = Immediate) ?(eof = false) input =
+let serve ?config ?(chunk = max_int) ?(mode = Immediate) ?(eof = false) input =
   let exchanges = ref [] in
   let errors = ref [] in
   let later = ref [] in
@@ -60,7 +60,7 @@ let serve ?(chunk = max_int) ?(mode = Immediate) ?(eof = false) input =
     Body.Writer.write_string body "error";
     Body.Writer.close body
   in
-  let conn = Server_connection.create ~error_handler request_handler in
+  let conn = Server_connection.create ?config ~error_handler request_handler in
   let pending = ref input in
   let eof_sent = ref false in
   let output = Buffer.create 256 in
@@ -163,9 +163,9 @@ let statuses output =
 
 let smuggled = "GET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n"
 
-let check_rejected ?(chunk = max_int) ~status input =
-  let msg = Printf.sprintf "%S" input in
-  let s = serve ~chunk (input ^ smuggled) in
+let check_rejected ?config ?(chunk = max_int) ~status input =
+  let msg = Grammar_corpus.summary (Printf.sprintf "%S" input) in
+  let s = serve ?config ~chunk (input ^ smuggled) in
   Alcotest.(check (list int))
     (msg ^ ": statuses")
     [ status ]
@@ -182,19 +182,19 @@ let first_requests =
   ; "POST /first HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello"
   ]
 
-let check_rejected_after_first ~chunk ~mode ~status first input =
+let check_rejected_after_first ?config ~chunk ~mode ~status first input =
   let msg =
     Printf.sprintf
-      "%S then %S (chunk %d, %s)"
+      "%S then %s (chunk %d, %s)"
       first
-      input
+      (Grammar_corpus.summary (Printf.sprintf "%S" input))
       chunk
       (match mode with
       | Immediate -> "immediate"
       | Deferred -> "deferred"
       | Streaming -> "streaming")
   in
-  let s = serve ~chunk ~mode (first ^ input ^ smuggled) in
+  let s = serve ?config ~chunk ~mode (first ^ input ^ smuggled) in
   Alcotest.(check (list int))
     (msg ^ ": statuses")
     [ 200; status ]
@@ -206,15 +206,21 @@ let check_rejected_after_first ~chunk ~mode ~status first input =
   Alcotest.(check bool) (msg ^ ": reader closed") true s.read_closed;
   Alcotest.(check bool) (msg ^ ": writer closed") true s.write_closed
 
-let check_rejected_both ~status input =
+let check_rejected_both ?config ~status input =
   List.iter
     (fun chunk ->
-       check_rejected ~chunk ~status input;
+       check_rejected ?config ~chunk ~status input;
        List.iter
          (fun first ->
             List.iter
               (fun mode ->
-                 check_rejected_after_first ~chunk ~mode ~status first input)
+                 check_rejected_after_first
+                   ?config
+                   ~chunk
+                   ~mode
+                   ~status
+                   first
+                   input)
               [ Immediate; Deferred; Streaming ])
          first_requests)
     [ max_int; 1 ]
@@ -228,8 +234,8 @@ let only_exchange s =
       (List.length exs)
       s.output
 
-let accepted ?chunk input =
-  let s = serve ?chunk input in
+let accepted ?config ?chunk input =
+  let s = serve ?config ?chunk input in
   Alcotest.(check string)
     (Printf.sprintf "%S: status" input)
     "HTTP/1.1 200 OK"
@@ -524,6 +530,53 @@ let body_framing_rejected () =
     ; true, chunked_head ^ "100\r\n" ^ smuggled
     ]
 
+let line_limits () =
+  let config = { Config.default with max_header_size = 1024 } in
+  List.iter
+    (fun (status, input) -> check_rejected_both ~config ~status input)
+    [ 501, String.make 2000 'M' ^ " / HTTP/1.1\r\nHost: a\r\n\r\n"
+    ; 501, String.make 1024 'M'
+    ; 414, "GET /" ^ String.make 2000 'a' ^ " HTTP/1.1\r\nHost: a\r\n\r\n"
+    ; 414, "GET /" ^ String.make 1100 'a'
+    ; ( 431
+      , "GET / HTTP/1.1\r\nHost: a\r\nX: " ^ String.make 2000 'v' ^ "\r\n\r\n" )
+    ; 431, "GET / HTTP/1.1\r\n" ^ String.make 2000 'X'
+    ];
+  ignore
+    (accepted
+       ~config
+       ("GET /" ^ String.make 900 'a' ^ " HTTP/1.1\r\nHost: a\r\n\r\n")
+     : exchange)
+
+let target_form_rejected () =
+  List.iter
+    (fun input -> check_rejected_both ~status:400 input)
+    [ "GET * HTTP/1.1\r\nHost: a\r\n\r\n"
+    ; "POST * HTTP/1.1\r\nHost: a\r\n\r\n"
+    ; "GET 127.0.0.1:80 HTTP/1.1\r\nHost: a\r\n\r\n"
+    ; "POST [::1]:8080 HTTP/1.1\r\nHost: a\r\n\r\n"
+    ; "OPTIONS 127.0.0.1:80 HTTP/1.1\r\nHost: a\r\n\r\n"
+    ; "GET a/b HTTP/1.1\r\nHost: a\r\n\r\n"
+    ; "GET :80 HTTP/1.1\r\nHost: a\r\n\r\n"
+    ; "GET 1http://a/ HTTP/1.1\r\nHost: a\r\n\r\n"
+    ; "GET ?x HTTP/1.1\r\nHost: a\r\n\r\n"
+    ]
+
+let target_form_accepted () =
+  List.iter
+    (fun (meth, target) ->
+       let ex =
+         accepted (meth ^ " " ^ target ^ " HTTP/1.1\r\nHost: a\r\n\r\n")
+       in
+       Alcotest.(check string) "target" target ex.request.target)
+    [ "OPTIONS", "*"
+    ; "OPTIONS", "/"
+    ; "GET", "/a?b"
+    ; "GET", "http://a/b"
+    ; "GET", "HTTPS://a"
+    ; "POST", "urn:x-y.z+1:a"
+    ]
+
 let content_length_shared () =
   let response cl =
     Response.create ~headers:(Headers.of_list [ "content-length", cl ]) `OK
@@ -662,6 +715,9 @@ let tests =
   ; "framing rejected", `Quick, framing_rejected
   ; "framing accepted", `Quick, framing_accepted
   ; "body framing rejected", `Quick, body_framing_rejected
+  ; "request line limits", `Quick, line_limits
+  ; "target form rejected", `Quick, target_form_rejected
+  ; "target form accepted", `Quick, target_form_accepted
   ; "content-length shared", `Quick, content_length_shared
   ; "connection close option", `Quick, connection_close_option
   ; "smuggling", `Quick, smuggling

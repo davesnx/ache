@@ -276,6 +276,7 @@ module Reqd : sig
     [ `Bad_request
     | `Not_implemented
     | `Http_version_not_supported
+    | `Uri_too_long
     | `Bad_gateway
     | `Internal_server_error
     | `Request_header_fields_too_large
@@ -335,7 +336,8 @@ module Config : sig
     ; max_header_size : int
       (** Largest request or response head, chunk-size line or trailer
               section, in bytes. Default is [16384]. A larger request head gets
-              a [431] response. *)
+              a [501], [414] or [431] response, see
+              {!Server_connection.create}. *)
     ; proxy : bool
     }
 
@@ -369,11 +371,19 @@ module Server_connection : sig
         obs-fold is an error); an HTTP/1.1 request has no Host field; a request
         has more than one Host field or a Host value that is not
         [uri-host [":" port]] (RFC 3986 §3.2); a CONNECT target is not
-        [host:port] with a port of 0 to 65535; Content-Length is not a list of one
+        [host:port] with a port of 0 to 65535; the target is [*] and the
+        method is not OPTIONS; the method is not CONNECT or OPTIONS and the
+        target is neither origin-form ([/...]) nor absolute-form
+        ([scheme:...]); Content-Length is not a list of one
         repeated [1*DIGIT] value; the request has both Content-Length and
         Transfer-Encoding; an HTTP/1.0 request has Transfer-Encoding; chunked
         is not the final transfer coding or is applied twice.
-      - [`Not_implemented] (501): a transfer coding other than chunked.
+      - [`Not_implemented] (501): a transfer coding other than chunked, or a
+        method that reaches [Config.max_header_size] before its end.
+      - [`Uri_too_long] (414): a request-target that reaches
+        [Config.max_header_size] before the end of the request line.
+      - [`Request_header_fields_too_large] (431): a head that reaches
+        [Config.max_header_size] after the request line.
       - [`Http_version_not_supported] (505): a major version other than 1.
 
       A request with version HTTP/1.x, x > 1, is processed as HTTP/1.1. Its

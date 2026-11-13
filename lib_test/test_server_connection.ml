@@ -18,6 +18,7 @@ let request_error_pp_hum fmt = function
   | `Not_implemented -> Format.fprintf fmt "Not_implemented"
   | `Http_version_not_supported ->
     Format.fprintf fmt "Http_version_not_supported"
+  | `Uri_too_long -> Format.fprintf fmt "Uri_too_long"
   | `Bad_gateway -> Format.fprintf fmt "Bad_gateway"
   | `Internal_server_error -> Format.fprintf fmt "Internal_server_error"
   | `Request_header_fields_too_large ->

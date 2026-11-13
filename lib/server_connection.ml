@@ -39,6 +39,7 @@ type error =
   | `Bad_request
   | `Not_implemented
   | `Http_version_not_supported
+  | `Uri_too_long
   | `Internal_server_error
   | `Request_header_fields_too_large
   | `Exn of exn
@@ -303,6 +304,12 @@ let next_read_operation t =
     `Close
   | `Error `Header_too_large ->
     set_error_and_handle t `Request_header_fields_too_large;
+    `Close
+  | `Error `Method_too_long ->
+    set_error_and_handle t `Not_implemented;
+    `Close
+  | `Error `Target_too_long ->
+    set_error_and_handle t `Uri_too_long;
     `Close
   | `Error (`Invalid_request (request, error)) ->
     set_error_and_handle ~request t (error :> error);

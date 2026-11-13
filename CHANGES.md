@@ -98,6 +98,14 @@ ache Unreleased
   not a token, a field value with CR, LF or NUL, a method that is not a token,
   a request target with CR, LF, NUL or space, or a reason phrase with CR, LF
   or NUL. httpun wrote them as given.
+- A request head that reaches `Config.max_header_size` inside the method gets
+  501 (`` `Not_implemented ``), inside the request-target or the rest of the
+  request line gets 414 (new `` `Uri_too_long `` case of `Reqd.error`), and
+  later gets 431 as before (RFC 9112 §3).
+- The server answers 400 to a request-target form that does not fit the
+  method: `*` is only for OPTIONS, authority-form only for CONNECT, and other
+  methods need origin-form or absolute-form (RFC 9112 §3.2). httpun passed
+  `GET *` and `GET 127.0.0.1:80` to the handler.
 
 httpun history
 ==============
