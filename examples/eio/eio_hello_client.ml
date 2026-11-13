@@ -23,13 +23,18 @@ let () =
   in
   let client = Ache_eio.Client.create_connection ~sw flow in
   let finished, resolve_finished = Eio.Promise.create () in
+  let on_error () =
+    Eio.Promise.resolve_error
+      resolve_finished
+      (Failure "response body cut short")
+  in
   let response_handler response body =
     Format.printf "%a@." Response.pp_hum response;
     let rec on_read buffer ~off ~len =
       print_string (Bigstringaf.substring buffer ~off ~len);
-      Body.Reader.schedule_read body ~on_read ~on_eof
-    and on_eof () = Eio.Promise.resolve resolve_finished () in
-    Body.Reader.schedule_read body ~on_read ~on_eof
+      Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+    and on_eof () = Eio.Promise.resolve_ok resolve_finished () in
+    Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
   in
   let headers =
     Headers.of_list [ "host", Printf.sprintf "127.0.0.1:%d" port ]
@@ -42,5 +47,5 @@ let () =
       ~response_handler
   in
   Body.Writer.close request_body;
-  Eio.Promise.await finished;
+  Eio.Promise.await_exn finished;
   Eio.Promise.await (Ache_eio.Client.shutdown client)

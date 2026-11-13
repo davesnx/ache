@@ -72,6 +72,7 @@ let echo_server () =
   Runtime.make (module Echo) (Echo.create (fun t s -> Echo.send t s))
 
 let server_errors : Server_connection.error list ref = ref []
+let partial_body_cut = ref false
 let stream_flush_closed : unit Lwt.u option ref = ref None
 let stream_start : unit Lwt.t ref = ref Lwt.return_unit
 
@@ -116,9 +117,10 @@ let request_handler (_ : Unix.sockaddr) reqd =
         response_body
         (Bigstringaf.substring buffer ~off ~len);
       Body.Writer.flush response_body (fun _ ->
-        Body.Reader.schedule_read body ~on_eof ~on_read)
-    and on_eof () = Body.Writer.close response_body in
-    Body.Reader.schedule_read body ~on_eof ~on_read
+        Body.Reader.schedule_read body ~on_eof ~on_error ~on_read)
+    and on_eof () = Body.Writer.close response_body
+    and on_error () = failwith "request body cut short" in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | `GET, "/upgrade" ->
     Body.Reader.close body;
     Reqd.respond_with_upgrade
@@ -138,9 +140,10 @@ let request_handler (_ : Unix.sockaddr) reqd =
   | `GET, "/raise" -> failwith "handler failed"
   | `POST, "/partial" ->
     let rec on_read _ ~off:_ ~len:_ =
-      Body.Reader.schedule_read body ~on_eof ~on_read
-    and on_eof () = () in
-    Body.Reader.schedule_read body ~on_eof ~on_read
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () = Alcotest.fail "a cut body completed"
+    and on_error () = partial_body_cut := true in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | _, target ->
     Body.Reader.close body;
     Reqd.respond_with_string
@@ -208,9 +211,10 @@ let read_body body =
   let p, u = Lwt.wait () in
   let rec on_read bs ~off ~len =
     Stdlib.Buffer.add_string buf (Bigstringaf.substring bs ~off ~len);
-    Body.Reader.schedule_read body ~on_eof ~on_read
-  and on_eof () = Lwt.wakeup_later u (Stdlib.Buffer.contents buf) in
-  Body.Reader.schedule_read body ~on_eof ~on_read;
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+  and on_eof () = Lwt.wakeup_later u (Stdlib.Buffer.contents buf)
+  and on_error () = Lwt.wakeup_later u "<response body cut short>" in
+  Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
   p
 
 let client_error_handler error =
@@ -515,6 +519,7 @@ let test_read_failure () = with_failing_io ~read:true ~write:false
 let test_write_failure () = with_failing_io ~read:false ~write:true
 
 let test_eof_mid_body () =
+  partial_body_cut := false;
   with_server (fun connect ->
     connect () >>= fun socket ->
     write_all
@@ -527,6 +532,7 @@ let test_eof_mid_body () =
     >>= fun () ->
     Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
     read_all socket >>= fun (_ : string) -> Lwt_unix.close socket);
+  Alcotest.(check bool) "request body cut" true !partial_body_cut;
   match !server_errors with
   | [ `Bad_request ] -> ()
   | _ ->

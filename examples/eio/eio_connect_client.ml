@@ -5,12 +5,16 @@ let http_handler ~on_eof response response_body =
   match response with
   | { Response.status = `OK; _ } as response ->
     Format.eprintf "response: %a@." Response.pp_hum response;
+    let on_error () =
+      prerr_endline "response body cut short";
+      exit 1
+    in
     let rec on_read bs ~off ~len =
       Bigstringaf.substring ~off ~len bs |> print_string;
       flush stdout;
-      Body.Reader.schedule_read response_body ~on_read ~on_eof
+      Body.Reader.schedule_read response_body ~on_read ~on_eof ~on_error
     in
-    Body.Reader.schedule_read response_body ~on_read ~on_eof
+    Body.Reader.schedule_read response_body ~on_read ~on_eof ~on_error
   | response ->
     Format.fprintf Format.err_formatter "%a\n%!" Response.pp_hum response;
     Stdlib.exit 124

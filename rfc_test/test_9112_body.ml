@@ -965,7 +965,11 @@ let incomplete_tests =
                 Alcotest.(check bool)
                   (String.escaped body ^ ": body not complete")
                   false
-                  ex.body_complete
+                  ex.body_complete;
+                Alcotest.(check bool)
+                  (String.escaped body ^ ": body reported cut")
+                  true
+                  ex.body_cut
               | _ -> Alcotest.fail "expected one request")
            [ [ cl "5" ], "ab"; [ te "chunked" ], "3\r\nabc\r\n" ])
   ; test "§8 client MUST: EOF in the head is reported as an error" (fun () ->

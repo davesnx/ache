@@ -84,7 +84,12 @@ let writer_closed t =
 let connection_is_shutdown t =
   Alcotest.(check bool) "connection is shutdown" true (is_closed t)
 
-let default_response_handler expected_response response body =
+let default_response_handler
+      ?(on_error = Helpers.body_must_complete __LOC__)
+      expected_response
+      response
+      body
+  =
   Alcotest.check
     (module Response)
     "expected response"
@@ -92,7 +97,7 @@ let default_response_handler expected_response response body =
     response;
   let on_read _ ~off:_ ~len:_ = () in
   let on_eof () = () in
-  Body.Reader.schedule_read body ~on_read ~on_eof
+  Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
 
 let no_error_handler _ = assert false
 
@@ -770,9 +775,18 @@ let backpressure_response_handler
     response;
   let rec on_read _buffer ~off:_ ~len:_ =
     continue_reading :=
-      fun () -> Body.Reader.schedule_read body ~on_eof ~on_read
+      fun () ->
+        Body.Reader.schedule_read
+          ~on_error:(Helpers.body_must_complete __LOC__)
+          body
+          ~on_eof
+          ~on_read
   and on_eof () = print_endline "got eof" in
-  Body.Reader.schedule_read body ~on_eof ~on_read
+  Body.Reader.schedule_read
+    ~on_error:(Helpers.body_must_complete __LOC__)
+    body
+    ~on_eof
+    ~on_read
 
 let test_handling_backpressure_when_read_not_scheduled () =
   let writer_woken_up = ref false in
@@ -865,7 +879,11 @@ let test_eof_with_another_pipelined_request () =
     let on_read _buffer ~off:_ ~len:_ =
       continue_reading := fun () -> Body.Reader.close body
     and on_eof () = print_endline "got eof" in
-    Body.Reader.schedule_read body ~on_eof ~on_read
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      body
+      ~on_eof
+      ~on_read
   in
   let body =
     request
@@ -946,7 +964,11 @@ let test_eof_handler_response_body_not_closed () =
       response;
     let on_read _buffer ~off:_ ~len:_ = () in
     let on_eof () = print_endline "got eof" in
-    Body.Reader.schedule_read body ~on_eof ~on_read
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      body
+      ~on_eof
+      ~on_read
   in
   let error_handler_called = ref false in
   let body =
@@ -997,7 +1019,11 @@ let test_eof_handler_closed_response_body () =
     let on_read _buffer ~off:_ ~len:_ =
       continue_reading := fun () -> Body.Reader.close body
     and on_eof () = print_endline "got eof" in
-    Body.Reader.schedule_read body ~on_eof ~on_read
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      body
+      ~on_eof
+      ~on_read
   in
   let error_handler_called = ref false in
   let body =
@@ -1116,7 +1142,11 @@ let test_exception_reading_response_body () =
       response;
     let on_read _ ~off:_ ~len:_ = failwith "something went wrong" in
     let on_eof () = () in
-    Body.Reader.schedule_read body ~on_read ~on_eof
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      body
+      ~on_read
+      ~on_eof
   in
   let body =
     request
@@ -1152,12 +1182,17 @@ let test_exception_reading_response_body_last_chunk () =
     let on_eof () = () in
     let on_read _ ~off:_ ~len:_ =
       Body.Reader.schedule_read
+        ~on_error:(Helpers.body_must_complete __LOC__)
         body
         ~on_read:(fun _ ~off:_ ~len:_ ->
           report_exn t (Failure "something went wrong"))
         ~on_eof
     in
-    Body.Reader.schedule_read body ~on_read ~on_eof
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      body
+      ~on_read
+      ~on_eof
   in
   let body =
     request
@@ -1202,7 +1237,11 @@ let test_async_exception_reading_response_body () =
         fun () -> report_exn t (Failure "something went wrong")
     in
     let on_eof () = () in
-    Body.Reader.schedule_read body ~on_read ~on_eof
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      body
+      ~on_read
+      ~on_eof
   in
   let body =
     request
@@ -1341,12 +1380,25 @@ let test_response_arrives_before_body_uploaded () =
       response;
     let on_read _buffer ~off:_ ~len:_ = ()
     and on_eof () = eof_delivered := true in
-    Body.Reader.schedule_read body ~on_eof ~on_read;
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      body
+      ~on_eof
+      ~on_read;
     continue_response :=
       fun () ->
-        Body.Reader.schedule_read body ~on_eof ~on_read;
+        Body.Reader.schedule_read
+          ~on_error:(Helpers.body_must_complete __LOC__)
+          body
+          ~on_eof
+          ~on_read;
         continue_response :=
-          fun () -> Body.Reader.schedule_read body ~on_eof ~on_read
+          fun () ->
+            Body.Reader.schedule_read
+              ~on_error:(Helpers.body_must_complete __LOC__)
+              body
+              ~on_eof
+              ~on_read
   in
   let error_handler_called = ref false in
   let second_error_handler_called = ref false in
@@ -1541,12 +1593,16 @@ let test_chunked_error () =
   let response =
     Response.create ~headers:(Headers.of_list [ "content-length", "10" ]) `OK
   in
+  let body_cut = ref false in
   let body =
     request
       t
       request'
       ~flush_headers_immediately:true
-      ~response_handler:(default_response_handler response)
+      ~response_handler:
+        (default_response_handler
+           ~on_error:(fun () -> body_cut := true)
+           response)
       ~error_handler:(fun _ -> error_handler_called := true)
   in
   write_request t request';
@@ -1556,6 +1612,7 @@ let test_chunked_error () =
   read_response t response;
   report_exn t (Failure "something went wrong");
   Alcotest.(check bool) "First error handler called" true !error_handler_called;
+  Alcotest.(check bool) "response body reported cut" true !body_cut;
   Alcotest.(check bool)
     "request body is closed"
     true
@@ -1642,6 +1699,7 @@ let test_schedule_read_with_data_available () =
   let schedule_read expected =
     let did_read = ref false in
     Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
       body
       ~on_read:(fun buf ~off ~len ->
         let actual = Bigstringaf.substring buf ~off ~len in
@@ -1663,6 +1721,7 @@ let test_schedule_read_with_data_available () =
   schedule_read "!";
   let did_eof = ref false in
   Body.Reader.schedule_read
+    ~on_error:(Helpers.body_must_complete __LOC__)
     body
     ~on_read:(fun _ ~off:_ ~len:_ -> Alcotest.fail "Expected eof")
     ~on_eof:(fun () -> did_eof := true);
@@ -1829,9 +1888,17 @@ let test_request_pipelining_single_read () =
       response
       actual_response;
     let rec on_read _ ~off:_ ~len:_ =
-      Body.Reader.schedule_read body ~on_read ~on_eof
+      Body.Reader.schedule_read
+        ~on_error:(Helpers.body_must_complete __LOC__)
+        body
+        ~on_read
+        ~on_eof
     and on_eof () = () in
-    Body.Reader.schedule_read body ~on_read ~on_eof
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      body
+      ~on_read
+      ~on_eof
   in
 
   let t = create () in

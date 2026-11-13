@@ -324,6 +324,7 @@ module Server = struct
     ; request : Request.t
     ; mutable body : string
     ; mutable body_complete : bool
+    ; mutable body_cut : bool
     }
 
   type t =
@@ -340,6 +341,7 @@ module Server = struct
         ~on_eof:(fun () ->
           ex.body_complete <- true;
           on_complete ex.body)
+        ~on_error:(fun () -> ex.body_cut <- true)
         ~on_read:(fun bs ~off ~len ->
           ex.body <- ex.body ^ Bigstringaf.substring bs ~off ~len;
           loop ())
@@ -387,7 +389,12 @@ module Server = struct
     let request_handler reqd =
       let s = get () in
       let ex =
-        { reqd; request = Reqd.request reqd; body = ""; body_complete = false }
+        { reqd
+        ; request = Reqd.request reqd
+        ; body = ""
+        ; body_complete = false
+        ; body_cut = false
+        }
       in
       s.exchanges <- s.exchanges @ [ ex ];
       handler ex
@@ -434,6 +441,7 @@ module Client = struct
     ; mutable responses : Response.t list
     ; mutable body : string
     ; mutable body_eof : bool
+    ; mutable body_cut : bool
     ; mutable errors : string list
     }
 
@@ -458,6 +466,7 @@ module Client = struct
              Body.Reader.schedule_read
                reader
                ~on_eof:(fun () -> ex.body_eof <- true)
+               ~on_error:(fun () -> ex.body_cut <- true)
                ~on_read:(fun bs ~off ~len ->
                  ex.body <- ex.body ^ Bigstringaf.substring bs ~off ~len;
                  loop ())
@@ -481,6 +490,7 @@ module Client = struct
          ; responses = []
          ; body = ""
          ; body_eof = false
+         ; body_cut = false
          ; errors = []
          })
     in

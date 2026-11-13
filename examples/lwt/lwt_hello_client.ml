@@ -25,9 +25,14 @@ let () =
        Format.printf "%a@." Response.pp_hum response;
        let rec on_read buffer ~off ~len =
          print_string (Bigstringaf.substring buffer ~off ~len);
-         Body.Reader.schedule_read body ~on_read ~on_eof
-       and on_eof () = Lwt.wakeup_later notify_finished () in
-       Body.Reader.schedule_read body ~on_read ~on_eof
+         Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+       and on_eof () = Lwt.wakeup_later notify_finished ()
+       and on_error () =
+         Lwt.wakeup_later_exn
+           notify_finished
+           (Failure "response body cut short")
+       in
+       Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
      in
      let headers =
        Headers.of_list [ "host", Printf.sprintf "127.0.0.1:%d" port ]

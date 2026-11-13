@@ -429,6 +429,7 @@ let client ?(meth = `GET) input =
     r.statuses <- r.statuses @ [ Status.to_code response.status ];
     let rec loop () =
       Body.Reader.schedule_read
+        ~on_error:(Helpers.body_must_complete __LOC__)
         body
         ~on_eof:(fun () -> r.eof <- true)
         ~on_read:(fun bs ~off ~len ->
@@ -562,6 +563,7 @@ let informational_then_final interim reqd =
   let received = Buffer.create 5 in
   let rec loop () =
     Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
       body
       ~on_eof:(fun () ->
         with_string `OK ("got " ^ Buffer.contents received) reqd)
@@ -759,6 +761,7 @@ let test_client_cl_and_te_pipelined () =
             statuses := (target, Status.to_code response.status) :: !statuses;
             let rec loop () =
               Body.Reader.schedule_read
+                ~on_error:(Helpers.body_must_complete __LOC__)
                 body
                 ~on_eof:ignore
                 ~on_read:(fun _ ~off:_ ~len:_ -> loop ())

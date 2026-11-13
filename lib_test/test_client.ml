@@ -622,6 +622,80 @@ let write_closed_after_101 ~bytewise =
   | `Write _ | `Close _ -> ());
   check_ex "upgrade" ~statuses:[ 101 ] ex
 
+let response_body_endings ~bytewise =
+  List.iter
+    (fun (case, input, finish, expected) ->
+       let t = create () in
+       let events = ref [] in
+       let body = ref None in
+       let rec record b =
+         Body.Reader.schedule_read
+           b
+           ~on_eof:(fun () -> events := "eof" :: !events)
+           ~on_error:(fun () -> events := "error" :: !events)
+           ~on_read:(fun _ ~off:_ ~len:_ ->
+             events := "read" :: !events;
+             record b)
+       in
+       let request_body =
+         Client_connection.request
+           t.c
+           ~flush_headers_immediately:true
+           (Request.create ~headers:(Headers.of_list [ "host", "a" ]) `GET "/")
+           ~error_handler:(fun _ -> ())
+           ~response_handler:(fun _ b ->
+             body := Some b;
+             record b)
+       in
+       Body.Writer.close request_body;
+       pump t;
+       feed ~bytewise t input;
+       finish t (Option.get !body);
+       let ends = List.filter (fun e -> e <> "read") !events in
+       Alcotest.(check (list string)) (case ^ ": one ending") [ expected ] ends;
+       Alcotest.(check string)
+         (case ^ ": ending is last")
+         expected
+         (List.hd !events);
+       let before = List.length !events in
+       record (Option.get !body);
+       Client_connection.shutdown t.c;
+       close_input t;
+       Alcotest.(check int)
+         (case ^ ": nothing after the ending")
+         before
+         (List.length !events))
+    [ ( "complete"
+      , "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"
+      , (fun t _ -> close_input t)
+      , "eof" )
+    ; ( "close-delimited, complete at EOF"
+      , "HTTP/1.1 200 OK\r\n\r\nabc"
+      , (fun t _ -> close_input t)
+      , "eof" )
+    ; ( "cut by EOF"
+      , "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab"
+      , (fun t _ -> close_input t)
+      , "error" )
+    ; ( "framing error"
+      , "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX"
+      , (fun t _ ->
+          ignore
+            (Client_connection.next_read_operation t.c
+             : [ `Read | `Yield | `Close ]))
+      , "error" )
+    ; ( "closed by the application"
+      , "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab"
+      , (fun t b ->
+          Body.Reader.close b;
+          feed ~bytewise t "cde")
+      , "eof" )
+    ; ( "connection shutdown"
+      , "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab"
+      , (fun t _ -> Client_connection.shutdown t.c)
+      , "error" )
+    ]
+
 let tests =
   [ both "response body cut short calls on_error, not on_eof" response_body_end
   ; both "unsolicited response is an error, not an exception" unsolicited
@@ -649,5 +723,6 @@ let tests =
       "request body flush answered when the connection closes"
       request_body_flush_on_close
   ; both "request after the peer closed" request_after_peer_closed
+  ; both "response body: one final ending" response_body_endings
   ; both "write side closed after a 101" write_closed_after_101
   ]

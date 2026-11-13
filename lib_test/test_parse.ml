@@ -641,12 +641,20 @@ let test_many_small_chunks () =
     let rec on_read bs ~off ~len =
       incr on_read_calls;
       Buffer.add_string received (Bigstringaf.substring bs ~off ~len);
-      Body.Reader.schedule_read body ~on_read ~on_eof
+      Body.Reader.schedule_read
+        ~on_error:(Helpers.body_must_complete __LOC__)
+        body
+        ~on_read
+        ~on_eof
     and on_eof () =
       eof := true;
       Reqd.respond_with_string reqd (Response.create `OK) ""
     in
-    Body.Reader.schedule_read body ~on_read ~on_eof
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      body
+      ~on_read
+      ~on_eof
   in
   let conn = Server_connection.create handler in
   let bs = Bigstringaf.of_string input ~off:0 ~len:(String.length input) in
@@ -663,9 +671,17 @@ let collect_body body =
   let done_ = ref false in
   let rec on_read bs ~off ~len =
     Buffer.add_string buf (Bigstringaf.substring bs ~off ~len);
-    Body.Reader.schedule_read body ~on_read ~on_eof
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      body
+      ~on_read
+      ~on_eof
   and on_eof () = done_ := true in
-  Body.Reader.schedule_read body ~on_read ~on_eof;
+  Body.Reader.schedule_read
+    ~on_error:(Helpers.body_must_complete __LOC__)
+    body
+    ~on_read
+    ~on_eof;
   buf, done_
 
 let test_pipelined_body_read_late () =
@@ -748,7 +764,11 @@ let test_unread_body_backpressure () =
     if rounds > 100 then Alcotest.fail "body not read to the end";
     if not !eof
     then (
-      Body.Reader.schedule_read body_reader ~on_read ~on_eof;
+      Body.Reader.schedule_read
+        ~on_error:(Helpers.body_must_complete __LOC__)
+        body_reader
+        ~on_read
+        ~on_eof;
       (match Server_connection.next_read_operation conn with
       | `Read when !fed < String.length input -> read_some ()
       | _ -> ());

@@ -80,36 +80,36 @@ module Body : sig
     type t
 
     val schedule_read :
-       ?on_error:(unit -> unit)
-      -> t
+       t
       -> on_eof:(unit -> unit)
+      -> on_error:(unit -> unit)
       -> on_read:(Bigstringaf.t -> off:int -> len:int -> unit)
       -> unit
-    (** [schedule_read t ~on_error ~on_eof ~on_read] will setup [on_read],
-        [on_eof] and [on_error] as callbacks for when bytes are available in
-        [t] for the application to consume, when the body is complete, or when
-        the body ends before it is complete.
+    (** [schedule_read t ~on_eof ~on_error ~on_read] schedules one read of
+        [t]. Exactly one of the three callbacks is called, once:
+        - [on_read] when bytes are available. It receives every byte
+          available at that time; schedule the next read to get more.
+        - [on_eof] when the body is complete and every byte has been given to
+          [on_read]. A close-delimited response body is complete at end of
+          input.
+        - [on_error] when the body ends before its framing ends: end of input
+          or a shutdown of the connection in the middle of the body, an
+          invalid framing, or an exception reported for the request. Such a
+          body is incomplete (RFC 9112 §8). The cause goes to the connection's
+          error handler, and to {!Reqd.error_code} on a server.
 
-        [on_eof] is called only for a complete body, or after {!close}.
-        [on_error] is called instead when the body ends before its framing
-        ends: the connection reached end of input or closed in the middle of
-        the body, or the body's framing is invalid. Such a body is incomplete
-        (RFC 9112 §8). The cause goes to the connection's error handler (and
-        {!Reqd.error_code} on a server). A close-delimited response body is
-        complete at end of input. Without [on_error], nothing is called for
-        an incomplete body.
-
-        Once one of these callbacks has been called, they become inactive.
-        The application is responsible for scheduling subsequent reads, either
-        within the [on_read] callback or by some other mechanism.
+        Exactly one of [on_eof] and [on_error] ends a body. After it, no
+        callback of [t] is called again, also for later [schedule_read]
+        calls. Bytes received before the end are given to [on_read] first.
 
         [on_read] receives every byte available at the time of the call. The
         library does not reuse the bytes it passes to [on_read], so the
         application may keep them after [on_read] returns. *)
 
     val close : t -> unit
-    (** [close t] closes [t], indicating that any subsequent input received
-        should be discarded. *)
+    (** [close t] closes [t]: input received after it is discarded. Bytes
+        already received are still given to [on_read], then [on_eof] is
+        called; a later failure of the connection does not call [on_error]. *)
 
     val is_closed : t -> bool
     (** [is_closed t] is [true] if {!close} has been called on [t] and [false]

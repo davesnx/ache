@@ -49,6 +49,9 @@ let serve ?config ?(chunk = max_int) ?(mode = Immediate) ?(eof = false) input =
     let rec loop () =
       Body.Reader.schedule_read
         body
+        ~on_error:(fun () ->
+          if Reqd.error_code reqd = None
+          then Alcotest.fail "request body cut without an error code")
         ~on_eof:(fun () ->
           match Reqd.error_code reqd with None -> respond reqd | Some _ -> ())
         ~on_read:(fun bs ~off ~len ->

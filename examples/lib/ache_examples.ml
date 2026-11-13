@@ -49,11 +49,15 @@ module Client = struct
     match response with
     | { Response.status = `OK; _ } as response ->
       Format.fprintf Format.std_formatter "%a\n%!" Response.pp_hum response;
+      let on_error () =
+        prerr_endline "response body cut short";
+        exit 1
+      in
       let rec on_read bs ~off ~len =
         Bigstringaf.substring ~off ~len bs |> print_string;
-        Body.Reader.schedule_read response_body ~on_read ~on_eof
+        Body.Reader.schedule_read response_body ~on_read ~on_eof ~on_error
       in
-      Body.Reader.schedule_read response_body ~on_read ~on_eof
+      Body.Reader.schedule_read response_body ~on_read ~on_eof ~on_error
     | response ->
       Format.fprintf Format.err_formatter "%a\n%!" Response.pp_hum response;
       Stdlib.exit 1
@@ -79,9 +83,10 @@ module Server = struct
       let response_body = Reqd.respond_with_streaming reqd response in
       let rec on_read buffer ~off ~len =
         Body.Writer.write_bigstring response_body buffer ~off ~len;
-        Body.Reader.schedule_read request_body ~on_eof ~on_read
-      and on_eof () = Body.Writer.close response_body in
-      Body.Reader.schedule_read (Reqd.request_body reqd) ~on_eof ~on_read
+        Body.Reader.schedule_read request_body ~on_eof ~on_error ~on_read
+      and on_eof () = Body.Writer.close response_body
+      and on_error () = prerr_endline "request body cut short" in
+      Body.Reader.schedule_read request_body ~on_eof ~on_error ~on_read
     | _ ->
       let headers = Headers.of_list [ "connection", "close" ] in
       Reqd.respond_with_string

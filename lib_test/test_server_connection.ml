@@ -331,12 +331,21 @@ let echo_handler response reqd =
       (Bigstringaf.substring ~off ~len buffer);
     Body.Writer.flush response_body (function
       | `Closed -> assert false
-      | `Written -> Body.Reader.schedule_read request_body ~on_eof ~on_read)
+      | `Written ->
+        Body.Reader.schedule_read
+          ~on_error:(Helpers.body_must_complete __LOC__)
+          request_body
+          ~on_eof
+          ~on_read)
   and on_eof () =
     print_endline "echo handler eof";
     Body.Writer.close response_body
   in
-  Body.Reader.schedule_read request_body ~on_eof ~on_read
+  Body.Reader.schedule_read
+    ~on_error:(Helpers.body_must_complete __LOC__)
+    request_body
+    ~on_eof
+    ~on_read
 
 let streaming_handler ?(flush = false) ?(error = false) response writes reqd =
   let writes = ref writes in
@@ -1349,12 +1358,21 @@ let backpressure_request_handler continue_reading reqd =
   let request_body = Reqd.request_body reqd in
   let rec on_read _buffer ~off:_ ~len:_ =
     continue_reading :=
-      fun () -> Body.Reader.schedule_read request_body ~on_eof ~on_read
+      fun () ->
+        Body.Reader.schedule_read
+          ~on_error:(Helpers.body_must_complete __LOC__)
+          request_body
+          ~on_eof
+          ~on_read
   and on_eof () =
     print_endline
       ("got eof" ^ string_of_bool (Body.Reader.is_closed request_body))
   in
-  Body.Reader.schedule_read request_body ~on_eof ~on_read
+  Body.Reader.schedule_read
+    ~on_error:(Helpers.body_must_complete __LOC__)
+    request_body
+    ~on_eof
+    ~on_read
 
 let test_handling_backpressure_when_read_not_scheduled () =
   let continue_reading = ref (fun () -> ()) in
@@ -1726,6 +1744,10 @@ let test_shutdown_hangs_request_body_read () =
   do_read t ignore;
   connection_is_shutdown t
 
+let cut_with_error_code reqd () =
+  if Reqd.error_code reqd = None
+  then Alcotest.fail "request body cut without an error code"
+
 let test_finish_response_after_read_eof_well_formed () =
   let response =
     Response.create ~headers:(Headers.of_list [ "content-length", "5" ]) `OK
@@ -1733,9 +1755,17 @@ let test_finish_response_after_read_eof_well_formed () =
   let request_handler reqd =
     let request_body = Reqd.request_body reqd in
     let rec on_read _buffer ~off:_ ~len:_ =
-      Body.Reader.schedule_read request_body ~on_eof ~on_read
+      Body.Reader.schedule_read
+        ~on_error:(Helpers.body_must_complete __LOC__)
+        request_body
+        ~on_eof
+        ~on_read
     and on_eof = fun () -> Reqd.respond_with_string reqd response "hello" in
-    Body.Reader.schedule_read request_body ~on_eof ~on_read
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      request_body
+      ~on_eof
+      ~on_read
   in
   let error_handler ?request:_ _error _start_response =
     Alcotest.fail
@@ -1772,7 +1802,11 @@ let test_finish_response_after_read_eof_malformed () =
   let request_handler reqd =
     let request_body = Reqd.request_body reqd in
     let rec on_read _buffer ~off:_ ~len:_ =
-      Body.Reader.schedule_read request_body ~on_eof ~on_read
+      Body.Reader.schedule_read
+        ~on_error:(cut_with_error_code reqd)
+        request_body
+        ~on_eof
+        ~on_read
     and on_eof =
      fun () ->
       continue_response :=
@@ -1780,7 +1814,11 @@ let test_finish_response_after_read_eof_malformed () =
           try Reqd.respond_with_string reqd response "hello" with
           | exn -> Reqd.report_exn reqd exn
     in
-    Body.Reader.schedule_read request_body ~on_eof ~on_read
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      request_body
+      ~on_eof
+      ~on_read
   in
   let error_handler ?request:_ _error start_response =
     error_handler_called := true;
@@ -1823,13 +1861,21 @@ let test_request_body_eof_response_not_sent () =
   let request_handler reqd =
     let request_body = Reqd.request_body reqd in
     let rec on_read _buffer ~off:_ ~len:_ =
-      Body.Reader.schedule_read request_body ~on_eof ~on_read
+      Body.Reader.schedule_read
+        ~on_error:(cut_with_error_code reqd)
+        request_body
+        ~on_eof
+        ~on_read
     and on_eof =
      fun () ->
       try Reqd.respond_with_string reqd response "hello" with
       | exn -> Reqd.report_exn reqd exn
     in
-    Body.Reader.schedule_read request_body ~on_eof ~on_read
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      request_body
+      ~on_eof
+      ~on_read
   in
   let error_handler ?request:_ _error start_response =
     error_handler_called := true;
@@ -1868,13 +1914,21 @@ let test_request_body_eof_response_not_sent_empty_eof () =
   let request_handler reqd =
     let request_body = Reqd.request_body reqd in
     let rec on_read _buffer ~off:_ ~len:_ =
-      Body.Reader.schedule_read request_body ~on_eof ~on_read
+      Body.Reader.schedule_read
+        ~on_error:(cut_with_error_code reqd)
+        request_body
+        ~on_eof
+        ~on_read
     and on_eof =
      fun () ->
       try Reqd.respond_with_string reqd response "hello" with
       | exn -> Reqd.report_exn reqd exn
     in
-    Body.Reader.schedule_read request_body ~on_eof ~on_read
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      request_body
+      ~on_eof
+      ~on_read
   in
   let error_handler ?request:_ _error start_response =
     error_handler_called := true;
@@ -1912,10 +1966,12 @@ let test_race_condition_writer_issues_yield_after_reader_eof () =
   let response_handler reqd =
     let request_body = Reqd.request_body reqd in
     Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
       request_body
       ~on_eof:ignore
       ~on_read:(fun _ ~off:_ ~len:_ ->
         Body.Reader.schedule_read
+          ~on_error:(Helpers.body_must_complete __LOC__)
           request_body
           ~on_read:(fun _ ~off:_ ~len:_ -> ())
           ~on_eof:(fun () ->
@@ -2115,6 +2171,7 @@ let test_response_finished_before_body_read () =
   let request_handler reqd =
     let rec read_body () =
       Body.Reader.schedule_read
+        ~on_error:(Helpers.body_must_complete __LOC__)
         (Reqd.request_body reqd)
         ~on_read:(fun buf ~off ~len ->
           rev_body_chunks :=
@@ -2165,10 +2222,20 @@ let test_body_flush_fairness () =
         rev_body_chunks :=
           Bigstringaf.substring buffer ~off ~len :: !rev_body_chunks;
         continue :=
-          fun () -> Body.Reader.schedule_read request_body ~on_eof ~on_read
+          fun () ->
+            Body.Reader.schedule_read
+              ~on_error:(Helpers.body_must_complete __LOC__)
+              request_body
+              ~on_eof
+              ~on_read
       and on_eof () = print_endline "got eof" in
       continue :=
-        fun () -> Body.Reader.schedule_read request_body ~on_eof ~on_read)
+        fun () ->
+          Body.Reader.schedule_read
+            ~on_error:(Helpers.body_must_complete __LOC__)
+            request_body
+            ~on_eof
+            ~on_read)
   in
   read_request t (Request.create `GET "/" ~headers:(Headers.encoding_fixed 20));
   reader_yielded t;
@@ -2249,6 +2316,7 @@ let test_schedule_read_with_data_available () =
   let schedule_read expected =
     let did_read = ref false in
     Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
       body
       ~on_read:(fun buf ~off ~len ->
         let actual = Bigstringaf.substring buf ~off ~len in
@@ -2267,6 +2335,7 @@ let test_schedule_read_with_data_available () =
   schedule_read "!";
   (* Also works with eof *)
   Body.Reader.schedule_read
+    ~on_error:(Helpers.body_must_complete __LOC__)
     body
     ~on_read:(fun _ ~off:_ ~len:_ -> Alcotest.fail "Expected eof")
     ~on_eof:(fun () -> !continue ());
@@ -2279,13 +2348,22 @@ let test_eof_called_multiple_times () =
     let request_body = Reqd.request_body reqd in
     let rec on_read _buffer ~off:_ ~len:_ =
       continue_reading :=
-        fun () -> Body.Reader.schedule_read request_body ~on_eof ~on_read
+        fun () ->
+          Body.Reader.schedule_read
+            ~on_error:(Helpers.body_must_complete __LOC__)
+            request_body
+            ~on_eof
+            ~on_read
     and on_eof () =
       incr eof_counter;
       print_endline
         ("got eof" ^ string_of_bool (Body.Reader.is_closed request_body))
     in
-    Body.Reader.schedule_read request_body ~on_eof ~on_read
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      request_body
+      ~on_eof
+      ~on_read
   in
   let t = create ~error_handler request_handler in
   reader_ready t;
@@ -2325,7 +2403,11 @@ let test_eof_called_for_empty_bodies () =
     let request_body = Reqd.request_body reqd in
     let on_read _buffer ~off:_ ~len:_ = assert false
     and on_eof () = incr eof_counter in
-    Body.Reader.schedule_read request_body ~on_eof ~on_read
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      request_body
+      ~on_eof
+      ~on_read
   in
   let t = create ~error_handler request_handler in
   reader_ready t;
@@ -2393,9 +2475,17 @@ let test_pipelined_requests_in_single_buffer_partial_body () =
     let response_body = Reqd.respond_with_streaming reqd response in
     let rec on_read buffer ~off ~len =
       Body.Writer.write_bigstring response_body buffer ~off ~len;
-      Body.Reader.schedule_read request_body ~on_eof ~on_read
+      Body.Reader.schedule_read
+        ~on_error:(Helpers.body_must_complete __LOC__)
+        request_body
+        ~on_eof
+        ~on_read
     and on_eof () = Body.Writer.close response_body in
-    Body.Reader.schedule_read (Reqd.request_body reqd) ~on_eof ~on_read
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      (Reqd.request_body reqd)
+      ~on_eof
+      ~on_read
   in
   let t = create request_handler in
   let req = Request.create `POST "/" ~headers:(Headers.encoding_fixed 5) in
@@ -2421,9 +2511,17 @@ let test_multiple_pipelined_requests () =
     let response_body = Reqd.respond_with_streaming reqd response in
     let rec on_read buffer ~off ~len =
       Body.Writer.write_bigstring response_body buffer ~off ~len;
-      Body.Reader.schedule_read request_body ~on_eof ~on_read
+      Body.Reader.schedule_read
+        ~on_error:(Helpers.body_must_complete __LOC__)
+        request_body
+        ~on_eof
+        ~on_read
     and on_eof () = Body.Writer.close response_body in
-    Body.Reader.schedule_read (Reqd.request_body reqd) ~on_eof ~on_read
+    Body.Reader.schedule_read
+      ~on_error:(Helpers.body_must_complete __LOC__)
+      (Reqd.request_body reqd)
+      ~on_eof
+      ~on_read
   in
   let t = create request_handler in
   let req = Request.create `POST "/" ~headers:(Headers.encoding_fixed 5) in
@@ -2946,6 +3044,7 @@ let test_unread_body_discarded_after_response () =
               (Raw.take_output t);
             let held = ref 0 in
             Body.Reader.schedule_read
+              ~on_error:(Helpers.body_must_complete __LOC__)
               (List.nth !bodies 1)
               ~on_eof:ignore
               ~on_read:(fun _ ~off:_ ~len -> held := !held + len);
@@ -3638,6 +3737,78 @@ let test_tunnel_after_eof () =
        Alcotest.check read_operation (split ^ ": reader closed") `Close op)
     splits
 
+let record_body events body =
+  let rec loop () =
+    Body.Reader.schedule_read
+      body
+      ~on_eof:(fun () -> events := "eof" :: !events)
+      ~on_error:(fun () -> events := "error" :: !events)
+      ~on_read:(fun _ ~off:_ ~len:_ ->
+        events := "read" :: !events;
+        loop ())
+  in
+  loop ()
+
+let check_one_ending label expected events =
+  let ends = List.filter (fun e -> e <> "read") !events in
+  Alcotest.(check (list string)) (label ^ ": one ending") [ expected ] ends;
+  Alcotest.(check string)
+    (label ^ ": ending is last")
+    expected
+    (List.hd !events)
+
+let test_request_body_endings () =
+  let post headers body =
+    "POST / HTTP/1.1\r\nHost: a\r\n" ^ headers ^ "\r\n" ^ body
+  in
+  List.iter
+    (fun (split, chunk) ->
+       List.iter
+         (fun (case, input, finish, expected) ->
+            let label = case ^ ", " ^ split in
+            let events = ref [] in
+            let body = ref None in
+            let t =
+              Raw.create (fun reqd ->
+                body := Some (Reqd.request_body reqd);
+                record_body events (Reqd.request_body reqd))
+            in
+            Raw.feed ~chunk t input;
+            finish t (Option.get !body);
+            check_one_ending label expected events;
+            let before = List.length !events in
+            record_body events (Option.get !body);
+            Server_connection.shutdown t.conn;
+            Raw.feed ~eof:true ~chunk t "more";
+            Alcotest.(check int)
+              (label ^ ": nothing after the ending")
+              before
+              (List.length !events))
+         [ ( "complete"
+           , post "content-length: 3\r\n" "abc"
+           , (fun t _ -> Raw.feed ~eof:true ~chunk t "")
+           , "eof" )
+         ; ( "cut by EOF"
+           , post "content-length: 5\r\n" "ab"
+           , (fun t _ -> Raw.feed ~eof:true ~chunk t "")
+           , "error" )
+         ; ( "framing error"
+           , post "transfer-encoding: chunked\r\n" "3\r\nabcX"
+           , (fun t _ -> ignore (Raw.read_op t))
+           , "error" )
+         ; ( "closed by the application"
+           , post "content-length: 5\r\n" "ab"
+           , (fun t body ->
+               Body.Reader.close body;
+               Raw.feed ~chunk t "cde")
+           , "eof" )
+         ; ( "connection shutdown"
+           , post "content-length: 5\r\n" "ab"
+           , (fun t _ -> Server_connection.shutdown t.conn)
+           , "error" )
+         ])
+    splits
+
 let tests =
   [ "initial reader state", `Quick, test_initial_reader_state
   ; "shutdown reader closed", `Quick, test_reader_is_closed_after_eof
@@ -3874,6 +4045,7 @@ let tests =
     , `Quick
     , test_report_exn_while_error_handler_pending )
   ; "tunnel response after EOF", `Quick, test_tunnel_after_eof
+  ; "request body: one final ending", `Quick, test_request_body_endings
   ; ( "upgrade wins over Connection: close"
     , `Quick
     , test_upgrade_wins_over_connection_close )

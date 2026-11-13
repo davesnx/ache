@@ -106,13 +106,18 @@ let () =
   in
   let client = Ache_eio.Client.create_connection ~sw flow in
   let finished, resolve_finished = Eio.Promise.create () in
+  let on_error () =
+    Eio.Promise.resolve_error
+      resolve_finished
+      (Failure "response body cut short")
+  in
   let response_handler response body =
     Format.printf "%a@." Response.pp_hum response;
     let rec on_read buffer ~off ~len =
       print_string (Bigstringaf.substring buffer ~off ~len);
-      Body.Reader.schedule_read body ~on_read ~on_eof
-    and on_eof () = Eio.Promise.resolve resolve_finished () in
-    Body.Reader.schedule_read body ~on_read ~on_eof
+      Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+    and on_eof () = Eio.Promise.resolve_ok resolve_finished () in
+    Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
   in
   let headers =
     Headers.of_list [ "host", Printf.sprintf "127.0.0.1:%d" port ]
@@ -125,7 +130,7 @@ let () =
       ~response_handler
   in
   Body.Writer.close request_body;
-  Eio.Promise.await finished;
+  Eio.Promise.await_exn finished;
   Eio.Promise.await (Ache_eio.Client.shutdown client)
 ```
 
@@ -208,9 +213,14 @@ let () =
        Format.printf "%a@." Response.pp_hum response;
        let rec on_read buffer ~off ~len =
          print_string (Bigstringaf.substring buffer ~off ~len);
-         Body.Reader.schedule_read body ~on_read ~on_eof
-       and on_eof () = Lwt.wakeup_later notify_finished () in
-       Body.Reader.schedule_read body ~on_read ~on_eof
+         Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+       and on_eof () = Lwt.wakeup_later notify_finished ()
+       and on_error () =
+         Lwt.wakeup_later_exn
+           notify_finished
+           (Failure "response body cut short")
+       in
+       Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
      in
      let headers =
        Headers.of_list [ "host", Printf.sprintf "127.0.0.1:%d" port ]
@@ -305,9 +315,10 @@ httpun rejected chunk extensions and trailers.
 
 ### Bodies
 
-- `Body.Reader.schedule_read` takes `?on_error`. A body cut by the end of the
-  input, by a framing error or by a closed connection calls `on_error`, not
-  `on_eof`. httpun called `on_eof`, as for a complete body.
+- `Body.Reader.schedule_read` takes a required `~on_error`. A body cut by the
+  end of the input, by a framing error or by a closed connection calls
+  `on_error`, not `on_eof`; exactly one of the two ends a body. httpun called
+  `on_eof`, as for a complete body.
 - `on_read` gets all the bytes that are available in one call, so a body of
   many small chunks is delivered in linear time. ache does not reuse the
   bytes it gives to `on_read`.
@@ -421,7 +432,7 @@ yet, and CI does not run it.
 | `Response.Body_length.t` | Also `` `No_body `` (response to `HEAD`, 1xx, 204, 304) |
 | `` `Payload_too_large `` | `` `Content_too_large `` |
 | `Status.of_code 422` is `` `Code 422 `` (also 102, 103, 207, 208, 226, 308, 421, 423, 424, 425, 451, 506, 507, 508) | A named constructor, such as `` `Unprocessable_content ``. Exhaustive matches on the `Status` subtypes must handle them |
-| `Body.Reader.schedule_read t ~on_eof ~on_read` | Also `?on_error`, called for a cut body; without it nothing is called |
+| `Body.Reader.schedule_read t ~on_eof ~on_read` | Also `~on_error` (required), called in place of `on_eof` for a cut body |
 | `respond_with_string` with a 1xx status | `Reqd.respond_with_informational` |
 | `respond_with_*` sends the head as given | Raises `Invalid_argument` in the cases listed in [Responses](#responses) |
 | `Client_connection.request` sends the head as given | Raises `Invalid_argument` for an invalid head |

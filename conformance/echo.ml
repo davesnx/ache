@@ -6,7 +6,8 @@ let request_handler reqd =
   let body = Buffer.create 128 in
   let rec on_read buffer ~off ~len =
     Buffer.add_string body (Bigstringaf.substring buffer ~off ~len);
-    Body.Reader.schedule_read request_body ~on_eof ~on_read
+    Body.Reader.schedule_read request_body ~on_eof ~on_error ~on_read
+  and on_error () = prerr_endline "request body cut short"
   and on_eof () =
     let content_type =
       match Headers.get headers "content-type" with
@@ -22,7 +23,7 @@ let request_handler reqd =
       (Response.create ~headers `OK)
       (Buffer.contents body)
   in
-  Body.Reader.schedule_read request_body ~on_eof ~on_read
+  Body.Reader.schedule_read request_body ~on_eof ~on_error ~on_read
 
 let error_handler = Ache_examples.Server.error_handler
 

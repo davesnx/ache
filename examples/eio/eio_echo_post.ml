@@ -25,13 +25,15 @@ let request_handler ~u (_ : Eio.Net.Sockaddr.stream) reqd =
     let response_body = Reqd.respond_with_streaming reqd response in
     let rec on_read buffer ~off ~len =
       Body.Writer.write_bigstring response_body buffer ~off ~len;
-      Body.Reader.schedule_read request_body ~on_eof ~on_read
+      Body.Reader.schedule_read request_body ~on_eof ~on_error ~on_read
     and on_eof () =
       Stdlib.Format.eprintf "EOF@.";
       Body.Writer.close response_body;
       Eio.Promise.resolve_ok u ()
+    and on_error () =
+      Eio.Promise.resolve_error u (Failure "request body cut short")
     in
-    Body.Reader.schedule_read (Reqd.request_body reqd) ~on_eof ~on_read
+    Body.Reader.schedule_read request_body ~on_eof ~on_error ~on_read
   | _ ->
     let headers = Headers.of_list [ "connection", "close" ] in
     Reqd.respond_with_string

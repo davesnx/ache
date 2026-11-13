@@ -41,6 +41,12 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - The `respond_with_*` functions and `Client_connection.request` raise
   `Invalid_argument` for heads and framing they cannot send correctly (see
   Server and Client below). httpun sent them as given.
+- `Body.Reader.schedule_read` takes a required `~on_error:(unit -> unit)`.
+  A body cut by end of input, a framing error, an exception or `shutdown`
+  calls it in place of `on_eof`, and the cause goes to the error handler
+  (RFC 9112 §8). Exactly one of `on_eof` and `on_error` ends a body. A
+  close-delimited response body still ends with `on_eof`. Add `~on_error`
+  to every call.
 
 ### Server
 
@@ -130,10 +136,6 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 
 ### Bodies
 
-- `Body.Reader.schedule_read` takes `?on_error`. A body cut by end of input,
-  a framing error, an exception or `shutdown` calls it in place of `on_eof`,
-  and the cause goes to the error handler (RFC 9112 §8). A close-delimited
-  response body still ends with `on_eof`.
 - `on_read` gets all the available bytes in one call, so a body of many
   small chunks is delivered in linear time. Body bytes are copied into one
   buffer per body, and bytes given to `on_read` are never overwritten.

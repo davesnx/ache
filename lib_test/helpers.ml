@@ -76,3 +76,12 @@ module Headers = struct
   let encoding_chunked = Headers.of_list [ "transfer-encoding", "chunked" ]
   let encoding_fixed n = Headers.of_list [ "content-length", string_of_int n ]
 end
+
+let cut_bodies = ref []
+
+let body_must_complete loc () =
+  cut_bodies := loc :: !cut_bodies;
+  Alcotest.failf "body cut short at %s" loc
+
+let no_body_cut () =
+  Alcotest.(check (list string)) "bodies cut short" [] (List.rev !cut_bodies)

@@ -113,7 +113,7 @@ module Reader = struct
     if t.read_scheduled
     then do_execute_read t ~on_error:t.on_error t.on_eof t.on_read
 
-  let schedule_read ?(on_error = default_on_error) t ~on_eof ~on_read =
+  let schedule_read t ~on_eof ~on_error ~on_read =
     if t.read_scheduled
     then failwith "Body.schedule_read: reader already scheduled";
     if not (is_closed t)

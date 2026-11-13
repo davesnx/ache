@@ -72,6 +72,7 @@ let echo_server () =
   Runtime.make (module Echo) (Echo.create (fun t s -> Echo.send t s))
 
 let server_errors : Server_connection.error list ref = ref []
+let partial_body_cut = ref false
 let stream_flush_closed : unit Eio.Promise.u option ref = ref None
 let requests_seen = ref 0
 
@@ -103,9 +104,10 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
         response_body
         (Bigstringaf.substring buffer ~off ~len);
       Body.Writer.flush response_body (fun _ ->
-        Body.Reader.schedule_read body ~on_eof ~on_read)
-    and on_eof () = Body.Writer.close response_body in
-    Body.Reader.schedule_read body ~on_eof ~on_read
+        Body.Reader.schedule_read body ~on_eof ~on_error ~on_read)
+    and on_eof () = Body.Writer.close response_body
+    and on_error () = failwith "request body cut short" in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | `GET, "/upgrade" ->
     Body.Reader.close body;
     Reqd.respond_with_upgrade
@@ -129,9 +131,10 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
   | `GET, "/raise" -> failwith "handler failed"
   | `POST, "/partial" ->
     let rec on_read _ ~off:_ ~len:_ =
-      Body.Reader.schedule_read body ~on_eof ~on_read
-    and on_eof () = () in
-    Body.Reader.schedule_read body ~on_eof ~on_read
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () = Alcotest.fail "a cut body completed"
+    and on_error () = partial_body_cut := true in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | _, target ->
     Body.Reader.close body;
     Reqd.respond_with_string
@@ -201,9 +204,10 @@ let read_body body =
   let p, u = Eio.Promise.create () in
   let rec on_read bs ~off ~len =
     Stdlib.Buffer.add_string buf (Bigstringaf.substring bs ~off ~len);
-    Body.Reader.schedule_read body ~on_eof ~on_read
-  and on_eof () = Eio.Promise.resolve u (Stdlib.Buffer.contents buf) in
-  Body.Reader.schedule_read body ~on_eof ~on_read;
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+  and on_eof () = Eio.Promise.resolve u (Stdlib.Buffer.contents buf)
+  and on_error () = Eio.Promise.resolve u "<response body cut short>" in
+  Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
   p
 
 let client_error_handler error =
@@ -452,6 +456,7 @@ let test_write_failure () =
   check_shutdowns ()
 
 let test_eof_mid_body () =
+  partial_body_cut := false;
   with_server (fun ~sw ~net addr ->
     let socket = Eio.Net.connect ~sw net addr in
     Eio.Flow.copy_string
@@ -466,6 +471,7 @@ let test_eof_mid_body () =
       Eio.Buf_read.parse_exn Eio.Buf_read.take_all ~max_size:65536 socket
     in
     Eio.Flow.close socket);
+  Alcotest.(check bool) "request body cut" true !partial_body_cut;
   match !server_errors with
   | [ `Bad_request ] -> ()
   | _ ->
