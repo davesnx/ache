@@ -128,7 +128,30 @@ module Grammar = struct
     | 3 -> Status.of_code (int_of_string code)
     | _ -> Parseff.fail (Printf.sprintf "status-code too long: %S" code)
 
+  (* RFC 9112 §5.2: a recipient of a response replaces each obs-fold with SP. *)
+  let folded_headers () =
+    let rec loop acc =
+      match Parseff.peek_char (), acc with
+      | Some '\r', _ -> Headers.of_rev_list acc
+      | Some (' ' | '\t'), (name, value) :: acc ->
+        Parseff.skip_while is_space;
+        let more = Parseff.take_while is_field_char in
+        eol ();
+        loop ((name, String.trim (value ^ " " ^ more)) :: acc)
+      | Some _, _ -> loop (header () :: acc)
+      | None, _ -> Parseff.fail "unexpected end of input"
+    in
+    loop []
+
+  (* RFC 9112 §2.2: empty lines before a response are discarded. *)
   let response_head () =
+    let rec skip_empty_lines () =
+      if Parseff.peek_char () = Some '\r'
+      then (
+        eol ();
+        skip_empty_lines ())
+    in
+    skip_empty_lines ();
     let version = version () in
     if version.major <> 1
     then
@@ -142,7 +165,7 @@ module Grammar = struct
     ignore (Parseff.char ' ');
     let reason = Parseff.take_while is_field_char in
     eol ();
-    let headers = headers () in
+    let headers = folded_headers () in
     eol ();
     Response.create ~reason ~version ~headers status
 
@@ -225,6 +248,7 @@ module Reader = struct
     [ `Invalid_response_body_length of Response.t
     | `Parse of string
     | `Header_too_large
+    | `Unsolicited_response
     ]
 
   type _ Effect.t += Need_input : unit Effect.t
@@ -399,7 +423,6 @@ module Reader = struct
 
   let response ~max_header_size request_queue =
     let on_head t response =
-      assert (not (Queue.is_empty request_queue));
       let exception Local of Respd.t option in
       match
         Queue.iter
@@ -410,31 +433,34 @@ module Reader = struct
              then raise (Local None))
           request_queue
       with
-      | () -> assert false
+      | () -> t.state <- Fail `Unsolicited_response
       | exception Local None -> t.state <- Cancelled_parse
       | exception Local (Some respd) ->
         let request = Respd.request respd in
-        (match Response.body_length ~request_method:request.meth response with
-        | `No_body
-          when Status.is_informational response.status
-               && response.status <> `Switching_protocols ->
-          t.state <- Done
-        | `Error `Bad_gateway -> assert false
-        | `Error `Internal_server_error ->
-          t.state <- Fail (`Invalid_response_body_length response)
-        | `No_body | `Fixed 0L ->
-          respd.response_handler response (Body.Reader.create_empty ());
-          t.state <- Done
-        | (`Fixed _ | `Chunked | `Close_delimited) as encoding ->
-          let body = create_body t in
-          let framing =
-            match encoding with
-            | `Fixed n -> Fixed n
-            | `Chunked -> Chunk_line None
-            | `Close_delimited -> Close_delimited
-          in
-          t.state <- Body (body, framing);
-          respd.response_handler response body)
+        if response.Response.status = `Switching_protocols
+        then respd.response_handler response (Body.Reader.create_empty ())
+        else if request.meth = `CONNECT && Status.is_successful response.status
+        then respd.response_handler response (create_body t)
+        else (
+          match Response.body_length ~request_method:request.meth response with
+          | `No_body when Status.is_informational response.status ->
+            t.state <- Done
+          | `Error `Bad_gateway -> assert false
+          | `Error `Internal_server_error ->
+            t.state <- Fail (`Invalid_response_body_length response)
+          | `No_body | `Fixed 0L ->
+            respd.response_handler response (Body.Reader.create_empty ());
+            t.state <- Done
+          | (`Fixed _ | `Chunked | `Close_delimited) as encoding ->
+            let body = create_body t in
+            let framing =
+              match encoding with
+              | `Fixed n -> Fixed n
+              | `Chunked -> Chunk_line None
+              | `Close_delimited -> Close_delimited
+            in
+            t.state <- Body (body, framing);
+            respd.response_handler response body)
     in
     create
       ~max_header_size

@@ -820,8 +820,7 @@ let client_framing_tests =
          Client.close_input c;
          check_client_ok "close-delimited" ~body:"abcdef" ex;
          Alcotest.(check bool) "closed" true (Client.is_closed c))
-  ; known_failure
-      ~ticket:"27"
+  ; test
       "§6.1 client MUST: HTTP/1.0 response with Transfer-Encoding closes the \
        connection"
       (fun () ->

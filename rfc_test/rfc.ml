@@ -442,6 +442,7 @@ module Client = struct
   let error_to_string = function
     | `Malformed_response _ -> "Malformed_response"
     | `Invalid_response_body_length _ -> "Invalid_response_body_length"
+    | `Connection_closed -> "Connection_closed"
     | `Exn exn -> "Exn " ^ Printexc.to_string exn
 
   let create ?config () =

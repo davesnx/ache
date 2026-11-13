@@ -40,6 +40,7 @@ module Client = struct
       match error with
       | `Malformed_response err -> Format.sprintf "Malformed response: %s" err
       | `Invalid_response_body_length _ -> "Invalid body length"
+      | `Connection_closed -> "Connection closed before the response"
       | `Exn exn -> Format.sprintf "Exn raised: %s" (Printexc.to_string exn)
     in
     Format.eprintf "Error handling response: %s\n%!" error

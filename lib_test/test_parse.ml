@@ -153,6 +153,7 @@ let client ?config ?(meth = `GET) () =
           match error with
           | `Malformed_response msg -> "Malformed_response " ^ msg
           | `Invalid_response_body_length _ -> "Invalid_response_body_length"
+          | `Connection_closed -> "Connection_closed"
           | `Exn exn -> Printexc.to_string exn
         in
         c.cerrors <- e :: c.cerrors)
