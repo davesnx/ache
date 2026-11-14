@@ -7,6 +7,8 @@ a connection. Two runtimes drive it on sockets:
 - `ache-eio`, for [Eio](https://github.com/ocaml-multicore/eio)
 - `ache-lwt`, for [Lwt](https://github.com/ocsigen/lwt)
 
+`ache-eio-tls` and `ache-lwt-tls` add TLS (see [TLS](#tls)).
+
 ache is a fork of [httpun](https://github.com/anmonteiro/httpun), which is a
 fork of [httpaf](https://github.com/inhabitedtype/httpaf). It keeps their
 `Reqd`, `Body` and connection API, and changes this:
@@ -31,6 +33,7 @@ ache is not on opam yet. Pin it from GitHub:
 ```sh
 opam pin add ache https://github.com/davesnx/ache.git
 opam pin add ache-eio https://github.com/davesnx/ache.git  # or ache-lwt
+opam pin add ache-eio-tls https://github.com/davesnx/ache.git  # or ache-lwt-tls, for TLS
 ```
 
 ache needs OCaml 5.3 or later.
@@ -240,6 +243,291 @@ let () =
 The output is the same as with Eio. `examples/` has more: streaming request
 and response bodies, pipelined requests, and a CONNECT proxy.
 
+## TLS
+
+TLS uses [ocaml-tls](https://github.com/mirleft/ocaml-tls): `ache-eio-tls`
+runs `ache-eio` over `tls-eio`, and `ache-lwt-tls` runs `ache-lwt` over
+`tls-lwt`. OpenSSL (`lwt_ssl`) is not supported.
+
+The examples load a certificate from PEM files. To make a test CA and a
+certificate for `localhost` and `127.0.0.1` (the repository has no key
+material):
+
+```console
+$ dune exec examples/certs/gen_test_certs.exe -- /tmp
+```
+
+An Eio server. The handler does the handshake in the connection fiber; when
+it fails, it raises and `run_server` gives the exception to `on_error`. With
+`?clock` and `?idle_timeout`, the handshake must be complete in
+`idle_timeout`.
+
+<!-- example: examples/eio/eio_tls_hello_server.ml -->
+```ocaml
+open Ache
+
+let request_handler _client_address reqd =
+  let body = "Hello, TLS!\n" in
+  let headers = Headers.of_list [ "content-type", "text/plain" ] in
+  Reqd.respond_with_string reqd (Response.create ~headers `OK) body
+
+let error_handler _client_address ?request:_ error start_response =
+  let body = start_response Headers.empty in
+  (match error with
+  | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
+  | #Status.standard as status ->
+    Body.Writer.write_string body (Status.default_reason_phrase status));
+  Body.Writer.close body
+
+let () =
+  let port = int_of_string Sys.argv.(1) in
+  let cert = Sys.argv.(2)
+  and key = Sys.argv.(3) in
+  Mirage_crypto_rng_unix.use_default ();
+  Eio_main.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  let certificate =
+    X509_eio.private_of_pems
+      ~cert:Eio.Path.(fs / cert)
+      ~priv_key:Eio.Path.(fs / key)
+  in
+  let tls =
+    match Tls.Config.server ~certificates:(`Single certificate) () with
+    | Ok tls -> tls
+    | Error (`Msg message) -> failwith message
+  in
+  Eio.Switch.run @@ fun sw ->
+  let socket =
+    Eio.Net.listen
+      ~sw
+      ~backlog:128
+      ~reuse_addr:true
+      (Eio.Stdenv.net env)
+      (`Tcp (Eio.Net.Ipaddr.V4.loopback, port))
+  in
+  Printf.printf "Listening on https://127.0.0.1:%d\n%!" port;
+  Eio.Net.run_server
+    socket
+    ~on_error:(Eio.traceln "connection error: %a" Fmt.exn)
+    (Ache_eio_tls.Server.create_connection_handler
+       ~tls
+       ~request_handler
+       ~error_handler)
+```
+
+An Eio client that trusts the test CA. A client for public servers uses the
+system trust anchors, for example `Ca_certs.authenticator ()` from the
+`ca-certs` package, and the name of the server as `~host`.
+
+<!-- example: examples/eio/eio_tls_hello_client.ml -->
+```ocaml
+open Ache
+
+let error_handler error =
+  let message =
+    match error with
+    | `Malformed_response message -> message
+    | `Invalid_response_body_length _ -> "invalid response body length"
+    | `Connection_closed -> "connection closed before the response"
+    | `Exn exn -> Printexc.to_string exn
+  in
+  prerr_endline ("request failed: " ^ message);
+  exit 1
+
+let () =
+  let port = int_of_string Sys.argv.(1) in
+  let ca = Sys.argv.(2) in
+  Mirage_crypto_rng_unix.use_default ();
+  Eio_main.run @@ fun env ->
+  let authenticator =
+    X509_eio.authenticator (`Ca_file Eio.Path.(Eio.Stdenv.fs env / ca))
+  in
+  let tls =
+    match Tls.Config.client ~authenticator () with
+    | Ok tls -> tls
+    | Error (`Msg message) -> failwith message
+  in
+  Eio.Switch.run @@ fun sw ->
+  let socket =
+    Eio.Net.connect
+      ~sw
+      (Eio.Stdenv.net env)
+      (`Tcp (Eio.Net.Ipaddr.V4.loopback, port))
+  in
+  let host = Domain_name.(host_exn (of_string_exn "localhost")) in
+  let client = Ache_eio_tls.Client.create_connection ~sw ~tls ~host socket in
+  let finished, resolve_finished = Eio.Promise.create () in
+  let on_error () =
+    Eio.Promise.resolve_error
+      resolve_finished
+      (Failure "response body cut short")
+  in
+  let response_handler response body =
+    Format.printf "%a@." Response.pp_hum response;
+    let rec on_read buffer ~off ~len =
+      print_string (Bigstringaf.substring buffer ~off ~len);
+      Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+    and on_eof () = Eio.Promise.resolve_ok resolve_finished () in
+    Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+  in
+  let headers =
+    Headers.of_list [ "host", Printf.sprintf "localhost:%d" port ]
+  in
+  let request_body =
+    Ache_eio_tls.Client.request
+      client
+      (Request.create ~headers `GET "/")
+      ~error_handler
+      ~response_handler
+  in
+  Body.Writer.close request_body;
+  Eio.Promise.await_exn finished;
+  Eio.Promise.await (Ache_eio_tls.Client.shutdown client)
+```
+
+```console
+$ dune exec examples/eio/eio_tls_hello_server.exe -- 8443 /tmp/server.pem /tmp/server.key &
+Listening on https://127.0.0.1:8443
+$ dune exec examples/eio/eio_tls_hello_client.exe -- 8443 /tmp/ca.pem
+((version "HTTP/1.1") (status 200) (reason "OK") (headers (("content-type" "text/plain")
+                                                          ("content-length" "12"))))
+Hello, TLS!
+$ curl --cacert /tmp/ca.pem https://127.0.0.1:8443/
+Hello, TLS!
+```
+
+The same with Lwt. `create_connection_handler_with_fd` does the handshake,
+closes the socket when it fails, and with `?idle_timeout` limits the time of
+the handshake too.
+
+<!-- example: examples/lwt/lwt_tls_hello_server.ml -->
+```ocaml
+open Ache
+
+let request_handler _client_address reqd =
+  let body = "Hello, TLS!\n" in
+  let headers = Headers.of_list [ "content-type", "text/plain" ] in
+  Reqd.respond_with_string reqd (Response.create ~headers `OK) body
+
+let error_handler _client_address ?request:_ error start_response =
+  let body = start_response Headers.empty in
+  (match error with
+  | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
+  | #Status.standard as status ->
+    Body.Writer.write_string body (Status.default_reason_phrase status));
+  Body.Writer.close body
+
+let () =
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  let port = int_of_string Sys.argv.(1) in
+  let cert = Sys.argv.(2)
+  and key = Sys.argv.(3) in
+  let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
+  Lwt_main.run
+    (let open Lwt.Syntax in
+     let* certificate = X509_lwt.private_of_pems ~cert ~priv_key:key in
+     let tls =
+       match Tls.Config.server ~certificates:(`Single certificate) () with
+       | Ok tls -> tls
+       | Error (`Msg message) -> failwith message
+     in
+     let* _server =
+       Lwt_io.establish_server_with_client_socket
+         listen_address
+         (Ache_lwt_tls.Server.create_connection_handler_with_fd
+            ~tls
+            ~request_handler
+            ~error_handler)
+     in
+     Printf.printf "Listening on https://127.0.0.1:%d\n%!" port;
+     fst (Lwt.wait ()))
+```
+
+<!-- example: examples/lwt/lwt_tls_hello_client.ml -->
+```ocaml
+open Ache
+
+let error_handler error =
+  let message =
+    match error with
+    | `Malformed_response message -> message
+    | `Invalid_response_body_length _ -> "invalid response body length"
+    | `Connection_closed -> "connection closed before the response"
+    | `Exn exn -> Printexc.to_string exn
+  in
+  prerr_endline ("request failed: " ^ message);
+  exit 1
+
+let () =
+  let port = int_of_string Sys.argv.(1) in
+  let ca = Sys.argv.(2) in
+  Lwt_main.run
+    (let open Lwt.Syntax in
+     let* authenticator = X509_lwt.authenticator (`Ca_file ca) in
+     let tls =
+       match Tls.Config.client ~authenticator () with
+       | Ok tls -> tls
+       | Error (`Msg message) -> failwith message
+     in
+     let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+     let* () =
+       Lwt_unix.connect socket Unix.(ADDR_INET (inet_addr_loopback, port))
+     in
+     let host = Domain_name.(host_exn (of_string_exn "localhost")) in
+     let* client =
+       Ache_lwt_tls.Client.create_connection_with_fd ~tls ~host socket
+     in
+     let finished, notify_finished = Lwt.wait () in
+     let response_handler response body =
+       Format.printf "%a@." Response.pp_hum response;
+       let rec on_read buffer ~off ~len =
+         print_string (Bigstringaf.substring buffer ~off ~len);
+         Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+       and on_eof () = Lwt.wakeup_later notify_finished ()
+       and on_error () =
+         Lwt.wakeup_later_exn
+           notify_finished
+           (Failure "response body cut short")
+       in
+       Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+     in
+     let headers =
+       Headers.of_list [ "host", Printf.sprintf "localhost:%d" port ]
+     in
+     let request_body =
+       Ache_lwt_tls.Client.request
+         client
+         (Request.create ~headers `GET "/")
+         ~error_handler
+         ~response_handler
+     in
+     Body.Writer.close request_body;
+     let* () = finished in
+     Ache_lwt_tls.Client.shutdown client)
+```
+
+A response without `Content-Length` or `Transfer-Encoding: chunked` ends when
+the connection closes. Over TLS, only a `close_notify` alert proves that the
+peer closed the connection; without it, an attacker can cut the response.
+The clients of `ache-eio-tls` and `ache-lwt-tls` report such a response as
+cut: the body gets `on_error`, and the error handler gets
+`` `Exn Ache_eio_tls.Truncated `` or `` `Exn Ache_lwt_tls.Truncated ``. In
+every other case the end of TCP without `close_notify` counts as the end of
+the input, as without TLS: a complete response with `Content-Length` or
+chunked framing is not an error, and a request that got no byte of its
+response gets `` `Connection_closed ``, so that the application can retry
+it. `Ache_eio` also accepts a `Tls_eio` flow directly,
+but `tls-eio` 2.1.5 does not tell `close_notify` from the end of TCP, so a
+client on such a flow reports a cut response as complete. A request body
+always has an explicit length, so a server reports a cut body without this
+check.
+
+Timeouts: with `?idle_timeout` (and `?clock` with Eio), the TLS handshake
+must also be complete in `idle_timeout`. Without it, the handshake has no time
+limit. A client that sends plain HTTP to a TLS port gets no answer, because
+ocaml-tls waits for the rest of what it reads as a TLS record, so without
+`?idle_timeout` the connection stays open until the client closes it.
+
 ## Differences from httpun
 
 ache forks httpun at commit `37fdcd8` (httpun 0.2.0 and 10 commits).
@@ -346,7 +634,7 @@ httpun rejected chunk extensions and trailers.
 ## Limits
 
 - HTTP/1.0 and HTTP/1.1 only. There is no HTTP/2 or HTTP/3.
-- `ache-lwt` has no TLS module (see [Runtime notes](#runtime-notes)).
+- TLS is ocaml-tls only (see [TLS](#tls)): there is no OpenSSL runtime.
 - Trailer fields are read and discarded. The API does not give them to the
   application.
 - Server timeouts are off by default. `?idle_timeout` closes a connection
@@ -362,15 +650,16 @@ httpun rejected chunk extensions and trailers.
 
 - **Eio.** `Ache_eio.Server.create_connection_handler ~request_handler
   ~error_handler` can be given to `Eio.Net.run_server`. The server and the
-  client accept any `_ Eio.Flow.two_way`, for example a TLS flow. Timeouts
+  client accept any `_ Eio.Flow.two_way`; `ache-eio-tls` gives TLS. Timeouts
   need `?clock`. With a clock, when the server stops reading (after a
   response that closes the connection) it reads and drops input until the
   peer closes, for at most `idle_timeout` (2 s without
   one), so that the peer can read the response before the connection is
   reset. Without a clock it closes at once.
 - **Lwt.** The application must ignore `SIGPIPE`. `Ache_lwt.Server` and
-  `Ache_lwt.Client` use `Lwt_unix.file_descr`. For another socket type, such
-  as a TLS socket, implement `Ache_lwt.IO` and apply `Ache_lwt.Make`: `read`
+  `Ache_lwt.Client` use `Lwt_unix.file_descr`, and `ache-lwt-tls` a TLS
+  socket. For another socket type, implement `Ache_lwt.IO` and apply
+  `Ache_lwt.Make`: `read`
   fails with `End_of_file` at the end of the input or when the peer is gone,
   and `writev` returns `` `Closed `` when the peer is gone. The `Ache_lwt.IO`
   documentation has the full contract. The Lwt server does not wait for the
@@ -379,15 +668,17 @@ httpun rejected chunk extensions and trailers.
 ## Testing
 
 `dune test` runs these suites (counts from `dune test --force` on
-2026-11-13):
+2026-11-14):
 
 | Suite | Tests |
 |---|---|
-| `lib_test`: core unit tests | 256 |
+| `lib_test`: core unit tests | 259 |
 | `rfc_test`: RFC 9110 | 159 |
 | `rfc_test`: RFC 9112 | 178 |
-| `eio_test`: Eio on loopback sockets | 28 |
+| `eio_test`: Eio on loopback sockets | 32 |
+| `eio_tls_test`: `ache-eio-tls` on loopback sockets | 27 |
 | `lwt_test`: Lwt on loopback sockets | 24 |
+| `lwt_tls_test`: `ache-lwt-tls` on loopback sockets | 17 |
 
 The RFC suites start from each sentence of RFC 9110 and RFC 9112 §2–§11 that
 has a requirement keyword (MUST, SHOULD, MAY and others), plus definitions
@@ -420,7 +711,9 @@ yet, and CI does not run it.
 | `Httpun_eio` | `Ache_eio` |
 | `Httpun_lwt_unix.Server`, `Httpun_lwt_unix.Client` | `Ache_lwt.Server`, `Ache_lwt.Client` |
 | `Httpun_lwt.Server (Gluten_lwt.Server)`, `Httpun_lwt.Client (...)` | `Ache_lwt.Make (Io)`, with `Io : Ache_lwt.IO` |
-| `Httpun_lwt_unix.Server.TLS`, `.SSL`, `Client.TLS`, `.SSL` | Removed. Implement `Ache_lwt.IO` for the TLS socket |
+| `Httpun_lwt_unix.Server.TLS`, `Client.TLS` | `Ache_lwt_tls.Server`, `Ache_lwt_tls.Client` (package `ache-lwt-tls`). `Server.TLS.create_connection_handler_with_default ~certfile ~keyfile` becomes `Server.create_connection_handler_with_fd ~tls`, with a `Tls.Config.server`. `Client.TLS.create_connection_with_default` did not check the server certificate; `Client.create_connection_with_fd ~tls ?host` takes a `Tls.Config.client` with an authenticator |
+| `Httpun_lwt_unix.Server.SSL`, `Client.SSL` | Removed. There is no OpenSSL runtime; implement `Ache_lwt.IO` over `Lwt_ssl` to use one |
+| TLS with `httpun-eio` | `Ache_eio_tls.Server.create_connection_handler ~tls` and `Ache_eio_tls.Client.create_connection ~tls ?host` (package `ache-eio-tls`) |
 | Runtime `request_handler : addr -> Reqd.t Gluten.reqd -> unit` | `addr -> Reqd.t -> unit` |
 | `Reqd.respond_with_upgrade : t -> Headers.t -> (unit -> unit) -> unit` | `t -> Headers.t -> Ache.Runtime.impl -> unit`; make the `impl` with `Ache.Runtime.make` |
 | `Client.upgrade : t -> Gluten.impl -> unit` | `t -> Ache.Runtime.impl -> unit` |

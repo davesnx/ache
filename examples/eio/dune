@@ -8,6 +8,18 @@
   eio_hello_server
   eio_hello_client))
 
+(executables
+ (libraries
+  ache
+  ache-eio
+  ache-eio-tls
+  domain-name
+  eio_main
+  mirage-crypto-rng.unix
+  tls
+  tls-eio)
+ (names eio_tls_hello_server eio_tls_hello_client))
+
 (alias
  (name examples)
  (deps

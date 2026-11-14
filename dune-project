@@ -59,6 +59,34 @@
   (alcotest :with-test)))
 
 (package
+ (name ache-eio-tls)
+ (synopsis "TLS for the Eio runtime of ache")
+ (description
+  "Runs ache HTTP/1.1 servers and clients over TLS on Eio flows, with ocaml-tls (tls-eio). A client reports a response that ends at the close of the connection without a TLS close_notify as an error.")
+ (documentation "https://ocaml.org/p/ache-eio-tls/latest/doc/index.html")
+ (tags
+  (http http-server http-client web eio tls))
+ (depends
+  (ocaml
+   (>= 5.3))
+  (ache
+   (= :version))
+  (ache-eio
+   (= :version))
+  domain-name
+  eio
+  ipaddr
+  (tls
+   (>= 2.1.5))
+  (tls-eio
+   (>= 2.1.5))
+  (eio_main :with-test)
+  (x509 :with-test)
+  (ptime :with-test)
+  (mirage-crypto-rng :with-test)
+  (alcotest :with-test)))
+
+(package
  (name ache-lwt)
  (synopsis "Lwt runtime for ache")
  (description
@@ -73,4 +101,32 @@
    (= :version))
   bigstringaf
   lwt
+  (alcotest :with-test)))
+
+(package
+ (name ache-lwt-tls)
+ (synopsis "TLS for the Lwt runtime of ache")
+ (description
+  "Runs ache HTTP/1.1 servers and clients over TLS on Lwt_unix sockets, with ocaml-tls (tls-lwt). A client reports a response that ends at the close of the connection without a TLS close_notify as an error.")
+ (documentation "https://ocaml.org/p/ache-lwt-tls/latest/doc/index.html")
+ (tags
+  (http http-server http-client web lwt tls))
+ (depends
+  (ocaml
+   (>= 5.3))
+  (ache
+   (= :version))
+  (ache-lwt
+   (= :version))
+  bigstringaf
+  domain-name
+  ipaddr
+  lwt
+  (tls
+   (>= 2.1.5))
+  (tls-lwt
+   (>= 2.1.5))
+  (x509 :with-test)
+  (ptime :with-test)
+  (mirage-crypto-rng :with-test)
   (alcotest :with-test)))

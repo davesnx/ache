@@ -150,6 +150,6 @@ jobs:
       - name: Release
         uses: davesnx/dune-release-action@v0.6.0
         with:
-          packages: 'ache,ache-eio,ache-lwt'
+          packages: 'ache,ache-eio,ache-eio-tls,ache-lwt,ache-lwt-tls'
           changelog: './CHANGES.md'
           github-token: ${{ secrets.GH_TOKEN }}

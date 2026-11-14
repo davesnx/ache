@@ -18,7 +18,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `Ache_lwt.Client.upgrade` take a `Runtime.impl`.
 - `ache-lwt`: `Make (Io)` over the new `module type IO` replaces the functors
   over gluten runtimes. `Server` and `Client` run on `Lwt_unix.file_descr`.
-  The `TLS` and `SSL` modules are removed: implement `IO` for a TLS socket.
+  The `TLS` and `SSL` modules are removed: TLS is in the new package
+  `ache-lwt-tls`, and there is no OpenSSL runtime.
 - `ache-eio`: `Server.create_connection_handler` takes the flow before the
   address and no longer takes `~sw`, so that
   `create_connection_handler ~request_handler ~error_handler` can be given to
@@ -208,6 +209,26 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - httpaf #86: idle and head timeouts.
 - httpaf #191: 422 `` `Unprocessable_content ``.
 - httpaf #192: `respond_with_string` adds `Content-Length`.
+
+### TLS
+
+- New packages `ache-eio-tls` (module `Ache_eio_tls`, over `tls-eio`) and
+  `ache-lwt-tls` (module `Ache_lwt_tls`, over `tls-lwt`). Each has a server
+  handler that does the handshake on the accepted socket (limited by
+  `?idle_timeout`) and a client constructor that takes a `Tls.Config.client`
+  and `?host`. A client reports a response that ends at the close of the
+  connection without a TLS `close_notify` alert as
+  `` `Exn Ache_eio_tls.Truncated `` or `` `Exn Ache_lwt_tls.Truncated ``,
+  so a cut response body calls `on_error`. A complete response with
+  `Content-Length` or chunked framing, and a request that got no byte of its
+  response (`` `Connection_closed ``), are not affected.
+- `ache-eio`: a read is no longer cancelled by an idle or head timeout, by
+  the linger after the last response, or by `Client.shutdown`; the
+  connection waits for the result of the read in place of cancelling it.
+  `tls-eio` keeps the cancellation of a read as the permanent error of the
+  flow, so over TLS the 408 response and the `close_notify` alert were not
+  sent and the handler raised `Eio.Cancel.Cancelled`.
+- The README has TLS quick starts for Eio and Lwt.
 
 httpun history
 ==============

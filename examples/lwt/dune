@@ -8,6 +8,10 @@
   lwt_hello_server
   lwt_hello_client))
 
+(executables
+ (libraries ache ache-lwt-tls domain-name lwt lwt.unix tls tls-lwt)
+ (names lwt_tls_hello_server lwt_tls_hello_client))
+
 (alias
  (name examples)
  (deps

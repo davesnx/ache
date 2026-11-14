@@ -1,0 +1,14 @@
+(library
+ (name ache_lwt_tls)
+ (public_name ache-lwt-tls)
+ (libraries
+  ache
+  ache-lwt
+  bigstringaf
+  domain-name
+  ipaddr
+  lwt
+  lwt.unix
+  tls
+  tls-lwt
+  unix))

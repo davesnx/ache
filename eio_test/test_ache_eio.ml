@@ -75,6 +75,7 @@ let server_errors : Server_connection.error list ref = ref []
 let partial_body_cut = ref false
 let stream_flush_closed : unit Eio.Promise.u option ref = ref None
 let requests_seen = ref 0
+let pending_upgrade : Reqd.t option ref = ref None
 
 let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
   incr requests_seen;
@@ -128,6 +129,7 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
           Option.iter (fun u -> Eio.Promise.resolve u ()) !stream_flush_closed)
     in
     loop ()
+  | `GET, "/upgrade-later" -> pending_upgrade := Some reqd
   | `GET, "/raise" -> failwith "handler failed"
   | `POST, "/partial" ->
     let rec on_read _ ~off:_ ~len:_ =
@@ -913,6 +915,201 @@ let test_report_exn_raises () =
       (Runtime.make (module Raising) { Raising.sent = false });
     Eio.Promise.await (Ache_eio.Client.shutdown client))
 
+module Poison_flow = struct
+  type t = { inner : Eio.Flow.two_way_ty Eio.Resource.t }
+
+  let bytes_read = ref 0
+  let cancelled_reads = ref 0
+  let ops_after_cancel = ref 0
+  let send_shutdowns = ref 0
+
+  let reset () =
+    bytes_read := 0;
+    cancelled_reads := 0;
+    ops_after_cancel := 0;
+    send_shutdowns := 0
+
+  let check_poisoned () =
+    if !cancelled_reads > 0
+    then (
+      incr ops_after_cancel;
+      failwith "operation after a cancelled read")
+
+  let read_methods = []
+
+  let single_read t buf =
+    check_poisoned ();
+    match Eio.Flow.single_read t.inner buf with
+    | n ->
+      bytes_read := !bytes_read + n;
+      n
+    | exception (Eio.Cancel.Cancelled _ as exn) ->
+      incr cancelled_reads;
+      raise exn
+
+  let single_write t bufs =
+    check_poisoned ();
+    Eio.Flow.single_write t.inner bufs
+
+  let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
+
+  let shutdown t cmd =
+    check_poisoned ();
+    (match cmd with `Send | `All -> incr send_shutdowns | `Receive -> ());
+    Eio.Flow.shutdown t.inner cmd
+
+  let wrap socket =
+    Eio.Resource.T
+      ( { inner = (socket :> Eio.Flow.two_way_ty Eio.Resource.t) }
+      , Eio.Flow.Pi.two_way
+          (module struct
+            type nonrec t = t
+
+            let read_methods = read_methods
+            let single_read = single_read
+            let single_write = single_write
+            let copy = copy
+            let shutdown = shutdown
+          end) )
+
+  let check ~bytes_sent =
+    Alcotest.(check int) "every byte read once" bytes_sent !bytes_read;
+    Alcotest.(check int) "no read cancelled" 0 !cancelled_reads;
+    Alcotest.(check int)
+      "no operation after a cancelled read"
+      0
+      !ops_after_cancel
+end
+
+let read_head reader =
+  let status = Eio.Buf_read.line reader in
+  let rec skip () = if Eio.Buf_read.line reader <> "" then skip () in
+  skip ();
+  status
+
+let test_head_timeout_then_data () =
+  let clock = Eio_mock.Clock.make () in
+  Poison_flow.reset ();
+  let first = "GET /hello HTTP/1.1\r\nHo"
+  and late = "st: localhost\r\n\r\nGET /hello HTTP/1.1\r\n\r\n" in
+  with_server
+    ~flow:Poison_flow.wrap
+    ~clock
+    ~head_timeout:0.1
+    (fun ~sw ~net addr ->
+       let socket = Eio.Net.connect ~sw net addr in
+       let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+       Eio.Flow.copy_string first socket;
+       advance clock;
+       Alcotest.(check string)
+         "status line"
+         "HTTP/1.1 408 Request Timeout"
+         (read_head reader);
+       Eio.Flow.copy_string late socket;
+       Eio.Flow.shutdown socket `Send;
+       Alcotest.(check bool)
+         "nothing more"
+         true
+         (Eio.Buf_read.at_end_of_input reader);
+       Eio.Stream.take connections_done;
+       Eio.Flow.close socket);
+  Alcotest.(check int) "no request handled" 0 !requests_seen;
+  Alcotest.(check int) "one error" 1 (List.length !server_errors);
+  Poison_flow.check ~bytes_sent:(String.length first + String.length late)
+
+let test_idle_timeout_then_request () =
+  let clock = Eio_mock.Clock.make () in
+  Poison_flow.reset ();
+  with_server
+    ~flow:Poison_flow.wrap
+    ~clock
+    ~idle_timeout:0.1
+    (fun ~sw ~net addr ->
+       let socket = Eio.Net.connect ~sw net addr in
+       advance clock;
+       Eio.Flow.copy_string get_hello socket;
+       Eio.Flow.shutdown socket `Send;
+       Alcotest.(check string) "no response" "" (read_all socket);
+       Eio.Stream.take connections_done;
+       Eio.Flow.close socket);
+  Alcotest.(check int) "no request handled" 0 !requests_seen;
+  Alcotest.(check int) "no error" 0 (List.length !server_errors);
+  Poison_flow.check ~bytes_sent:(String.length get_hello)
+
+let test_client_shutdown_with_pending_read () =
+  Poison_flow.reset ();
+  let errors = ref [] in
+  Eio_main.run (fun env ->
+    Eio.Switch.run (fun sw ->
+      let client_end, server_end = Eio_unix.Net.socketpair_stream ~sw () in
+      let client =
+        Ache_eio.Client.create_connection ~sw (Poison_flow.wrap client_end)
+      in
+      let request_body =
+        Ache_eio.Client.request
+          client
+          (Request.create
+             ~headers:(Headers.of_list [ "host", "localhost" ])
+             `GET
+             "/")
+          ~error_handler:(fun error -> errors := error :: !errors)
+          ~response_handler:(fun _ _ -> Alcotest.fail "unexpected response")
+      in
+      Body.Writer.close request_body;
+      let reader = Eio.Buf_read.of_flow server_end ~max_size:65536 in
+      let (_ : string) = read_head reader in
+      let partial = "HTTP/1.1 200 OK\r\ncontent-le" in
+      Eio.Flow.copy_string partial server_end;
+      Eio.Time.sleep (Eio.Stdenv.clock env) 0.05;
+      Eio.Promise.await (Ache_eio.Client.shutdown client);
+      Alcotest.(check bool)
+        "peer sees the end of input"
+        true
+        (Eio.Buf_read.at_end_of_input reader);
+      Alcotest.(check int)
+        "bytes read"
+        (String.length partial)
+        !Poison_flow.bytes_read;
+      Alcotest.(check int) "Send shutdown" 1 !Poison_flow.send_shutdowns;
+      Alcotest.(check int)
+        "no operation after a cancelled read"
+        0
+        !Poison_flow.ops_after_cancel));
+  Alcotest.(check int) "one error" 1 (List.length !errors)
+
+let test_upgrade_with_read_pending () =
+  with_server (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    Eio.Flow.copy_string
+      "GET /upgrade-later HTTP/1.1\r\n\
+       host: localhost\r\n\
+       connection: upgrade\r\n\
+       upgrade: echo\r\n\
+       \r\n"
+      socket;
+    !real_sleep 0.05;
+    Eio.Flow.copy_string "ping" socket;
+    !real_sleep 0.05;
+    Reqd.respond_with_upgrade
+      (Option.get !pending_upgrade)
+      (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
+      (echo_server ());
+    let expected =
+      "HTTP/1.1 101 Switching Protocols\r\n\
+       connection: upgrade\r\n\
+       upgrade: echo\r\n\
+       \r\n\
+       ping"
+    in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Alcotest.(check string)
+      "101 then the bytes sent before it"
+      expected
+      (Eio.Buf_read.take (String.length expected) reader);
+    Eio.Flow.shutdown socket `Send;
+    Eio.Stream.take connections_done;
+    Eio.Flow.close socket)
+
 let () =
   Alcotest.run
     "ache-eio loopback"
@@ -978,5 +1175,17 @@ let () =
         ; ( "a pipelined head gets its own deadline"
           , `Quick
           , test_pipelined_head_deadline )
+        ; ( "input after a head timeout is read once, no read cancelled"
+          , `Quick
+          , test_head_timeout_then_data )
+        ; ( "a request after the idle timeout is read once, no read cancelled"
+          , `Quick
+          , test_idle_timeout_then_request )
+        ; ( "Client.shutdown with a read pending does not cancel it"
+          , `Quick
+          , test_client_shutdown_with_pending_read )
+        ; ( "upgrade gets the bytes sent before the 101"
+          , `Quick
+          , test_upgrade_with_read_pending )
         ] )
     ]

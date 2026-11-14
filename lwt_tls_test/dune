@@ -1,0 +1,15 @@
+(test
+ (name test_ache_lwt_tls)
+ (package ache-lwt-tls)
+ (libraries
+  ache
+  ache-lwt-tls
+  ache_test_certs
+  alcotest
+  bigstringaf
+  domain-name
+  lwt
+  lwt.unix
+  tls
+  tls-lwt
+  unix))

@@ -95,6 +95,7 @@ module IO_loop = struct
      ~linger:lingers
      t
      socket ->
+    Switch.run @@ fun sw ->
     let read_closed, resolve_read_closed = read_closed
     and receive_shut = ref false
     and send_shut = ref false
@@ -127,13 +128,31 @@ module IO_loop = struct
         ignore (Promise.try_resolve resolve_failed () : bool)
     in
     let read_buffer = Buffer.create read_buffer_size in
+    let pending_read = ref None in
+    let read_socket () =
+      let result =
+        match !pending_read with
+        | Some result -> result
+        | None ->
+          let result, resolve = Promise.create () in
+          pending_read := Some result;
+          Fiber.fork_daemon ~sw (fun () ->
+            (match read socket read_buffer with
+            | n -> Promise.resolve_ok resolve n
+            | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+            | exception exn -> Promise.resolve_error resolve exn);
+            `Stop_daemon);
+          result
+      in
+      let result = Promise.await result in
+      pending_read := None;
+      match result with Ok n -> n | Error exn -> raise exn
+    in
     let rec read_loop =
       let read () =
-        Fiber.first
-          (fun () -> read socket read_buffer)
-          (fun () ->
-             Promise.await read_closed;
-             raise End_of_file)
+        Fiber.first read_socket (fun () ->
+          Promise.await read_closed;
+          raise End_of_file)
       in
       let rec linger () =
         match timed_read `Linger read with
@@ -162,7 +181,8 @@ module IO_loop = struct
             | exception End_of_file ->
               let (_ : int) =
                 Buffer.get read_buffer ~f:(fun buf ~off ~len ->
-                  Runtime.read_eof t buf ~off ~len)
+                  let n = Runtime.read_eof t buf ~off ~len in
+                  if Option.is_some !pending_read then 0 else n)
               in
               ());
             read_loop_step ()

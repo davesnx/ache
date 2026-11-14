@@ -1,0 +1,14 @@
+(test
+ (name test_ache_eio_tls)
+ (package ache-eio-tls)
+ (libraries
+  ache
+  ache-eio
+  ache-eio-tls
+  ache_test_certs
+  alcotest
+  bigstringaf
+  domain-name
+  eio
+  eio_main
+  tls-eio))
