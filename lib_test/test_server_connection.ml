@@ -3859,6 +3859,44 @@ let test_request_body_endings () =
          ])
     splits
 
+let test_upgrade_failure_messages () =
+  let messages = ref [] in
+  let attempt f =
+    match f () with
+    | () -> messages := "no exception" :: !messages
+    | exception Failure msg -> messages := msg :: !messages
+  in
+  let impl () =
+    Ache.Runtime.make (module Recorder) { Recorder.got = ""; eof = false }
+  in
+  let t =
+    Raw.create
+      ~error_handler:(fun ?request:_ _ _ -> ())
+      (fun reqd ->
+         match (Reqd.request reqd).target with
+         | "/twice" ->
+           Reqd.respond_with_upgrade reqd Headers.empty (impl ());
+           attempt (fun () ->
+             Reqd.respond_with_upgrade reqd Headers.empty (impl ()))
+         | _ ->
+           Reqd.report_exn reqd (Failure "x");
+           attempt (fun () ->
+             Reqd.respond_with_upgrade reqd Headers.empty (impl ())))
+  in
+  Raw.feed ~chunk:max_int t "GET /error HTTP/1.1\r\nHost: a\r\n\r\n";
+  let t2 =
+    Raw.create (fun reqd ->
+      Reqd.respond_with_upgrade reqd Headers.empty (impl ());
+      attempt (fun () -> Reqd.respond_with_upgrade reqd Headers.empty (impl ())))
+  in
+  Raw.feed ~chunk:max_int t2 "GET /twice HTTP/1.1\r\nHost: a\r\n\r\n";
+  Alcotest.(check (list string))
+    "messages name respond_with_upgrade"
+    [ "ache.Reqd.respond_with_upgrade: invalid state, currently handling error"
+    ; "ache.Reqd.respond_with_upgrade: response already started"
+    ]
+    (List.rev !messages)
+
 let tests =
   [ "initial reader state", `Quick, test_initial_reader_state
   ; "shutdown reader closed", `Quick, test_reader_is_closed_after_eof
@@ -4101,6 +4139,9 @@ let tests =
     , `Quick
     , test_report_exn_while_error_handler_pending )
   ; "tunnel response after EOF", `Quick, test_tunnel_after_eof
+  ; ( "respond_with_upgrade failures name it"
+    , `Quick
+    , test_upgrade_failure_messages )
   ; "request body: one final ending", `Quick, test_request_body_endings
   ; ( "upgrade wins over Connection: close"
     , `Quick

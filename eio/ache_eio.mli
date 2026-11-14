@@ -72,8 +72,10 @@ module Server : sig
       half-close (for example some TLS flows) ends the connection normally.
 
       @raise Invalid_argument
-        when applied to a flow, if a timeout is given without [clock] or a
-        timeout is not positive. *)
+        if a timeout is given without [clock] or a timeout is not positive.
+        It is raised when [~error_handler] is applied if all four optional
+        arguments are given too, and otherwise when the handler is applied
+        to a flow: with [Eio.Net.run_server], in each connection fiber. *)
 
   val linger_without_idle_timeout : float
   (** Seconds a connection with [clock] and no [idle_timeout] waits for the

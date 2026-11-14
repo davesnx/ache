@@ -577,7 +577,7 @@ on the same connection get their responses first.
 | A bare LF or a bare CR as a line end, obs-fold, a field name that is not a token, a CTL (for example NUL) in a field value | 400 |
 | A request line without a version | 400 |
 | An HTTP/1.1 request without `Host`, two `Host` fields, a `Host` value that is not `uri-host [":" port]` | 400 |
-| A target form that does not fit the method: `*` with a method other than OPTIONS, authority-form with a method other than CONNECT | 400 |
+| A target form that does not fit the method: `*` with a method other than OPTIONS; without CONNECT, a target that is neither `/...` nor `scheme:...` (an authority such as `example.com:80` reads as a URI with scheme `example.com` and is accepted; `127.0.0.1:80` or `[::1]:80` is not) | 400 |
 | A CONNECT target that is not `host:port` with a port of 0 to 65535 | 400 |
 | A `Content-Length` that is not one repeated `1*DIGIT` value, such as `+3` or `3, 4` | 400 |
 | Both `Content-Length` and `Transfer-Encoding`; `Transfer-Encoding` in an HTTP/1.0 request; `chunked` that is not the final coding or is there twice | 400 |
@@ -689,13 +689,13 @@ httpun rejected chunk extensions and trailers.
 
 | Suite | Tests |
 |---|---|
-| `lib_test`: core unit tests | 261 |
+| `lib_test`: core unit tests | 264 |
 | `rfc_test`: RFC 9110 | 159 |
 | `rfc_test`: RFC 9112 | 178 |
-| `eio_test`: Eio on loopback sockets | 32 |
-| `eio_tls_test`: `ache-eio-tls` on loopback sockets | 33 |
-| `lwt_test`: Lwt on loopback sockets | 24 |
-| `lwt_tls_test`: `ache-lwt-tls` on loopback sockets | 23 |
+| `eio_test`: Eio on loopback sockets | 33 |
+| `eio_tls_test`: `ache-eio-tls` on loopback sockets | 34 |
+| `lwt_test`: Lwt on loopback sockets | 25 |
+| `lwt_tls_test`: `ache-lwt-tls` on loopback sockets | 24 |
 
 The RFC suites start from each sentence of RFC 9110 and RFC 9112 §2–§11 that
 has a requirement keyword (MUST, SHOULD, MAY and others), plus definitions
@@ -714,7 +714,7 @@ compiled examples.
 
 `conformance/` runs the [h1spec](https://github.com/uNetworking/h1spec)
 requests against an Eio and a Lwt echo server. It has not been run with h1spec
-yet, and CI does not run it.
+yet: the CI `conformance` job exists and has never run.
 
 ## Migrating from httpun 0.2
 

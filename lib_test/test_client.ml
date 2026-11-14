@@ -696,6 +696,32 @@ let response_body_endings ~bytewise =
       , "error" )
     ]
 
+let request_after_write_closed_while_reading ~bytewise =
+  let t = create () in
+  let first = send t "/1" in
+  feed ~bytewise t "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nr1";
+  Client_connection.report_write_result t.c `Closed;
+  let errors = ref [] in
+  let (_ : Body.Writer.t) =
+    Client_connection.request
+      t.c
+      (Request.create ~headers:(Headers.of_list [ "host", "a" ]) `GET "/2")
+      ~error_handler:(fun e -> errors := error_to_string e :: !errors)
+      ~response_handler:(fun _ _ -> Alcotest.fail "response handler called")
+  in
+  Alcotest.(check (list string)) "no error before the reader stops" [] !errors;
+  feed ~bytewise t "r1";
+  Alcotest.(check (list string))
+    "error once the first response is complete"
+    [ "Connection_closed" ]
+    !errors;
+  close_input t;
+  check_ex "first" ~statuses:[ 200 ] ~body:"r1r1" first;
+  Alcotest.(check (list string))
+    "second: one outcome"
+    [ "Connection_closed" ]
+    !errors
+
 let tests =
   [ both "response body cut short calls on_error, not on_eof" response_body_end
   ; both "unsolicited response is an error, not an exception" unsolicited
@@ -723,6 +749,9 @@ let tests =
       "request body flush answered when the connection closes"
       request_body_flush_on_close
   ; both "request after the peer closed" request_after_peer_closed
+  ; both
+      "request after the write side closed, earlier response still read"
+      request_after_write_closed_while_reading
   ; both "response body: one final ending" response_body_endings
   ; both "write side closed after a 101" write_closed_after_101
   ]

@@ -564,6 +564,39 @@ let test_no_response_without_close_notify () =
     true
     (match errors with [ `Connection_closed ] -> true | _ -> false)
 
+let test_timeout_check_timing () =
+  let raises f =
+    match f () with () -> false | exception Invalid_argument _ -> true
+  in
+  Eio_main.run (fun env ->
+    Eio.Switch.run (fun sw ->
+      let flow, _peer = Eio_unix.Net.socketpair_stream ~sw () in
+      let bound =
+        Ache_eio_tls.Server.create_connection_handler
+          ~head_timeout:(-1.)
+          ~tls:server_config
+          ~request_handler
+          ~error_handler
+      in
+      Alcotest.(check bool)
+        "bound: raises on a flow"
+        true
+        (raises (fun () -> bound flow (`Unix "socketpair")));
+      Alcotest.(check bool)
+        "every optional argument given: raises at once"
+        true
+        (raises (fun () ->
+           ignore
+             (Ache_eio_tls.Server.create_connection_handler
+                ~config:Ache.Config.default
+                ~clock:(Eio.Stdenv.clock env)
+                ~idle_timeout:1.
+                ~head_timeout:(-1.)
+                ~tls:server_config
+                ~request_handler
+                ~error_handler
+              : _ -> _ -> unit)))))
+
 let test_untrusted_certificate () =
   let other_ca = Ache_test_certs.generate () in
   with_server (fun _ connect ->
@@ -994,6 +1027,10 @@ let () =
             "a plain Tls_eio flow misses the truncation"
             `Quick
             test_plain_tls_eio_flow_misses_truncation
+        ; Alcotest.test_case
+            "when the timeout arguments are checked"
+            `Quick
+            test_timeout_check_timing
         ; Alcotest.test_case
             "untrusted certificate"
             `Quick

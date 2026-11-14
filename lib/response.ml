@@ -133,7 +133,10 @@ let frame ~fn ~proxy ~request_method ~request_version ~persistent ~length t =
   let t, encoding =
     match body_length ~proxy ~request_method t with
     | `Error (`Bad_gateway | `Internal_server_error) ->
-      failwith (fn ^ ": invalid response body length")
+      reject
+        (Printf.sprintf
+           "invalid content-length %S"
+           (String.concat ", " (Headers.get_multi t.headers "content-length")))
     | `No_body -> t, `No_body
     | `Fixed n ->
       (match length with

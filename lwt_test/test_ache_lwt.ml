@@ -736,6 +736,40 @@ let test_timeout_must_be_positive () =
   | exception Invalid_argument _ -> ());
   Lwt_main.run (Lwt_unix.close socket)
 
+let test_timeout_check_timing () =
+  let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, 0) in
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let raises f =
+    match f () with
+    | (_ : unit Lwt.t) -> false
+    | exception Invalid_argument _ -> true
+  in
+  let bound =
+    Ache_lwt.Server.create_connection_handler
+      ~config:Ache.Config.default
+      ~idle_timeout:0.
+      ~head_timeout:1.
+      ~request_handler
+      ~error_handler
+  in
+  Alcotest.(check bool)
+    "bound, every option given: raises on a socket"
+    true
+    (raises (fun () -> bound addr socket));
+  let take (h : Unix.sockaddr -> Lwt_unix.file_descr -> unit Lwt.t) = h in
+  let inline =
+    take
+      (Ache_lwt.Server.create_connection_handler
+         ~idle_timeout:0.
+         ~request_handler
+         ~error_handler)
+  in
+  Alcotest.(check bool)
+    "inline: raises on a socket"
+    true
+    (raises (fun () -> inline addr socket));
+  Lwt_main.run (Lwt_unix.close socket)
+
 let contains s sub =
   let n = String.length sub in
   let rec go i =
@@ -914,6 +948,9 @@ let () =
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
         ; "a timeout must be positive", `Quick, test_timeout_must_be_positive
+        ; ( "when the timeout arguments are checked"
+          , `Quick
+          , test_timeout_check_timing )
         ; ( "a pipelined head gets its own deadline"
           , `Quick
           , test_pipelined_head_deadline )

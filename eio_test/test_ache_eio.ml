@@ -693,6 +693,54 @@ let test_timeout_needs_clock () =
     | () -> Alcotest.fail "expected Invalid_argument"
     | exception Invalid_argument _ -> ())
 
+let test_timeout_check_timing () =
+  let addr = `Tcp (Eio.Net.Ipaddr.V4.loopback, 0) in
+  let raises f =
+    match f () with () -> false | exception Invalid_argument _ -> true
+  in
+  Eio_mock.Backend.run (fun () ->
+    let flow = Eio_mock.Flow.make "flow" in
+    let bound =
+      Ache_eio.Server.create_connection_handler
+        ~idle_timeout:(-1.)
+        ~request_handler
+        ~error_handler
+    in
+    Alcotest.(check bool)
+      "bound: raises on a flow"
+      true
+      (raises (fun () -> bound flow addr));
+    let take (h : Eio_mock.Flow.t -> Eio.Net.Sockaddr.stream -> unit) = h in
+    let inline = ref None in
+    Alcotest.(check bool)
+      "inline: no raise when passed"
+      false
+      (raises (fun () ->
+         inline :=
+           Some
+             (take
+                (Ache_eio.Server.create_connection_handler
+                   ~idle_timeout:(-1.)
+                   ~request_handler
+                   ~error_handler))));
+    Alcotest.(check bool)
+      "inline: raises on a flow"
+      true
+      (raises (fun () -> Option.get !inline flow addr));
+    Alcotest.(check bool)
+      "every optional argument given: raises at once"
+      true
+      (raises (fun () ->
+         ignore
+           (Ache_eio.Server.create_connection_handler
+              ~config:Ache.Config.default
+              ~clock:(Eio_mock.Clock.make ())
+              ~idle_timeout:(-1.)
+              ~head_timeout:1.
+              ~request_handler
+              ~error_handler
+            : _ -> _ -> unit))))
+
 let test_cancel_is_not_an_error () =
   server_errors := [];
   Eio_main.run (fun _env ->
@@ -1180,6 +1228,9 @@ let () =
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
         ; "a timeout needs a clock", `Quick, test_timeout_needs_clock
+        ; ( "when the timeout arguments are checked"
+          , `Quick
+          , test_timeout_check_timing )
         ; ( "a pipelined head gets its own deadline"
           , `Quick
           , test_pipelined_head_deadline )

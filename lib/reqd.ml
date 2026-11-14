@@ -267,16 +267,15 @@ let unsafe_respond_with_upgrade t headers impl =
     Body.Reader.close t.request_body;
     Writer.wakeup t.writer
   | Streaming _ | Upgrade _ ->
-    failwith "ache.Reqd.unsafe_respond_with_upgrade: response already started"
+    failwith "ache.Reqd.respond_with_upgrade: response already started"
   | Fixed _ ->
-    failwith "ache.Reqd.unsafe_respond_with_upgrade: response already complete"
+    failwith "ache.Reqd.respond_with_upgrade: response already complete"
 
 let respond_with_upgrade t headers impl =
   if t.error_code <> `Ok
   then
     failwith
-      "ache.Reqd.respond_with_streaming: invalid state, currently handling \
-       error";
+      "ache.Reqd.respond_with_upgrade: invalid state, currently handling error";
   unsafe_respond_with_upgrade t headers impl
 
 let report_error t error =

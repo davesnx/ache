@@ -55,9 +55,11 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   CTL. A request line without a version gets 400. HTTP/1.x with x > 1 is
   handled as HTTP/1.1; another major version gets 505. One empty line before
   the request line is ignored (RFC 9112 §2.2).
-- The target form must fit the method: `*` only with OPTIONS, authority-form
-  only with CONNECT, and a `host:port` CONNECT target with a port of 0 to
-  65535. Otherwise 400 (RFC 9112 §3.2, RFC 9110 §9.3.6).
+- The target form must fit the method: `*` only with OPTIONS, a `host:port`
+  CONNECT target with a port of 0 to 65535, and otherwise `/...` or
+  `scheme:...`. An authority such as `example.com:80` reads as a URI with
+  scheme `example.com` and is accepted with any method; `127.0.0.1:80` or
+  `[::1]:80` is not. Otherwise 400 (RFC 9112 §3.2, RFC 9110 §9.3.6).
 - An HTTP/1.1 request without `Host`, with more than one `Host`, or with a
   `Host` value that is not `uri-host [":" port]` gets 400 (RFC 9112 §3.2).
 - Body framing: `Content-Length` must be one repeated `1*DIGIT` value. Both
@@ -118,7 +120,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 
 - Each request that gets no byte of its response before the connection
   stops reading gets `` `Connection_closed `` once. A request made after the
-  connection stopped writing gets it before `request` returns.
+  connection stopped writing gets it from inside `request` when no earlier
+  request is pending, and otherwise once the earlier responses are complete.
 - A request is pipelined only behind requests with an idempotent method, and
   never behind `CONNECT` or an `Upgrade` request (RFC 9112 §9.3.2).
 - A response that closes the connection also stops the request body being
@@ -180,8 +183,9 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 ### Runtimes
 
 - A write that fails because the peer is gone (`EPIPE`, `ECONNRESET`,
-  `ENOTCONN`, Eio `Connection_reset`) reports `` `Closed ``. In `ache-lwt` a
-  read that fails with `ECONNRESET` or `ENOTCONN` is end of input.
+  `ENOTCONN`, Eio `Connection_reset`, and in `ache-lwt` `EBADF` on a socket
+  that is already closed) reports `` `Closed ``. In `ache-lwt` a read that
+  fails with `ECONNRESET`, `ENOTCONN` or `EBADF` is end of input.
 - A `shutdown` or `close` of the flow that raises, and an exception from
   `Runtime.S.report_exn`, end the connection; the handler returns normally.
 - `yield_reader` and `yield_writer` on a closed side call their callback at

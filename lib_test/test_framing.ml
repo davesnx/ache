@@ -881,6 +881,18 @@ let rejected =
   ; ( "CONNECT 200 streaming, app TE"
     , req "CONNECT"
     , streaming ~headers:[ "transfer-encoding", "chunked" ] `OK "tunnel" )
+  ; ( "string, invalid CL"
+    , req "GET"
+    , with_string ~headers:[ "content-length", "abc" ] `OK "ok" )
+  ; ( "streaming, invalid CL"
+    , req "GET"
+    , streaming ~headers:[ "content-length", "-1" ] `OK "ok" )
+  ; ( "streaming, two different CL"
+    , req "GET"
+    , streaming
+        ~headers:[ "content-length", "1"; "content-length", "2" ]
+        `OK
+        "ok" )
   ; ( "103 informational, app CL"
     , req "GET"
     , fun reqd ->
@@ -919,6 +931,26 @@ let test_rejected () =
         (label ^ ": nothing written")
         ""
         (Buffer.contents s.out))
+
+let test_invalid_content_length_message () =
+  let raised = ref "" in
+  let (_ : server) =
+    server
+      (fun reqd ->
+         match
+           Reqd.respond_with_string
+             reqd
+             (response ~headers:[ "content-length", "abc" ] `OK)
+             "ok"
+         with
+         | () -> ()
+         | exception Invalid_argument msg -> raised := msg)
+      (req "GET")
+  in
+  Alcotest.(check string)
+    "message"
+    {|ache.Reqd.respond_with_string: invalid content-length "abc"|}
+    !raised
 
 let test_streaming_overflow () =
   let s =
@@ -970,6 +1002,9 @@ let test_streaming_short () =
 let tests =
   tests
   @ [ "application framing fields rejected", `Quick, test_rejected
+    ; ( "invalid content-length names the field"
+      , `Quick
+      , test_invalid_content_length_message )
     ; "streaming write over Content-Length", `Quick, test_streaming_overflow
     ; "streaming body short of Content-Length", `Quick, test_streaming_short
     ]

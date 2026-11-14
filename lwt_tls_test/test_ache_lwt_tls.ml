@@ -383,6 +383,23 @@ let test_no_response_without_close_notify () =
     true
     (match !errors with [ `Connection_closed ] -> true | _ -> false)
 
+let test_timeout_check_timing () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, 0) in
+  let bound =
+    Ache_lwt_tls.Server.create_connection_handler_with_fd
+      ~config:Ache.Config.default
+      ~idle_timeout:0.
+      ~head_timeout:1.
+      ~tls:server_config
+      ~request_handler
+      ~error_handler
+  in
+  (match bound addr fd with
+  | (_ : unit Lwt.t) -> Alcotest.fail "expected Invalid_argument"
+  | exception Invalid_argument _ -> ());
+  Lwt_main.run (Lwt_unix.close fd)
+
 let test_untrusted_certificate () =
   let other_ca = Ache_test_certs.generate () in
   with_server (fun connect ->
@@ -582,6 +599,10 @@ let () =
             "no response and no close_notify is Connection_closed"
             `Quick
             test_no_response_without_close_notify
+        ; Alcotest.test_case
+            "when the timeout arguments are checked"
+            `Quick
+            test_timeout_check_timing
         ; Alcotest.test_case
             "untrusted certificate"
             `Quick

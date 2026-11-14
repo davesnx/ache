@@ -121,5 +121,8 @@ module Server : sig
       [on_error] and serves the other connections. The caller closes the flow.
 
       @raise Invalid_argument
-        as {!Ache_eio.Server.create_connection_handler} does. *)
+        in the cases of {!Ache_eio.Server.create_connection_handler}: when
+        [~error_handler] is applied if all four optional arguments are given
+        too, and otherwise when the handler is applied to a flow, before the
+        handshake. *)
 end

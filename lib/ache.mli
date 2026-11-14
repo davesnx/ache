@@ -355,6 +355,8 @@ module Reqd : sig
       - [Transfer-Encoding] in a string or bigstring response with a body;
       - a [Content-Length] that differs from the length of the string or
         bigstring body;
+      - a [Content-Length] that is not one repeated [1*DIGIT] value
+        (RFC 9110 §8.6);
       - an invalid head, naming the offending field: a field name that is
         not a token (RFC 9110 §5.1), a field value with CR, LF or NUL (§5.5),
         or a reason phrase with CR, LF or NUL.
@@ -453,9 +455,11 @@ module Server_connection : sig
         has more than one Host field or a Host value that is not
         [uri-host [":" port]] (RFC 3986 §3.2); a CONNECT target is not
         [host:port] with a port of 0 to 65535; the target is [*] and the
-        method is not OPTIONS; the method is not CONNECT or OPTIONS and the
-        target is neither origin-form ([/...]) nor absolute-form
-        ([scheme:...]); Content-Length is not a list of one
+        method is not OPTIONS; the method is not CONNECT and the target is
+        not [*] for OPTIONS, nor origin-form ([/...]), nor absolute-form
+        ([scheme:...]) (an authority such as [example.com:80] reads as
+        absolute-form with scheme [example.com] and is accepted with any
+        method; one such as [127.0.0.1:80] or [[::1]:80] is not); Content-Length is not a list of one
         repeated [1*DIGIT] value; the request has both Content-Length and
         Transfer-Encoding; an HTTP/1.0 request has Transfer-Encoding; chunked
         is not the final transfer coding or is applied twice.
@@ -647,7 +651,9 @@ module Client_connection : sig
       [Transfer-Encoding]), the connection stops writing, also in the middle of
       a request body, and the later requests get [`Connection_closed]. A
       request made after the connection stopped writing gets
-      [`Connection_closed] before [request] returns.
+      [`Connection_closed] once: from inside [request], before it returns,
+      when no earlier request is pending; otherwise once the earlier
+      responses are complete.
 
       Response bytes that arrive when no request waits for a response close the
       connection. Empty lines before a response are discarded.
