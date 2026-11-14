@@ -22,7 +22,7 @@ fork of [httpaf](https://github.com/inhabitedtype/httpaf). It keeps their
   There is no gluten and no Angstrom; Faraday is vendored.
 
 Status: not released, and not publishable to opam until parseff releases
-`Source.of_function ?buf_size` (see [Install](#install)). The API can change
+`Source.of_function ?initial_buffer_size` (see [Install](#install)). The API can change
 before 1.0. Users of httpun 0.2 can read
 [Migrating from httpun](#migrating-from-httpun-02).
 

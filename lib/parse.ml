@@ -515,7 +515,9 @@ module Reader = struct
            Parseff.parse_source
              ~backtrack_window:(max 2 feed.limit)
              ~consume:`Partial
-             (Parseff.Source.of_function ~buf_size:(buf_size len) t.read)
+             (Parseff.Source.of_function
+                ~initial_buffer_size:(buf_size len)
+                t.read)
              grammar)
         ()
         (handler ())
