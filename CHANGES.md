@@ -177,7 +177,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   allocates 190 fewer words (648 to 458), and no benchmark row allocates
   more. This needs a parseff later than 0.5.0. Until a parseff release has
   `?initial_buffer_size`, `ache.opam` pins `parseff.dev` to davesnx/parseff#57
-  (commit b9fbbf3) with `pin-depends`, and ache cannot be published to the
+  (commit b78e970) with `pin-depends`, and ache cannot be published to the
   opam repository.
 
 ### Runtimes
