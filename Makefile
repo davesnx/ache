@@ -46,6 +46,25 @@ format: ## Format the codebase with ocamlformat
 format-check: ## Checks if format is correct
 	@DUNE_CONFIG__GLOBAL_LOCK=disabled $(DUNE) build --root . @fmt
 
+NODE = opam exec -- node
+BENCH_DEPS = httpaf.0.7.1 httpaf-lwt-unix.0.7.1 httpun.0.2.0 httpun-lwt-unix.0.2.0 httpun-eio.0.2.0 eio_main
+
+.PHONY: bench-deps
+bench-deps: ## Install httpaf and httpun for the comparison benchmark
+	opam install -y $(BENCH_DEPS)
+
+.PHONY: bench-build
+bench-build: ## Build the comparison benchmark in the release profile
+	$(DUNE) build --root . --profile=release @benchmarks/vs/all
+
+.PHONY: bench-quick
+bench-quick: bench-build ## Run the comparison benchmark, quick profile (about 15 min)
+	$(NODE) benchmarks/vs/run.ts --profile quick $(BENCH_FLAGS)
+
+.PHONY: bench
+bench: bench-build ## Run the comparison benchmark, full profile (about 2 h 30 min)
+	$(NODE) benchmarks/vs/run.ts --profile full $(BENCH_FLAGS)
+
 .PHONY: docs
 docs: ## Generate odoc documentation
 	$(DUNE) build --root . @doc

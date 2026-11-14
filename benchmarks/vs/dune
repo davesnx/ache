@@ -1,0 +1,76 @@
+(library
+ (name vs)
+ (modules vs)
+ (libraries bigstringaf))
+
+(library
+ (name vs_ache)
+ (modules vs_ache)
+ (libraries ache bigstringaf vs))
+
+(library
+ (name vs_httpun)
+ (modules vs_httpun)
+ (optional)
+ (libraries bigstringaf httpun vs))
+
+(library
+ (name vs_httpaf)
+ (modules vs_httpaf)
+ (optional)
+ (libraries bigstringaf httpaf vs))
+
+(library
+ (name vs_lwt)
+ (modules vs_lwt)
+ (libraries lwt lwt.unix unix))
+
+(library
+ (name vs_eio)
+ (modules vs_eio)
+ (optional)
+ (libraries eio eio_main))
+
+(executable
+ (name server_ache_lwt)
+ (modules server_ache_lwt)
+ (libraries ache-lwt vs vs_ache vs_lwt))
+
+(executable
+ (name server_httpun_lwt)
+ (modules server_httpun_lwt)
+ (optional)
+ (libraries gluten httpun-lwt-unix vs vs_httpun vs_lwt))
+
+(executable
+ (name server_httpaf_lwt)
+ (modules server_httpaf_lwt)
+ (optional)
+ (libraries httpaf-lwt-unix vs vs_httpaf vs_lwt))
+
+(executable
+ (name server_ache_eio)
+ (modules server_ache_eio)
+ (optional)
+ (libraries ache-eio vs vs_ache vs_eio))
+
+(executable
+ (name server_httpun_eio)
+ (modules server_httpun_eio)
+ (optional)
+ (libraries gluten httpun-eio vs vs_eio vs_httpun))
+
+(executable
+ (name core_bench)
+ (modules core_bench)
+ (optional)
+ (libraries
+  ache
+  bigstringaf
+  httpaf
+  httpun
+  str
+  unix
+  vs_ache
+  vs_httpaf
+  vs_httpun))
