@@ -560,18 +560,31 @@ module Reader = struct
     | Cancelled_parse -> len
     | Done when len = 0 || t.paused -> 0
     | Done ->
-      parse
-        t
-        t.head
-        None
-        bs
-        ~off
-        ~len
-        more
-        ~on_suspend:(fun k ->
-          t.state <- Head k;
-          len)
-        ~on_parsed:(head_parsed t)
+      (* A head parsed from the first chunk alone equals the streaming
+         result. *)
+      let n = Int.max 0 (Int.min (max_chunk len) (Int.min len t.feed.limit)) in
+      (match
+         Parseff.parse
+           ~consume:`Partial
+           (Bigstringaf.substring bs ~off ~len:n)
+           t.head
+       with
+      | Ok (head, position) ->
+        head_parsed t head;
+        position
+      | Error _ ->
+        parse
+          t
+          t.head
+          None
+          bs
+          ~off
+          ~len
+          more
+          ~on_suspend:(fun k ->
+            t.state <- Head k;
+            len)
+          ~on_parsed:(head_parsed t))
     | Head _ when len = 0 && more = Incomplete -> 0
     | Head k ->
       t.state <- Done;
