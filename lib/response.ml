@@ -73,50 +73,122 @@ module Body_length = struct
       Format.pp_print_string fmt "Error: Internal server error"
 end
 
-let final_coding headers =
-  Headers.get_multi headers "transfer-encoding"
-  |> List.concat_map (String.split_on_char ',')
-  |> List.map String.trim
-  |> List.filter (fun coding -> coding <> "")
-  |> List.rev
-  |> function
-  | [] when Headers.mem headers "transfer-encoding" -> Some ""
+type fields =
+  { mutable lengths : string list
+  ; mutable codings : string list
+  ; mutable options : string list
+  }
+
+let rec collect_fields f = function
+  | [] -> f
+  | (name, value) :: rest ->
+    (match String.length name with
+    | 14 when Headers.ci_equal name "content-length" ->
+      f.lengths <- value :: f.lengths
+    | 17 when Headers.ci_equal name "transfer-encoding" ->
+      f.codings <- value :: f.codings
+    | 10 when Headers.ci_equal name "connection" ->
+      f.options <- value :: f.options
+    | _ -> ());
+    collect_fields f rest
+
+let fields headers =
+  collect_fields
+    { lengths = []; codings = []; options = [] }
+    (Headers.to_rev_list headers)
+
+let final_coding = function
   | [] -> None
-  | coding :: _ -> Some coding
+  | codings ->
+    codings
+    |> List.concat_map (String.split_on_char ',')
+    |> List.map String.trim
+    |> List.filter (fun coding -> coding <> "")
+    |> List.rev
+    |> ( function
+     | [] -> Some ""
+     | coding :: _ -> Some coding )
+
+let rec digits_from s i =
+  i = String.length s
+  ||
+  match String.unsafe_get s i with
+  | '0' .. '9' -> digits_from s (i + 1)
+  | _ -> false
+
+let rec int_of_digits s i acc =
+  if i = String.length s
+  then acc
+  else
+    int_of_digits
+      s
+      (i + 1)
+      ((acc * 10) + Char.code (String.unsafe_get s i) - Char.code '0')
+
+let max_int_digits = if Sys.int_size >= 63 then 18 else 9
+
+let content_length_of_string s =
+  if String.length s > 0 && String.length s <= max_int_digits && digits_from s 0
+  then Int64.of_int (int_of_digits s 0 0)
+  else Message.content_length_of_string s
+
+let unique_lengths headers = function
+  | [] -> []
+  | [ len ] as lengths when String.length len > 0 && digits_from len 0 ->
+    lengths
+  | _ -> Message.unique_content_length_values headers
+
+let length_of_fields ~proxy headers f : Body_length.t =
+  match final_coding f.codings with
+  | Some coding when Headers.ci_equal coding "chunked" -> `Chunked
+  | Some _ -> `Close_delimited
+  | None ->
+    (match unique_lengths headers f.lengths with
+    | [] -> `Close_delimited
+    | [ len ] ->
+      let len = content_length_of_string len in
+      if len >= 0L
+      then `Fixed len
+      else if proxy
+      then proxy_error
+      else server_error
+    | _ -> if proxy then proxy_error else server_error)
+
+let persistent_of_options version options =
+  match options with
+  | [] -> Version.(compare version v1_1) >= 0
+  | options ->
+    if Message.has_member options "close"
+    then false
+    else
+      Version.(compare version v1_1) >= 0
+      || Message.has_member options "keep-alive"
+
+let length_without_fields ~request_method status : Body_length.t option =
+  match status, request_method with
+  | _, `HEAD | (`No_content | `Not_modified), _ -> Some `No_body
+  | s, _ when Status.is_informational s -> Some `No_body
+  | s, `CONNECT when Status.is_successful s -> Some `Close_delimited
+  | _, _ -> None
 
 let body_length ?(proxy = false) ~request_method { status; headers; _ } :
   Body_length.t
   =
-  match status, request_method with
-  | _, `HEAD | (`No_content | `Not_modified), _ -> `No_body
-  | s, _ when Status.is_informational s -> `No_body
-  | s, `CONNECT when Status.is_successful s -> `Close_delimited
-  | _, _ ->
-    (match final_coding headers with
-    | Some coding when Headers.ci_equal coding "chunked" -> `Chunked
-    | Some _ -> `Close_delimited
-    | None ->
-      (match Message.unique_content_length_values headers with
-      | [] -> `Close_delimited
-      | [ len ] ->
-        let len = Message.content_length_of_string len in
-        if len >= 0L
-        then `Fixed len
-        else if proxy
-        then proxy_error
-        else server_error
-      | _ -> if proxy then proxy_error else server_error))
+  match length_without_fields ~request_method status with
+  | Some length -> length
+  | None -> length_of_fields ~proxy headers (fields headers)
 
 let frame ~fn ~proxy ~request_method ~request_version ~persistent ~length t =
   let reject reason = invalid_arg (Printf.sprintf "%s: %s" fn reason) in
   let add name value t =
     { t with headers = Headers.add t.headers name value }
   in
-  let has_length = Headers.mem t.headers "content-length" in
-  let has_coding = Headers.mem t.headers "transfer-encoding" in
+  let f = fields t.headers in
+  let has_length = f.lengths <> [] in
+  let has_coding = f.codings <> [] in
   let http_1_1 = Version.compare request_version Version.v1_1 >= 0 in
   let tunnel = request_method = `CONNECT && Status.is_successful t.status in
-  let persists t = persistent && persistent_connection ~proxy t in
+  let persists = persistent && persistent_of_options t.version f.options in
   (* RFC 9112 §6.2 *)
   if has_length && has_coding
   then reject "content-length and transfer-encoding are both set";
@@ -130,8 +202,13 @@ let frame ~fn ~proxy ~request_method ~request_version ~persistent ~length t =
     reject
       "content-length or transfer-encoding in a 1xx, a 204, or a 2xx to CONNECT";
   let close t = t, `Close_delimited in
+  let body_length =
+    match length_without_fields ~request_method t.status with
+    | Some length -> length
+    | None -> length_of_fields ~proxy t.headers f
+  in
   let t, encoding =
-    match body_length ~proxy ~request_method t with
+    match body_length with
     | `Error (`Bad_gateway | `Internal_server_error) ->
       reject
         (Printf.sprintf
@@ -159,21 +236,15 @@ let frame ~fn ~proxy ~request_method ~request_version ~persistent ~length t =
       | Some length ->
         ( add "content-length" (string_of_int length) t
         , `Fixed (Int64.of_int length) )
-      | None when http_1_1 && persists t ->
+      | None when http_1_1 && persists ->
         add "transfer-encoding" "chunked" t, `Chunked
       | None -> close t)
   in
-  let closes =
-    (not tunnel) && (encoding = `Close_delimited || not (persists t))
-  in
+  let closes = (not tunnel) && (encoding = `Close_delimited || not persists) in
   (* RFC 9112 §9.6 *)
-  if
-    closes
-    && not
-         (Message.has_member (Headers.get_multi t.headers "connection") "close")
+  if closes && not (Message.has_member f.options "close")
   then add "connection" "close" t, encoding
-  else if
-    (not http_1_1) && persists t && not (Headers.mem t.headers "connection")
+  else if (not http_1_1) && persists && f.options = []
   then add "connection" "keep-alive" t, encoding
   else t, encoding
 

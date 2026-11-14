@@ -49,13 +49,12 @@ let is_tchar = function
 let tchars =
   Bytes.init 256 (fun i -> if is_tchar (Char.chr i) then '\001' else '\000')
 
-let is_token s =
-  let rec go i =
-    i = String.length s
-    || (Bytes.unsafe_get tchars (Char.code (String.unsafe_get s i)) = '\001'
-       && go (i + 1))
-  in
-  s <> "" && go 0
+let rec is_token_from s i =
+  i = String.length s
+  || (Bytes.unsafe_get tchars (Char.code (String.unsafe_get s i)) = '\001'
+     && is_token_from s (i + 1))
+
+let is_token s = s <> "" && is_token_from s 0
 
 let rec has_cr_lf_nul s i =
   i < String.length s
@@ -72,23 +71,27 @@ let rec has_cr_lf_nul_space s i =
 
 let invalid_argf fmt = Printf.ksprintf invalid_arg fmt
 
-let check_headers headers =
-  List.iter
-    (fun (name, value) ->
-       if not (is_token name)
-       then invalid_argf "ache: invalid field name %S" name;
-       if has_cr_lf_nul value 0
-       then invalid_argf "ache: invalid value for field %S" name)
-    (Headers.to_rev_list headers)
+let rec check_fields = function
+  | [] -> ()
+  | (name, value) :: rest ->
+    if not (is_token name) then invalid_argf "ache: invalid field name %S" name;
+    if has_cr_lf_nul value 0
+    then invalid_argf "ache: invalid value for field %S" name;
+    check_fields rest
+
+let check_headers headers = check_fields (Headers.to_rev_list headers)
+
+let rec write_fields t = function
+  | [] -> ()
+  | (name, value) :: rest ->
+    write_string t name;
+    write_string t ": ";
+    write_string t value;
+    write_crlf t;
+    write_fields t rest
 
 let write_headers t headers =
-  List.iter
-    (fun (name, value) ->
-       write_string t name;
-       write_string t ": ";
-       write_string t value;
-       write_crlf t)
-    (Headers.to_list headers);
+  write_fields t (Headers.to_list headers);
   write_crlf t
 
 let check_request { Request.meth; target; headers; _ } =
