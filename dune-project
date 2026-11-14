@@ -29,9 +29,7 @@
    (>= 5.3))
   bigstringaf
   (parseff
-   (and
-    (>= 0.5.0)
-    (< 0.6.0)))
+   (> 0.5.0))
   (alcotest :with-test)
   (faraday :with-test)
   (ocamlformat

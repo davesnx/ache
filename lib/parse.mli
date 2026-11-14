@@ -69,6 +69,9 @@ module Reader : sig
 
   val is_closed : (_, _) t -> bool
 
+  val pause : (_, _) t -> unit
+  (** Stops parsing at the end of the current message until {!resume}. *)
+
   val resume : (_, _) t -> unit
   (** Continues parsing after a request that may switch protocols, once its
       response does not switch. *)

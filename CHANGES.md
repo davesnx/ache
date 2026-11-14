@@ -97,6 +97,11 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - When the write side is closed, `respond_with_*` record the response and
   drop its bytes, and pending `Body.Writer.flush` callbacks get
   `` `Closed ``.
+- Once the write side has closed, no new request is read or dispatched; the
+  request in progress still gets its body, then the reader closes. This
+  reverses httpun #136: a client cannot tell a processed but unanswered
+  request from an unprocessed one, so its retries would duplicate side
+  effects.
 - When the error handler raises, the connection drops its pending output and
   closes. Its response function raises `Failure` when called twice.
 - `Reqd.report_exn` before the error handler has responded closes the
@@ -143,7 +148,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 
 ### Parsing
 
-- parseff (`>= 0.5.0 & < 0.6.0`) replaces Angstrom for message heads,
+- parseff (`> 0.5.0`) replaces Angstrom for message heads,
   chunk-size lines and trailer sections. Bodies are framed by hand.
   `Ache_private.Parse.Grammar` exposes the head grammars.
 - Faraday 0.8.2 is vendored in `vendor/faraday` and compiled inside `ache`,
@@ -164,6 +169,13 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `Connection` field.
 - `read` and `read_eof` consume every byte of an incomplete head, chunk-size
   line or trailer section, and of a head that fails to parse.
+- Head parses size parseff's read buffer with `Source.of_function
+  ?initial_buffer_size` from the bytes at hand: a 462-byte GET head read at once
+  allocates 190 fewer words (647 to 457), and no benchmark row allocates
+  more. This needs a parseff later than 0.5.0. Until a parseff release has
+  `?initial_buffer_size`, `ache.opam` pins `parseff.dev` to davesnx/parseff#57
+  (commit b5673d8) with `pin-depends`, and ache cannot be published to the
+  opam repository.
 
 ### Runtimes
 

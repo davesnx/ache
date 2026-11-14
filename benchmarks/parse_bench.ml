@@ -13,6 +13,15 @@ let get_head =
    Connection: keep-alive\r\n\
    \r\n"
 
+let head_of_size size =
+  let base = String.sub get_head 0 (String.length get_head - 2) in
+  let cookie = "Cookie: " in
+  let pad = size - String.length base - String.length cookie - 4 in
+  base
+  ^ cookie
+  ^ String.init pad (fun i -> if i mod 40 = 39 then ';' else 'c')
+  ^ "\r\n\r\n"
+
 let chunked_post =
   let chunk = Printf.sprintf "400\r\n%s\r\n" (String.make 1024 'x') in
   "POST /upload HTTP/1.1\r\n\
@@ -85,19 +94,21 @@ let bench name input reads iterations =
     feed conn bs reads
   done;
   Gc.full_major ();
-  let words = Gc.minor_words () in
+  let minor0, promoted0, major0 = Gc.counters () in
   let t0 = Sys.time () in
   for _ = 1 to iterations do
     feed conn bs reads
   done;
   let t1 = Sys.time () in
-  let words = Gc.minor_words () -. words in
+  let minor1, promoted1, major1 = Gc.counters () in
   let n = float_of_int iterations in
+  let direct_major = major1 -. major0 -. (promoted1 -. promoted0) in
   Printf.printf
-    "%-40s %8.0f ns/request %8.0f minor words/request\n%!"
+    "%-44s %8.0f ns/request %8.0f minor words %6.0f major words\n%!"
     name
     ((t1 -. t0) *. 1e9 /. n)
-    (words /. n)
+    ((minor1 -. minor0) /. n)
+    (direct_major /. n)
 
 let bench_serialize name write iterations =
   let f = Ache_private.Faraday.create 0x1000 in
@@ -131,6 +142,15 @@ let () =
     get_head
     [ 0, 200; 200, head - 200 ]
     1_000_000;
+  List.iter
+    (fun size ->
+       let input = head_of_size size in
+       bench
+         (Printf.sprintf "GET head (%d bytes), 1 read" size)
+         input
+         [ 0, String.length input ]
+         1_000_000)
+    [ 1500; 3000 ];
   bench
     (Printf.sprintf "POST, 16 KiB chunked body, 4096-byte reads")
     chunked_post

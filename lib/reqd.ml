@@ -352,6 +352,7 @@ let error_code t =
 
 let persistent_connection t =
   t.persistent
+  && (not (Writer.is_closed t.writer))
   &&
   match t.response_state with
   | Streaming (_, response_body) ->

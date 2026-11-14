@@ -384,6 +384,7 @@ module Reader = struct
 
   let is_closed t = t.closed
   let resume t = t.paused <- false
+  let pause t = t.paused <- true
 
   let on_wakeup t k =
     if is_closed t
@@ -488,6 +489,13 @@ module Reader = struct
       ~on_head
       ~fail:(fun e -> (e :> response_error))
 
+  (* Parseff grows a read buffer that one read fills to 4096 bytes, and copies
+     every byte it reads. Below parseff's default of 2040, a buffer larger than
+     [len] holds the bytes at hand without growing; 512 bytes holds a short head
+     split across reads, and limits the body bytes read with a head when [len]
+     is larger. *)
+  let buf_size len = if len < 2040 then max 512 (len + 1) else 512
+
   (* Runs [grammar], or resumes [suspended], on the bytes in [bs]. A parse that
      suspends has taken every byte of [bs]. *)
   let run t grammar suspended bs ~off ~len more =
@@ -507,7 +515,9 @@ module Reader = struct
            Parseff.parse_source
              ~backtrack_window:(max 2 feed.limit)
              ~consume:`Partial
-             (Parseff.Source.of_function t.read)
+             (Parseff.Source.of_function
+                ~initial_buffer_size:(buf_size len)
+                t.read)
              grammar)
         ()
         (handler ())

@@ -126,6 +126,7 @@ let shutdown_writer t =
     Response_state.flush_response_body response_state
   | No_error -> ());
   Writer.close t.writer;
+  Reader.pause t.reader;
   wakeup_writer t
 
 let error_code t =
@@ -260,7 +261,8 @@ let report_exn t exn = set_error_and_handle t (`Exn exn)
 
 let advance_request_queue t =
   ignore (Queue.take t.request_queue);
-  if Queue.is_empty t.request_queue then Reader.resume t.reader;
+  if Queue.is_empty t.request_queue && not (Writer.is_closed t.writer)
+  then Reader.resume t.reader;
   if not (Queue.is_empty t.request_queue)
   then t.request_handler (Queue.peek t.request_queue)
 
@@ -269,6 +271,9 @@ let rec _next_read_operation t =
   then (
     match t.error_code with
     | Error _ -> `Close
+    | No_error when Writer.is_closed t.writer ->
+      shutdown t;
+      `Close
     | No_error ->
       let next = Reader.next t.reader in
       (match next with
@@ -420,6 +425,7 @@ let report_write_result t result =
   match result with
   | `Ok _ -> ()
   | `Closed ->
+    Reader.pause t.reader;
     if is_active t then Reqd.flush_response_body (current_reqd_exn t);
     (match t.error_code with
     | Error { response_state; _ } ->
