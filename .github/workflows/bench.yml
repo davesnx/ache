@@ -1,0 +1,94 @@
+name: Benchmark
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+jobs:
+  bench:
+    name: Compare with httpun and httpaf
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    env:
+      RESULTS: benchmarks/vs/results/full-ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the CPU count
+        run: test "$(nproc)" -ge 4
+
+      - name: Setup OCaml and dependencies
+        uses: ml-in-barcelona/gh-ci-action@v1.2.0
+        with:
+          ocaml-compiler: 5.4.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install wrk
+        run: sudo apt-get update && sudo apt-get install -y wrk
+
+      - name: Install httpaf and httpun
+        run: make bench-deps
+
+      - name: Build
+        run: make bench-build
+
+      - name: Quick check
+        id: check
+        continue-on-error: true
+        run: make bench-check CHECK_CPU=1 | tee bench-check.txt
+
+      - name: Full benchmark
+        timeout-minutes: 240
+        run: |
+          ulimit -n 8192
+          make bench BENCH_FLAGS="--server-cpu 1 --client-cpus 2,3 --threads 2 --retries 0 --out $RESULTS.json"
+
+      - name: Write the report summary
+        if: always()
+        run: |
+          if [ -f "$RESULTS.json" ] && [ ! -f "$RESULTS.md" ]; then
+            opam exec -- node benchmarks/vs/run.ts report "$RESULTS.json"
+          fi
+          {
+            echo '## Quick check'
+            echo '```'
+            cat bench-check.txt || echo 'no output'
+            echo '```'
+            if [ -f "$RESULTS.md" ]; then
+              sed '/^## Details/,$d' "$RESULTS.md"
+            fi
+          } > summary.md
+          head -c 900000 summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.sha }}
+          path: |
+            bench-check.txt
+            ${{ env.RESULTS }}.json
+            ${{ env.RESULTS }}.md
+          if-no-files-found: warn
+
+      - name: Warn when the quick check failed
+        if: steps.check.outcome == 'failure'
+        run: echo "::warning title=Quick check::a ratio is above its bound in benchmarks/vs/expectations.txt, see the job summary"

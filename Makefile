@@ -57,12 +57,18 @@ bench-deps: ## Install httpaf and httpun for the comparison benchmark
 bench-build: ## Build the comparison benchmark in the release profile
 	$(DUNE) build --root . --profile=release @benchmarks/vs/all
 
+CHECK_FLAGS = --reps 11 --time 0.12
+
+.PHONY: bench-check
+bench-check: bench-build ## Compare ache with httpun and httpaf in process against benchmarks/vs/expectations.txt (about 1 min)
+	$(if $(CHECK_CPU),taskset -c $(CHECK_CPU) )_build/default/benchmarks/vs/core_bench.exe --check benchmarks/vs/expectations.txt $(CHECK_FLAGS)
+
 .PHONY: bench-quick
 bench-quick: bench-build ## Run the comparison benchmark, quick profile (about 15 min)
 	$(NODE) benchmarks/vs/run.ts --profile quick $(BENCH_FLAGS)
 
 .PHONY: bench
-bench: bench-build ## Run the comparison benchmark, full profile (about 2 h 30 min)
+bench: bench-build ## Run the comparison benchmark, full profile (about 3 h)
 	$(NODE) benchmarks/vs/run.ts --profile full $(BENCH_FLAGS)
 
 .PHONY: docs

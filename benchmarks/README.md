@@ -71,19 +71,61 @@ cells.
 
 ```sh
 make bench-deps    # opam install httpaf, httpun and their runtimes
+make bench-check   # in-process comparison against recorded bounds, about 1 min
 make bench-quick   # 1 run per cell and server, 2 s each, about 15 min
-make bench         # 5 runs per cell and server, 5 s each, about 2 h 30 min
+make bench         # 5 runs per cell and server, 5 s each, about 3 h
 ```
 
 `opam exec` selects the switch. Set `OPAMSWITCH` to use another one. Pass
 driver flags with `BENCH_FLAGS`, for example
-`make bench-quick BENCH_FLAGS="--only '^base$' --servers lwt"`.
+`make bench-quick BENCH_FLAGS='--only ^base$$ --servers lwt'` (make reads
+`$$` as `$`; keep the single quotes, or the shell reads `$$` first).
 `node benchmarks/vs/run.ts --help` lists the flags. Node 22.18 or later runs
 the TypeScript driver directly. `core_bench.exe --help` lists its flags.
 
 The driver writes `benchmarks/vs/results/<profile>-<time>.json` after each
 run and a Markdown report next to it at the end.
 `node benchmarks/vs/run.ts report <file.json>` writes the report again.
+
+## Quick check
+
+`make bench-check` runs `core_bench.exe --check benchmarks/vs/expectations.txt`
+in about one minute. Use it between changes; use the full matrix before a
+release. For each in-process scenario it runs ache, httpun and httpaf in the
+same repetition and takes, per repetition, ache ns divided by the ns of each
+library. The median over the repetitions is the ratio against that library.
+The ratio that counts is the larger one: ache against the faster baseline.
+
+| Column | Meaning |
+|---|---|
+| ache ns | ache ns per message, median |
+| vs httpun, vs httpaf | ratio: below 1.00, ache is faster |
+| bound | the largest ratio allowed, from `expectations.txt` |
+| verdict | `faster` (ratio below 1.00), `slower, known` (1.00 or more, within the bound), `FAIL` (above the bound) |
+
+The last line counts each verdict. `core_bench.exe` exits 1 when a scenario
+fails, and 2 when a scenario has no bound or a bound has no scenario; make
+shows that code as `Error 1` or `Error 2` and exits 2 for both. A
+library that cannot run a scenario shows `failed`, with the reason below the
+table.
+
+`expectations.txt` has one `scenario max_ratio` per line. A bound of 1.00
+or less means ache must stay faster. A bound above 1.00 is a known loss: the
+list of work to do. The bounds are a ratchet: after an improvement, run the
+check 3 times and set the bound to the largest ratio plus 5 % (at least
+0.03), rounded up to 0.01. Raise a bound only for a loss that you accept,
+and say why in the commit. The bounds come from one machine; another CPU
+can give other ratios. Two byte-identical copies of `core_bench.exe` can
+differ by up to 0.05 in the 64 KiB ratios, so each rebuild moves them: take
+the 3 runs from different builds or copies of the binary.
+
+On a shared machine, pin the run to one idle CPU:
+`make bench-check CHECK_CPU=200`. Set repetitions and time with
+`CHECK_FLAGS`, for example `CHECK_FLAGS="--reps 21 --time 0.2"`; add
+`--only REGEX` there to run some scenarios. Make prints the command.
+
+The check covers the connection state machines only: no sockets, no Lwt or
+Eio runtime, no kernel. Use `make bench` for those.
 
 ## How a run works
 
@@ -110,6 +152,25 @@ the SMT sibling of the server core was more than 20 % busy. A run kept
 above that limit is flagged in the report. The driver never builds: it
 records the commit and warns when the binaries are older than the newest
 source file.
+
+## CI
+
+`.github/workflows/bench.yml` runs on each push to `main` and by hand
+(`workflow_dispatch`), never on pull requests. A new run cancels the one in
+progress. It installs the baselines and wrk, builds, runs
+`make bench-check`, then the full profile with fixed CPUs: server on CPU 1,
+wrk on CPUs 2 and 3 with 2 threads, no repeated runs. A failed quick check
+does not stop the full run and does not fail the job: it shows a warning,
+because the bounds were set on another CPU than the runner's.
+
+The runner is a shared virtual machine with 4 vCPUs: other tenants, no
+stable CPU topology, and a CPU other than the one that set the bounds. Read
+the ratios between servers of one run, not requests/s across runs or
+against a local run.
+
+The artifact `bench-<commit>` of each run holds the results JSON, the
+Markdown report and the quick check output. The summary page of the run
+shows the quick check and the report up to its detail tables.
 
 ## How to read the report
 
