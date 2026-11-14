@@ -169,13 +169,13 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `Connection` field.
 - `read` and `read_eof` consume every byte of an incomplete head, chunk-size
   line or trailer section, and of a head that fails to parse.
-- Head parses size parseff's read buffer with `Source.of_function
-  ?initial_buffer_size` from the bytes at hand: a 462-byte GET head read at once
-  allocates 190 fewer words (648 to 458), and no benchmark row allocates
-  more. This needs a parseff later than 0.5.0. Until a parseff release has
-  `?initial_buffer_size`, `ache.opam` pins `parseff.dev` to davesnx/parseff#57
-  (commit b9fbbf3) with `pin-depends`, and ache cannot be published to the
-  opam repository.
+- Head parses give parseff the bytes at hand with `Source.of_chunks`: one
+  chunk when fewer than 2040 bytes are at hand, else chunks of 512 bytes.
+  parseff takes a chunk as its input with no other copy, and a 462-byte GET
+  head read at once allocates 406 minor words. This needs a parseff later than
+  0.5.0. Until a parseff release has `Source.of_chunks` without a read buffer,
+  `ache.opam` pins `parseff.dev` to davesnx/parseff#64 (commit b28281e) with
+  `pin-depends`, and ache cannot be published to the opam repository.
 
 ### Runtimes
 
