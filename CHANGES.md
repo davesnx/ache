@@ -171,7 +171,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   line or trailer section, and of a head that fails to parse.
 - Head parses size parseff's read buffer with `Source.of_function
   ?initial_buffer_size` from the bytes at hand: a 462-byte GET head read at once
-  allocates 190 fewer words (647 to 457), and no benchmark row allocates
+  allocates 190 fewer words (648 to 458), and no benchmark row allocates
   more. This needs a parseff later than 0.5.0. Until a parseff release has
   `?initial_buffer_size`, `ache.opam` pins `parseff.dev` to davesnx/parseff#57
   (commit b9fbbf3) with `pin-depends`, and ache cannot be published to the

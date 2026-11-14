@@ -489,12 +489,12 @@ module Reader = struct
       ~on_head
       ~fail:(fun e -> (e :> response_error))
 
-  (* Parseff grows a read buffer that one read fills to 4096 bytes, and copies
-     every byte it reads. Below parseff's default of 2040, a buffer larger than
-     [len] holds the bytes at hand without growing; 512 bytes holds a short head
-     split across reads, and limits the body bytes read with a head when [len]
-     is larger. *)
-  let buf_size len = if len < 2040 then max 512 (len + 1) else 512
+  (* Parseff copies every byte it reads. After a read that fills its buffer, its
+     next read allocates a 4096-byte buffer. Below parseff's default of 2040, a
+     buffer of [len] bytes takes the bytes at hand in one read; 512 bytes holds
+     a short head split across reads, and limits the body bytes read with a head
+     when [len] is larger. *)
+  let initial_buffer_size len = if len < 2040 then max 512 len else 512
 
   (* Runs [grammar], or resumes [suspended], on the bytes in [bs]. A parse that
      suspends has taken every byte of [bs]. *)
@@ -516,7 +516,7 @@ module Reader = struct
              ~backtrack_window:(max 2 feed.limit)
              ~consume:`Partial
              (Parseff.Source.of_function
-                ~initial_buffer_size:(buf_size len)
+                ~initial_buffer_size:(initial_buffer_size len)
                 t.read)
              grammar)
         ()
