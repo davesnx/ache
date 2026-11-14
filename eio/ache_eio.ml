@@ -54,14 +54,14 @@ module IO_loop = struct
       `Closed
 
   let read_once flow buffer =
-    let p, u = Promise.create () in
+    let result = ref 0 in
     Buffer.put
       ~f:(fun buf ~off ~len k ->
         let cstruct = Cstruct.of_bigarray buf ~off ~len in
         k (Eio.Flow.single_read flow cstruct))
       buffer
-      (Promise.resolve u);
-    Promise.await p
+      (fun n -> result := n);
+    !result
 
   let read flow buffer =
     match read_once flow buffer with
@@ -128,31 +128,53 @@ module IO_loop = struct
         ignore (Promise.try_resolve resolve_failed () : bool)
     in
     let read_buffer = Buffer.create read_buffer_size in
-    let pending_read = ref None in
-    let read_socket () =
-      let result =
-        match !pending_read with
-        | Some result -> result
-        | None ->
-          let result, resolve = Promise.create () in
-          pending_read := Some result;
-          Fiber.fork_daemon ~sw (fun () ->
-            (match read socket read_buffer with
-            | n -> Promise.resolve_ok resolve n
-            | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
-            | exception exn -> Promise.resolve_error resolve exn);
-            `Stop_daemon);
-          result
+    let pending_read = ref false
+    and read_requested = ref false
+    and read_result = ref None
+    and request_read = Eio.Condition.create ()
+    and read_ready = Eio.Condition.create () in
+    (* tls-eio keeps a cancelled read as a permanent error. *)
+    Fiber.fork_daemon ~sw (fun () ->
+      let requested () = if !read_requested then Some () else None in
+      let rec reader () =
+        if not !read_requested
+        then Eio.Condition.loop_no_mutex request_read requested;
+        read_requested := false;
+        (read_result :=
+           match read socket read_buffer with
+           | n -> Some (Ok n)
+           | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+           | exception exn -> Some (Error exn));
+        Eio.Condition.broadcast read_ready;
+        reader ()
       in
-      let result = Promise.await result in
-      pending_read := None;
-      match result with Ok n -> n | Error exn -> raise exn
-    in
+      reader ());
+    Fiber.fork_daemon ~sw (fun () ->
+      Promise.await read_closed;
+      Eio.Condition.broadcast read_ready;
+      `Stop_daemon);
     let rec read_loop =
+      let ready () =
+        if Option.is_some !read_result || Promise.is_resolved read_closed
+        then Some ()
+        else None
+      in
       let read () =
-        Fiber.first read_socket (fun () ->
-          Promise.await read_closed;
-          raise End_of_file)
+        if Option.is_none !read_result
+        then (
+          if Promise.is_resolved read_closed then raise End_of_file;
+          if not !pending_read
+          then (
+            pending_read := true;
+            read_requested := true;
+            Eio.Condition.broadcast request_read);
+          Eio.Condition.loop_no_mutex read_ready ready);
+        match !read_result with
+        | None -> raise End_of_file
+        | Some result ->
+          read_result := None;
+          pending_read := false;
+          (match result with Ok n -> n | Error exn -> raise exn)
       in
       let rec linger () =
         match timed_read `Linger read with
@@ -182,7 +204,7 @@ module IO_loop = struct
               let (_ : int) =
                 Buffer.get read_buffer ~f:(fun buf ~off ~len ->
                   let n = Runtime.read_eof t buf ~off ~len in
-                  if Option.is_some !pending_read then 0 else n)
+                  if !pending_read then 0 else n)
               in
               ());
             read_loop_step ()
