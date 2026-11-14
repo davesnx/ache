@@ -186,7 +186,7 @@ let connect_client connect =
   connect () >>= fun fd ->
   Ache_lwt_tls.Client.create_connection_with_fd
     ~tls:client_config
-    ~host:localhost
+    ~peer:(`Host localhost)
     fd
 
 let body_result = Alcotest.(result string string)
@@ -391,7 +391,7 @@ let test_untrusted_certificate () =
       (fun () ->
          Ache_lwt_tls.Client.create_connection_with_fd
            ~tls:(Ache_test_certs.client_config other_ca)
-           ~host:localhost
+           ~peer:(`Host localhost)
            fd)
       (fun _ -> Alcotest.fail "handshake succeeded")
       (function
@@ -459,6 +459,89 @@ let test_head_timeout () =
     Alcotest.(check bool) "close_notify" true (ending = `Close_notify);
     raw_close raw)
 
+let handshake_with peer =
+  let result = ref None in
+  with_server (fun connect ->
+    connect () >>= fun fd ->
+    Lwt.try_bind
+      (fun () ->
+         Ache_lwt_tls.Client.create_connection_with_fd
+           ~tls:client_config
+           ~peer
+           fd)
+      (fun client ->
+         result := Some (Ok ());
+         Ache_lwt_tls.Client.shutdown client)
+      (fun exn ->
+         result := Some (Error exn);
+         Alcotest.(check bool)
+           "client file descriptor closed"
+           true
+           (Lwt_unix.state fd = Lwt_unix.Closed);
+         Lwt.return_unit));
+  Option.get !result
+
+let check_accepted name peer =
+  match handshake_with peer with
+  | Ok () -> ()
+  | Error exn ->
+    Alcotest.failf "%s: rejected with %s" name (Printexc.to_string exn)
+
+let check_rejected name peer =
+  match handshake_with peer with
+  | Error (Tls_lwt.Tls_failure (`Error (`AuthenticationFailure _))) -> ()
+  | Error exn ->
+    Alcotest.failf "%s: unexpected %s" name (Printexc.to_string exn)
+  | Ok () -> Alcotest.failf "%s: handshake accepted" name
+
+let test_peer_host () =
+  check_accepted "localhost" (`Host localhost);
+  check_rejected
+    "example.com"
+    (`Host Domain_name.(host_exn (of_string_exn "example.com")))
+
+let test_peer_ip () =
+  check_accepted "127.0.0.1" (`Ip (Ipaddr.of_string_exn "127.0.0.1"));
+  check_rejected "127.0.0.2" (`Ip (Ipaddr.of_string_exn "127.0.0.2"))
+
+let test_peer_insecure () = check_accepted "no name" `Insecure_no_name_check
+
+let stalled_handshake ?idle_timeout ?head_timeout () =
+  let since = Unix.gettimeofday () in
+  with_server ?idle_timeout ?head_timeout (fun connect ->
+    connect () >>= fun fd ->
+    let chunk = Bytes.create 16 in
+    Lwt_unix.read fd chunk 0 16 >>= fun n ->
+    Alcotest.(check int) "server closed" 0 n;
+    Lwt_unix.close fd);
+  Unix.gettimeofday () -. since
+
+let check_bounded name elapsed =
+  if elapsed > 1.0 then Alcotest.failf "%s: closed after %.3f s" name elapsed
+
+let test_handshake_head_timeout () =
+  check_bounded "head_timeout" (stalled_handshake ~head_timeout:0.2 ())
+
+let test_handshake_smaller_timeout () =
+  check_bounded
+    "head_timeout smaller"
+    (stalled_handshake ~idle_timeout:5.0 ~head_timeout:0.2 ());
+  check_bounded
+    "idle_timeout smaller"
+    (stalled_handshake ~idle_timeout:0.2 ~head_timeout:5.0 ())
+
+let test_handshake_no_timeout () =
+  with_server (fun connect ->
+    connect () >>= fun fd ->
+    let chunk = Bytes.create 16 in
+    Lwt.pick
+      [ (Lwt_unix.read fd chunk 0 16 >|= fun _ -> `Closed)
+      ; (Lwt_unix.sleep 0.5 >|= fun () -> `Open)
+      ]
+    >>= fun state ->
+    Alcotest.(check bool) "still open after 0.5 s" true (state = `Open);
+    Lwt_unix.close fd)
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
@@ -511,7 +594,28 @@ let () =
             "plain-text client that waits"
             `Quick
             test_plain_text_client_waits
-        ; Alcotest.test_case "handshake timeout" `Quick test_handshake_timeout
+        ; Alcotest.test_case
+            "handshake bounded by idle_timeout"
+            `Quick
+            test_handshake_timeout
+        ; Alcotest.test_case
+            "handshake bounded by head_timeout"
+            `Quick
+            test_handshake_head_timeout
+        ; Alcotest.test_case
+            "handshake bounded by the smaller timeout"
+            `Quick
+            test_handshake_smaller_timeout
+        ; Alcotest.test_case
+            "handshake without a timeout waits for the client"
+            `Quick
+            test_handshake_no_timeout
+        ; Alcotest.test_case "peer `Host" `Quick test_peer_host
+        ; Alcotest.test_case "peer `Ip" `Quick test_peer_ip
+        ; Alcotest.test_case
+            "peer `Insecure_no_name_check"
+            `Quick
+            test_peer_insecure
         ; Alcotest.test_case "idle timeout" `Quick test_idle_timeout
         ; Alcotest.test_case "head timeout" `Quick test_head_timeout
         ] )

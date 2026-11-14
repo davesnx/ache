@@ -952,8 +952,10 @@ module Poison_flow = struct
     Eio.Flow.single_write t.inner bufs
 
   let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
+  let shutdown_delay : (unit -> unit) ref = ref ignore
 
   let shutdown t cmd =
+    !shutdown_delay ();
     check_poisoned ();
     (match cmd with `Send | `All -> incr send_shutdowns | `Receive -> ());
     Eio.Flow.shutdown t.inner cmd
@@ -1027,6 +1029,7 @@ let test_idle_timeout_then_request () =
     (fun ~sw ~net addr ->
        let socket = Eio.Net.connect ~sw net addr in
        advance clock;
+       !real_sleep 0.05;
        Eio.Flow.copy_string get_hello socket;
        Eio.Flow.shutdown socket `Send;
        Alcotest.(check string) "no response" "" (read_all socket);
@@ -1040,6 +1043,7 @@ let test_client_shutdown_with_pending_read () =
   Poison_flow.reset ();
   let errors = ref [] in
   Eio_main.run (fun env ->
+    Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 5.0 @@ fun () ->
     Eio.Switch.run (fun sw ->
       let client_end, server_end = Eio_unix.Net.socketpair_stream ~sw () in
       let client =
@@ -1061,7 +1065,11 @@ let test_client_shutdown_with_pending_read () =
       let partial = "HTTP/1.1 200 OK\r\ncontent-le" in
       Eio.Flow.copy_string partial server_end;
       Eio.Time.sleep (Eio.Stdenv.clock env) 0.05;
-      Eio.Promise.await (Ache_eio.Client.shutdown client);
+      (Poison_flow.shutdown_delay :=
+         fun () -> Eio.Time.sleep (Eio.Stdenv.clock env) 0.05);
+      Fun.protect
+        ~finally:(fun () -> Poison_flow.shutdown_delay := ignore)
+        (fun () -> Eio.Promise.await (Ache_eio.Client.shutdown client));
       Alcotest.(check bool)
         "peer sees the end of input"
         true
@@ -1181,10 +1189,10 @@ let () =
         ; ( "a request after the idle timeout is read once, no read cancelled"
           , `Quick
           , test_idle_timeout_then_request )
-        ; ( "Client.shutdown with a read pending does not cancel it"
+        ; ( "Client.shutdown cancels no read before its Send shutdown"
           , `Quick
           , test_client_shutdown_with_pending_read )
-        ; ( "upgrade gets the bytes sent before the 101"
+        ; ( "bytes sent before a delayed 101 reach the new protocol"
           , `Quick
           , test_upgrade_with_read_pending )
         ] )

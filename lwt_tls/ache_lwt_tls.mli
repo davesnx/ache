@@ -13,7 +13,10 @@
 
     A client, on a connected [fd]:
     {[
-      Ache_lwt_tls.Client.create_connection_with_fd ~tls:client_config ~host fd
+      Ache_lwt_tls.Client.create_connection_with_fd
+        ~tls:client_config
+        ~peer:(`Host host)
+        fd
     ]}
 
     [tls-lwt] seeds the random number generator when it is linked. OpenSSL
@@ -45,16 +48,31 @@ val server_of_fd : Tls.Config.server -> Lwt_unix.file_descr -> socket Lwt.t
     [tls-lwt] ([End_of_file], [Tls_lwt.Tls_alert], [Tls_lwt.Tls_failure], or a
     [Unix.Unix_error]). *)
 
+type peer =
+  [ `Host of [ `host ] Domain_name.t
+  | `Ip of Ipaddr.t
+  | `Insecure_no_name_check
+  ]
+(** The identity that the server certificate must prove. With [`Host name],
+    the certificate must be valid for [name]; with [`Ip ip], it must have [ip]
+    as an IP address subject alternative name. [`Insecure_no_name_check]
+    accepts a certificate for any name or address, as long as the
+    authenticator of the [Tls.Config.client] accepts it: any server with a
+    certificate from a trusted CA can then impersonate the intended one. Use it
+    only with an authenticator that checks the identity itself, for example by
+    key fingerprint, or with a [Tls.Config.client] that has [~peer_name] or
+    [~ip]. *)
+
 val client_of_fd :
    Tls.Config.client
-  -> ?host:[ `host ] Domain_name.t
-  -> ?ip:Ipaddr.t
+  -> peer:peer
   -> Lwt_unix.file_descr
   -> socket Lwt.t
-(** [client_of_fd config ?host ?ip fd] does the client side of the TLS
-    handshake on [fd]. The server certificate must be valid for [host] or [ip]
-    (see [Tls.Config.client]). When the handshake fails, it closes [fd] and
-    fails with the exception of [tls-lwt]. *)
+(** [client_of_fd config ~peer fd] does the client side of the TLS handshake on
+    [fd]. When the handshake fails, for example because the certificate is not
+    valid for [peer], the promise fails with the exception of [tls-lwt]
+    ([Tls_lwt.Tls_failure (`Error (`AuthenticationFailure _))] for a rejected
+    certificate) and [fd] is closed. *)
 
 val epoch : socket -> (Tls.Core.epoch_data, unit) result
 (** The parameters of the TLS session, such as the peer certificate and the
@@ -83,8 +101,9 @@ module Server : sig
       can be passed to [Lwt_io.establish_server_with_client_socket]. It does the
       TLS handshake on the accepted file descriptor and then serves HTTP/1.1 as
       {!Ache_lwt.Server.create_connection_handler} does, with the same
-      timeouts. With [idle_timeout], the handshake must also be complete in
-      [idle_timeout] seconds.
+      timeouts. When [idle_timeout] or [head_timeout] is set, the handshake
+      must be complete within the smaller of them; without either, it has no
+      time limit.
 
       When the handshake fails, the promise resolves after the file descriptor
       is closed; the error is not reported. To see it, call {!server_of_fd} and
@@ -100,10 +119,9 @@ module Client : sig
   val create_connection_with_fd :
      ?config:Ache.Config.t
     -> tls:Tls.Config.client
-    -> ?host:[ `host ] Domain_name.t
-    -> ?ip:Ipaddr.t
+    -> peer:peer
     -> Lwt_unix.file_descr
     -> t Lwt.t
-  (** [create_connection_with_fd ~tls ?host ?ip fd] is {!client_of_fd}
-      followed by [create_connection]. *)
+  (** [create_connection_with_fd ~tls ~peer fd] is {!client_of_fd} followed by
+      [create_connection]. *)
 end

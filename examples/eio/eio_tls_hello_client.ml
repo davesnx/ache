@@ -32,7 +32,9 @@ let () =
       (`Tcp (Eio.Net.Ipaddr.V4.loopback, port))
   in
   let host = Domain_name.(host_exn (of_string_exn "localhost")) in
-  let client = Ache_eio_tls.Client.create_connection ~sw ~tls ~host socket in
+  let client =
+    Ache_eio_tls.Client.create_connection ~sw ~tls ~peer:(`Host host) socket
+  in
   let finished, resolve_finished = Eio.Promise.create () in
   let on_error () =
     Eio.Promise.resolve_error

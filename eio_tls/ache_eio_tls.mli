@@ -14,7 +14,11 @@
 
     A client, on a connected [flow]:
     {[
-      Ache_eio_tls.Client.create_connection ~sw ~tls:client_config ~host flow
+      Ache_eio_tls.Client.create_connection
+        ~sw
+        ~tls:client_config
+        ~peer:(`Host host)
+        flow
     ]}
 
     [tls-eio] needs a random number generator, for example
@@ -40,6 +44,21 @@ exception Truncated
     request that got no byte of its response gets [`Connection_closed]. A
     server never raises [Truncated]: a request body has an explicit length. *)
 
+type peer =
+  [ `Host of [ `host ] Domain_name.t
+  | `Ip of Ipaddr.t
+  | `Insecure_no_name_check
+  ]
+(** The identity that the server certificate must prove. With [`Host name],
+    the certificate must be valid for [name]; with [`Ip ip], it must have [ip]
+    as an IP address subject alternative name. [`Insecure_no_name_check]
+    accepts a certificate for any name or address, as long as the
+    authenticator of the [Tls.Config.client] accepts it: any server with a
+    certificate from a trusted CA can then impersonate the intended one. Use it
+    only with an authenticator that checks the identity itself, for example by
+    key fingerprint, or with a [Tls.Config.client] that has [~peer_name] or
+    [~ip]. *)
+
 module Client : sig
   type t
 
@@ -47,16 +66,15 @@ module Client : sig
      ?config:Ache.Config.t
     -> sw:Eio.Switch.t
     -> tls:Tls.Config.client
-    -> ?host:[ `host ] Domain_name.t
-    -> ?ip:Ipaddr.t
+    -> peer:peer
     -> [> Eio.Flow.two_way_ty | Eio.Resource.close_ty ] Eio.Resource.t
     -> t
-  (** [create_connection ~sw ~tls ?host ?ip flow] does the client side of the
-      TLS handshake on [flow] and runs {!Ache_eio.Client} on the TLS flow. The
-      server certificate must be valid for [host] or [ip] (see
-      [Tls.Config.client]). It raises the exceptions of
-      [Tls_eio.client_of_flow] when the handshake fails. The caller closes
-      [flow]. *)
+  (** [create_connection ~sw ~tls ~peer flow] does the client side of the TLS
+      handshake on [flow] and runs {!Ache_eio.Client} on the TLS flow. When the
+      handshake fails, for example because the certificate is not valid for
+      [peer], it raises the exception of [Tls_eio.client_of_flow]
+      ([Tls_eio.Tls_failure (`Error (`AuthenticationFailure _))] for a
+      rejected certificate). The caller closes [flow]. *)
 
   val request :
      t
@@ -91,9 +109,9 @@ module Server : sig
       passed to [Eio.Net.run_server]. In the connection fiber, it does the TLS
       handshake on the accepted flow and then serves HTTP/1.1 as
       {!Ache_eio.Server.create_connection_handler} does, with the same
-      timeouts. With [clock] and [idle_timeout], the handshake must also be
-      complete in [idle_timeout] seconds. Without them, the handshake has no
-      time limit: a client that sends plain HTTP to the TLS port gets no
+      timeouts. When [idle_timeout] or [head_timeout] is set (both need
+      [clock]), the handshake must be complete within the smaller of them.
+      Without either, the handshake has no time limit: a client that sends plain HTTP to the TLS port gets no
       answer (ocaml-tls waits for the rest of what it reads as a TLS record),
       and the connection stays open until the client closes it.
 

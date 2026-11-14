@@ -8,6 +8,7 @@
   alcotest
   bigstringaf
   domain-name
+  ipaddr
   lwt
   lwt.unix
   tls

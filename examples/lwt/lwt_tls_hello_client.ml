@@ -28,7 +28,10 @@ let () =
      in
      let host = Domain_name.(host_exn (of_string_exn "localhost")) in
      let* client =
-       Ache_lwt_tls.Client.create_connection_with_fd ~tls ~host socket
+       Ache_lwt_tls.Client.create_connection_with_fd
+         ~tls
+         ~peer:(`Host host)
+         socket
      in
      let finished, notify_finished = Lwt.wait () in
      let response_handler response body =

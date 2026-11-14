@@ -71,18 +71,29 @@ let close_delimited (request : Ache.Request.t) (response : Ache.Response.t) =
   | status, `CONNECT when Ache.Status.is_successful status -> false
   | _ -> Ache.Response.body_length ~request_method response = `Close_delimited
 
+type peer =
+  [ `Host of [ `host ] Domain_name.t
+  | `Ip of Ipaddr.t
+  | `Insecure_no_name_check
+  ]
+
 module Client = struct
   type t =
     { client : Ache_eio.Client.t
     ; guard : guard
     }
 
-  let create_connection ?config ~sw ~tls ?host ?ip flow =
+  let create_connection ?config ~sw ~tls ~(peer : peer) flow =
     let guard = { tcp_eof = ref false; close_delimited = false } in
     let tcp : flow =
       Eio.Resource.T ({ Tcp.flow :> flow; eof = guard.tcp_eof }, tcp_handler)
     in
-    let tls = Tls_eio.client_of_flow tls ?host ?ip tcp in
+    let tls =
+      match peer with
+      | `Host host -> Tls_eio.client_of_flow tls ~host tcp
+      | `Ip ip -> Tls_eio.client_of_flow tls ~ip tcp
+      | `Insecure_no_name_check -> Tls_eio.client_of_flow tls tcp
+    in
     let guarded : flow =
       Eio.Resource.T ({ Guarded.tls; guard }, guarded_handler)
     in
@@ -131,7 +142,13 @@ module Server = struct
     fun flow client_addr ->
       let handshake () = Tls_eio.server_of_flow tls flow in
       let flow =
-        match clock, idle_timeout with
+        let limit =
+          match idle_timeout, head_timeout with
+          | None, None -> None
+          | Some seconds, None | None, Some seconds -> Some seconds
+          | Some idle, Some head -> Some (Float.min idle head)
+        in
+        match clock, limit with
         | Some clock, Some seconds ->
           Eio.Time.with_timeout_exn clock seconds handshake
         | _ -> handshake ()

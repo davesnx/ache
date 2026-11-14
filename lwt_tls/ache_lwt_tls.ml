@@ -51,8 +51,26 @@ let handshake fd start =
 let server_of_fd config fd =
   handshake fd (Tls_lwt.Unix.server_of_channels config)
 
-let client_of_fd config ?host ?ip fd =
+type peer =
+  [ `Host of [ `host ] Domain_name.t
+  | `Ip of Ipaddr.t
+  | `Insecure_no_name_check
+  ]
+
+let client_of_fd config ~(peer : peer) fd =
+  let host, ip =
+    match peer with
+    | `Host host -> Some host, None
+    | `Ip ip -> None, Some ip
+    | `Insecure_no_name_check -> None, None
+  in
   handshake fd (Tls_lwt.Unix.client_of_channels config ?host ?ip)
+
+let handshake_limit idle_timeout head_timeout =
+  match idle_timeout, head_timeout with
+  | None, None -> None
+  | Some seconds, None | None, Some seconds -> Some seconds
+  | Some idle, Some head -> Some (Float.min idle head)
 
 let epoch t = Tls_lwt.Unix.epoch t.tls
 
@@ -134,7 +152,7 @@ module Server = struct
       [ idle_timeout; head_timeout ];
     let handshake = server_of_fd tls fd in
     let handshake =
-      match idle_timeout with
+      match handshake_limit idle_timeout head_timeout with
       | None -> handshake
       | Some seconds ->
         Lwt.pick
@@ -178,8 +196,8 @@ module Client = struct
   let create_connection ?config socket =
     Client.create_connection ?config socket >|= fun client -> { client; socket }
 
-  let create_connection_with_fd ?config ~tls ?host ?ip fd =
-    client_of_fd tls ?host ?ip fd >>= create_connection ?config
+  let create_connection_with_fd ?config ~tls ~peer fd =
+    client_of_fd tls ~peer fd >>= create_connection ?config
 
   let request
         t

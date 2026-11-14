@@ -9,6 +9,7 @@
   alcotest
   bigstringaf
   domain-name
+  ipaddr
   eio
   eio_main
   tls-eio))

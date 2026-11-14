@@ -226,9 +226,11 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 
 - New packages `ache-eio-tls` (module `Ache_eio_tls`, over `tls-eio`) and
   `ache-lwt-tls` (module `Ache_lwt_tls`, over `tls-lwt`). Each has a server
-  handler that does the handshake on the accepted socket (limited by
-  `?idle_timeout`) and a client constructor that takes a `Tls.Config.client`
-  and `?host`. A client reports a response that ends at the close of the
+  handler that does the handshake on the accepted socket (limited by the
+  smaller of `?idle_timeout` and `?head_timeout`) and a client constructor
+  that takes a `Tls.Config.client` and a required `~peer`: the host name or
+  IP address that the certificate must prove, or the explicit
+  `` `Insecure_no_name_check ``. A client reports a response that ends at the close of the
   connection without a TLS `close_notify` alert as
   `` `Exn Ache_eio_tls.Truncated `` or `` `Exn Ache_lwt_tls.Truncated ``,
   so a cut response body calls `on_error`. A complete response with

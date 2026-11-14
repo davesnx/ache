@@ -266,9 +266,8 @@ $ dune exec examples/certs/gen_test_certs.exe -- /tmp
 ```
 
 An Eio server. The handler does the handshake in the connection fiber; when
-it fails, it raises and `run_server` gives the exception to `on_error`. With
-`?clock` and `?idle_timeout`, the handshake must be complete in
-`idle_timeout`.
+it fails, it raises and `run_server` gives the exception to `on_error`. The
+time limit of the handshake is under "Timeouts" below.
 
 <!-- example: examples/eio/eio_tls_hello_server.ml -->
 ```ocaml
@@ -325,7 +324,13 @@ let () =
 
 An Eio client that trusts the test CA. A client for public servers uses the
 system trust anchors, for example `Ca_certs.authenticator ()` from the
-`ca-certs` package, and the name of the server as `~host`.
+`ca-certs` package. `~peer` is required: `` `Host name `` or `` `Ip address ``
+is the identity that the certificate must prove. `` `Insecure_no_name_check ``
+accepts any certificate from a trusted CA for any name; use it only with an
+authenticator that checks the identity itself. When the certificate is
+rejected, `create_connection` raises
+`` Tls_eio.Tls_failure (`Error (`AuthenticationFailure _)) `` (Lwt: the promise
+fails with `Tls_lwt.Tls_failure` and the socket is closed).
 
 <!-- example: examples/eio/eio_tls_hello_client.ml -->
 ```ocaml
@@ -363,7 +368,9 @@ let () =
       (`Tcp (Eio.Net.Ipaddr.V4.loopback, port))
   in
   let host = Domain_name.(host_exn (of_string_exn "localhost")) in
-  let client = Ache_eio_tls.Client.create_connection ~sw ~tls ~host socket in
+  let client =
+    Ache_eio_tls.Client.create_connection ~sw ~tls ~peer:(`Host host) socket
+  in
   let finished, resolve_finished = Eio.Promise.create () in
   let on_error () =
     Eio.Promise.resolve_error
@@ -404,9 +411,8 @@ $ curl --cacert /tmp/ca.pem https://127.0.0.1:8443/
 Hello, TLS!
 ```
 
-The same with Lwt. `create_connection_handler_with_fd` does the handshake,
-closes the socket when it fails, and with `?idle_timeout` limits the time of
-the handshake too.
+The same with Lwt. `create_connection_handler_with_fd` does the handshake and
+closes the socket when it fails.
 
 <!-- example: examples/lwt/lwt_tls_hello_server.ml -->
 ```ocaml
@@ -483,7 +489,10 @@ let () =
      in
      let host = Domain_name.(host_exn (of_string_exn "localhost")) in
      let* client =
-       Ache_lwt_tls.Client.create_connection_with_fd ~tls ~host socket
+       Ache_lwt_tls.Client.create_connection_with_fd
+         ~tls
+         ~peer:(`Host host)
+         socket
      in
      let finished, notify_finished = Lwt.wait () in
      let response_handler response body =
@@ -530,11 +539,12 @@ client on such a flow reports a cut response as complete. A request body
 always has an explicit length, so a server reports a cut body without this
 check.
 
-Timeouts: with `?idle_timeout` (and `?clock` with Eio), the TLS handshake
-must also be complete in `idle_timeout`. Without it, the handshake has no time
-limit. A client that sends plain HTTP to a TLS port gets no answer, because
-ocaml-tls waits for the rest of what it reads as a TLS record, so without
-`?idle_timeout` the connection stays open until the client closes it.
+Timeouts: when `?idle_timeout` or `?head_timeout` is set (with `?clock` for
+Eio), the TLS handshake must be complete within the smaller of them. Without
+either, the handshake has no time limit. A client that sends plain HTTP to a
+TLS port gets no answer, because ocaml-tls waits for the rest of what it
+reads as a TLS record, so without a timeout the connection stays open until
+the client closes it.
 
 ## Differences from httpun
 
@@ -679,13 +689,13 @@ httpun rejected chunk extensions and trailers.
 
 | Suite | Tests |
 |---|---|
-| `lib_test`: core unit tests | 259 |
+| `lib_test`: core unit tests | 261 |
 | `rfc_test`: RFC 9110 | 159 |
 | `rfc_test`: RFC 9112 | 178 |
 | `eio_test`: Eio on loopback sockets | 32 |
-| `eio_tls_test`: `ache-eio-tls` on loopback sockets | 27 |
+| `eio_tls_test`: `ache-eio-tls` on loopback sockets | 33 |
 | `lwt_test`: Lwt on loopback sockets | 24 |
-| `lwt_tls_test`: `ache-lwt-tls` on loopback sockets | 17 |
+| `lwt_tls_test`: `ache-lwt-tls` on loopback sockets | 23 |
 
 The RFC suites start from each sentence of RFC 9110 and RFC 9112 §2–§11 that
 has a requirement keyword (MUST, SHOULD, MAY and others), plus definitions
@@ -718,9 +728,9 @@ yet, and CI does not run it.
 | `Httpun_eio` | `Ache_eio` |
 | `Httpun_lwt_unix.Server`, `Httpun_lwt_unix.Client` | `Ache_lwt.Server`, `Ache_lwt.Client` |
 | `Httpun_lwt.Server (Gluten_lwt.Server)`, `Httpun_lwt.Client (...)` | `Ache_lwt.Make (Io)`, with `Io : Ache_lwt.IO` |
-| `Httpun_lwt_unix.Server.TLS`, `Client.TLS` | `Ache_lwt_tls.Server`, `Ache_lwt_tls.Client` (package `ache-lwt-tls`). `Server.TLS.create_connection_handler_with_default ~certfile ~keyfile` becomes `Server.create_connection_handler_with_fd ~tls`, with a `Tls.Config.server`. `Client.TLS.create_connection_with_default` did not check the server certificate; `Client.create_connection_with_fd ~tls ?host` takes a `Tls.Config.client` with an authenticator |
+| `Httpun_lwt_unix.Server.TLS`, `Client.TLS` | `Ache_lwt_tls.Server`, `Ache_lwt_tls.Client` (package `ache-lwt-tls`). `Server.TLS.create_connection_handler_with_default ~certfile ~keyfile` becomes `Server.create_connection_handler_with_fd ~tls`, with a `Tls.Config.server`. `Client.TLS.create_connection_with_default` did not check the server certificate; `Client.create_connection_with_fd ~tls ~peer` takes a `Tls.Config.client` with an authenticator and the required server identity `~peer` |
 | `Httpun_lwt_unix.Server.SSL`, `Client.SSL` | Removed. There is no OpenSSL runtime; implement `Ache_lwt.IO` over `Lwt_ssl` to use one |
-| TLS with `httpun-eio` | `Ache_eio_tls.Server.create_connection_handler ~tls` and `Ache_eio_tls.Client.create_connection ~tls ?host` (package `ache-eio-tls`) |
+| TLS with `httpun-eio` | `Ache_eio_tls.Server.create_connection_handler ~tls` and `Ache_eio_tls.Client.create_connection ~tls ~peer` (package `ache-eio-tls`) |
 | Runtime `request_handler : addr -> Reqd.t Gluten.reqd -> unit` | `addr -> Reqd.t -> unit` |
 | `Reqd.respond_with_upgrade : t -> Headers.t -> (unit -> unit) -> unit` | `t -> Headers.t -> Ache.Runtime.impl -> unit`; make the `impl` with `Ache.Runtime.make` |
 | `Client.upgrade : t -> Gluten.impl -> unit` | `t -> Ache.Runtime.impl -> unit` |
