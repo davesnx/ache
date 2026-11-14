@@ -175,10 +175,10 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - Head parses give parseff the bytes at hand with `Source.of_chunks`: one
   chunk when fewer than 2040 bytes are at hand, else chunks of 512 bytes.
   parseff takes a chunk as its input with no other copy, and a 462-byte GET
-  head read at once allocates 406 minor words. This needs a parseff later than
+  head read at once allocates 405 minor words. This needs a parseff later than
   0.5.0. Until a parseff release has `Source.of_chunks` without a read buffer,
   `ache.opam` pins `parseff.dev` to the `main` branch of davesnx/parseff
-  (commit 5eb98e2, which has davesnx/parseff#64) with `pin-depends`, and ache
+  (commit 57112b6, which has davesnx/parseff#64) with `pin-depends`, and ache
   cannot be published to the opam repository.
 
 ### Runtimes
