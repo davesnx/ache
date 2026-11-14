@@ -24,7 +24,7 @@ fork of [httpaf](https://github.com/inhabitedtype/httpaf). It keeps their
   There is no gluten and no Angstrom; Faraday is vendored.
 
 Status: not released, and not publishable to opam until parseff releases
-`Source.of_function ?initial_buffer_size` (see [Install](#install)). The API can change
+`Source.of_chunks` without a read buffer (see [Install](#install)). The API can change
 before 1.0. Users of httpun 0.2 can read
 [Migrating from httpun](#migrating-from-httpun-02).
 
@@ -39,8 +39,9 @@ opam pin add ache-eio-tls https://github.com/davesnx/ache.git  # or ache-lwt-tls
 ```
 
 ache needs a parseff later than 0.5.0, which is not released yet. The
-`pin-depends` field of `ache.opam` pins `parseff.dev` to
-[davesnx/parseff#57](https://github.com/davesnx/parseff/pull/57), so the
+`pin-depends` field of `ache.opam` pins `parseff.dev` to a commit of parseff's
+`main` branch that has
+[davesnx/parseff#64](https://github.com/davesnx/parseff/pull/64), so the
 commands above fetch it. ache cannot be published to the opam repository
 until a parseff release contains that change.
 

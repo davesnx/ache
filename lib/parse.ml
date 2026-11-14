@@ -297,7 +297,6 @@ module Reader = struct
 
   type ('head, 'error) t =
     { feed : feed
-    ; read : bytes -> int -> int -> int
     ; head : unit -> 'head * int
     ; on_head : ('head, 'error) t -> 'head -> unit
     ; fail : [ `Parse of string | `Header_too_large ] -> 'error
@@ -310,31 +309,26 @@ module Reader = struct
   type request = (Request.t, request_error) t
   type response = (Response.t, response_error) t
 
-  let rec read_feed feed buf off len =
+  let rec next_chunk cap feed () =
     if feed.fed >= feed.limit
     then (
       feed.hit_limit <- true;
-      0)
+      None)
     else if feed.len > 0
     then (
-      let n = min (min len feed.len) (feed.limit - feed.fed) in
-      Bigstringaf.blit_to_bytes
-        feed.bs
-        ~src_off:feed.off
-        buf
-        ~dst_off:off
-        ~len:n;
+      let n = min (min cap feed.len) (feed.limit - feed.fed) in
+      let chunk = Bigstringaf.substring feed.bs ~off:feed.off ~len:n in
       feed.off <- feed.off + n;
       feed.len <- feed.len - n;
       feed.fed <- feed.fed + n;
-      n)
+      Some chunk)
     else if feed.eof
     then (
       feed.hit_eof <- true;
-      0)
+      None)
     else (
       Effect.perform Need_input;
-      read_feed feed buf off len)
+      next_chunk cap feed ())
 
   let with_position grammar () =
     let v = grammar () in
@@ -372,7 +366,6 @@ module Reader = struct
       }
     in
     { feed
-    ; read = read_feed feed
     ; head
     ; on_head
     ; fail
@@ -489,12 +482,12 @@ module Reader = struct
       ~on_head
       ~fail:(fun e -> (e :> response_error))
 
-  (* Parseff copies every byte it reads. After a read that fills its buffer, its
-     next read allocates a 4096-byte buffer. Below parseff's default of 2040, a
-     buffer of [len] bytes takes the bytes at hand in one read; 512 bytes holds
-     a short head split across reads, and limits the body bytes read with a head
-     when [len] is larger. *)
-  let initial_buffer_size len = if len < 2040 then max 512 len else 512
+  (* Each chunk is a copy. Parseff takes a chunk as its input with no other copy
+     when it holds no other bytes. A chunk longer than 2040 bytes is allocated
+     on the major heap. Below that, one chunk of [len] bytes takes the bytes at
+     hand; 512 bytes holds a short head split across reads, and limits the body
+     bytes copied with a head when [len] is larger. *)
+  let max_chunk len = if len < 2040 then max 512 len else 512
 
   (* Runs [grammar], or resumes [suspended], on the bytes in [bs]. A parse that
      suspends has taken every byte of [bs]. *)
@@ -515,9 +508,7 @@ module Reader = struct
            Parseff.parse_source
              ~backtrack_window:(max 2 feed.limit)
              ~consume:`Partial
-             (Parseff.Source.of_function
-                ~initial_buffer_size:(initial_buffer_size len)
-                t.read)
+             (Parseff.Source.of_chunks (next_chunk (max_chunk len) feed))
              grammar)
         ()
         (handler ())
