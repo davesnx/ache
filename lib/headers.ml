@@ -54,19 +54,55 @@ module CI = struct
     let upper = codes - (e lsr 2) in
     upper lsr 8 = upper land 0xff
 
-  let equal x y =
+  external unsafe_get_int64 : string -> int -> int64 = "%caml_string_get64u"
+  external unsafe_get_int32 : string -> int -> int32 = "%caml_string_get32u"
+
+  let[@inline always] lower_ascii w =
+    let h = Int64.logand w 0x7f7f7f7f7f7f7f7fL in
+    let ge_a = Int64.add h 0x3f3f3f3f3f3f3f3fL in
+    let gt_z = Int64.add h 0x2525252525252525L in
+    let m =
+      Int64.logand
+        (Int64.logand ge_a (Int64.lognot gt_z))
+        (Int64.logand (Int64.lognot w) 0x8080808080808080L)
+    in
+    Int64.logor w (Int64.shift_right_logical m 2)
+
+  let[@inline always] word_equal x y i =
+    let a = unsafe_get_int64 x i in
+    let b = unsafe_get_int64 y i in
+    Int64.equal a b || Int64.equal (lower_ascii a) (lower_ascii b)
+
+  let[@inline always] word32_equal x y i =
+    let a = unsafe_get_int32 x i in
+    let b = unsafe_get_int32 y i in
+    Int32.equal a b
+    || Int64.equal
+         (lower_ascii (Int64.of_int32 a))
+         (lower_ascii (Int64.of_int32 b))
+
+  let rec words_equal x y i last =
+    if i >= last
+    then word_equal x y last
+    else word_equal x y i && words_equal x y (i + 8) last
+
+  let rec bytes_equal x y i len =
+    i >= len
+    || (char_code_equal_ci
+          (Char.code (String.unsafe_get x i))
+          (Char.code (String.unsafe_get y i))
+       && bytes_equal x y (i + 1) len)
+
+  let equal_same_length x y len =
+    if len >= 8
+    then words_equal x y 0 (len - 8)
+    else if len >= 4
+    then word32_equal x y 0 && word32_equal x y (len - 4)
+    else bytes_equal x y 0 len
+
+  let[@inline] equal x y =
     let len = String.length x in
-    len = String.length y
-    &&
-    let equal_so_far = ref true in
-    let i = ref 0 in
-    while !equal_so_far && !i < len do
-      let c1 = Char.code (String.unsafe_get x !i) in
-      let c2 = Char.code (String.unsafe_get y !i) in
-      equal_so_far := char_code_equal_ci c1 c2;
-      incr i
-    done;
-    !equal_so_far
+    len = String.length y && equal_same_length x y len
 end
 
 let ci_equal = CI.equal

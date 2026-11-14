@@ -1,0 +1,188 @@
+module type HTTP = sig
+  type reqd
+  type reader
+  type writer
+  type response
+  type flushed
+
+  val target : reqd -> string
+  val request_body : reqd -> reader
+
+  val schedule_read :
+     reader
+    -> on_eof:(unit -> unit)
+    -> on_read:(Bigstringaf.t -> off:int -> len:int -> unit)
+    -> unit
+
+  val response : [ `OK | `Not_found ] -> (string * string) list -> response
+  val respond_with_string : reqd -> response -> string -> unit
+  val respond_with_bigstring : reqd -> response -> Bigstringaf.t -> unit
+  val respond_with_streaming : reqd -> response -> writer
+  val write_bigstring : writer -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
+  val flush : writer -> (flushed -> unit) -> unit
+  val close_writer : writer -> unit
+  val writer_is_closed : writer -> bool
+end
+
+type settings =
+  { port : int
+  ; read_buffer_size : int
+  ; request_body_buffer_size : int
+  ; response_buffer_size : int
+  ; response_body_buffer_size : int
+  }
+
+let settings () =
+  let port = ref 8080
+  and read_buffer_size = ref 4096
+  and request_body_buffer_size = ref 4096
+  and response_buffer_size = ref 1024
+  and response_body_buffer_size = ref 4096 in
+  Arg.parse
+    [ "--port", Arg.Set_int port, " Port on 127.0.0.1 (8080)"
+    ; "--read-buffer-size", Arg.Set_int read_buffer_size, " (4096)"
+    ; ( "--request-body-buffer-size"
+      , Arg.Set_int request_body_buffer_size
+      , " (4096)" )
+    ; "--response-buffer-size", Arg.Set_int response_buffer_size, " (1024)"
+    ; ( "--response-body-buffer-size"
+      , Arg.Set_int response_body_buffer_size
+      , " (4096)" )
+    ]
+    (fun arg -> raise (Arg.Bad arg))
+    "Benchmark server. Routes: GET /fixed/<bytes>, GET /close/<bytes>, GET \
+     /stream/<chunk>/<count>, GET /streamcl/<chunk>/<count>, POST /sink, POST \
+     /echo, GET /gc.";
+  { port = !port
+  ; read_buffer_size = !read_buffer_size
+  ; request_body_buffer_size = !request_body_buffer_size
+  ; response_buffer_size = !response_buffer_size
+  ; response_body_buffer_size = !response_body_buffer_size
+  }
+
+let bigstrings : (int, Bigstringaf.t) Hashtbl.t = Hashtbl.create 16
+
+let bigstring size =
+  match Hashtbl.find bigstrings size with
+  | b -> b
+  | exception Not_found ->
+    let b = Bigstringaf.create size in
+    Bigarray.Array1.fill b 'x';
+    Hashtbl.add bigstrings size b;
+    b
+
+let gc_json () =
+  let s = Gc.quick_stat () in
+  Printf.sprintf
+    {|{"minor_words":%.0f,"promoted_words":%.0f,"major_words":%.0f,"minor_collections":%d,"major_collections":%d,"heap_words":%d,"top_heap_words":%d}|}
+    (Gc.minor_words ())
+    s.promoted_words
+    s.major_words
+    s.minor_collections
+    s.major_collections
+    s.heap_words
+    s.top_heap_words
+
+module Make (H : HTTP) = struct
+  type action =
+    | Fixed of H.response * Bigstringaf.t
+    | Stream of H.response * Bigstringaf.t * int
+    | Sink
+    | Echo
+    | Gc_stat
+    | Missing
+
+  let with_length n = H.response `OK [ "content-length", string_of_int n ]
+  let chunked = H.response `OK [ "transfer-encoding", "chunked" ]
+  let not_found = H.response `Not_found [ "content-length", "0" ]
+  let by_length = Array.init 24 with_length
+
+  let positive s =
+    match int_of_string_opt s with Some n when n > 0 -> Some n | _ -> None
+
+  let action_of_target target =
+    let path =
+      match String.index_opt target '?' with
+      | Some i -> String.sub target 0 i
+      | None -> target
+    in
+    match String.split_on_char '/' path with
+    | [ ""; "fixed"; n ] ->
+      (match int_of_string_opt n with
+      | Some n when n >= 0 -> Fixed (with_length n, bigstring n)
+      | _ -> Missing)
+    | [ ""; "close"; n ] ->
+      (match int_of_string_opt n with
+      | Some n when n >= 0 ->
+        Fixed
+          ( H.response
+              `OK
+              [ "content-length", string_of_int n; "connection", "close" ]
+          , bigstring n )
+      | _ -> Missing)
+    | [ ""; "stream"; c; k ] ->
+      (match positive c, positive k with
+      | Some c, Some k -> Stream (chunked, bigstring c, k)
+      | _ -> Missing)
+    | [ ""; "streamcl"; c; k ] ->
+      (match positive c, positive k with
+      | Some c, Some k -> Stream (with_length (c * k), bigstring c, k)
+      | _ -> Missing)
+    | [ ""; "sink" ] -> Sink
+    | [ ""; "echo" ] -> Echo
+    | [ ""; "gc" ] -> Gc_stat
+    | _ -> Missing
+
+  let actions : (string, action) Hashtbl.t = Hashtbl.create 64
+
+  let action target =
+    match Hashtbl.find actions target with
+    | a -> a
+    | exception Not_found ->
+      let a = action_of_target target in
+      Hashtbl.add actions target a;
+      a
+
+  let stream writer chunk count =
+    let rec go i =
+      if i = count || H.writer_is_closed writer
+      then H.close_writer writer
+      else (
+        H.write_bigstring writer chunk;
+        H.flush writer (fun _ -> go (i + 1)))
+    in
+    go 0
+
+  let sink reqd =
+    let body = H.request_body reqd in
+    let total = ref 0 in
+    let rec on_read _ ~off:_ ~len =
+      total := !total + len;
+      H.schedule_read body ~on_eof ~on_read
+    and on_eof () =
+      let s = string_of_int !total in
+      H.respond_with_string reqd by_length.(String.length s) s
+    in
+    H.schedule_read body ~on_eof ~on_read
+
+  let echo reqd =
+    let body = H.request_body reqd in
+    let writer = H.respond_with_streaming reqd chunked in
+    let rec on_read bs ~off ~len =
+      H.write_bigstring writer ~off ~len bs;
+      H.schedule_read body ~on_eof ~on_read
+    and on_eof () = H.close_writer writer in
+    H.schedule_read body ~on_eof ~on_read
+
+  let handle reqd =
+    match action (H.target reqd) with
+    | Fixed (response, body) -> H.respond_with_bigstring reqd response body
+    | Stream (response, chunk, count) ->
+      stream (H.respond_with_streaming reqd response) chunk count
+    | Sink -> sink reqd
+    | Echo -> echo reqd
+    | Gc_stat ->
+      let s = gc_json () in
+      H.respond_with_string reqd (with_length (String.length s)) s
+    | Missing -> H.respond_with_string reqd not_found ""
+end

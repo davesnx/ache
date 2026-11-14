@@ -172,10 +172,13 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `Connection` field.
 - `read` and `read_eof` consume every byte of an incomplete head, chunk-size
   line or trailer section, and of a head that fails to parse.
-- Head parses give parseff the bytes at hand with `Source.of_chunks`: one
-  chunk when fewer than 2040 bytes are at hand, else chunks of 512 bytes.
-  parseff takes a chunk as its input with no other copy, and a 462-byte GET
-  head read at once allocates 405 minor words. This needs a parseff later than
+- A head is first parsed from the bytes at hand alone: all of them when fewer
+  than 2040 bytes are at hand, else the first 512. When that parse fails, for
+  example because the head is not complete, the head goes to parseff with
+  `Source.of_chunks`, in chunks of the same sizes, and the result is the same.
+  A 462-byte GET head read at once allocates 336 minor words. A head split
+  across reads, or longer than the bytes tried first, is parsed twice up to
+  the point where the first parse stopped. This needs a parseff later than
   0.5.0. Until a parseff release has `Source.of_chunks` without a read buffer,
   `ache.opam` pins `parseff.dev` to the `main` branch of davesnx/parseff
   (commit 57112b6, which has davesnx/parseff#64) with `pin-depends`, and ache
@@ -244,6 +247,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - `ache-eio`: a read is no longer cancelled by an idle or head timeout, by
   the linger after the last response, or by `Client.shutdown`; the
   connection waits for the result of the read in place of cancelling it.
+  One fiber per connection does the reads.
   `tls-eio` keeps the cancellation of a read as the permanent error of the
   flow, so over TLS the 408 response and the `close_notify` alert were not
   sent and the handler raised `Eio.Cancel.Cancelled`.

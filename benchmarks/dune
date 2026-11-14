@@ -1,9 +1,4 @@
 (executable
- (name wrk_lwt_benchmark)
- (modules Wrk_lwt_benchmark)
- (libraries ache ache_examples ache-lwt lwt.unix))
-
-(executable
  (name parse_bench)
  (modules parse_bench)
  (libraries ache bigstringaf))
