@@ -74,3 +74,9 @@
   vs_ache
   vs_httpaf
   vs_httpun))
+
+(executable
+ (name server_httpcats_miou)
+ (modules server_httpcats_miou)
+ (optional)
+ (libraries h1 h2 httpcats logs miou miou.unix unix vs))

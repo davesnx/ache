@@ -6,8 +6,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 
-type Runtime = "lwt" | "eio";
-type Lib = "ache" | "httpun" | "httpaf";
+type Runtime = "lwt" | "eio" | "miou";
+type Lib = "ache" | "httpun" | "httpaf" | "httpcats";
 type EioBackend = "linux" | "posix";
 
 interface Server {
@@ -170,6 +170,7 @@ const SERVERS: Server[] = [
   { id: "httpaf-lwt", lib: "httpaf", runtime: "lwt", exe: "server_httpaf_lwt.exe" },
   { id: "ache-eio", lib: "ache", runtime: "eio", exe: "server_ache_eio.exe" },
   { id: "httpun-eio", lib: "httpun", runtime: "eio", exe: "server_httpun_eio.exe" },
+  { id: "httpcats-miou", lib: "httpcats", runtime: "miou", exe: "server_httpcats_miou.exe" },
 ];
 
 const DEFAULT_BUFFERS: Buffers = { read: 4096, requestBody: 4096, response: 1024, responseBody: 4096 };
@@ -190,7 +191,7 @@ const BASE: Cell = {
   close: false,
   buffers: DEFAULT_BUFFERS,
   eioBackend: null,
-  runtimes: ["lwt", "eio"],
+  runtimes: ["lwt", "eio", "miou"],
   ocamlrunparam: null,
   note: null,
 };
@@ -919,7 +920,7 @@ function environment(settings: Settings, cpuNote: string, servers: Server[]): En
   const destdir = sh("ocamlfind", ["printconf", "destdir"]);
   const switchPackages = path.join(destdir, "..", ".opam-switch", "packages");
   const installed = fs.existsSync(switchPackages) ? fs.readdirSync(switchPackages) : [];
-  for (const p of ["httpaf", "httpaf-lwt-unix", "httpun", "httpun-lwt-unix", "httpun-eio", "gluten", "lwt", "eio", "eio_main", "parseff", "faraday", "angstrom", "bigstringaf"])
+  for (const p of ["httpaf", "httpaf-lwt-unix", "httpun", "httpun-lwt-unix", "httpun-eio", "httpcats", "h1", "miou", "gluten", "lwt", "eio", "eio_main", "parseff", "faraday", "angstrom", "bigstringaf"])
     packages[p] = installed.find((d) => d.startsWith(`${p}.`))?.slice(p.length + 1) ?? "unknown";
   const governorFile = `/sys/devices/system/cpu/cpu${settings.serverCpu ?? 0}/cpufreq/scaling_governor`;
   return {
@@ -1189,7 +1190,7 @@ function report(r: Results): string {
   const okRuns = (cell: string, server: string): Run[] =>
     r.runs.filter((x) => x.cell === cell && x.server === server && x.ok && x.metrics);
   const med = (runs: Run[], f: (m: Metrics) => number): number => median(runs.map((x) => f(x.metrics!)));
-  const ache = (server: Server): string => (server.runtime === "lwt" ? "ache-lwt" : "ache-eio");
+  const ache = (server: Server): string => `ache-${server.runtime}`;
   const us = (v: number): string => (v > 0 ? fmt(v / 1000, 2) : "-");
 
   const core = r.core as { results?: { scenario: string; lib: string; ns_median: number; ns_min: number; words_median: number }[]; error?: string } | null;
