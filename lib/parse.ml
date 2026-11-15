@@ -73,7 +73,7 @@ let response_of o =
 let table f =
   String.init 256 (fun i -> if f (Char.chr i) then '\001' else '\000')
 
-let is table c = String.get table (Char.code c) = '\001'
+let is table c = String.unsafe_get table (Char.code c) = '\001'
 
 (* RFC 9110 §5.6.2 tchar *)
 let tchar =
@@ -113,15 +113,15 @@ let hex =
   table (function '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true | _ -> false)
 
 (* Past [stop] every byte reads as NUL, which no rule accepts. *)
-let get bs stop i = if i < stop then Bigstringaf.get bs i else '\000'
+let get bs stop i = if i < stop then Bigstringaf.unsafe_get bs i else '\000'
 
 let rec skip table bs stop i =
-  if i < stop && is table (Bigstringaf.get bs i)
+  if i < stop && is table (Bigstringaf.unsafe_get bs i)
   then skip table bs stop (i + 1)
   else i
 
 let rec skip_zeros bs stop i =
-  if i < stop && Bigstringaf.get bs i = '0'
+  if i < stop && Bigstringaf.unsafe_get bs i = '0'
   then skip_zeros bs stop (i + 1)
   else i
 
@@ -150,12 +150,23 @@ let end_line ~eof o bs stop p where =
 let rec http_slash ~eof o bs stop p i where =
   if i = 5
   then p + 5
-  else if get bs stop (p + i) <> "HTTP/".[i]
+  else if get bs stop (p + i) <> String.unsafe_get "HTTP/" i
   then unexpected ~eof o bs stop (p + i) where
   else http_slash ~eof o bs stop p (i + 1) where
 
+external get_int32 : Bigstringaf.t -> int -> int32 = "%caml_bigstring_get32u"
+
+let http = if Sys.big_endian then 0x48545450l else 0x50545448l
+
 let version ~eof o bs stop p where =
-  let p = http_slash ~eof o bs stop p 0 where in
+  let p =
+    if
+      p + 5 <= stop
+      && Int32.equal (get_int32 bs p) http
+      && Bigstringaf.unsafe_get bs (p + 4) = '/'
+    then p + 5
+    else http_slash ~eof o bs stop p 0 where
+  in
   if p < 0
   then p
   else
@@ -178,7 +189,8 @@ let version ~eof o bs stop p where =
 
 let rec same bs off s i =
   i = String.length s
-  || (Bigstringaf.get bs (off + i) = s.[i] && same bs off s (i + 1))
+  || (Bigstringaf.unsafe_get bs (off + i) = String.unsafe_get s i
+     && same bs off s (i + 1))
 
 let literal bs off len s = String.length s = len && same bs off s 0
 
@@ -219,7 +231,7 @@ let request_line ~eof o bs off stop =
             ~len:(target_end - meth_end - 1));
       p
 
-let digit_at bs i = Char.code (Bigstringaf.get bs i) - 48
+let digit_at bs i = Char.code (Bigstringaf.unsafe_get bs i) - 48
 
 let status_line ~eof o bs off stop =
   let where = "status-line" in
@@ -241,7 +253,7 @@ let status_line ~eof o bs off stop =
     let n = code_end - p - 1 in
     if n = 0
     then fail_at ~eof o stop code_end "status-code empty"
-    else if n <> 3 || Bigstringaf.get bs (p + 1) = '0'
+    else if n <> 3 || Bigstringaf.unsafe_get bs (p + 1) = '0'
     then
       fail_at
         ~eof
@@ -273,7 +285,7 @@ let status_line ~eof o bs off stop =
       q
 
 let rec trim_end bs off i =
-  if i > off && is space (Bigstringaf.get bs (i - 1))
+  if i > off && is space (Bigstringaf.unsafe_get bs (i - 1))
   then trim_end bs off (i - 1)
   else i
 
@@ -371,7 +383,11 @@ let rec hex_number bs acc i stop =
   if i = stop
   then acc
   else
-    hex_number bs ((acc * 16) + hex_value (Bigstringaf.get bs i)) (i + 1) stop
+    hex_number
+      bs
+      ((acc * 16) + hex_value (Bigstringaf.unsafe_get bs i))
+      (i + 1)
+      stop
 
 let chunk_size_line ~eof o bs off stop =
   let where = "chunk-size line" in
@@ -758,6 +774,8 @@ module Reader = struct
       | _ -> unfinished t bs ~off ~take more q
 
   let section t bs ~off ~len more =
+    if off < 0 || len < 0 || off > Bigstringaf.length bs - len
+    then invalid_arg "Ache: read range outside the buffer";
     let take = Int.min len (t.limit - t.fed) in
     if t.buffered = 0
     then parse_lines t bs ~off ~take more off
