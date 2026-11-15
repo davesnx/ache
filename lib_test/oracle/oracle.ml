@@ -225,95 +225,11 @@ module Run (P : module type of Ache_private.Parse) = struct
     }
 end
 
-let kind_to_string = function
-  | Request -> "request"
-  | Response meth -> "response:" ^ Method.to_string meth
-
 let kind_of_string = function
   | "request" -> Request
   | s when String.starts_with ~prefix:"response:" s ->
     Response (Method.of_string (String.sub s 9 (String.length s - 9)))
   | s -> failwith ("unknown kind " ^ s)
-
-let output_case oc c =
-  let result = function
-    | Ok v -> Printf.fprintf oc " ok %S" v
-    | Error m -> Printf.fprintf oc " error %S" m
-  in
-  let snapshot ?previous s =
-    (match s.next with
-    | next when Some next = previous -> output_string oc " ="
-    | Read -> output_string oc " read"
-    | Start -> output_string oc " start"
-    | Close -> output_string oc " close"
-    | Failed (variant, detail) ->
-      Printf.fprintf oc " error %s %S" variant detail);
-    Printf.fprintf oc " %d %d" s.left s.heads
-  in
-  Printf.fprintf oc "case %s %d %S\n" (kind_to_string c.kind) c.limit c.input;
-  output_string oc "grammar";
-  result c.grammar.request;
-  result c.grammar.response;
-  result c.grammar.chunk_size;
-  result c.grammar.trailers;
-  output_char oc '\n';
-  let lefts o = [| o.mid.left; o.pre.left; o.post.left |] in
-  let same o o' =
-    o.mid.next = o'.mid.next
-    && o.pre.next = o'.pre.next
-    && o.post.next = o'.post.next
-    && o.mid.heads = o'.mid.heads
-    && o.pre.heads = o'.pre.heads
-    && o.post.heads = o'.post.heads
-    && o.messages = o'.messages
-  in
-  let write first last slopes =
-    let o = c.outcomes.(first) in
-    Printf.fprintf oc "split %d %d" first last;
-    Array.iter (Printf.fprintf oc " %d") slopes;
-    snapshot o.mid;
-    snapshot ~previous:o.mid.next o.pre;
-    snapshot ~previous:o.pre.next o.post;
-    if first > 0 && o.messages = c.outcomes.(first - 1).messages
-    then output_string oc " ="
-    else (
-      Printf.fprintf oc " %d" (List.length o.messages);
-      List.iter
-        (fun m -> Printf.fprintf oc " %S %S %s" m.head m.body m.finish)
-        o.messages);
-    output_char oc '\n'
-  in
-  let n = Array.length c.outcomes in
-  write 0 0 [| 0; 0; 0 |];
-  let rec run first k slopes =
-    let close () =
-      write first (k - 1) (Option.value slopes ~default:[| 0; 0; 0 |])
-    in
-    if k >= n
-    then (if first < n then close ())
-    else
-      let o = c.outcomes.(k) in
-      let o0 = c.outcomes.(first) in
-      let step =
-        Array.map2 (fun a b -> (b - a) / (k - first)) (lefts o0) (lefts o)
-      in
-      let fits =
-        k > first
-        && same o0 o
-        && Array.for_all (fun s -> abs s <= 1) step
-        && Array.for_all2
-             (fun s (a, b) -> a + (s * (k - first)) = b)
-             step
-             (Array.map2 (fun a b -> a, b) (lefts o0) (lefts o))
-        && match slopes with None -> true | Some s -> s = step
-      in
-      if fits
-      then run first (k + 1) (Some step)
-      else (
-        close ();
-        run k (k + 1) None)
-  in
-  if n > 1 then run 1 2 None
 
 let load path =
   let ib = Scanf.Scanning.open_in_bin path in

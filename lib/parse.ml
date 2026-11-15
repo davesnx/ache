@@ -405,8 +405,6 @@ module Grammar = struct
     then Ok (value o)
     else if p >= 0
     then Error (Printf.sprintf "unexpected %C after %s" input.[p] where)
-    else if p = partial
-    then Error "unexpected end of input"
     else Error o.error
 
   let empty_line o bs stop p where =
@@ -571,6 +569,7 @@ module Reader = struct
   let request ~max_header_size handler =
     let on_head t =
       let request = request_of t.out in
+      t.out.fields <- [];
       t.paused <- may_switch_protocols request;
       match Request.received_body_length request with
       | Error error -> t.state <- Fail (`Invalid_request (request, error))
@@ -591,6 +590,7 @@ module Reader = struct
   let response ~max_header_size request_queue =
     let on_head t =
       let response = response_of t.out in
+      t.out.fields <- [];
       let exception Local of Respd.t option in
       match
         Queue.iter
@@ -696,8 +696,7 @@ module Reader = struct
     match t.state with
     | Head ->
       t.state <- Head_done;
-      t.on_head t;
-      t.out.fields <- []
+      t.on_head t
     | Body (body, Chunk_line) ->
       if t.out.size = 0
       then (

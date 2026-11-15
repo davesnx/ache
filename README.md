@@ -22,9 +22,10 @@ fork of [httpaf](https://github.com/inhabitedtype/httpaf). It keeps their
   a response it cannot send correctly.
 - The client reports every request that gets no response, and pipelines only
   behind idempotent requests.
-- Message heads are parsed by a hand-written parser that parses each line
-  once, also when a head arrives in several reads. There is no gluten and no
-  Angstrom; Faraday is vendored.
+- Message heads are parsed by a hand-written parser. A complete line is
+  parsed once. An unfinished line is not parsed again until it ends, and once
+  more at the head limit or at end of input, so the work is linear in the head
+  size. There is no gluten and no Angstrom; Faraday is vendored.
 
 Status: not released. The API can change before 1.0. Users of httpun 0.2 can read
 [Migrating from httpun](#migrating-from-httpun-02).

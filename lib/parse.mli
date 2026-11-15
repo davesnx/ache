@@ -62,7 +62,9 @@ module Reader : sig
   (** Returns the number of bytes consumed. A head, chunk-size line or trailer
       section that is still incomplete consumes all the bytes it was given.
       Nothing is consumed after a message that may switch protocols until the
-      response decides. *)
+      response decides. A bad byte in the first part of a line split across
+      reads is rejected at once; a bad byte in a later part is reported when
+      the line ends, at the head limit, or at end of input. *)
 
   val force_close : (_, _) t -> unit
   (** Closes the reader. After a partial head, chunk-size line or trailer

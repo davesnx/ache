@@ -1057,6 +1057,27 @@ let test_reader_end_past_len () =
        Ache_private.Parse.Incomplete);
   Alcotest.(check int) "complete" 1 (List.length !heads)
 
+let test_reader_handler_raises () =
+  let exception Handler in
+  let heads = ref [] in
+  let r =
+    Reader.request ~max_header_size:0x4000 (fun request _ ->
+      heads := request_summary request :: !heads;
+      if request.target = "/one" then raise Handler)
+  in
+  Alcotest.check_raises "handler raises" Handler (fun () ->
+    ignore
+      (read r "POST /one HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\n"
+       : int));
+  ignore (read r "xGET /two HTTP/1.1\r\nHost: b\r\n\r\n" : int);
+  Alcotest.(check string) "no error" "start" (next r);
+  Alcotest.(check (list string))
+    "next head has only its own fields"
+    [ {|"GET" "/two" HTTP/1.1 ["Host":"b"]|}
+    ; {|"POST" "/one" HTTP/1.1 ["Host":"a";"Content-Length":"1"]|}
+    ]
+    !heads
+
 let tests =
   [ "GET at every split", `Quick, test_get
   ; "POST fixed body at every split", `Quick, test_post_fixed
@@ -1111,4 +1132,7 @@ let tests =
     , `Quick
     , test_reader_empty_trailer_split )
   ; "reader: final LF one byte past len", `Quick, test_reader_end_past_len
+  ; ( "reader: a raising handler leaves no fields behind"
+    , `Quick
+    , test_reader_handler_raises )
   ]

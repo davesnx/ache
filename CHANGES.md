@@ -172,10 +172,14 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `Connection` field.
 - `read` and `read_eof` consume every byte of an incomplete head, chunk-size
   line or trailer section, and of a head that fails to parse.
-- Each line of a head, chunk-size line or trailer section is parsed once.
-  When a head is split across reads, the reader keeps the lines that are
-  complete and copies only the unfinished line, so a split head is not parsed
-  again from its start and the work is linear in its size. In the quick check
+- A complete line of a head, chunk-size line or trailer section is parsed
+  once. When a head is split across reads, the reader keeps the lines that are
+  complete and copies only the unfinished line. That line is not parsed again
+  until it ends, and once more at the head limit or at end of input, so the
+  work is linear in the size of the head.
+- A bad byte in the first part of a line that is split across reads is
+  rejected at once. A bad byte in a later part is reported when the line ends,
+  at the head limit, or at end of input. In the quick check
   of `benchmarks/vs`, `get_small` takes 729 ns and 126 minor words per
   message, and `get_small_split_head` takes 834 ns and 126 minor words.
 
