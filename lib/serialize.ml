@@ -127,8 +127,20 @@ let write_response t ({ Response.version; status; reason; headers } as response)
   write_crlf t;
   write_headers t headers
 
+let rec write_hex_digits t len shift =
+  if shift >= 0
+  then (
+    String.unsafe_get "0123456789abcdef" ((len lsr shift) land 0xf)
+    |> write_char t;
+    write_hex_digits t len (shift - 4))
+
+let rec hex_top_shift len shift =
+  if shift < 60 && len lsr (shift + 4) <> 0
+  then hex_top_shift len (shift + 4)
+  else shift
+
 let write_chunk_length t len =
-  write_string t (Printf.sprintf "%x" len);
+  write_hex_digits t len (hex_top_shift len 0);
   write_crlf t
 
 let write_string_chunk t chunk =

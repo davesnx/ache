@@ -96,33 +96,58 @@ let is_ip_literal_char = function
   | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' | ':' | '.' -> true
   | _ -> false
 
-let rec all_in f s i stop = i >= stop || (f s.[i] && all_in f s (i + 1) stop)
+let reg_name_class = 1
+let ip_literal_class = 2
+let digit_class = 4
 
-let rec index_from s i c =
-  if i >= String.length s
-  then -1
-  else if s.[i] = c
-  then i
-  else index_from s (i + 1) c
+let host_classes =
+  String.init 256 (fun i ->
+    let c = Char.chr i in
+    Char.chr
+      ((if is_reg_name_char c then reg_name_class else 0)
+      lor (if is_ip_literal_char c then ip_literal_class else 0)
+      lor if Message.is_digit c then digit_class else 0))
+
+(* [stop] must not exceed [String.length s]. *)
+let rec skip_class s i stop cls =
+  if
+    i < stop
+    && Char.code
+         (String.unsafe_get host_classes (Char.code (String.unsafe_get s i)))
+       land cls
+       <> 0
+  then skip_class s (i + 1) stop cls
+  else i
 
 (* RFC 3986 §3.2.2: the end of the uri-host that starts [s], or -1. *)
 let host_end s =
   let length = String.length s in
-  if length > 0 && s.[0] = '['
+  if length > 0 && String.unsafe_get s 0 = '['
   then
-    let j = index_from s 0 ']' in
-    if j > 1 && all_in is_ip_literal_char s 1 j then j + 1 else -1
+    let j = skip_class s 1 length ip_literal_class in
+    if j > 1 && j < length && String.unsafe_get s j = ']' then j + 1 else -1
   else
-    let j = index_from s 0 ':' in
-    let j = if j < 0 then length else j in
-    if all_in is_reg_name_char s 0 j then j else -1
+    let j = skip_class s 0 length reg_name_class in
+    if j = length || String.unsafe_get s j = ':' then j else -1
 
 (* RFC 3986 §3.2: uri-host [ ":" port ]. *)
 let is_host_field s =
   let length = String.length s in
   let j = host_end s in
   j >= 0
-  && (j = length || (s.[j] = ':' && all_in Message.is_digit s (j + 1) length))
+  && (j = length
+     || (String.unsafe_get s j = ':'
+        && skip_class s (j + 1) length digit_class = length))
+
+let rec decimal_value s i stop acc =
+  if i >= stop
+  then acc
+  else
+    decimal_value
+      s
+      (i + 1)
+      stop
+      ((acc * 10) + Char.code (String.unsafe_get s i) - Char.code '0')
 
 (* RFC 9110 §9.3.6: CONNECT targets uri-host ":" port. *)
 let is_connect_target target =
@@ -131,11 +156,11 @@ let is_connect_target target =
   let digits = length - j - 1 in
   j > 0
   && j < length
-  && target.[j] = ':'
+  && String.unsafe_get target j = ':'
   && digits >= 1
   && digits <= 5
-  && all_in Message.is_digit target (j + 1) length
-  && int_of_string (String.sub target (j + 1) digits) <= 65535
+  && skip_class target (j + 1) length digit_class = length
+  && decimal_value target (j + 1) length 0 <= 65535
 
 let is_scheme_char = function
   | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '+' | '-' | '.' -> true
