@@ -47,7 +47,7 @@ format-check: ## Checks if format is correct
 	@DUNE_CONFIG__GLOBAL_LOCK=disabled $(DUNE) build --root . @fmt
 
 NODE = opam exec -- node
-BENCH_DEPS = httpaf.0.7.1 httpaf-lwt-unix.0.7.1 httpun.0.2.0 httpun-lwt-unix.0.2.0 httpun-eio.0.2.0 eio_main
+BENCH_DEPS = httpaf.0.7.1 httpaf-lwt-unix.0.7.1 httpun.0.2.0 httpun-lwt-unix.0.2.0 httpun-eio.0.2.0 httpcats.0.3.4 eio_main
 
 .PHONY: bench-deps
 bench-deps: ## Install httpaf and httpun for the comparison benchmark

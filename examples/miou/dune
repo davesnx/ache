@@ -1,0 +1,8 @@
+(executables
+ (libraries ache ache-miou miou miou.unix unix)
+ (names miou_hello_server miou_hello_client))
+
+(alias
+ (name examples)
+ (deps
+  (glob_files *.exe)))
