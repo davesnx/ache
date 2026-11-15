@@ -36,11 +36,11 @@ let test_parse_invalid_errors () =
     "GET / HTTP/1.1\r\n";
   check
     "invalid version"
-    ~expect:(Error "expected \"\\r\\n\", found '2'")
+    ~expect:(Error "unexpected '2' in request-line")
     "GET / HTTP/1.22\r\n\r\n";
   check
     "malformed header"
-    ~expect:(Error "expected ':', found ' '")
+    ~expect:(Error "unexpected ' ' in field line")
     "GET / HTTP/1.1\r\nLink : /path/to/some/website\r\n\r\n"
 
 let test_body_length () =

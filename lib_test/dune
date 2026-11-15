@@ -1,10 +1,12 @@
 (test
  (package ache)
- (libraries bigstringaf ache alcotest)
+ (libraries bigstringaf ache alcotest oracle)
+ (deps oracle/oracle.data)
  (modules
   helpers
   grammar_corpus
   test_grammar
+  test_oracle
   test_parse
   test_client_connection
   test_client

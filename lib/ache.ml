@@ -20,6 +20,24 @@ module Ache_private = struct
     module Buffer = Runtime.Buffer
   end
 
+  module Respd = struct
+    type t = Respd.t
+
+    let awaiting request response_handler =
+      let writer = Serialize.Writer.create () in
+      let respd =
+        Respd.create
+          ~error_handler:ignore
+          ~writer
+          ~response_handler
+          request
+          (Body.Writer.create_empty ~writer)
+      in
+      Respd.write_request respd;
+      respd
+  end
+
   module Parse = Parse
+  module Parse_v1 = Parse_v1
   module Serialize = Serialize
 end

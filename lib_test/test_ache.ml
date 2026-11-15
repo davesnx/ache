@@ -10,6 +10,7 @@ let () =
     ; "status", Test_status.tests
     ; "framing", Test_framing.tests
     ; "grammar", Test_grammar.tests
+    ; "oracle", Test_oracle.tests
     ; "parse", Test_parse.tests
     ; "client connection", Test_client_connection.tests
     ; "client", Test_client.tests

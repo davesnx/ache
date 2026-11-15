@@ -1,0 +1,135 @@
+open Oracle
+
+let data = "oracle/oracle.data"
+
+let ache_messages =
+  [ "chunk-size too long: "
+  ; "invalid status-code: "
+  ; "status-code empty"
+  ; "status-code too long: "
+  ; "unsupported HTTP-version: "
+  ; "unexpected end of input"
+  ; "expected more from "
+  ; "expected CRLF after chunk data"
+  ]
+
+let is_ache message =
+  List.exists (fun prefix -> String.starts_with ~prefix message) ache_messages
+
+let utf8_first_byte code =
+  Char.chr
+    (if code < 0x80
+     then code
+     else if code < 0x800
+     then 0xc0 lor (code lsr 6)
+     else if code < 0x10000
+     then 0xe0 lor (code lsr 12)
+     else 0xf0 lor (code lsr 18))
+
+let found_token message =
+  let key = ", found " in
+  let rec find i =
+    if i < 0
+    then None
+    else if String.sub message i (String.length key) = key
+    then
+      let at = i + String.length key in
+      Some (String.sub message at (String.length message - at))
+    else find (i - 1)
+  in
+  find (String.length message - String.length key)
+
+let first_byte token =
+  if String.length token < 3 || token.[0] <> '\''
+  then None
+  else if token.[1] <> '\\' || String.length token = 3
+  then Some token.[1]
+  else
+    match token.[2] with
+    | 'x' -> Some (Char.chr (int_of_string ("0x" ^ String.sub token 3 2)))
+    | 'u' ->
+      let close = String.index token '}' in
+      Some
+        (utf8_first_byte
+           (int_of_string ("0x" ^ String.sub token 4 (close - 4))))
+    | 'n' -> Some '\n'
+    | 'r' -> Some '\r'
+    | 't' -> Some '\t'
+    | c -> Some c
+
+let unexpected_byte message =
+  match Scanf.sscanf message "unexpected %C" Fun.id with
+  | c -> Some c
+  | exception (Scanf.Scan_failure _ | Failure _ | End_of_file) -> None
+
+let same_message expected actual =
+  expected = actual
+  || ((not (is_ache expected))
+     &&
+     match found_token expected with
+     | Some "end of input" -> actual = "unexpected end of input"
+     | Some token ->
+       (match first_byte token, unexpected_byte actual with
+       | Some e, Some a -> e = a
+       | _ -> false)
+     | None -> false)
+
+let same_result expected actual =
+  match expected, actual with
+  | Ok e, Ok a -> e = a
+  | Error e, Error a -> same_message e a
+  | _ -> false
+
+let same_next expected actual =
+  match expected, actual with
+  | Failed ("parse", e), Failed ("parse", a) -> same_message e a
+  | e, a -> e = a
+
+let same_snapshot e a =
+  same_next e.next a.next && e.left = a.left && e.heads = a.heads
+
+let same_outcome e a =
+  same_snapshot e.mid a.mid
+  && same_snapshot e.pre a.pre
+  && same_snapshot e.post a.post
+  && e.messages = a.messages
+
+let cases = lazy (load data)
+
+module R = Run (Ache.Ache_private.Parse)
+
+let test_size () =
+  let cases = Lazy.force cases in
+  Alcotest.(check int) "cases" 21294 (List.length cases);
+  Alcotest.(check int)
+    "outcomes"
+    620341
+    (List.fold_left (fun n c -> n + Array.length c.outcomes) 0 cases)
+
+let check name differs =
+  let cases = Lazy.force cases in
+  let failures = List.filter differs cases in
+  List.iteri
+    (fun i c -> if i < 20 then Printf.printf "%s differs: %S\n" name c.input)
+    failures;
+  Alcotest.(check int) (name ^ " cases that differ") 0 (List.length failures)
+
+let test_grammar () =
+  check "grammar" (fun c ->
+    let g = R.grammar c.input in
+    not
+      (same_result c.grammar.request g.request
+      && same_result c.grammar.response g.response
+      && same_result c.grammar.chunk_size g.chunk_size
+      && same_result c.grammar.trailers g.trailers))
+
+let test_reader () =
+  check "reader" (fun c ->
+    let now = R.case c.kind ~limit:c.limit c.input in
+    not (Array.for_all2 same_outcome c.outcomes now.outcomes))
+
+let tests =
+  [ "frozen data size", `Quick, test_size
+  ; "grammar matches v1", `Quick, test_grammar
+  ; "reader matches v1 at every split", `Quick, test_reader
+  ]

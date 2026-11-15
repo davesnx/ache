@@ -1,0 +1,9 @@
+(library
+ (name oracle)
+ (modules oracle)
+ (libraries ache bigstringaf))
+
+(executable
+ (name gen)
+ (modules gen)
+ (libraries oracle ache))

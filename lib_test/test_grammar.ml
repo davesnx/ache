@@ -159,7 +159,7 @@ let test_chunk_size () =
       , Error {|chunk-size too long: "10000000000000000"|} )
     ; "7fffffffffffffff\r\n", Error {|chunk-size too long: "7fffffffffffffff"|}
     ; "ffffffffffffffff\r\n", Error {|chunk-size too long: "ffffffffffffffff"|}
-    ; "\r\n", Error "expected chunk-size, found '\\r'"
+    ; "\r\n", Error "unexpected '\\r' in chunk-size line"
     ]
 
 let tests =

@@ -757,14 +757,68 @@ module Ache_private : sig
     end
   end
 
+  module Respd : sig
+    type t
+
+    val awaiting : Request.t -> (Response.t -> Body.Reader.t -> unit) -> t
+  end
+
   module Parse : sig
+    type more =
+      | Complete
+      | Incomplete
+
     module Grammar : sig
       val request : string -> (Request.t, string) result
       val response : string -> (Response.t, string) result
       val chunk_size : string -> (int64, string) result
       val trailers : string -> (Headers.t, string) result
     end
+
+    module Reader : sig
+      type request_error =
+        [ `Invalid_request of
+            Request.t
+            * [ `Bad_request | `Not_implemented | `Http_version_not_supported ]
+        | `Parse of string
+        | `Method_too_long
+        | `Target_too_long
+        | `Header_too_large
+        ]
+
+      type response_error =
+        [ `Invalid_response_body_length of Response.t
+        | `Parse of string
+        | `Header_too_large
+        | `Unsolicited_response
+        ]
+
+      type ('head, 'error) t
+      type request = (Request.t, request_error) t
+      type response = (Response.t, response_error) t
+
+      val request :
+         max_header_size:int
+        -> (Request.t -> Body.Reader.t -> unit)
+        -> request
+
+      val response : max_header_size:int -> Respd.t Queue.t -> response
+
+      val read_with_more :
+         (_, _) t
+        -> Bigstringaf.t
+        -> off:int
+        -> len:int
+        -> more
+        -> int
+
+      val next :
+         (_, 'error) t
+        -> [> `Read | `Start | `Close | `Error of 'error ]
+    end
   end
+
+  module Parse_v1 : module type of Parse
 
   module Serialize : sig
     val write_request : Faraday.t -> Request.t -> unit

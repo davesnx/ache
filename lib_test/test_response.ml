@@ -19,7 +19,7 @@ let test_parse_valid () =
 let test_parse_invalid_error () =
   check
     "OK response without a status message"
-    ~expect:(Error "expected ' ', found '\\r'")
+    ~expect:(Error "unexpected '\\r' in status-line")
     "HTTP/1.1 200\r\n\r\n";
   check
     "OK response without a status message"
