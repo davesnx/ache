@@ -81,6 +81,7 @@ module IO_loop = struct
     -> read_closed:Read_closed.t
     -> interruptible:bool
     -> timeout:([ `Read | `Linger ] -> (float * (unit -> unit)) option)
+    -> linger:bool
     -> t
     -> Miou_unix.file_descr
     -> unit
@@ -90,6 +91,7 @@ module IO_loop = struct
      ~read_closed
      ~interruptible
      ~timeout
+     ~linger:lingers
      t
      socket ->
     let receive_shut = ref false
@@ -230,7 +232,7 @@ module IO_loop = struct
       | `Close ->
         if not read_closed.closed
         then (
-          let result = linger () in
+          let result = if lingers then linger () else `Stopped in
           shutdown_once SHUTDOWN_RECEIVE;
           Read_closed.close read_closed;
           if result = `Eof && not !send_shut then report_exn End_of_file)
@@ -355,6 +357,7 @@ module Server = struct
         ~read_closed:(Read_closed.create ())
         ~interruptible:false
         ~timeout
+        ~linger:(not untimed)
         connection
         socket
 end
@@ -383,6 +386,7 @@ module Client = struct
           ~read_closed
           ~interruptible:true
           ~timeout:(fun _ -> None)
+          ~linger:true
           runtime
           socket)
     in

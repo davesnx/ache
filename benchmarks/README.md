@@ -2,15 +2,22 @@
 
 `parse_bench.exe` measures the ache request parser alone.
 
-`vs/` compares ache with httpaf 0.7.1 and httpun 0.2.0. It has two layers.
+`vs/` compares ache with httpaf 0.7.1, httpun 0.2.0 and httpcats 0.3.4. It
+has two layers.
 
 - **core**: `core_bench.exe` drives `Server_connection` and
-  `Client_connection` of each library in one process, with no sockets. It
-  gives the same bytes to each library and reports nanoseconds and minor
-  words per message. It isolates the library from the kernel and the runtime.
+  `Client_connection` of ache, httpun and httpaf in one process, with no
+  sockets. It gives the same bytes to each library and reports nanoseconds
+  and minor words per message. It isolates the library from the kernel and
+  the runtime. httpcats is not in core: it parses and serializes with h1
+  1.1.2, robur's fork of httpaf, on Angstrom and Faraday, and core measures
+  httpaf.
 - **wire**: one server executable per library and runtime: ache-lwt,
-  httpun-lwt, httpaf-lwt, ache-eio and httpun-eio. `wrk` loads each server
-  over loopback.
+  httpun-lwt, httpaf-lwt, ache-eio, httpun-eio, ache-miou and httpcats-miou.
+  `wrk` loads each server over loopback. httpcats-miou runs httpcats 0.3.4
+  on h1 1.1.2 and Miou 0.10.2, on one domain
+  (`Httpcats.Server.clear ~parallel:false` inside
+  `Miou_unix.run ~domains:0`).
 
 ## What is the same for every server
 
@@ -20,14 +27,19 @@
   `transfer-encoding: chunked`. A library can add fields of its own; the
   report shows such differences.
 - The accept loop and the socket options of each runtime (`vs/vs_lwt.ml`,
-  `vs/vs_eio.ml`): a listen backlog of 4096, `SO_REUSEADDR`, `TCP_NODELAY`,
-  one domain. An exception that escapes a connection is logged to stderr and
-  the server goes on (`Lwt.async_exception_hook` for Lwt, `on_error` for
-  Eio). The report lists every run whose server wrote to stderr.
+  `vs/vs_eio.ml`, `vs/server_ache_miou.ml`): a listen backlog of 4096,
+  `SO_REUSEADDR`, `TCP_NODELAY`, one domain. httpcats-miou uses the accept
+  loop of `Httpcats.Server.clear`, with a backlog of 4096; httpcats sets
+  `SO_REUSEADDR` and `TCP_NODELAY` itself. An exception that escapes a
+  connection is logged to stderr and the server goes on
+  (`Lwt.async_exception_hook` for Lwt, `on_error` for Eio, the accept loop
+  for ache-miou, `Logs` for httpcats). The report lists every run whose
+  server wrote to stderr.
 - The buffer sizes of `Config`, given by flags. The read, response and
   response-body buffers matter; `request_body_buffer_size` has no effect in
-  the server path of any of the three libraries. ache has more `Config`
-  fields; they keep their defaults.
+  the server path of ache, httpun or httpaf. httpcats gets the same four
+  sizes in `H1.Config`. ache has more `Config` fields; they keep their
+  defaults.
 - `OCAMLRUNPARAM`: unset, unless the cell sets it.
 - The compiler, the opam switch and the dune profile (release).
 
@@ -70,7 +82,7 @@ cells.
 ## How to run
 
 ```sh
-make bench-deps    # opam install httpaf, httpun and their runtimes
+make bench-deps    # opam install httpaf, httpun, httpcats and their runtimes
 make bench-check   # in-process comparison against recorded bounds, about 1 min
 make bench-quick   # 1 run per cell and server, 2 s each, about 15 min
 make bench         # 5 runs per cell and server, 5 s each, about 3 h
@@ -124,8 +136,8 @@ On a shared machine, pin the run to one idle CPU:
 `CHECK_FLAGS`, for example `CHECK_FLAGS="--reps 21 --time 0.2"`; add
 `--only REGEX` there to run some scenarios. Make prints the command.
 
-The check covers the connection state machines only: no sockets, no Lwt or
-Eio runtime, no kernel. Use `make bench` for those.
+The check covers the connection state machines only: no sockets, no Lwt,
+Eio or Miou runtime, no kernel. Use `make bench` for those.
 
 ## How a run works
 
@@ -175,7 +187,9 @@ shows the quick check and the report up to its detail tables.
 ## How to read the report
 
 - Ratio, in every table: the speed of that server or library divided by
-  the speed of ache on the same runtime. Above 1.00 means faster than ache.
+  the speed of ache on the same runtime: httpun-lwt and httpaf-lwt against
+  ache-lwt, httpun-eio against ache-eio, httpcats-miou against ache-miou.
+  Above 1.00 means faster than ache.
 - One summary table per axis: one row per cell, one column per server, the
   median requests/s and the ratio. `[3/5, 1 flagged]` shows passed runs and
   flagged runs when not all runs are clean.

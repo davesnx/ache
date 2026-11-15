@@ -40,9 +40,10 @@ module Server : sig
       [Connection: close], an error response, or a timeout), it reads and
       discards input until the peer closes, so that unread input does not
       make the kernel reset the connection before the peer has read the
-      response (RFC 9112 §9.6). It waits at most [idle_timeout], or
-      {!linger_without_idle_timeout} without [idle_timeout], after its last
-      write.
+      response (RFC 9112 §9.6). With [idle_timeout] or [head_timeout], it
+      waits at most [idle_timeout], or {!linger_without_idle_timeout} without
+      [idle_timeout], after its last write. Without a timeout it does not
+      wait: it shuts down reading at once, and the handler returns.
 
       A [shutdown] of [socket] that fails is ignored.
 
@@ -52,8 +53,8 @@ module Server : sig
         when the handler is applied to a socket. *)
 
   val linger_without_idle_timeout : float
-  (** Seconds a connection without [idle_timeout] waits for the peer to close
-      after its last write: 2.0. *)
+  (** Seconds a connection with [head_timeout] and no [idle_timeout] waits
+      for the peer to close after its last write: 2.0. *)
 end
 
 module Client : sig

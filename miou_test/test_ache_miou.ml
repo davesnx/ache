@@ -581,6 +581,8 @@ let close_without_reading_eof ?idle_timeout ?head_timeout ~linger () =
     check_elapsed "linger" ~from ~min:(linger -. 0.05) ~max:(linger +. 0.5);
     Miou_unix.close socket)
 
+let test_no_linger_without_timeouts () = close_without_reading_eof ~linger:0. ()
+
 let test_linger_bounded_by_idle_timeout () =
   close_without_reading_eof ~idle_timeout:0.3 ~linger:0.3 ()
 
@@ -977,6 +979,9 @@ let () =
         ; ( "cancelling the connection task is not an error"
           , `Quick
           , test_cancel_is_not_an_error )
+        ; ( "without a timeout the handler returns while the peer stays open"
+          , `Quick
+          , test_no_linger_without_timeouts )
         ; ( "lingering is bounded by idle_timeout"
           , `Quick
           , test_linger_bounded_by_idle_timeout )

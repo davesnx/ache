@@ -17,6 +17,10 @@ parses and serializes messages and keeps the state of a connection.
    {{:https://ocaml.org/p/ache-lwt/latest/doc/Ache_lwt/index.html}[Ache_lwt]},
    which runs ache on [Lwt_unix] sockets, or on any other socket through
    [Ache_lwt.Make]. A Lwt application must ignore [SIGPIPE].}
+{- [ache-miou]:
+   {{:https://ocaml.org/p/ache-miou/latest/doc/Ache_miou/index.html}[Ache_miou]},
+   which runs ache on [Miou_unix] sockets. A Miou application must ignore
+   [SIGPIPE].}
 {- [ache-eio-tls] and [ache-lwt-tls]:
    {{:https://ocaml.org/p/ache-eio-tls/latest/doc/Ache_eio_tls/index.html}[Ache_eio_tls]}
    and
@@ -44,5 +48,5 @@ and pipelines only behind requests with an idempotent method. See
 {1 Examples}
 
 The README and the [examples/] directory of the repository have complete
-servers and clients for Eio and Lwt, and a table of the API changes from
+servers and clients for Eio, Lwt and Miou, and a table of the API changes from
 httpun 0.2.

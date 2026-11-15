@@ -204,11 +204,13 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - New package `ache-miou` (module `Ache_miou`, over Miou 0.10), on
   `Miou_unix.file_descr`. It has the server handler and client of `ache-eio`,
   with `?idle_timeout` and `?head_timeout` timed by `Miou_unix.sleep` (no
-  clock argument). A server that stops reading always drops input until the
-  peer closes, for at most `idle_timeout` or
-  `Server.linger_without_idle_timeout` (2 s). `Client.shutdown` returns when
-  the connection has ended and must be called by the task that created the
-  connection. The application must ignore `SIGPIPE`.
+  clock argument). With `idle_timeout` or `head_timeout`, a server that
+  stops reading drops input until the peer closes, for at most
+  `idle_timeout` or `Server.linger_without_idle_timeout` (2 s); without a
+  timeout it does not wait, like `ache-eio` without a clock.
+  `Client.shutdown` returns when the connection has ended and must be called
+  by the task that created the connection. The application must ignore
+  `SIGPIPE`.
 
 ### Fixes of upstream issues
 

@@ -2,12 +2,14 @@
 
 ache is an HTTP/1.1 client and server library for OCaml 5. The core package,
 `ache`, does no I/O: it parses and serializes messages and keeps the state of
-a connection. Two runtimes drive it on sockets:
+a connection. Three runtimes drive it on sockets:
 
 - `ache-eio`, for [Eio](https://github.com/ocaml-multicore/eio)
 - `ache-lwt`, for [Lwt](https://github.com/ocsigen/lwt)
+- `ache-miou`, for [Miou](https://github.com/robur-coop/miou)
 
-`ache-eio-tls` and `ache-lwt-tls` add TLS (see [TLS](#tls)).
+`ache-eio-tls` and `ache-lwt-tls` add TLS (see [TLS](#tls)). There is no TLS
+package for `ache-miou`.
 
 ache is a fork of [httpun](https://github.com/anmonteiro/httpun), which is a
 fork of [httpaf](https://github.com/inhabitedtype/httpaf). It keeps their
@@ -34,7 +36,7 @@ ache is not on opam yet. Pin it from GitHub:
 
 ```sh
 opam pin add ache https://github.com/davesnx/ache.git
-opam pin add ache-eio https://github.com/davesnx/ache.git  # or ache-lwt
+opam pin add ache-eio https://github.com/davesnx/ache.git  # or ache-lwt, ache-miou
 opam pin add ache-eio-tls https://github.com/davesnx/ache.git  # or ache-lwt-tls, for TLS
 ```
 
@@ -251,6 +253,125 @@ let () =
 
 The output is the same as with Eio. `examples/` has more: streaming request
 and response bodies, pipelined requests, and a CONNECT proxy.
+
+## Quick start with Miou
+
+The same server and client with `ache-miou`. As with Lwt, the application
+must ignore `SIGPIPE`. The server runs each connection in its own task, made
+with `Miou.async ~orphans`, closes the socket when the handler returns, and
+collects ended tasks with `Miou.care`. The client calls `Client.shutdown`
+from the task that called `Client.create_connection`, because Miou requires
+a task to await the tasks it created.
+
+<!-- example: examples/miou/miou_hello_server.ml -->
+```ocaml
+open Ache
+
+let request_handler _client_address reqd =
+  let body = "Hello, world!\n" in
+  let headers = Headers.of_list [ "content-type", "text/plain" ] in
+  Reqd.respond_with_string reqd (Response.create ~headers `OK) body
+
+let error_handler _client_address ?request:_ error start_response =
+  let body = start_response Headers.empty in
+  (match error with
+  | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
+  | #Status.standard as status ->
+    Body.Writer.write_string body (Status.default_reason_phrase status));
+  Body.Writer.close body
+
+let rec clean_up orphans =
+  match Miou.care orphans with
+  | None | Some None -> ()
+  | Some (Some connection) ->
+    (match Miou.await connection with
+    | Ok () -> ()
+    | Error exn -> prerr_endline ("connection error: " ^ Printexc.to_string exn));
+    clean_up orphans
+
+let () =
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  let port = int_of_string Sys.argv.(1) in
+  let handler =
+    Ache_miou.Server.create_connection_handler ~request_handler ~error_handler
+  in
+  Miou_unix.run @@ fun () ->
+  let socket = Miou_unix.tcpv4 () in
+  Miou_unix.bind_and_listen
+    ~backlog:128
+    socket
+    Unix.(ADDR_INET (inet_addr_loopback, port));
+  Printf.printf "Listening on 127.0.0.1:%d\n%!" port;
+  let orphans = Miou.orphans () in
+  let rec accept () =
+    clean_up orphans;
+    let client, client_address = Miou_unix.accept socket in
+    ignore
+      (Miou.async ~orphans (fun () ->
+         Fun.protect
+           ~finally:(fun () -> Miou_unix.close client)
+           (fun () -> handler client client_address))
+       : unit Miou.t);
+    accept ()
+  in
+  accept ()
+```
+
+<!-- example: examples/miou/miou_hello_client.ml -->
+```ocaml
+open Ache
+
+let error_handler error =
+  let message =
+    match error with
+    | `Malformed_response message -> message
+    | `Invalid_response_body_length _ -> "invalid response body length"
+    | `Connection_closed -> "connection closed before the response"
+    | `Exn exn -> Printexc.to_string exn
+  in
+  prerr_endline ("request failed: " ^ message);
+  exit 1
+
+let () =
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  let port = int_of_string Sys.argv.(1) in
+  Miou_unix.run @@ fun () ->
+  let socket = Miou_unix.tcpv4 () in
+  Miou_unix.connect socket Unix.(ADDR_INET (inet_addr_loopback, port));
+  let client = Ache_miou.Client.create_connection socket in
+  let finished = Miou.Computation.create () in
+  let on_error () =
+    ignore
+      (Miou.Computation.try_cancel
+         finished
+         (Failure "response body cut short", Printexc.get_callstack 0)
+       : bool)
+  in
+  let response_handler response body =
+    Format.printf "%a@." Response.pp_hum response;
+    let rec on_read buffer ~off ~len =
+      print_string (Bigstringaf.substring buffer ~off ~len);
+      Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+    and on_eof () = ignore (Miou.Computation.try_return finished () : bool) in
+    Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+  in
+  let headers =
+    Headers.of_list [ "host", Printf.sprintf "127.0.0.1:%d" port ]
+  in
+  let request_body =
+    Ache_miou.Client.request
+      client
+      (Request.create ~headers `GET "/")
+      ~error_handler
+      ~response_handler
+  in
+  Body.Writer.close request_body;
+  Miou.Computation.await_exn finished;
+  Ache_miou.Client.shutdown client;
+  Miou_unix.close socket
+```
+
+The output is the same as with Eio.
 
 ## TLS
 
@@ -562,7 +683,8 @@ that each change fixes.
 - [Faraday](https://github.com/inhabitedtype/faraday) 0.8.2 is vendored in
   `vendor/faraday` and compiled inside `ache`. A program can also link the
   opam `faraday` package.
-- There is no gluten. `ache-eio` and `ache-lwt` have their own I/O loops.
+- There is no gluten. `ache-eio`, `ache-lwt` and `ache-miou` have their own
+  I/O loops.
   `Ache.Runtime.S` is the interface that a runtime drives, and
   `Ache.Runtime.make` packs a protocol so that an HTTP upgrade can hand the
   connection to it.
@@ -682,11 +804,21 @@ httpun rejected chunk extensions and trailers.
   and `writev` returns `` `Closed `` when the peer is gone. The `Ache_lwt.IO`
   documentation has the full contract. The Lwt server does not wait for the
   peer to close after the last response.
+- **Miou.** The application must ignore `SIGPIPE`. `Ache_miou.Server` and
+  `Ache_miou.Client` use `Miou_unix.file_descr`. Run the server handler in
+  its own task for each accepted socket, and close the socket when it
+  returns. Timeouts use `Miou_unix.sleep` and need no clock. With
+  `?idle_timeout` or `?head_timeout`, when the server stops reading it reads
+  and drops input until the peer closes, for at most `idle_timeout` (2 s
+  without one). Without a timeout it closes at once. Handlers and body
+  callbacks run in the connection tasks and must not leave a child task that
+  they do not await. `Client.shutdown` must be called by the task that
+  created the connection.
 
 ## Testing
 
 `dune test` runs these suites (counts from `dune test --force` on
-2026-11-14):
+2026-11-15):
 
 | Suite | Tests |
 |---|---|
@@ -697,6 +829,7 @@ httpun rejected chunk extensions and trailers.
 | `eio_tls_test`: `ache-eio-tls` on loopback sockets | 34 |
 | `lwt_test`: Lwt on loopback sockets | 25 |
 | `lwt_tls_test`: `ache-lwt-tls` on loopback sockets | 24 |
+| `miou_test`: Miou on loopback sockets | 28 |
 
 The RFC suites start from each sentence of RFC 9110 and RFC 9112 §2–§11 that
 has a requirement keyword (MUST, SHOULD, MAY and others), plus definitions

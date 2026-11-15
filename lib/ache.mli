@@ -45,9 +45,10 @@ module Headers : module type of Headers
 (** {2 Runtime Interface} *)
 
 module Runtime : sig
-  (** The interface that a runtime (such as [ache-eio] or [ache-lwt]) drives.
-      {!Server_connection} and {!Client_connection} implement it. A protocol
-      that takes over a connection after an HTTP upgrade implements it too. *)
+  (** The interface that a runtime (such as [ache-eio], [ache-lwt] or
+      [ache-miou]) drives. {!Server_connection} and {!Client_connection}
+      implement it. A protocol that takes over a connection after an HTTP
+      upgrade implements it too. *)
   module type S = sig
     type t
 
