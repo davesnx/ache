@@ -812,6 +812,9 @@ module Ache_private : sig
         -> more
         -> int
 
+      val force_close : (_, _) t -> unit
+      val resume : (_, _) t -> unit
+
       val next :
          (_, 'error) t
         -> [> `Read | `Start | `Close | `Error of 'error ]

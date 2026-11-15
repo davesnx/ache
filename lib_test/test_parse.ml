@@ -784,6 +784,279 @@ let test_unread_body_backpressure () =
          (String.equal copy (Bigstringaf.substring bs ~off ~len)))
     !held
 
+module Reader = Ache_private.Parse.Reader
+
+let reader ?(limit = 0x4000) () =
+  let heads = ref [] in
+  let bodies = ref [] in
+  let r =
+    Reader.request ~max_header_size:limit (fun request body ->
+      heads := request_summary request :: !heads;
+      bodies := body :: !bodies)
+  in
+  r, heads, bodies
+
+let response_reader ?(limit = 0x4000) () =
+  let heads = ref [] in
+  let queue = Queue.create () in
+  Queue.push
+    (Ache_private.Respd.awaiting (Request.create `GET "/") (fun response _ ->
+       heads := response_summary response :: !heads))
+    queue;
+  Reader.response ~max_header_size:limit queue, heads
+
+let read_more more r s =
+  let len = String.length s in
+  Reader.read_with_more r (Bigstringaf.of_string s ~off:0 ~len) ~off:0 ~len more
+
+let read r s = read_more Ache_private.Parse.Incomplete r s
+let read_eof r s = read_more Ache_private.Parse.Complete r s
+
+let next r =
+  match Reader.next r with
+  | `Read -> "read"
+  | `Start -> "start"
+  | `Close -> "close"
+  | `Error (`Parse message) -> "parse: " ^ message
+  | `Error `Method_too_long -> "method too long"
+  | `Error `Target_too_long -> "target too long"
+  | `Error `Header_too_large -> "header too large"
+  | `Error
+      ( `Invalid_request _ | `Invalid_response_body_length _
+      | `Unsolicited_response ) ->
+    "other error"
+
+let read_all r chunks = List.fold_left (fun n c -> n + read r c) 0 chunks
+
+let test_reader_every_split () =
+  let len = String.length get in
+  let r, heads, _ = reader () in
+  String.iteri
+    (fun i c ->
+       Alcotest.(check int) "byte consumed" 1 (read r (String.make 1 c));
+       Alcotest.(check int)
+         "head after its last byte"
+         (if i = len - 1 then 1 else 0)
+         (List.length !heads))
+    get;
+  for k = 1 to len - 1 do
+    let r, heads, _ = reader () in
+    Alcotest.(check int) "first read" k (read r (String.sub get 0 k));
+    Alcotest.(check (list string)) "no head yet" [] !heads;
+    Alcotest.(check int)
+      "second read"
+      (len - k)
+      (read r (String.sub get k (len - k)));
+    Alcotest.(check (list string)) "head" [ get_summary ] !heads
+  done
+
+let test_reader_limit_per_stage () =
+  let limit = 64 in
+  let check_stage stage prefix error make_reader =
+    List.iter
+      (fun (n, expect, consumed) ->
+         List.iter
+           (fun chunks ->
+              let r = make_reader () in
+              let total = read_all r chunks in
+              let msg = Printf.sprintf "%s, %d bytes" stage n in
+              Alcotest.(check string) msg expect (next r);
+              Alcotest.(check int) (msg ^ ": consumed") consumed total)
+           [ [ prefix n ]; every_byte (prefix n) ])
+      [ limit - 1, "read", limit - 1
+      ; limit, error, limit
+      ; limit + 1, error, limit
+      ]
+  in
+  let request () =
+    let r, _, _ = reader ~limit () in
+    r
+  in
+  check_stage "method" (fun n -> String.make n 'G') "method too long" request;
+  check_stage
+    "target"
+    (fun n -> "GET /" ^ String.make (n - 5) 'a')
+    "target too long"
+    request;
+  check_stage
+    "fields"
+    (fun n -> "GET / HTTP/1.1\r\nX: " ^ String.make (n - 19) 'v')
+    "header too large"
+    request;
+  check_stage
+    "response"
+    (fun n -> "HTTP/1.1 200 OK\r\nX: " ^ String.make (n - 20) 'v')
+    "header too large"
+    (fun () -> fst (response_reader ~limit ()))
+
+let test_reader_negative_limit () =
+  let r, heads, _ = reader ~limit:(-1) () in
+  Alcotest.(check int) "request consumed" 0 (read r get);
+  Alcotest.(check string) "request" "method too long" (next r);
+  Alcotest.(check (list string)) "no request" [] !heads;
+  let r, heads = response_reader ~limit:(-1) () in
+  Alcotest.(check int) "response consumed" 0 (read r "HTTP/1.1 200 OK\r\n\r\n");
+  Alcotest.(check string) "response" "header too large" (next r);
+  Alcotest.(check (list string)) "no response" [] !heads
+
+let test_reader_resume_after_upgrade () =
+  let upgrade =
+    "GET /chat HTTP/1.1\r\n\
+     Host: a\r\n\
+     Upgrade: websocket\r\n\
+     Connection: upgrade\r\n\
+     \r\n"
+  in
+  let input = upgrade ^ get in
+  let len = String.length upgrade in
+  for k = 1 to String.length input - 1 do
+    let r, heads, _ = reader () in
+    let a = read r (String.sub input 0 k) in
+    let b = read r (String.sub input a (String.length input - a)) in
+    let msg = Printf.sprintf "split at %d" k in
+    Alcotest.(check int) (msg ^ ": head only") len (a + b);
+    Alcotest.(check int) (msg ^ ": paused") 0 (read r get);
+    Reader.resume r;
+    Alcotest.(check int)
+      (msg ^ ": next request")
+      (String.length get)
+      (read r get);
+    Alcotest.(check (list string))
+      (msg ^ ": both requests")
+      [ get_summary
+      ; {|"GET" "/chat" HTTP/1.1 ["Host":"a";"Upgrade":"websocket";"Connection":"upgrade"]|}
+      ]
+      !heads
+  done
+
+let test_reader_bad_byte_at_line_end () =
+  List.iter
+    (fun (name, finish) ->
+       let r, heads, _ = reader () in
+       Alcotest.(check int) "line start" 18 (read r "GET / HTTP/1.1\r\nHo");
+       Alcotest.(check int) "bad byte" 6 (read r "st: \001b");
+       Alcotest.(check string) "not rejected yet" "read" (next r);
+       finish r;
+       Alcotest.(check string)
+         name
+         "parse: unexpected '\\001' in field line"
+         (next r);
+       Alcotest.(check (list string)) "no head" [] !heads)
+    [ ("rejected when the line ends", fun r -> ignore (read r "\r\n\r\n" : int))
+    ; ("rejected at EOF", fun r -> ignore (read_eof r "" : int))
+    ]
+
+let test_reader_force_close () =
+  let r, heads, _ = reader () in
+  ignore (read r "GET / HTTP/1.1\r\nHo" : int);
+  Reader.force_close r;
+  Alcotest.(check int) "rest dropped" 9 (read r "st: a\r\n\r\n");
+  Alcotest.(check (list string)) "no request" [] !heads;
+  Alcotest.(check string) "closed" "close" (next r);
+  List.iter
+    (fun (first, rest) ->
+       let r, _, bodies = reader () in
+       ignore (read r (chunked_head ^ first) : int);
+       let body = ref "open" in
+       read_body (List.hd !bodies) ~on_done:(fun b -> body := b);
+       Reader.force_close r;
+       Alcotest.(check int)
+         (first ^ ": rest dropped")
+         (String.length rest)
+         (read r rest);
+       Alcotest.(check string) (first ^ ": body not finished") "open" !body)
+    [ "5;e", "xt\r\nhello\r\n0\r\n\r\n"
+    ; "5\r\nhello\r\n0\r\nX-T", ": 1\r\n\r\n"
+    ]
+
+let test_reader_switch_protocols_split () =
+  let tunnel = "\022\003\001tunnel bytes" in
+  List.iter
+    (fun head ->
+       let len = String.length head in
+       let input = head ^ tunnel in
+       let check name chunks =
+         let r, heads, _ = reader () in
+         let consumed = read_all r chunks in
+         Alcotest.(check int) (name ^ ": head only") len consumed;
+         Alcotest.(check int) (name ^ ": one request") 1 (List.length !heads);
+         Alcotest.(check int) (name ^ ": paused") 0 (read r tunnel)
+       in
+       for k = 0 to len do
+         check
+           (Printf.sprintf "split at %d" k)
+           [ String.sub input 0 k
+           ; String.sub input k (String.length input - k)
+           ]
+       done;
+       check "one byte per read" (every_byte input))
+    [ "GET /chat HTTP/1.1\r\n\
+       Host: a\r\n\
+       Upgrade: websocket\r\n\
+       Connection: upgrade\r\n\
+       \r\n"
+    ; "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n\r\n"
+    ]
+
+let test_reader_continue_then_ok () =
+  check_client
+    ~expect:[ {|HTTP/1.1 200 "OK" ["Content-Length":"2"]|}, "ok" ]
+    "HTTP/1.1 100 Continue\r\n\
+     \r\n\
+     HTTP/1.1 200 OK\r\n\
+     Content-Length: 2\r\n\
+     \r\n\
+     ok"
+
+let test_reader_many_empty_lines () =
+  let input =
+    String.concat "" (List.init 8000 (fun _ -> "\r\n"))
+    ^ "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+  in
+  let c = run_client (every_byte input) in
+  Alcotest.(check (list request_body))
+    "response"
+    [ {|HTTP/1.1 200 "OK" ["Content-Length":"2"]|}, "ok" ]
+    c.responses;
+  Alcotest.(check (list string)) "errors" [] c.cerrors;
+  Alcotest.(check int) "consumed" (String.length input) c.cfeeder.consumed
+
+let test_reader_empty_trailer_split () =
+  let s = server () in
+  Feeder.feed s.feeder (chunked_head ^ "5\r\nhello\r\n0\r\n");
+  Feeder.feed s.feeder "\r";
+  Alcotest.(check string) "CR consumed" "" s.feeder.pending;
+  Alcotest.(check (list request_body)) "not finished" [] s.requests;
+  Feeder.feed s.feeder "\n";
+  Alcotest.(check (list request_body))
+    "finished"
+    [ chunked_summary, "hello" ]
+    s.requests;
+  Alcotest.(check (list string)) "errors" [] s.errors
+
+let test_reader_end_past_len () =
+  let head = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
+  let input = "xx" ^ head in
+  let bs = Bigstringaf.of_string input ~off:0 ~len:(String.length input) in
+  let r, heads, _ = reader () in
+  let len = String.length head - 1 in
+  Alcotest.(check int)
+    "consumed"
+    len
+    (Reader.read_with_more r bs ~off:2 ~len Ache_private.Parse.Incomplete);
+  Alcotest.(check (list string)) "incomplete" [] !heads;
+  Alcotest.(check string) "reading" "read" (next r);
+  Alcotest.(check int)
+    "last byte"
+    1
+    (Reader.read_with_more
+       r
+       bs
+       ~off:(2 + len)
+       ~len:1
+       Ache_private.Parse.Incomplete);
+  Alcotest.(check int) "complete" 1 (List.length !heads)
+
 let tests =
   [ "GET at every split", `Quick, test_get
   ; "POST fixed body at every split", `Quick, test_post_fixed
@@ -813,4 +1086,29 @@ let tests =
   ; "100,000 one-byte chunks in one read", `Quick, test_many_small_chunks
   ; "pipelined bodies read late", `Quick, test_pipelined_body_read_late
   ; "unread body: backpressure", `Quick, test_unread_body_backpressure
+  ; "reader: head at every split and byte", `Quick, test_reader_every_split
+  ; ( "reader: limit -1, at, +1 in each stage"
+    , `Quick
+    , test_reader_limit_per_stage )
+  ; ( "reader: bad byte in a split line found at its end"
+    , `Quick
+    , test_reader_bad_byte_at_line_end )
+  ; "reader: force_close with a partial line", `Quick, test_reader_force_close
+  ; "reader: negative limit", `Quick, test_reader_negative_limit
+  ; ( "reader: resume after a split Upgrade head"
+    , `Quick
+    , test_reader_resume_after_upgrade )
+  ; ( "reader: split Upgrade and CONNECT heads with tunnel bytes"
+    , `Quick
+    , test_reader_switch_protocols_split )
+  ; ( "reader: 100 Continue then 200 at every split"
+    , `Quick
+    , test_reader_continue_then_ok )
+  ; ( "reader: 8,000 empty lines then a response, one byte per read"
+    , `Quick
+    , test_reader_many_empty_lines )
+  ; ( "reader: empty trailer split as CR, LF"
+    , `Quick
+    , test_reader_empty_trailer_split )
+  ; "reader: final LF one byte past len", `Quick, test_reader_end_past_len
   ]

@@ -33,10 +33,42 @@ type more = Parse_v1.more =
   | Complete
   | Incomplete
 
-type 'a line =
-  | Line of 'a * int
-  | Partial
-  | Invalid of string
+let partial = -1
+let invalid = -2
+
+type out =
+  { mutable meth : Method.t
+  ; mutable text : string
+  ; mutable version : Version.t
+  ; mutable status : Status.t
+  ; mutable fields : (string * string) list
+  ; mutable size : int
+  ; mutable error : string
+  }
+
+let out () =
+  { meth = `GET
+  ; text = ""
+  ; version = Version.v1_1
+  ; status = `OK
+  ; fields = []
+  ; size = 0
+  ; error = ""
+  }
+
+let request_of o =
+  { Request.meth = o.meth
+  ; target = o.text
+  ; version = o.version
+  ; headers = Headers.of_rev_list o.fields
+  }
+
+let response_of o =
+  { Response.version = o.version
+  ; status = o.status
+  ; reason = o.text
+  ; headers = Headers.of_rev_list o.fields
+  }
 
 let table f =
   String.init 256 (fun i -> if f (Char.chr i) then '\001' else '\000')
@@ -93,126 +125,152 @@ let rec skip_zeros bs stop i =
   then skip_zeros bs stop (i + 1)
   else i
 
-let invalid ~eof stop p message =
-  if p >= stop && not eof then Partial else Invalid message
+let fail o message =
+  o.error <- message;
+  invalid
 
-let unexpected ~eof bs stop p where =
+let fail_at ~eof o stop p message =
+  if p >= stop && not eof then partial else fail o message
+
+let unexpected ~eof o bs stop p where =
   if p < stop
   then
-    Invalid (Printf.sprintf "unexpected %C in %s" (Bigstringaf.get bs p) where)
+    fail o (Printf.sprintf "unexpected %C in %s" (Bigstringaf.get bs p) where)
   else if eof
-  then Invalid "unexpected end of input"
-  else Partial
+  then fail o "unexpected end of input"
+  else partial
 
-let end_line ~eof bs stop p where =
+let end_line ~eof o bs stop p where =
   if get bs stop p <> '\r'
-  then unexpected ~eof bs stop p where
+  then unexpected ~eof o bs stop p where
   else if get bs stop (p + 1) <> '\n'
-  then unexpected ~eof bs stop (p + 1) where
-  else Line ((), p + 2)
+  then unexpected ~eof o bs stop (p + 1) where
+  else p + 2
 
-let version ~eof bs stop p where =
-  let rec literal i =
-    if i = 5
-    then
-      let major = get bs stop (p + 5) in
-      if not (is digit major)
-      then unexpected ~eof bs stop (p + 5) where
-      else if get bs stop (p + 6) <> '.'
-      then unexpected ~eof bs stop (p + 6) where
-      else
-        let minor = get bs stop (p + 7) in
-        if not (is digit minor)
-        then unexpected ~eof bs stop (p + 7) where
-        else
-          Line
-            ( { Version.major = Char.code major - 48
-              ; minor = Char.code minor - 48
-              }
-            , p + 8 )
-    else if get bs stop (p + i) <> "HTTP/".[i]
-    then unexpected ~eof bs stop (p + i) where
-    else literal (i + 1)
-  in
-  literal 0
+let rec http_slash ~eof o bs stop p i where =
+  if i = 5
+  then p + 5
+  else if get bs stop (p + i) <> "HTTP/".[i]
+  then unexpected ~eof o bs stop (p + i) where
+  else http_slash ~eof o bs stop p (i + 1) where
 
-let request_line ~eof bs off stop =
+let version ~eof o bs stop p where =
+  let p = http_slash ~eof o bs stop p 0 where in
+  if p < 0
+  then p
+  else
+    let major = get bs stop p
+    and minor = get bs stop (p + 2) in
+    if not (is digit major)
+    then unexpected ~eof o bs stop p where
+    else if get bs stop (p + 1) <> '.'
+    then unexpected ~eof o bs stop (p + 1) where
+    else if not (is digit minor)
+    then unexpected ~eof o bs stop (p + 2) where
+    else (
+      o.version <-
+        (match major, minor with
+        | '1', '1' -> Version.v1_1
+        | '1', '0' -> Version.v1_0
+        | _ ->
+          { Version.major = Char.code major - 48; minor = Char.code minor - 48 });
+      p + 3)
+
+let rec same bs off s i =
+  i = String.length s
+  || (Bigstringaf.get bs (off + i) = s.[i] && same bs off s (i + 1))
+
+let literal bs off len s = String.length s = len && same bs off s 0
+
+let methods =
+  [ "GET", `GET
+  ; "POST", `POST
+  ; "HEAD", `HEAD
+  ; "PUT", `PUT
+  ; "DELETE", `DELETE
+  ; "CONNECT", `CONNECT
+  ; "OPTIONS", `OPTIONS
+  ; "TRACE", `TRACE
+  ]
+
+let rec meth bs off len = function
+  | [] -> Method.of_string (Bigstringaf.substring bs ~off ~len)
+  | (s, m) :: rest -> if literal bs off len s then m else meth bs off len rest
+
+let request_line ~eof o bs off stop =
   let where = "request-line" in
   let meth_end = skip tchar bs stop off in
   if meth_end = off || get bs stop meth_end <> ' '
-  then unexpected ~eof bs stop meth_end where
+  then unexpected ~eof o bs stop meth_end where
   else
     let target_end = skip target_char bs stop (meth_end + 1) in
     if target_end = meth_end + 1 || get bs stop target_end <> ' '
-    then unexpected ~eof bs stop target_end where
+    then unexpected ~eof o bs stop target_end where
     else
-      match version ~eof bs stop (target_end + 1) where with
-      | (Partial | Invalid _) as e -> e
-      | Line (version, p) ->
-        (match end_line ~eof bs stop p where with
-        | (Partial | Invalid _) as e -> e
-        | Line ((), p) ->
-          let meth =
-            Method.of_string
-              (Bigstringaf.substring bs ~off ~len:(meth_end - off))
-          in
-          let target =
-            Bigstringaf.substring
-              bs
-              ~off:(meth_end + 1)
-              ~len:(target_end - meth_end - 1)
-          in
-          Line ((meth, target, version), p))
+      let p = version ~eof o bs stop (target_end + 1) where in
+      let p = if p < 0 then p else end_line ~eof o bs stop p where in
+      if p >= 0
+      then (
+        o.meth <- meth bs off (meth_end - off) methods;
+        o.text <-
+          Bigstringaf.substring
+            bs
+            ~off:(meth_end + 1)
+            ~len:(target_end - meth_end - 1));
+      p
 
-let status_line ~eof bs off stop =
+let digit_at bs i = Char.code (Bigstringaf.get bs i) - 48
+
+let status_line ~eof o bs off stop =
   let where = "status-line" in
-  match version ~eof bs stop off where with
-  | (Partial | Invalid _) as e -> e
-  | Line (version, _) when version.major <> 1 ->
-    Invalid
+  let p = version ~eof o bs stop off where in
+  if p < 0
+  then p
+  else if o.version.major <> 1
+  then
+    fail
+      o
       (Printf.sprintf
          "unsupported HTTP-version: %d.%d"
-         version.major
-         version.minor)
-  | Line (version, p) ->
-    if get bs stop p <> ' '
-    then unexpected ~eof bs stop p where
+         o.version.major
+         o.version.minor)
+  else if get bs stop p <> ' '
+  then unexpected ~eof o bs stop p where
+  else
+    let code_end = skip digit bs stop (p + 1) in
+    let n = code_end - p - 1 in
+    if n = 0
+    then fail_at ~eof o stop code_end "status-code empty"
+    else if n <> 3 || Bigstringaf.get bs (p + 1) = '0'
+    then
+      fail_at
+        ~eof
+        o
+        stop
+        code_end
+        (Printf.sprintf
+           (if n > 3
+            then "status-code too long: %S"
+            else "invalid status-code: %S")
+           (Bigstringaf.substring bs ~off:(p + 1) ~len:n))
+    else if get bs stop code_end <> ' '
+    then unexpected ~eof o bs stop code_end where
     else
-      let code_end = skip digit bs stop (p + 1) in
-      let n = code_end - p - 1 in
-      let code () = Bigstringaf.substring bs ~off:(p + 1) ~len:n in
-      if n = 0
-      then invalid ~eof stop code_end "status-code empty"
-      else if n > 3
-      then
-        invalid
-          ~eof
-          stop
-          code_end
-          (Printf.sprintf "status-code too long: %S" (code ()))
-      else if n < 3 || Bigstringaf.get bs (p + 1) = '0'
-      then
-        invalid
-          ~eof
-          stop
-          code_end
-          (Printf.sprintf "invalid status-code: %S" (code ()))
-      else if get bs stop code_end <> ' '
-      then unexpected ~eof bs stop code_end where
-      else
-        let reason_end = skip field_char bs stop (code_end + 1) in
-        (match end_line ~eof bs stop reason_end where with
-        | (Partial | Invalid _) as e -> e
-        | Line ((), q) ->
-          let d i = Char.code (Bigstringaf.get bs (p + i)) - 48 in
-          let status = Status.of_code ((100 * d 1) + (10 * d 2) + d 3) in
-          let reason =
-            Bigstringaf.substring
-              bs
-              ~off:(code_end + 1)
-              ~len:(reason_end - code_end - 1)
-          in
-          Line ((version, status, reason), q))
+      let reason_end = skip field_char bs stop (code_end + 1) in
+      let q = end_line ~eof o bs stop reason_end where in
+      if q >= 0
+      then (
+        o.status <-
+          Status.of_code
+            ((100 * digit_at bs (p + 1))
+            + (10 * digit_at bs (p + 2))
+            + digit_at bs (p + 3));
+        o.text <-
+          Bigstringaf.substring
+            bs
+            ~off:(code_end + 1)
+            ~len:(reason_end - code_end - 1));
+      q
 
 let rec trim_end bs off i =
   if i > off && is space (Bigstringaf.get bs (i - 1))
@@ -220,84 +278,85 @@ let rec trim_end bs off i =
   else i
 
 (* RFC 9112 §5.2: a recipient of a response replaces each obs-fold with SP. *)
-let field_line ~eof ~obs_fold fields bs off stop =
+let field_line ~eof ~obs_fold o bs off stop =
   let where = "field line" in
-  let fold = obs_fold && fields <> [] && is space (get bs stop off) in
+  let fold =
+    obs_fold
+    && (match o.fields with [] -> false | _ :: _ -> true)
+    && is space (get bs stop off)
+  in
   let name_end = if fold then off else skip tchar bs stop off in
   if (not fold) && (name_end = off || get bs stop name_end <> ':')
-  then unexpected ~eof bs stop name_end where
+  then unexpected ~eof o bs stop name_end where
   else
     let start = skip space bs stop (if fold then off else name_end + 1) in
     let value_end = skip field_char bs stop start in
-    match end_line ~eof bs stop value_end where with
-    | (Partial | Invalid _) as e -> e
-    | Line ((), p) ->
-      let value =
-        Bigstringaf.substring
-          bs
-          ~off:start
-          ~len:(trim_end bs start value_end - start)
-      in
-      (match fields with
-      | (name, previous) :: rest when fold ->
-        Line ((name, String.trim (previous ^ " " ^ value)) :: rest, p)
-      | _ ->
-        let name = Bigstringaf.substring bs ~off ~len:(name_end - off) in
-        Line ((name, value) :: fields, p))
+    let p = end_line ~eof o bs stop value_end where in
+    (if p >= 0
+     then
+       let value =
+         Bigstringaf.substring
+           bs
+           ~off:start
+           ~len:(trim_end bs start value_end - start)
+       in
+       match o.fields with
+       | (name, previous) :: rest when fold ->
+         o.fields <- (name, String.trim (previous ^ " " ^ value)) :: rest
+       | fields ->
+         o.fields <-
+           (Bigstringaf.substring bs ~off ~len:(name_end - off), value)
+           :: fields);
+    p
 
-let rec fields ~eof ~obs_fold ~where acc bs p stop =
+let rec fields ~eof ~obs_fold o bs p stop where =
   if get bs stop p = '\r'
-  then
-    match end_line ~eof bs stop p where with
-    | (Partial | Invalid _) as e -> e
-    | Line ((), p) -> Line (Headers.of_rev_list acc, p)
+  then end_line ~eof o bs stop p where
   else
-    match field_line ~eof ~obs_fold acc bs p stop with
-    | (Partial | Invalid _) as e -> e
-    | Line (acc, p) -> fields ~eof ~obs_fold ~where acc bs p stop
+    let p = field_line ~eof ~obs_fold o bs p stop in
+    if p < 0 then p else fields ~eof ~obs_fold o bs p stop where
 
-let rec quoted_string ~eof bs stop p where =
+let rec quoted_string ~eof o bs stop p where =
   let p = skip qdtext bs stop p in
   match get bs stop p with
-  | '"' -> Line ((), p + 1)
+  | '"' -> p + 1
   | '\\' ->
     if is quoted_pair_char (get bs stop (p + 1))
-    then quoted_string ~eof bs stop (p + 2) where
-    else unexpected ~eof bs stop (p + 1) where
-  | _ -> unexpected ~eof bs stop p where
+    then quoted_string ~eof o bs stop (p + 2) where
+    else unexpected ~eof o bs stop (p + 1) where
+  | _ -> unexpected ~eof o bs stop p where
 
 (* RFC 9112 §7.1.1 chunk-ext *)
-let rec chunk_ext ~eof bs stop p where =
+let rec chunk_ext ~eof o bs stop p where =
   match get bs stop p with
   | ' ' | '\t' | ';' ->
     let p = skip space bs stop p in
     if get bs stop p <> ';'
-    then unexpected ~eof bs stop p where
+    then unexpected ~eof o bs stop p where
     else
       let name = skip space bs stop (p + 1) in
       let name_end = skip tchar bs stop name in
       if name_end = name
-      then unexpected ~eof bs stop name where
+      then unexpected ~eof o bs stop name where
       else (
         match get bs stop name_end with
         | ' ' | '\t' | '=' ->
           let p = skip space bs stop name_end in
           if get bs stop p <> '='
-          then unexpected ~eof bs stop p where
+          then unexpected ~eof o bs stop p where
           else
             let value = skip space bs stop (p + 1) in
             if get bs stop value = '"'
             then
-              match quoted_string ~eof bs stop (value + 1) where with
-              | (Partial | Invalid _) as e -> e
-              | Line ((), p) -> chunk_ext ~eof bs stop p where
+              let p = quoted_string ~eof o bs stop (value + 1) where in
+              if p < 0 then p else chunk_ext ~eof o bs stop p where
             else
               let value_end = skip tchar bs stop value in
               if value_end = value
-              then unexpected ~eof bs stop value where
-              else chunk_ext ~eof bs stop value_end where
-        | _ -> chunk_ext ~eof bs stop name_end where)
-  | _ -> Line ((), p)
+              then unexpected ~eof o bs stop value where
+              else chunk_ext ~eof o bs stop value_end where
+        | _ -> chunk_ext ~eof o bs stop name_end where)
+  | _ -> p
 
 (* 15 hex digits keep the size below 2^60, so it fits an Int64 and an int. *)
 let max_chunk_size_digits = 15
@@ -308,114 +367,502 @@ let hex_value c =
   | 'a' .. 'f' -> Char.code c - 87
   | _ -> Char.code c - 55
 
-let chunk_size_line ~eof bs off stop =
+let rec hex_number bs acc i stop =
+  if i = stop
+  then acc
+  else
+    hex_number bs ((acc * 16) + hex_value (Bigstringaf.get bs i)) (i + 1) stop
+
+let chunk_size_line ~eof o bs off stop =
   let where = "chunk-size line" in
   let digits = skip_zeros bs stop off in
   let digits_end = skip hex bs stop digits in
   if digits_end = off
-  then unexpected ~eof bs stop off where
+  then unexpected ~eof o bs stop off where
   else if digits_end - digits > max_chunk_size_digits
   then
-    invalid
+    fail_at
       ~eof
+      o
       stop
       digits_end
       (Printf.sprintf
          "chunk-size too long: %S"
          (Bigstringaf.substring bs ~off:digits ~len:(digits_end - digits)))
   else
-    match chunk_ext ~eof bs stop digits_end where with
-    | (Partial | Invalid _) as e -> e
-    | Line ((), p) ->
-      (match end_line ~eof bs stop p where with
-      | (Partial | Invalid _) as e -> e
-      | Line ((), p) ->
-        let rec value acc i =
-          if i = digits_end
-          then acc
-          else value ((acc * 16) + hex_value (Bigstringaf.get bs i)) (i + 1)
-        in
-        Line (Int64.of_int (value 0 digits), p))
+    let p = chunk_ext ~eof o bs stop digits_end where in
+    let p = if p < 0 then p else end_line ~eof o bs stop p where in
+    if p >= 0 then o.size <- hex_number bs 0 digits digits_end;
+    p
 
 module Grammar = struct
-  let run head where input =
+  let run parse value where input =
     let len = String.length input in
     let bs = Bigstringaf.of_string input ~off:0 ~len in
-    match head bs len with
-    | Line (v, p) when p = len -> Ok v
-    | Line (_, p) ->
-      Error (Printf.sprintf "unexpected %C after %s" input.[p] where)
-    | Partial -> Error "unexpected end of input"
-    | Invalid message -> Error message
+    let o = out () in
+    let p = parse o bs len in
+    if p = len
+    then Ok (value o)
+    else if p >= 0
+    then Error (Printf.sprintf "unexpected %C after %s" input.[p] where)
+    else if p = partial
+    then Error "unexpected end of input"
+    else Error o.error
 
-  let leading_empty_line bs stop p where =
-    if get bs stop p = '\r'
-    then end_line ~eof:true bs stop p where
-    else Line ((), p)
+  let empty_line o bs stop p where =
+    if get bs stop p = '\r' then end_line ~eof:true o bs stop p where else p
 
   (* RFC 9112 §2.2: ignore one empty line before the request-line. *)
   let request =
     run
-      (fun bs stop ->
-         match leading_empty_line bs stop 0 "request-line" with
-         | (Partial | Invalid _) as e -> e
-         | Line ((), p) ->
-           (match request_line ~eof:true bs p stop with
-           | (Partial | Invalid _) as e -> e
-           | Line ((meth, target, version), p) ->
-             (match
-                fields
-                  ~eof:true
-                  ~obs_fold:false
-                  ~where:"header section"
-                  []
-                  bs
-                  p
-                  stop
-              with
-             | (Partial | Invalid _) as e -> e
-             | Line (headers, p) ->
-               Line (Request.create ~version ~headers meth target, p))))
+      (fun o bs stop ->
+         let p = empty_line o bs stop 0 "request-line" in
+         let p = if p < 0 then p else request_line ~eof:true o bs p stop in
+         if p < 0
+         then p
+         else fields ~eof:true ~obs_fold:false o bs p stop "header section")
+      request_of
       "header section"
 
   (* RFC 9112 §2.2: empty lines before a response are discarded. *)
+  let rec empty_lines o bs stop p =
+    let q = empty_line o bs stop p "status-line" in
+    if q > p then empty_lines o bs stop q else q
+
   let response =
     run
-      (fun bs stop ->
-         let rec skip_empty p =
-           match leading_empty_line bs stop p "status-line" with
-           | Line ((), q) when q > p -> skip_empty q
-           | r -> r
-         in
-         match skip_empty 0 with
-         | (Partial | Invalid _) as e -> e
-         | Line ((), p) ->
-           (match status_line ~eof:true bs p stop with
-           | (Partial | Invalid _) as e -> e
-           | Line ((version, status, reason), p) ->
-             (match
-                fields
-                  ~eof:true
-                  ~obs_fold:true
-                  ~where:"header section"
-                  []
-                  bs
-                  p
-                  stop
-              with
-             | (Partial | Invalid _) as e -> e
-             | Line (headers, p) ->
-               Line (Response.create ~reason ~version ~headers status, p))))
+      (fun o bs stop ->
+         let p = empty_lines o bs stop 0 in
+         let p = if p < 0 then p else status_line ~eof:true o bs p stop in
+         if p < 0
+         then p
+         else fields ~eof:true ~obs_fold:true o bs p stop "header section")
+      response_of
       "header section"
 
   let chunk_size =
-    run (fun bs stop -> chunk_size_line ~eof:true bs 0 stop) "chunk-size line"
+    run
+      (fun o bs stop -> chunk_size_line ~eof:true o bs 0 stop)
+      (fun o -> Int64.of_int o.size)
+      "chunk-size line"
 
   let trailers =
     run
-      (fun bs stop ->
-         fields ~eof:true ~obs_fold:false ~where:"trailer section" [] bs 0 stop)
+      (fun o bs stop ->
+         fields ~eof:true ~obs_fold:false o bs 0 stop "trailer section")
+      (fun o -> Headers.of_rev_list o.fields)
       "trailer section"
 end
 
-module Reader = Parse_v1.Reader
+module Reader = struct
+  type request_error =
+    [ `Invalid_request of Request.t * Request.error
+    | `Parse of string
+    | `Method_too_long
+    | `Target_too_long
+    | `Header_too_large
+    ]
+
+  type response_error =
+    [ `Invalid_response_body_length of Response.t
+    | `Parse of string
+    | `Header_too_large
+    | `Unsolicited_response
+    ]
+
+  type framing =
+    | Fixed of int64
+    | Chunk_line
+    | Chunk_data of int64
+    | Chunk_crlf of int
+    | Trailers
+    | Close_delimited
+
+  type ('head, 'error) state =
+    | Done
+    | Head
+    | Head_done
+    | Body of Body.Reader.t * framing
+    | Fail of 'error
+    | Cancelled_parse
+
+  type stage =
+    | Leading
+    | First
+    | Fields
+    | Trailer
+    | Chunk_size
+    | Ended
+
+  type ('head, 'error) t =
+    { limit : int
+    ; request : bool
+    ; out : out
+    ; on_head : ('head, 'error) t -> unit
+    ; fail :
+        [ `Parse of string
+        | `Header_too_large
+        | `Method_too_long
+        | `Target_too_long
+        ]
+        -> 'error
+    ; mutable state : ('head, 'error) state
+    ; mutable stage : stage
+    ; mutable fed : int
+    ; mutable buffer : Bigstringaf.t
+    ; mutable buffered : int
+    ; mutable paused : bool
+    ; mutable closed : bool
+    ; mutable wakeup : Optional_thunk.t
+    }
+
+  type request = (Request.t, request_error) t
+  type response = (Response.t, response_error) t
+
+  let create ~max_header_size ~request ~on_head ~fail =
+    { limit = Int.max 0 max_header_size
+    ; request
+    ; out = out ()
+    ; on_head
+    ; fail
+    ; state = Done
+    ; stage = Ended
+    ; fed = 0
+    ; buffer = Bigstringaf.empty
+    ; buffered = 0
+    ; paused = false
+    ; closed = false
+    ; wakeup = Optional_thunk.none
+    }
+
+  let is_closed t = t.closed
+  let resume t = t.paused <- false
+  let pause t = t.paused <- true
+
+  let on_wakeup t k =
+    if is_closed t
+    then failwith "on_wakeup on closed reader"
+    else if Optional_thunk.is_some t.wakeup
+    then failwith "on_wakeup: only one callback can be registered at a time"
+    else t.wakeup <- Optional_thunk.some k
+
+  let wakeup t =
+    let f = t.wakeup in
+    t.wakeup <- Optional_thunk.none;
+    Optional_thunk.call_if_some f
+
+  let create_body t =
+    Body.Reader.create
+      ~when_ready_to_read:(Optional_thunk.some (fun () -> wakeup t))
+
+  let chunk_line t body =
+    t.stage <- Chunk_size;
+    Body (body, Chunk_line)
+
+  (* RFC 9110 §7.8, §9.3.6: the connection may stop carrying HTTP/1.1 after the
+     response to this request. *)
+  let may_switch_protocols (request : Request.t) =
+    request.meth = `CONNECT
+    || (Headers.mem request.headers "upgrade"
+       && Message.has_member
+            (Headers.get_multi request.headers "connection")
+            "upgrade")
+
+  let request ~max_header_size handler =
+    let on_head t =
+      let request = request_of t.out in
+      t.paused <- may_switch_protocols request;
+      match Request.received_body_length request with
+      | Error error -> t.state <- Fail (`Invalid_request (request, error))
+      | Ok (`Fixed 0L) ->
+        handler request (Body.Reader.create_empty ());
+        t.state <- Done
+      | Ok ((`Fixed _ | `Chunked) as encoding) ->
+        let body = create_body t in
+        t.state <-
+          (match encoding with
+          | `Fixed n -> Body (body, Fixed n)
+          | `Chunked -> chunk_line t body);
+        handler request body
+    in
+    create ~max_header_size ~request:true ~on_head ~fail:(fun e ->
+      (e :> request_error))
+
+  let response ~max_header_size request_queue =
+    let on_head t =
+      let response = response_of t.out in
+      let exception Local of Respd.t option in
+      match
+        Queue.iter
+          (fun respd ->
+             if respd.Respd.state = Awaiting_response
+             then raise (Local (Some respd))
+             else if not (Respd.persistent_connection respd)
+             then raise (Local None))
+          request_queue
+      with
+      | () -> t.state <- Fail `Unsolicited_response
+      | exception Local None -> t.state <- Cancelled_parse
+      | exception Local (Some respd) ->
+        let request = Respd.request respd in
+        if response.Response.status = `Switching_protocols
+        then respd.response_handler response (Body.Reader.create_empty ())
+        else if request.meth = `CONNECT && Status.is_successful response.status
+        then respd.response_handler response (create_body t)
+        else (
+          match Response.body_length ~request_method:request.meth response with
+          | `No_body when Status.is_informational response.status ->
+            t.state <- Done
+          | `Error `Bad_gateway -> assert false
+          | `Error `Internal_server_error ->
+            t.state <- Fail (`Invalid_response_body_length response)
+          | `No_body | `Fixed 0L ->
+            respd.response_handler response (Body.Reader.create_empty ());
+            t.state <- Done
+          | (`Fixed _ | `Chunked | `Close_delimited) as encoding ->
+            let body = create_body t in
+            t.state <-
+              (match encoding with
+              | `Fixed n -> Body (body, Fixed n)
+              | `Chunked -> chunk_line t body
+              | `Close_delimited -> Body (body, Close_delimited));
+            respd.response_handler response body)
+    in
+    create ~max_header_size ~request:false ~on_head ~fail:(function
+      | (`Parse _ | `Header_too_large) as e -> e
+      | `Method_too_long | `Target_too_long -> `Header_too_large)
+
+  let line t bs p stop =
+    let o = t.out in
+    match t.stage with
+    | Leading when get bs stop p = '\r' ->
+      let where = if t.request then "request-line" else "status-line" in
+      let q = end_line ~eof:false o bs stop p where in
+      if q >= 0 && t.request then t.stage <- First;
+      q
+    | Leading | First ->
+      let q =
+        if t.request
+        then request_line ~eof:false o bs p stop
+        else status_line ~eof:false o bs p stop
+      in
+      if q >= 0 then t.stage <- Fields;
+      q
+    | (Fields | Trailer) when get bs stop p = '\r' ->
+      let where =
+        if t.stage = Fields then "header section" else "trailer section"
+      in
+      let q = end_line ~eof:false o bs stop p where in
+      if q >= 0 then t.stage <- Ended;
+      q
+    | Fields -> field_line ~eof:false ~obs_fold:(not t.request) o bs p stop
+    | Trailer -> field_line ~eof:false ~obs_fold:false o bs p stop
+    | Chunk_size ->
+      let q = chunk_size_line ~eof:false o bs p stop in
+      if q >= 0 then t.stage <- Ended;
+      q
+    | Ended -> p
+
+  let rec lines t bs p stop =
+    match t.stage with
+    | Ended -> p
+    | _ ->
+      let q = line t bs p stop in
+      if q = partial then p else if q < 0 then q else lines t bs q stop
+
+  let save t bs off len =
+    let size = t.buffered + len in
+    if size > Bigstringaf.length t.buffer
+    then (
+      let buffer =
+        Bigstringaf.create (Int.max 256 (Int.max size (2 * t.buffered)))
+      in
+      Bigstringaf.blit t.buffer ~src_off:0 buffer ~dst_off:0 ~len:t.buffered;
+      t.buffer <- buffer);
+    Bigstringaf.blit bs ~src_off:off t.buffer ~dst_off:t.buffered ~len;
+    t.buffered <- size
+
+  let drop t =
+    t.fed <- 0;
+    t.buffered <- 0;
+    if Bigstringaf.length t.buffer > 4096 then t.buffer <- Bigstringaf.empty
+
+  let finish t body =
+    Body.Reader.close body;
+    t.state <- Done
+
+  let ended t =
+    drop t;
+    match t.state with
+    | Head ->
+      t.state <- Head_done;
+      t.on_head t;
+      t.out.fields <- []
+    | Body (body, Chunk_line) ->
+      if t.out.size = 0
+      then (
+        t.stage <- Trailer;
+        t.state <- Body (body, Trailers))
+      else t.state <- Body (body, Chunk_data (Int64.of_int t.out.size))
+    | Body (body, Trailers) ->
+      t.out.fields <- [];
+      finish t body
+    | Done | Head_done | Body _ | Fail _ | Cancelled_parse -> ()
+
+  let failed t error =
+    t.buffer <- Bigstringaf.empty;
+    t.state <- Fail (t.fail error)
+
+  let too_large t =
+    match t.stage with
+    | (Leading | First) when t.request ->
+      let meth_end = skip tchar t.buffer t.buffered 0 in
+      if get t.buffer t.buffered meth_end = ' '
+      then `Target_too_long
+      else `Method_too_long
+    | _ -> `Header_too_large
+
+  let unfinished t bs ~off ~take more p =
+    save t bs p (off + take - p);
+    t.fed <- t.fed + take;
+    if t.fed < t.limit && more = Incomplete
+    then take
+    else
+      let q = line t t.buffer 0 t.buffered in
+      failed
+        t
+        (if q <> partial
+         then `Parse t.out.error
+         else if t.fed >= t.limit
+         then too_large t
+         else `Parse "unexpected end of input");
+      take
+
+  let parse_lines t bs ~off ~take more p =
+    let q = lines t bs p (off + take) in
+    if q < 0
+    then (
+      let n =
+        match t.stage with
+        | Chunk_size when t.fed = 0 ->
+          let nl = Bigstringaf.memchr bs off '\n' take in
+          if nl < 0 then take else nl + 1 - off
+        | _ -> take
+      in
+      failed t (`Parse t.out.error);
+      n)
+    else
+      match t.stage with
+      | Ended ->
+        ended t;
+        q - off
+      | _ -> unfinished t bs ~off ~take more q
+
+  let section t bs ~off ~len more =
+    let take = Int.min len (t.limit - t.fed) in
+    if t.buffered = 0
+    then parse_lines t bs ~off ~take more off
+    else
+      let nl = Bigstringaf.memchr bs off '\n' take in
+      if nl < 0
+      then unfinished t bs ~off ~take more off
+      else (
+        save t bs off (nl + 1 - off);
+        if line t t.buffer 0 t.buffered < 0
+        then (
+          failed t (`Parse t.out.error);
+          take)
+        else (
+          t.buffered <- 0;
+          parse_lines t bs ~off ~take more (nl + 1)))
+
+  let deliver body bs ~off ~len remaining =
+    let n =
+      if Int64.compare remaining (Int64.of_int len) < 0
+      then Int64.to_int remaining
+      else len
+    in
+    Body.Reader.write body bs ~off ~len:n;
+    n
+
+  let step t bs ~off ~len more =
+    match t.state with
+    | Fail _ | Head_done -> 0
+    | Cancelled_parse -> len
+    | Done when len = 0 || t.paused -> 0
+    | Done ->
+      t.state <- Head;
+      t.stage <- Leading;
+      section t bs ~off ~len more
+    | Head
+    | Body (_, (Chunk_line | Chunk_data _ | Chunk_crlf _ | Trailers | Fixed _))
+      when len = 0 && more = Incomplete ->
+      0
+    | Head | Body (_, (Chunk_line | Trailers)) -> section t bs ~off ~len more
+    | Body (_, ((Fixed _ | Chunk_data _ | Chunk_crlf _) as framing))
+      when len = 0 ->
+      failed
+        t
+        (`Parse
+            (match framing with
+            | Fixed _ -> "expected more from fixed body"
+            | _ -> "expected more from body chunk"));
+      0
+    | Body (body, ((Fixed remaining | Chunk_data remaining) as framing)) ->
+      let n = deliver body bs ~off ~len remaining in
+      let remaining = Int64.sub remaining (Int64.of_int n) in
+      (match framing with
+      | Fixed _ when remaining = 0L -> finish t body
+      | Fixed _ -> t.state <- Body (body, Fixed remaining)
+      | _ when remaining = 0L -> t.state <- Body (body, Chunk_crlf 0)
+      | _ -> t.state <- Body (body, Chunk_data remaining));
+      n
+    | Body (body, Chunk_crlf seen) ->
+      if Bigstringaf.get bs off <> if seen = 0 then '\r' else '\n'
+      then (
+        failed t (`Parse "expected CRLF after chunk data");
+        0)
+      else (
+        t.state <-
+          (if seen = 0 then Body (body, Chunk_crlf 1) else chunk_line t body);
+        1)
+    | Body (body, Close_delimited) ->
+      if len > 0 then ignore (deliver body bs ~off ~len Int64.max_int : int);
+      (match more with Complete -> finish t body | Incomplete -> ());
+      len
+
+  let in_message = function
+    | Head | Body _ -> true
+    | Done | Head_done | Fail _ | Cancelled_parse -> false
+
+  let rec read_loop t bs ~off ~len more consumed =
+    let previous = t.state in
+    let n = step t bs ~off ~len more in
+    let consumed = consumed + n in
+    let len = len - n in
+    if
+      (n > 0 || t.state != previous)
+      && (len > 0 || (more = Complete && in_message t.state))
+    then read_loop t bs ~off:(off + n) ~len more consumed
+    else consumed
+
+  let read_with_more t bs ~off ~len more =
+    let consumed = read_loop t bs ~off ~len more 0 in
+    (match more with Complete -> t.closed <- true | Incomplete -> ());
+    consumed
+
+  let force_close t =
+    t.closed <- true;
+    match t.state with
+    | (Head | Body (_, (Chunk_line | Trailers))) when t.fed > 0 ->
+      t.state <- Cancelled_parse;
+      t.buffer <- Bigstringaf.empty
+    | Done | Head | Head_done | Body _ | Fail _ | Cancelled_parse -> ()
+
+  let next t =
+    match t.state with
+    | Fail failure -> `Error failure
+    | _ when t.closed -> `Close
+    | Done -> `Start
+    | Head | Head_done | Body _ | Cancelled_parse -> `Read
+end

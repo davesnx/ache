@@ -1304,7 +1304,7 @@ let test_failed_response_parse () =
   test
     "HTTP/1.1 200\r\n\r\n"
     16
-    (`Malformed_response "expected ' ', found '\\r'");
+    (`Malformed_response "unexpected '\\r' in status-line");
 
   let response = Response.create `OK ~headers:(Headers.encoding_fixed (-1)) in
   test (response_to_string response) 39 (`Invalid_response_body_length response)

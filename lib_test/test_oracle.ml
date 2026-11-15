@@ -88,9 +88,23 @@ let same_next expected actual =
 let same_snapshot e a =
   same_next e.next a.next && e.left = a.left && e.heads = a.heads
 
-let same_outcome e a =
+(* A bad byte in a line that began in an earlier read is found when the line
+   ends or at EOF; v1 found it at the byte. When the second read neither starts
+   nor ends a line, v1 rejects before EOF and this reader at EOF, with the same
+   error and the same bytes consumed. *)
+let rejected_at_eof input k e a =
+  k > 0
+  && input.[k - 1] <> '\n'
+  && (not (String.contains_from input k '\n'))
+  && (match e.pre.next, a.pre.next with
+    | Failed ("parse", _), Read -> same_next e.pre.next a.post.next
+    | _ -> false)
+  && e.pre.left = a.pre.left
+  && e.pre.heads = a.pre.heads
+
+let same_outcome input k e a =
   same_snapshot e.mid a.mid
-  && same_snapshot e.pre a.pre
+  && (same_snapshot e.pre a.pre || rejected_at_eof input k e a)
   && same_snapshot e.post a.post
   && e.messages = a.messages
 
@@ -126,10 +140,28 @@ let test_grammar () =
 let test_reader () =
   check "reader" (fun c ->
     let now = R.case c.kind ~limit:c.limit c.input in
-    not (Array.for_all2 same_outcome c.outcomes now.outcomes))
+    not
+      (Array.for_all
+         Fun.id
+         (Array.mapi
+            (fun k e -> same_outcome c.input k e now.outcomes.(k))
+            c.outcomes)))
+
+let test_splits_end_as_one_read () =
+  check "split" (fun c ->
+    let now = R.case c.kind ~limit:c.limit c.input in
+    let one = now.outcomes.(0) in
+    not
+      (Array.for_all
+         (fun o ->
+            same_next one.post.next o.post.next
+            && one.post.heads = o.post.heads
+            && one.messages = o.messages)
+         now.outcomes))
 
 let tests =
   [ "frozen data size", `Quick, test_size
   ; "grammar matches v1", `Quick, test_grammar
   ; "reader matches v1 at every split", `Quick, test_reader
+  ; "every split ends as one read", `Quick, test_splits_end_as_one_read
   ]
