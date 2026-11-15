@@ -151,8 +151,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 
 ### Parsing
 
-- parseff (`> 0.5.0`) replaces Angstrom for message heads,
-  chunk-size lines and trailer sections. Bodies are framed by hand.
+- A hand-written parser replaces Angstrom for message heads, chunk-size
+  lines and trailer sections. Bodies are framed by hand.
   `Ache_private.Parse.Grammar` exposes the head grammars.
 - Faraday 0.8.2 is vendored in `vendor/faraday` and compiled inside `ache`,
   which can be linked with the opam `faraday` package.
@@ -172,17 +172,12 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `Connection` field.
 - `read` and `read_eof` consume every byte of an incomplete head, chunk-size
   line or trailer section, and of a head that fails to parse.
-- A head is first parsed from the bytes at hand alone: all of them when fewer
-  than 2040 bytes are at hand, else the first 512. When that parse fails, for
-  example because the head is not complete, the head goes to parseff with
-  `Source.of_chunks`, in chunks of the same sizes, and the result is the same.
-  A 462-byte GET head read at once allocates 336 minor words. A head split
-  across reads, or longer than the bytes tried first, is parsed twice up to
-  the point where the first parse stopped. This needs a parseff later than
-  0.5.0. Until a parseff release has `Source.of_chunks` without a read buffer,
-  `ache.opam` pins `parseff.dev` to the `main` branch of davesnx/parseff
-  (commit 57112b6, which has davesnx/parseff#64) with `pin-depends`, and ache
-  cannot be published to the opam repository.
+- Each line of a head, chunk-size line or trailer section is parsed once.
+  When a head is split across reads, the reader keeps the lines that are
+  complete and copies only the unfinished line, so a split head is not parsed
+  again from its start and the work is linear in its size. In the quick check
+  of `benchmarks/vs`, `get_small` takes 729 ns and 126 minor words per
+  message, and `get_small_split_head` takes 834 ns and 126 minor words.
 
 ### Runtimes
 
@@ -234,8 +229,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - httpun #164: `Content-Length` with `Transfer-Encoding` gets 400.
 - httpun #165: no body in a response to `HEAD`.
 - httpaf #18: the head limit no longer depends on `read_buffer_size`.
-- httpaf #38: chunk sizes are parsed by the parseff grammar with a length
-  limit.
+- httpaf #38: chunk sizes are parsed with a length limit.
 - httpaf #86: idle and head timeouts.
 - httpaf #191: 422 `` `Unprocessable_content ``.
 - httpaf #192: `respond_with_string` adds `Content-Length`.

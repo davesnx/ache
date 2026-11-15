@@ -921,7 +921,7 @@ function environment(settings: Settings, cpuNote: string, servers: Server[]): En
   const destdir = sh("ocamlfind", ["printconf", "destdir"]);
   const switchPackages = path.join(destdir, "..", ".opam-switch", "packages");
   const installed = fs.existsSync(switchPackages) ? fs.readdirSync(switchPackages) : [];
-  for (const p of ["httpaf", "httpaf-lwt-unix", "httpun", "httpun-lwt-unix", "httpun-eio", "httpcats", "h1", "miou", "gluten", "lwt", "eio", "eio_main", "parseff", "faraday", "angstrom", "bigstringaf"])
+  for (const p of ["httpaf", "httpaf-lwt-unix", "httpun", "httpun-lwt-unix", "httpun-eio", "httpcats", "h1", "miou", "gluten", "lwt", "eio", "eio_main", "faraday", "angstrom", "bigstringaf"])
     packages[p] = installed.find((d) => d.startsWith(`${p}.`))?.slice(p.length + 1) ?? "unknown";
   const governorFile = `/sys/devices/system/cpu/cpu${settings.serverCpu ?? 0}/cpufreq/scaling_governor`;
   return {

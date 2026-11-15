@@ -2,7 +2,7 @@
 opam-version: "2.0"
 synopsis: "High-performance, memory-efficient HTTP/1.1 for OCaml"
 description:
-  "ache is an HTTP/1.1 client and server library. It parses and serializes messages and keeps the state of a connection, without doing I/O itself; the ache-eio, ache-lwt and ache-miou packages run it on sockets. ache is a fork of httpun and httpaf: it rejects requests that RFC 9110 and RFC 9112 do not allow, sets the framing of each response, limits head size, and parses heads with parseff."
+  "ache is an HTTP/1.1 client and server library. It parses and serializes messages and keeps the state of a connection, without doing I/O itself; the ache-eio, ache-lwt and ache-miou packages run it on sockets. ache is a fork of httpun and httpaf: it rejects requests that RFC 9110 and RFC 9112 do not allow, sets the framing of each response, limits head size, and parses heads with a hand-written parser."
 maintainer: ["David Sancho <dsnxmoreno@gmail.com>"]
 authors: [
   "David Sancho <dsnxmoreno@gmail.com>"
@@ -18,7 +18,6 @@ depends: [
   "dune" {>= "3.17"}
   "ocaml" {>= "5.3"}
   "bigstringaf"
-  "parseff" {> "0.5.0"}
   "alcotest" {with-test}
   "faraday" {with-test}
   "ocamlformat" {= "0.29.0" & with-dev-setup}
@@ -40,9 +39,3 @@ build: [
 ]
 dev-repo: "git+https://github.com/davesnx/ache.git"
 x-maintenance-intent: ["(latest)"]
-pin-depends: [
-  [
-    "parseff.dev"
-    "git+https://github.com/davesnx/parseff#57112b67dc13e2dc703f74962f8c39d3fb1c6845"
-  ]
-]

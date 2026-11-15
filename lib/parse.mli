@@ -65,7 +65,9 @@ module Reader : sig
       response decides. *)
 
   val force_close : (_, _) t -> unit
-  (** Closes the reader and cancels a suspended parse. *)
+  (** Closes the reader. After a partial head, chunk-size line or trailer
+      section, the reader drops the buffered bytes and the bytes of later
+      reads. *)
 
   val is_closed : (_, _) t -> bool
 

@@ -822,8 +822,6 @@ module Ache_private : sig
     end
   end
 
-  module Parse_v1 : module type of Parse
-
   module Serialize : sig
     val write_request : Faraday.t -> Request.t -> unit
     val write_response : Faraday.t -> Response.t -> unit

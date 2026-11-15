@@ -29,7 +29,7 @@
   EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   ----------------------------------------------------------------------------*)
 
-type more = Parse_v1.more =
+type more =
   | Complete
   | Incomplete
 

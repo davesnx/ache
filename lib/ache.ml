@@ -38,6 +38,5 @@ module Ache_private = struct
   end
 
   module Parse = Parse
-  module Parse_v1 = Parse_v1
   module Serialize = Serialize
 end

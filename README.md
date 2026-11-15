@@ -22,12 +22,11 @@ fork of [httpaf](https://github.com/inhabitedtype/httpaf). It keeps their
   a response it cannot send correctly.
 - The client reports every request that gets no response, and pipelines only
   behind idempotent requests.
-- Message heads are parsed with [parseff](https://github.com/davesnx/parseff).
-  There is no gluten and no Angstrom; Faraday is vendored.
+- Message heads are parsed by a hand-written parser that parses each line
+  once, also when a head arrives in several reads. There is no gluten and no
+  Angstrom; Faraday is vendored.
 
-Status: not released, and not publishable to opam until parseff releases
-`Source.of_chunks` without a read buffer (see [Install](#install)). The API can change
-before 1.0. Users of httpun 0.2 can read
+Status: not released. The API can change before 1.0. Users of httpun 0.2 can read
 [Migrating from httpun](#migrating-from-httpun-02).
 
 ## Install
@@ -39,13 +38,6 @@ opam pin add ache https://github.com/davesnx/ache.git
 opam pin add ache-eio https://github.com/davesnx/ache.git  # or ache-lwt, ache-miou
 opam pin add ache-eio-tls https://github.com/davesnx/ache.git  # or ache-lwt-tls, for TLS
 ```
-
-ache needs a parseff later than 0.5.0, which is not released yet. The
-`pin-depends` field of `ache.opam` pins `parseff.dev` to a commit of parseff's
-`main` branch that has
-[davesnx/parseff#64](https://github.com/davesnx/parseff/pull/64), so the
-commands above fetch it. ache cannot be published to the opam repository
-until a parseff release contains that change.
 
 ache needs OCaml 5.3 or later.
 
@@ -678,8 +670,8 @@ that each change fixes.
 
 - `httpun-types` is part of `ache`. `httpun-lwt` and `httpun-lwt-unix` are
   one package, `ache-lwt`. The async and mirage runtimes are removed.
-- Message heads, chunk-size lines and trailer sections are parsed with
-  parseff in place of Angstrom. Bodies are framed by a small state machine.
+- Message heads, chunk-size lines and trailer sections are parsed by a
+  hand-written parser in place of Angstrom. Bodies are framed by a small state machine.
 - [Faraday](https://github.com/inhabitedtype/faraday) 0.8.2 is vendored in
   `vendor/faraday` and compiled inside `ache`. A program can also link the
   opam `faraday` package.
@@ -822,7 +814,7 @@ httpun rejected chunk extensions and trailers.
 
 | Suite | Tests |
 |---|---|
-| `lib_test`: core unit tests | 264 |
+| `lib_test`: core unit tests | 279 |
 | `rfc_test`: RFC 9110 | 159 |
 | `rfc_test`: RFC 9112 | 178 |
 | `eio_test`: Eio on loopback sockets | 33 |

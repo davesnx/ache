@@ -20,7 +20,7 @@
  (name ache)
  (synopsis "High-performance, memory-efficient HTTP/1.1 for OCaml")
  (description
-  "ache is an HTTP/1.1 client and server library. It parses and serializes messages and keeps the state of a connection, without doing I/O itself; the ache-eio, ache-lwt and ache-miou packages run it on sockets. ache is a fork of httpun and httpaf: it rejects requests that RFC 9110 and RFC 9112 do not allow, sets the framing of each response, limits head size, and parses heads with parseff.")
+  "ache is an HTTP/1.1 client and server library. It parses and serializes messages and keeps the state of a connection, without doing I/O itself; the ache-eio, ache-lwt and ache-miou packages run it on sockets. ache is a fork of httpun and httpaf: it rejects requests that RFC 9110 and RFC 9112 do not allow, sets the framing of each response, limits head size, and parses heads with a hand-written parser.")
  (documentation "https://ocaml.org/p/ache/latest/doc/index.html")
  (tags
   (http http-server http-client web))
@@ -28,8 +28,6 @@
   (ocaml
    (>= 5.3))
   bigstringaf
-  (parseff
-   (> 0.5.0))
   (alcotest :with-test)
   (faraday :with-test)
   (ocamlformat
