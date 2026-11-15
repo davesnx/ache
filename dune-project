@@ -20,7 +20,7 @@
  (name ache)
  (synopsis "High-performance, memory-efficient HTTP/1.1 for OCaml")
  (description
-  "ache is an HTTP/1.1 client and server library. It parses and serializes messages and keeps the state of a connection, without doing I/O itself; the ache-eio and ache-lwt packages run it on sockets. ache is a fork of httpun and httpaf: it rejects requests that RFC 9110 and RFC 9112 do not allow, sets the framing of each response, limits head size, and parses heads with parseff.")
+  "ache is an HTTP/1.1 client and server library. It parses and serializes messages and keeps the state of a connection, without doing I/O itself; the ache-eio, ache-lwt and ache-miou packages run it on sockets. ache is a fork of httpun and httpaf: it rejects requests that RFC 9110 and RFC 9112 do not allow, sets the framing of each response, limits head size, and parses heads with parseff.")
  (documentation "https://ocaml.org/p/ache/latest/doc/index.html")
  (tags
   (http http-server http-client web))
@@ -99,6 +99,24 @@
    (= :version))
   bigstringaf
   lwt
+  (alcotest :with-test)))
+
+(package
+ (name ache-miou)
+ (synopsis "Miou runtime for ache")
+ (description
+  "Runs ache HTTP/1.1 servers and clients on Miou_unix sockets. The application must ignore SIGPIPE.")
+ (documentation "https://ocaml.org/p/ache-miou/latest/doc/index.html")
+ (tags
+  (http http-server http-client web miou))
+ (depends
+  (ocaml
+   (>= 5.3))
+  (ache
+   (= :version))
+  bigstringaf
+  (miou
+   (>= 0.10.0))
   (alcotest :with-test)))
 
 (package

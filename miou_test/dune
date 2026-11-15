@@ -1,0 +1,4 @@
+(test
+ (name test_ache_miou)
+ (package ache-miou)
+ (libraries ache ache-miou alcotest bigstringaf miou miou.unix unix))

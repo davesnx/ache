@@ -76,6 +76,11 @@
   vs_httpun))
 
 (executable
+ (name server_ache_miou)
+ (modules server_ache_miou)
+ (libraries ache-miou miou miou.unix unix vs vs_ache))
+
+(executable
  (name server_httpcats_miou)
  (modules server_httpcats_miou)
  (optional)

@@ -170,6 +170,7 @@ const SERVERS: Server[] = [
   { id: "httpaf-lwt", lib: "httpaf", runtime: "lwt", exe: "server_httpaf_lwt.exe" },
   { id: "ache-eio", lib: "ache", runtime: "eio", exe: "server_ache_eio.exe" },
   { id: "httpun-eio", lib: "httpun", runtime: "eio", exe: "server_httpun_eio.exe" },
+  { id: "ache-miou", lib: "ache", runtime: "miou", exe: "server_ache_miou.exe" },
   { id: "httpcats-miou", lib: "httpcats", runtime: "miou", exe: "server_httpcats_miou.exe" },
 ];
 
