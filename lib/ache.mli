@@ -49,7 +49,7 @@ module Runtime : sig
       [ache-miou]) drives. {!Server_connection} and {!Client_connection}
       implement it. A protocol that takes over a connection after an HTTP
       upgrade implements it too. *)
-  module type S = sig
+  module type ENGINE = sig
     type t
 
     val next_read_operation : t -> [ `Read | `Yield | `Close ]
@@ -69,9 +69,9 @@ module Runtime : sig
   end
 
   type impl
-  (** A value of some type together with its {!S} implementation. *)
+  (** A value of some type together with its {!ENGINE} implementation. *)
 
-  val make : (module S with type t = 't) -> 't -> impl
+  val make : (module ENGINE with type t = 't) -> 't -> impl
 end
 
 (** {2 Message Body} *)
@@ -728,11 +728,11 @@ end
 (**/**)
 
 module Ache_private : sig
-  module Faraday = Faraday
+  module Encoder = Encoder
 
   module Runtime : sig
     module Upgradable : sig
-      include Runtime.S
+      include Runtime.ENGINE
 
       val create : Runtime.impl -> t
       val upgrade : t -> Runtime.impl -> unit
@@ -823,7 +823,7 @@ module Ache_private : sig
   end
 
   module Serialize : sig
-    val write_request : Faraday.t -> Request.t -> unit
-    val write_response : Faraday.t -> Response.t -> unit
+    val write_request : Encoder.t -> Request.t -> unit
+    val write_response : Encoder.t -> Response.t -> unit
   end
 end

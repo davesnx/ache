@@ -83,18 +83,18 @@ let gc_json () =
     s.heap_words
     s.top_heap_words
 
-module Make (H : HTTP) = struct
+module Make (Http : HTTP) = struct
   type action =
-    | Fixed of H.response * Bigstringaf.t
-    | Stream of H.response * Bigstringaf.t * int
+    | Fixed of Http.response * Bigstringaf.t
+    | Stream of Http.response * Bigstringaf.t * int
     | Sink
     | Echo
     | Gc_stat
     | Missing
 
-  let with_length n = H.response `OK [ "content-length", string_of_int n ]
-  let chunked = H.response `OK [ "transfer-encoding", "chunked" ]
-  let not_found = H.response `Not_found [ "content-length", "0" ]
+  let with_length n = Http.response `OK [ "content-length", string_of_int n ]
+  let chunked = Http.response `OK [ "transfer-encoding", "chunked" ]
+  let not_found = Http.response `Not_found [ "content-length", "0" ]
   let by_length = Array.init 24 with_length
 
   let positive s =
@@ -115,7 +115,7 @@ module Make (H : HTTP) = struct
       (match int_of_string_opt n with
       | Some n when n >= 0 ->
         Fixed
-          ( H.response
+          ( Http.response
               `OK
               [ "content-length", string_of_int n; "connection", "close" ]
           , bigstring n )
@@ -145,44 +145,44 @@ module Make (H : HTTP) = struct
 
   let stream writer chunk count =
     let rec go i =
-      if i = count || H.writer_is_closed writer
-      then H.close_writer writer
+      if i = count || Http.writer_is_closed writer
+      then Http.close_writer writer
       else (
-        H.write_bigstring writer chunk;
-        H.flush writer (fun _ -> go (i + 1)))
+        Http.write_bigstring writer chunk;
+        Http.flush writer (fun _ -> go (i + 1)))
     in
     go 0
 
   let sink reqd =
-    let body = H.request_body reqd in
+    let body = Http.request_body reqd in
     let total = ref 0 in
     let rec on_read _ ~off:_ ~len =
       total := !total + len;
-      H.schedule_read body ~on_eof ~on_read
+      Http.schedule_read body ~on_eof ~on_read
     and on_eof () =
       let s = string_of_int !total in
-      H.respond_with_string reqd by_length.(String.length s) s
+      Http.respond_with_string reqd by_length.(String.length s) s
     in
-    H.schedule_read body ~on_eof ~on_read
+    Http.schedule_read body ~on_eof ~on_read
 
   let echo reqd =
-    let body = H.request_body reqd in
-    let writer = H.respond_with_streaming reqd chunked in
+    let body = Http.request_body reqd in
+    let writer = Http.respond_with_streaming reqd chunked in
     let rec on_read bs ~off ~len =
-      H.write_bigstring writer ~off ~len bs;
-      H.schedule_read body ~on_eof ~on_read
-    and on_eof () = H.close_writer writer in
-    H.schedule_read body ~on_eof ~on_read
+      Http.write_bigstring writer ~off ~len bs;
+      Http.schedule_read body ~on_eof ~on_read
+    and on_eof () = Http.close_writer writer in
+    Http.schedule_read body ~on_eof ~on_read
 
   let handle reqd =
-    match action (H.target reqd) with
-    | Fixed (response, body) -> H.respond_with_bigstring reqd response body
+    match action (Http.target reqd) with
+    | Fixed (response, body) -> Http.respond_with_bigstring reqd response body
     | Stream (response, chunk, count) ->
-      stream (H.respond_with_streaming reqd response) chunk count
+      stream (Http.respond_with_streaming reqd response) chunk count
     | Sink -> sink reqd
     | Echo -> echo reqd
     | Gc_stat ->
       let s = gc_json () in
-      H.respond_with_string reqd (with_length (String.length s)) s
-    | Missing -> H.respond_with_string reqd not_found ""
+      Http.respond_with_string reqd (with_length (String.length s)) s
+    | Missing -> Http.respond_with_string reqd not_found ""
 end

@@ -40,7 +40,7 @@ let of_list t = of_rev_list (List.rev t)
 let to_rev_list t = t
 let to_list t = List.rev (to_rev_list t)
 
-module CI = struct
+module Case_insensitive = struct
   (* Convert codes to upper case and compare them. This is a port of assembly
      code from the page:
 
@@ -105,11 +105,11 @@ module CI = struct
     len = String.length y && equal_same_length x y len
 end
 
-let ci_equal = CI.equal
+let ci_equal = Case_insensitive.equal
 
 let rec mem t name =
   match t with
-  | (name', _) :: t' -> CI.equal name name' || mem t' name
+  | (name', _) :: t' -> Case_insensitive.equal name name' || mem t' name
   | _ -> false
 
 let add t name value = (name, value) :: t
@@ -135,7 +135,7 @@ let replace t name value =
     match t with
     | [] -> if not seen then raise Local else []
     | ((name, _) as nv') :: t ->
-      if CI.equal needle name
+      if Case_insensitive.equal needle name
       then if seen then loop t needle nv true else nv :: loop t needle nv true
       else nv' :: loop t needle nv seen
   in
@@ -146,7 +146,7 @@ let remove t name =
     match s with
     | [] -> if not seen then raise Local else []
     | ((name, _) as nv') :: s' ->
-      if CI.equal needle name
+      if Case_insensitive.equal needle name
       then loop s' needle true
       else nv' :: loop s' needle seen
   in
@@ -156,7 +156,7 @@ let get t name =
   let rec loop t n =
     match t with
     | [] -> None
-    | (n', v) :: t' -> if CI.equal n n' then Some v else loop t' n
+    | (n', v) :: t' -> if Case_insensitive.equal n n' then Some v else loop t' n
   in
   loop t name
 
@@ -164,7 +164,7 @@ let get_exn t name =
   let rec loop t n =
     match t with
     | [] -> raise Not_found
-    | (n', v) :: t' -> if CI.equal n n' then v else loop t' n
+    | (n', v) :: t' -> if Case_insensitive.equal n n' then v else loop t' n
   in
   loop t name
 
@@ -173,7 +173,9 @@ let get_multi t name =
     match t with
     | [] -> acc
     | (n', v) :: t' ->
-      if CI.equal n n' then loop t' n (v :: acc) else loop t' n acc
+      if Case_insensitive.equal n n'
+      then loop t' n (v :: acc)
+      else loop t' n acc
   in
   loop t name []
 

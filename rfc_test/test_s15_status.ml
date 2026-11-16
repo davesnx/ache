@@ -306,20 +306,22 @@ let tests =
                 Body.Writer.close body)
               (get "/")))
   ; test "§15.5 server SHOULD: library 400 carries an explanation" (fun () ->
-      let module D = Server.D in
-      let d = D.make (Server_connection.create (fun _ -> ())) in
-      D.feed d (req ~headers:[ "Host", "a"; "Content-Length", "x" ] "GET" "/");
-      let r = Wire.response (D.output d) in
+      let module Driver = Server.Driver in
+      let d = Driver.make (Server_connection.create (fun _ -> ())) in
+      Driver.feed
+        d
+        (req ~headers:[ "Host", "a"; "Content-Length", "x" ] "GET" "/");
+      let r = Wire.response (Driver.output d) in
       Alcotest.(check string) "status" "HTTP/1.1 400 Bad Request" r.start_line;
       Alcotest.(check bool) "explanation" true (String.length r.body > 0))
   ; test "§15.6 server SHOULD: library 500 carries an explanation" (fun () ->
-      let module D = Server.D in
+      let module Driver = Server.Driver in
       let conn = Server_connection.create (fun _ -> ()) in
-      let d = D.make conn in
-      D.feed d (get "/");
+      let d = Driver.make conn in
+      Driver.feed d (get "/");
       Server_connection.report_exn conn (Failure "boom");
-      D.pump d;
-      let r = Wire.response (D.output d) in
+      Driver.pump d;
+      let r = Wire.response (Driver.output d) in
       Alcotest.(check string)
         "status"
         "HTTP/1.1 500 Internal Server Error"

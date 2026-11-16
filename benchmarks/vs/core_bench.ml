@@ -26,13 +26,13 @@ end
 
 let window = 4096
 
-module Drive (C : CONN) = struct
+module Drive (Connection : CONN) = struct
   let rec drain conn capture written =
-    match C.next_write_operation conn with
+    match Connection.next_write_operation conn with
     | `Write iovecs ->
-      let n = C.lengthv iovecs in
-      (match capture with Some b -> C.capture b iovecs | None -> ());
-      C.report_write_result conn (`Ok n);
+      let n = Connection.lengthv iovecs in
+      (match capture with Some b -> Connection.capture b iovecs | None -> ());
+      Connection.report_write_result conn (`Ok n);
       drain conn capture (written + n)
     | `Yield | `Close _ -> written
 
@@ -42,10 +42,10 @@ module Drive (C : CONN) = struct
       if off >= total
       then drain conn capture written
       else
-        match C.next_read_operation conn with
+        match Connection.next_read_operation conn with
         | `Read ->
           let len = min want (total - off) in
-          let n = C.read conn input ~off ~len in
+          let n = Connection.read conn input ~off ~len in
           let written = drain conn capture written in
           if n > 0
           then go (off + n) window 0 written
@@ -421,22 +421,22 @@ type runner =
   ; check : unit -> string
   }
 
-let runner (module L : LIB) scenario =
+let runner (module Lib : LIB) scenario =
   let first = scenario.first_read in
   match scenario.side with
   | Server_side input ->
-    let module D = Drive (L.Server) in
+    let module Bench = Drive (Lib.Server) in
     let input = bigstring_of_string input in
-    let conn = L.server () in
-    { iteration = (fun () -> D.feed ~first conn input None)
+    let conn = Lib.server () in
+    { iteration = (fun () -> Bench.feed ~first conn input None)
     ; check =
         (fun () ->
           let b = Buffer.create 4096 in
-          ignore (D.feed ~first conn input (Some b) : int);
+          ignore (Bench.feed ~first conn input (Some b) : int);
           Buffer.contents b)
     }
   | Client_side input ->
-    let module D = Drive (L.Client) in
+    let module Bench = Drive (Lib.Client) in
     let input = bigstring_of_string input in
     let received = ref 0
     and finished = ref false in
@@ -445,9 +445,9 @@ let runner (module L : LIB) scenario =
     let exchange capture =
       received := 0;
       finished := false;
-      let conn = L.get ~on_read ~on_eof in
-      let written = D.drain conn capture 0 in
-      let _ = D.feed ~first conn input None in
+      let conn = Lib.get ~on_read ~on_eof in
+      let written = Bench.drain conn capture 0 in
+      let _ = Bench.feed ~first conn input None in
       if not !finished then failwith "response not complete";
       written + !received
     in
@@ -743,20 +743,20 @@ let () =
   let matches re s = re = "" || Str.string_match (Str.regexp re) s 0 in
   let scenarios = List.filter (fun s -> matches !only s.id) scenarios in
   let libs =
-    List.filter (fun (module L : LIB) -> matches !only_libs L.name) libs
+    List.filter (fun (module Lib : LIB) -> matches !only_libs Lib.name) libs
   in
   let prepared =
     List.map
       (fun scenario ->
          ( scenario
          , List.map
-             (fun ((module L : LIB) as lib) ->
-                ( L.name
+             (fun ((module Lib : LIB) as lib) ->
+                ( Lib.name
                 , ref
                     (attempt (fun () ->
                        let r = runner lib scenario in
-                       let output = check_output L.name scenario r in
-                       { lib = L.name
+                       let output = check_output Lib.name scenario r in
+                       { lib = Lib.name
                        ; r
                        ; output
                        ; n = calibrate r !target

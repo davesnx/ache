@@ -64,7 +64,7 @@ module IO_loop = struct
 
   let start : type t fd.
     (module IO with type socket = fd)
-    -> (module Ache.Runtime.S with type t = t)
+    -> (module Ache.Runtime.ENGINE with type t = t)
     -> t
     -> read_buffer_size:int
     -> timed_read:((unit -> int Lwt.t) -> (int, [ `Timeout ]) result Lwt.t)

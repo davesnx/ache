@@ -125,14 +125,14 @@ let expected =
   ]
 
 let parse kind input =
-  let module G = Ache.Ache_private.Parse.Grammar in
+  let module Grammar = Ache.Ache_private.Parse.Grammar in
   match kind with
   | Request ->
-    (match G.request input with
+    (match Grammar.request input with
     | Ok r -> Accept (summary (request_to_string r))
     | Error _ -> Reject)
   | Response ->
-    (match G.response input with
+    (match Grammar.response input with
     | Ok r -> Accept (summary (response_to_string r))
     | Error _ -> Reject)
 
