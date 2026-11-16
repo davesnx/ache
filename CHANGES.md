@@ -30,6 +30,9 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - `Reqd.respond_with_informational`, for `100 Continue` and `103 Early Hints`.
 - Server timeouts `?idle_timeout` and `?head_timeout`, and
   `Config.max_header_size`.
+- `Server.run` in `ache-eio` and `ache-miou`: one accept loop for each
+  domain, each on its own `SO_REUSEPORT` socket, with no state shared
+  between domains.
 - `Ache_lwt.Timeout`: timeouts that share one Lwt timer for each length, so
   that cancelled timers do not pile up with the `select` and `poll` engines.
 

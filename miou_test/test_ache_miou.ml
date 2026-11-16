@@ -1132,6 +1132,89 @@ let test_upgrade_with_read_pending () =
     wait_connection_done ();
     Miou_unix.close socket)
 
+let domain_handler (_ : Unix.sockaddr) reqd =
+  let body = string_of_int (Stdlib.Domain.self () :> int) in
+  Reqd.respond_with_string
+    reqd
+    (Response.create
+       ~headers:
+         (Headers.of_list
+            [ "content-length", string_of_int (String.length body) ])
+       `OK)
+    body
+
+let check_domain_response seen response =
+  let body =
+    match String.split_on_char '\n' response |> List.rev with
+    | body :: _ -> body
+    | [] -> ""
+  in
+  Alcotest.(check string)
+    "response"
+    (Printf.sprintf
+       "HTTP/1.1 200 OK\r\ncontent-length: %d\r\nconnection: close\r\n\r\n%s"
+       (String.length body)
+       body)
+    response;
+  Hashtbl.replace seen (int_of_string body) ()
+
+let get_close = "GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+
+let rec connect_retrying addr =
+  let socket = Miou_unix.tcpv4 () in
+  match Miou_unix.connect socket addr with
+  | () -> socket
+  | exception Unix.Unix_error (ECONNREFUSED, _, _) ->
+    Miou_unix.close socket;
+    Miou_unix.sleep 0.01;
+    connect_retrying addr
+
+let test_server_run_domains () =
+  server_errors := [];
+  Miou_unix.run ~domains:1 (fun () ->
+    let port =
+      let socket = Miou_unix.tcpv4 () in
+      Fun.protect
+        ~finally:(fun () -> Miou_unix.close socket)
+        (fun () ->
+           Miou_unix.bind_and_listen
+             socket
+             (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+           match Unix.getsockname (Miou_unix.to_file_descr socket) with
+           | ADDR_INET (_, port) -> port
+           | ADDR_UNIX _ -> assert false)
+    in
+    let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, port) in
+    let server =
+      Miou.async (fun () ->
+        Ache_miou.Server.run
+          ~domains:2
+          ~on_error:raise
+          ~request_handler:domain_handler
+          ~error_handler
+          addr)
+    in
+    Fun.protect
+      ~finally:(fun () -> Miou.cancel server)
+      (fun () ->
+         with_timeout 10.0 (fun () ->
+           let seen = Hashtbl.create 2 in
+           let get () =
+             let socket = connect_retrying addr in
+             Fun.protect
+               ~finally:(fun () -> Miou_unix.close socket)
+               (fun () ->
+                  send socket get_close;
+                  read_all socket)
+           in
+           while Hashtbl.length seen < 2 do
+             List.iter
+               (fun response ->
+                  check_domain_response seen (Result.get_ok response))
+               (Miou.await_all (List.init 16 (fun _ -> Miou.async get)))
+           done;
+           Alcotest.(check int) "domains that served" 2 (Hashtbl.length seen))))
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
@@ -1175,6 +1258,9 @@ let () =
         ; ( "an exception from report_exn ends the connection"
           , `Quick
           , test_report_exn_raises )
+        ; ( "Server.run with 2 domains serves from both"
+          , `Quick
+          , test_server_run_domains )
         ] )
     ; ( "timeouts"
       , [ "idle connection is closed", `Quick, test_idle_timeout

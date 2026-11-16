@@ -493,3 +493,98 @@ module Io = struct
 end
 
 include Make (Io)
+
+module Server = struct
+  include Server
+
+  let rec clean_up orphans =
+    match Miou.care orphans with
+    | None | Some None -> ()
+    | Some (Some connection) ->
+      let (_ : (unit, exn) result) = Miou.await connection in
+      clean_up orphans
+
+  let run
+        ?config
+        ?idle_timeout
+        ?head_timeout
+        ?domains
+        ?(backlog = 128)
+        ~on_error
+        ~request_handler
+        ~error_handler
+        addr
+    =
+    let self = Miou.Domain.self () in
+    let others =
+      List.filter
+        (fun domain -> not (Miou.Domain.Uid.equal domain self))
+        (Miou.Domain.all ())
+    in
+    let available = List.length others + 1 in
+    let domains = Option.value domains ~default:available in
+    if domains < 1 || domains > available
+    then
+      invalid_arg
+        (Printf.sprintf
+           "Ache_miou.Server.run: domains must be between 1 and %d"
+           available);
+    let socket =
+      match addr with
+      | Unix.ADDR_UNIX _ ->
+        invalid_arg "Ache_miou.Server.run: addr must be an Internet address"
+      | ADDR_INET (inet_addr, _) ->
+        if Unix.is_inet6_addr inet_addr
+        then Miou_unix.tcpv6
+        else Miou_unix.tcpv4
+    in
+    let handler =
+      create_connection_handler
+        ?config
+        ?idle_timeout
+        ?head_timeout
+        ~request_handler
+        ~error_handler
+    in
+    let failed = Miou.Computation.create () in
+    let serve () =
+      let listening = socket () in
+      Fun.protect ~finally:(fun () -> Miou_unix.close listening) @@ fun () ->
+      Miou_unix.bind_and_listen
+        ~backlog
+        ~reuseaddr:true
+        ~reuseport:true
+        listening
+        addr;
+      let orphans = Miou.orphans () in
+      let rec accept () =
+        clean_up orphans;
+        let client, client_addr = Miou_unix.accept listening in
+        ignore
+          (Miou.async ~orphans (fun () ->
+             Fun.protect
+               ~finally:(fun () -> Miou_unix.close client)
+               (fun () ->
+                  match handler client client_addr with
+                  | () -> ()
+                  | exception (Miou.Cancelled as exn) -> raise exn
+                  | exception exn ->
+                    (try on_error exn with
+                    | exn ->
+                      let bt = Printexc.get_raw_backtrace () in
+                      ignore
+                        (Miou.Computation.try_cancel failed (exn, bt) : bool))))
+           : unit Miou.t);
+        accept ()
+      in
+      accept ()
+    in
+    let loops =
+      Miou.async (fun () -> Miou.Computation.await_exn failed)
+      :: Miou.async serve
+      :: List.map
+           (fun pin -> Miou.call ~pin serve)
+           (List.filteri (fun i _ -> i < domains - 1) others)
+    in
+    match Miou.await_first loops with Ok () -> () | Error exn -> raise exn
+end

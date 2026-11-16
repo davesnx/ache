@@ -6,7 +6,8 @@
   eio_connect_server
   eio_connect_client
   eio_hello_server
-  eio_hello_client))
+  eio_hello_client
+  eio_multicore_server))
 
 (executables
  (libraries

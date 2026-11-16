@@ -77,6 +77,47 @@ module Server : sig
         arguments are given too, and otherwise when the handler is applied
         to a flow: with [Eio.Net.run_server], in each connection fiber. *)
 
+  val run :
+     ?config:Ache.Config.t
+    -> ?clock:_ Eio.Time.clock
+    -> ?idle_timeout:float
+    -> ?head_timeout:float
+    -> ?domains:int
+    -> ?backlog:int
+    -> on_error:(exn -> unit)
+    -> net:_ Eio.Net.t
+    -> domain_mgr:_ Eio.Domain_manager.t
+    -> request_handler:(Eio.Net.Sockaddr.stream -> Ache.Reqd.t -> unit)
+    -> error_handler:
+         (Eio.Net.Sockaddr.stream -> Ache.Server_connection.error_handler)
+    -> [ `Tcp of Eio.Net.Ipaddr.v4v6 * int ]
+    -> unit
+  (** [run ~on_error ~net ~domain_mgr ~request_handler ~error_handler addr]
+      serves HTTP/1.1 on [addr] with one accept loop in each of [domains]
+      domains: the calling domain and [domains - 1] domains started with
+      [domain_mgr]. Each domain opens its own listening socket on [addr] with
+      [SO_REUSEADDR] and [SO_REUSEPORT], and the kernel spreads new
+      connections between them. Domains share no socket and no state of
+      ache. [addr] must name a fixed port: with port 0, each domain listens on
+      a different port.
+
+      Each loop is [Eio.Net.run_server] with [on_error] and the handler from
+      {!create_connection_handler}, which takes [config], [clock],
+      [idle_timeout], [head_timeout], [request_handler] and [error_handler].
+      [request_handler] and [error_handler] run in several domains at the
+      same time.
+
+      [domains] defaults to [Domain.recommended_domain_count ()], [backlog]
+      to 128.
+
+      [run] does not return. Cancel its fiber to stop all domains. If
+      [on_error] raises, or a listen or accept fails in one domain, [run]
+      cancels all domains and raises the exception.
+
+      @raise Invalid_argument
+        if [domains] is less than 1, or for the reasons that
+        {!create_connection_handler} gives. *)
+
   val linger_without_idle_timeout : float
   (** Seconds a connection with [clock] and no [idle_timeout] waits for the
       peer to close after its last write: 2.0. *)

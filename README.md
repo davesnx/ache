@@ -8,6 +8,9 @@ a connection. Three runtimes drive it on sockets:
 - `ache-lwt`, for [Lwt](https://github.com/ocsigen/lwt)
 - `ache-miou`, for [Miou](https://github.com/robur-coop/miou)
 
+With `ache-eio` and `ache-miou`, `Server.run` serves on every CPU core: one
+accept loop in each domain, each on its own `SO_REUSEPORT` socket.
+
 `ache-eio-tls`, `ache-lwt-tls` and `ache-miou-tls` add TLS (see
 [TLS](docs/ache.md#tls)).
 

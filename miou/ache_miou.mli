@@ -37,5 +37,49 @@ module Make (Io : IO) : sig
   module Client : Client with type socket = Io.socket
 end
 
-module Server : Server with type socket = Miou_unix.file_descr
+module Server : sig
+  include Server with type socket = Miou_unix.file_descr
+
+  val run :
+     ?config:Ache.Config.t
+    -> ?idle_timeout:float
+    -> ?head_timeout:float
+    -> ?domains:int
+    -> ?backlog:int
+    -> on_error:(exn -> unit)
+    -> request_handler:(Unix.sockaddr -> Ache.Reqd.t -> unit)
+    -> error_handler:(Unix.sockaddr -> Ache.Server_connection.error_handler)
+    -> Unix.sockaddr
+    -> unit
+  (** [run ~on_error ~request_handler ~error_handler addr] serves HTTP/1.1 on
+      [addr] with one accept loop in each of [domains] Miou domains: the
+      domain of the caller and [domains - 1] other domains of [Miou_unix.run].
+      Each domain opens its own listening socket on [addr] with
+      [SO_REUSEADDR] and [SO_REUSEPORT], and the kernel spreads new
+      connections between them. Domains share no socket and no state of
+      ache. [addr] must name a fixed port: with port 0, each domain listens on
+      a different port.
+
+      Call it inside [Miou_unix.run]. Each accepted socket is served in its
+      own task, in the domain that accepted it, by the handler from
+      {!create_connection_handler}, which takes [config], [idle_timeout],
+      [head_timeout], [request_handler] and [error_handler].
+      [request_handler] and [error_handler] run in several domains at the
+      same time. When the handler of a connection raises, [on_error] is
+      called with the exception at once, in the task of the connection, and
+      the socket is closed.
+
+      [domains] defaults to all domains: [Miou_unix.run ~domains:n] gives
+      [n + 1]. [backlog] defaults to 128.
+
+      [run] does not return. Cancel its task to stop all domains. If
+      [on_error] raises, or a listen or accept fails in one domain, [run]
+      cancels all domains and raises the exception.
+
+      @raise Invalid_argument
+        if [domains] is less than 1 or more than the domains available, if
+        [addr] is a Unix domain socket address, or for the reasons that
+        {!create_connection_handler} gives. *)
+end
+
 module Client : Client with type socket = Miou_unix.file_descr

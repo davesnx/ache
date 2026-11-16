@@ -1,6 +1,6 @@
 (executables
  (libraries ache ache-miou miou miou.unix unix)
- (names miou_hello_server miou_hello_client))
+ (names miou_hello_server miou_hello_client miou_multicore_server))
 
 (executables
  (libraries

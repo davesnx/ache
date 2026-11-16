@@ -360,6 +360,49 @@ module Server = struct
         ~linger:(Option.is_some clock)
         connection
         socket
+
+  let run
+        ?config
+        ?clock
+        ?idle_timeout
+        ?head_timeout
+        ?(domains = Domain.recommended_domain_count ())
+        ?(backlog = 128)
+        ~on_error
+        ~net
+        ~domain_mgr
+        ~request_handler
+        ~error_handler
+        (addr : [ `Tcp of Eio.Net.Ipaddr.v4v6 * int ])
+    =
+    if domains < 1
+    then invalid_arg "Ache_eio.Server.run: domains must be at least 1";
+    let handler =
+      create_connection_handler
+        ?config
+        ?clock
+        ?idle_timeout
+        ?head_timeout
+        ~request_handler
+        ~error_handler
+    in
+    let serve () =
+      Switch.run @@ fun sw ->
+      let socket =
+        Eio.Net.listen
+          ~sw
+          ~reuse_addr:true
+          ~reuse_port:true
+          ~backlog
+          net
+          (addr :> Eio.Net.Sockaddr.stream)
+      in
+      Eio.Net.run_server ~on_error socket handler
+    in
+    Fiber.all
+      (serve
+      :: List.init (domains - 1) (fun _ () ->
+        Eio.Domain_manager.run domain_mgr serve))
 end
 
 module Client = struct

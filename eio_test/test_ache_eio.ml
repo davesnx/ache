@@ -1200,6 +1200,84 @@ let test_upgrade_with_read_pending () =
     Eio.Stream.take connections_done;
     Eio.Flow.close socket)
 
+let domain_handler (_ : Eio.Net.Sockaddr.stream) reqd =
+  let body = string_of_int (Stdlib.Domain.self () :> int) in
+  Reqd.respond_with_string
+    reqd
+    (Response.create
+       ~headers:
+         (Headers.of_list
+            [ "content-length", string_of_int (String.length body) ])
+       `OK)
+    body
+
+let check_domain_response seen response =
+  let body =
+    match String.split_on_char '\n' response |> List.rev with
+    | body :: _ -> body
+    | [] -> ""
+  in
+  Alcotest.(check string)
+    "response"
+    (Printf.sprintf
+       "HTTP/1.1 200 OK\r\ncontent-length: %d\r\nconnection: close\r\n\r\n%s"
+       (String.length body)
+       body)
+    response;
+  Hashtbl.replace seen (int_of_string body) ()
+
+let get_close = "GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+
+let test_server_run_domains () =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let port =
+      Eio.Switch.run (fun sw ->
+        match
+          Eio.Net.listening_addr
+            (Eio.Net.listen
+               ~sw
+               ~backlog:1
+               net
+               (`Tcp (Eio.Net.Ipaddr.V4.loopback, 0)))
+        with
+        | `Tcp (_, port) -> port
+        | `Unix _ -> assert false)
+    in
+    let addr = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
+    Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 10.0 (fun () ->
+      Eio.Fiber.first
+        (fun () ->
+           Ache_eio.Server.run
+             ~domains:2
+             ~on_error:raise
+             ~net
+             ~domain_mgr:(Eio.Stdenv.domain_mgr env)
+             ~request_handler:domain_handler
+             ~error_handler
+             addr)
+        (fun () ->
+           let seen = Hashtbl.create 2 in
+           let rec get () =
+             match
+               Eio.Switch.run (fun sw ->
+                 let socket = Eio.Net.connect ~sw net addr in
+                 Eio.Flow.copy_string get_close socket;
+                 read_all socket)
+             with
+             | response -> response
+             | exception Eio.Io (Eio.Net.E (Connection_failure (Refused _)), _)
+               ->
+               Eio.Time.sleep (Eio.Stdenv.clock env) 0.01;
+               get ()
+           in
+           while Hashtbl.length seen < 2 do
+             Eio.Fiber.List.iter
+               (fun () -> check_domain_response seen (get ()))
+               (List.init 16 (fun _ -> ()))
+           done;
+           Alcotest.(check int) "domains that served" 2 (Hashtbl.length seen))))
+
 let () =
   Alcotest.run
     "ache-eio loopback"
@@ -1221,6 +1299,9 @@ let () =
         ; ( "run_server takes the partially applied handler"
           , `Quick
           , test_run_server )
+        ; ( "Server.run with 2 domains serves from both"
+          , `Quick
+          , test_server_run_domains )
         ; ( "normal close with trailing bytes shuts each direction once"
           , `Quick
           , test_close_with_trailing_bytes )
