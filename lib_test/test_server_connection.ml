@@ -696,13 +696,11 @@ let test_synchronous_error () =
   read_request t (Request.create `GET "/");
   reader_errored t;
   Alcotest.(check bool) "Writer woken up" true !writer_woken_up;
-  (* This shows up in two flushes because [Reqd] creates error reposnses with
-     [~flush_headers_immediately:true] *)
   write_response
     t
     ~msg:"Error response written"
-    (Response.create ~headers:Headers.connection_close `Internal_server_error);
-  write_string t "got an error"
+    ~body:"got an error"
+    (Response.create ~headers:Headers.connection_close `Internal_server_error)
 
 let test_synchronous_error_asynchronous_handling () =
   let continue = ref (fun () -> ()) in
@@ -2011,14 +2009,15 @@ let test_race_condition_writer_issues_yield_after_reader_eof () =
 let test_multiple_requests_in_single_read () =
   let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
   let t = create (fun reqd -> Reqd.respond_with_string reqd response "") in
-  let reqs =
-    request_to_string (Request.create `GET "/")
-    ^ request_to_string (Request.create `GET "/")
-  in
-  read_string t reqs;
-
-  write_string t (response_to_string response);
-  write_string t (response_to_string response)
+  let request = request_to_string (Request.create `GET "/") in
+  read_string t (request ^ request ^ request);
+  let response = response_to_string response in
+  write_string
+    ~msg:"one write holds every response"
+    t
+    (response ^ response ^ response);
+  writer_yielded t;
+  reader_ready t
 
 let test_multiple_async_requests_in_single_read () =
   let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
@@ -2119,8 +2118,8 @@ let test_multiple_requests_in_single_read_with_eof () =
     ^ request_to_string (Request.create `GET "/")
   in
   read_string t reqs ~eof:true;
-  write_string t (response_to_string response);
-  write_string t (response_to_string response)
+  let response = response_to_string response in
+  write_string ~msg:"one write holds both responses" t (response ^ response)
 
 let test_parse_failure_after_checkpoint () =
   let error_queue = ref None in

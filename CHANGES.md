@@ -44,6 +44,10 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   sleeps at most 0.5 s at a time, so cancelled timers do not pile up in the
   heap. The TLS handshake timeout does the same: `ache-lwt-tls` uses
   `Ache_lwt.Timeout`, and `ache-miou-tls` sleeps at most 0.5 s at a time.
+- The responses to all pipelined requests in one read go out in one write.
+  `ache-miou` sends all buffers with one `sendmsg`, not one write per buffer.
+- The server stops reading new requests once a response will close the
+  connection.
 - Fixes httpun #95, #143, #150, #151, #154 to #165, and httpaf #18, #38,
   #86, #191, #192.
 

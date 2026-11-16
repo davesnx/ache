@@ -141,6 +141,10 @@ let write_response t response =
   then Serialize.check_response response
   else Writer.write_response t.writer response
 
+let commit_persistence t response =
+  if t.persistent then t.persistent <- Response.persistent_connection response;
+  if not t.persistent then Reader.pause t.reader
+
 let has_body t encoding =
   encoding <> `No_body && not (Writer.is_closed t.writer)
 
@@ -160,7 +164,7 @@ let respond_with_string t response str =
     in
     write_response t response;
     if has_body t encoding then Writer.write_string t.writer str;
-    if t.persistent then t.persistent <- Response.persistent_connection response;
+    commit_persistence t response;
     t.response_state <- Fixed response;
     Writer.wakeup t.writer
   | Streaming _ | Upgrade _ ->
@@ -185,7 +189,7 @@ let respond_with_bigstring t response (bstr : Bigstring.t) =
     in
     write_response t response;
     if has_body t encoding then Writer.schedule_bigstring t.writer bstr;
-    if t.persistent then t.persistent <- Response.persistent_connection response;
+    commit_persistence t response;
     t.response_state <- Fixed response;
     Writer.wakeup t.writer
   | Streaming _ | Upgrade _ ->
@@ -234,7 +238,7 @@ let unsafe_respond_with_streaming ~flush_headers_immediately t response =
     in
     write_response t response;
     if Writer.is_closed t.writer then Body.Writer.close_and_drain response_body;
-    if t.persistent then t.persistent <- Response.persistent_connection response;
+    commit_persistence t response;
     t.response_state <- Streaming (response, response_body);
     if flush_headers_immediately then Writer.wakeup t.writer;
     response_body
@@ -257,7 +261,7 @@ let unsafe_respond_with_upgrade t headers impl =
     let response = Response.create ~headers `Switching_protocols in
     let closed = Writer.is_closed t.writer in
     write_response t response;
-    if t.persistent then t.persistent <- Response.persistent_connection response;
+    commit_persistence t response;
     t.response_state <- Upgrade response;
     Writer.flush t.writer (function
       | `Written when not closed -> t.upgrade impl

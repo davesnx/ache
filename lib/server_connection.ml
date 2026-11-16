@@ -349,12 +349,22 @@ let next_read_operation t =
   | (`Yield | `Close) as operation -> operation
 
 let read_with_more t bs ~off ~len more =
-  let consumed = Reader.read_with_more t.reader bs ~off ~len more in
-  (if is_active t
-   then
-     let reqd = current_reqd_exn t in
-     Reqd.flush_request_body reqd);
-  consumed
+  Writer.hold t.writer;
+  match
+    let consumed = Reader.read_with_more t.reader bs ~off ~len more in
+    (if is_active t
+     then
+       let reqd = current_reqd_exn t in
+       Reqd.flush_request_body reqd);
+    consumed
+  with
+  | consumed ->
+    Writer.release t.writer;
+    consumed
+  | exception exn ->
+    let backtrace = Printexc.get_raw_backtrace () in
+    Writer.release t.writer;
+    Printexc.raise_with_backtrace exn backtrace
 
 let read t bs ~off ~len = read_with_more t bs ~off ~len Incomplete
 let read_eof t bs ~off ~len = read_with_more t bs ~off ~len Complete

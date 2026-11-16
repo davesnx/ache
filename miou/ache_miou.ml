@@ -474,16 +474,36 @@ module Io = struct
     | exception Unix.Unix_error ((ECONNRESET | ENOTCONN), _, _) ->
       raise End_of_file
 
+  external sendmsg :
+     Unix.file_descr
+    -> Ache.Bigstring.t Ache.IOVec.t list
+    -> int
+    = "ache_miou_sendmsg"
+
+  let write_each socket iovecs =
+    List.fold_left
+      (fun total { Ache.IOVec.buffer; off; len } ->
+         Miou_unix.write_bigstring socket buffer ~off ~len;
+         total + len)
+      0
+      iovecs
+
   let writev socket iovecs =
-    match
-      List.fold_left
-        (fun total { Ache.IOVec.buffer; off; len } ->
-           Miou_unix.write_bigstring socket buffer ~off ~len;
-           total + len)
-        0
-        iovecs
-    with
+    let fd = Miou_unix.to_file_descr socket in
+    let rec send () =
+      match sendmsg fd iovecs with
+      | -1 ->
+        Miou_unix.blocking_write fd;
+        send ()
+      | n -> n
+    in
+    match send () with
     | n -> `Ok n
+    | exception Unix.Unix_error (ENOTSOCK, _, _) ->
+      (match write_each socket iovecs with
+      | n -> `Ok n
+      | exception Unix.Unix_error ((EPIPE | ECONNRESET | ENOTCONN), _, _) ->
+        `Closed)
     | exception Unix.Unix_error ((EPIPE | ECONNRESET | ENOTCONN), _, _) ->
       `Closed
 
