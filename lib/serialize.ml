@@ -188,12 +188,20 @@ module Writer = struct
     ; mutable wakeup : Optional_thunk.t
       (* The callback from the runtime to be invoked when output is ready to be
        * flushed. *)
+    ; mutable held : bool
+    ; mutable woken_while_held : bool
     }
 
   let create ?(buffer_size = 0x800) () =
     let buffer = Bigstring.create buffer_size in
     let encoder = Encoder.of_bigstring buffer in
-    { buffer; encoder; drained_bytes = 0; wakeup = Optional_thunk.none }
+    { buffer
+    ; encoder
+    ; drained_bytes = 0
+    ; wakeup = Optional_thunk.none
+    ; held = false
+    ; woken_while_held = false
+    }
 
   let encoder t = t.encoder
   let write_request t request = write_request t.encoder request
@@ -225,11 +233,23 @@ module Writer = struct
     else t.wakeup <- Optional_thunk.some k
 
   let wakeup t =
-    let f = t.wakeup in
-    if Optional_thunk.is_some f
+    if t.held
+    then t.woken_while_held <- true
+    else
+      let f = t.wakeup in
+      if Optional_thunk.is_some f
+      then (
+        t.wakeup <- Optional_thunk.none;
+        Optional_thunk.call_if_some f)
+
+  let hold t = t.held <- true
+
+  let release t =
+    t.held <- false;
+    if t.woken_while_held
     then (
-      t.wakeup <- Optional_thunk.none;
-      Optional_thunk.call_if_some f)
+      t.woken_while_held <- false;
+      wakeup t)
 
   let flush t f =
     flush_with_reason t.encoder (fun reason ->

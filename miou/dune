@@ -1,4 +1,7 @@
 (library
  (name ache_miou)
  (public_name ache-miou)
+ (foreign_stubs
+  (language c)
+  (names ache_miou_stubs))
  (libraries ache miou miou.unix unix))
