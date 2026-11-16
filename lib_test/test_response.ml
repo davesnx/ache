@@ -108,13 +108,13 @@ let test_body_length () =
 
 let test_serialize_rejects_invalid_head () =
   let check_rejected name ~expect response =
-    let f = Faraday.create 0x100 in
+    let f = Encoder.create 0x100 in
     Alcotest.check_raises name (Invalid_argument expect) (fun () ->
       Ache_private.Serialize.write_response f response);
     Alcotest.(check int)
       (name ^ ": nothing written")
       0
-      (Faraday.pending_bytes f)
+      (Encoder.pending_bytes f)
   in
   List.iter
     (fun reason ->

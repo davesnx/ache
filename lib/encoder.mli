@@ -32,14 +32,14 @@
 (** Serialization primitives built for speed an memory-efficiency.
 
 
-    Faraday is a library for writing fast and memory-efficient serializers. Its
-    core type and related operation gives the user fine-grained control over
-    copying and allocation behavior while serializing user-defined types, and
+    Encoder is ache's buffered writer for fast and memory-efficient
+    serializers. Its core type and related operation gives the user
+    fine-grained control over copying and allocation behavior while serializing user-defined types, and
     presents the output in a form that makes it possible to use vectorized
     write operations, such as the [writev][] system call, or any other platform
     or application-specific output APIs.
 
-    A Faraday serializer manages an internal buffer and a queue of output
+    A serializer manages an internal buffer and a queue of output
     buffers. The output bufferes may be a sub range of the serializer's
     internal buffer or one that is user-provided. Buffered writes such as
     {!write_string}, {!write_char} and {!write_bigstring} copy the source

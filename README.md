@@ -25,7 +25,7 @@ fork of [httpaf](https://github.com/inhabitedtype/httpaf). It keeps their
 - Message heads are parsed by a hand-written parser. A complete line is
   parsed once. An unfinished line is not parsed again until it ends, and once
   more at the head limit or at end of input, so the work is linear in the head
-  size. There is no gluten and no Angstrom; Faraday is vendored.
+  size. There is no gluten, Angstrom or Faraday dependency.
 
 Status: experimental. The API can change before 1.0.
 

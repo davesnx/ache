@@ -728,7 +728,7 @@ end
 (**/**)
 
 module Ache_private : sig
-  module Faraday = Faraday
+  module Encoder = Encoder
 
   module Runtime : sig
     module Upgradable : sig
@@ -823,7 +823,7 @@ module Ache_private : sig
   end
 
   module Serialize : sig
-    val write_request : Faraday.t -> Request.t -> unit
-    val write_response : Faraday.t -> Response.t -> unit
+    val write_request : Encoder.t -> Request.t -> unit
+    val write_response : Encoder.t -> Response.t -> unit
   end
 end

@@ -51,7 +51,7 @@ module Writer = Serialize.Writer
  * allocated for each new request/response on a connection. This is wasteful,
  * as it creates garbage on persistent connections. A better approach would be
  * to allocate a single [Reqd.t] per connection and reuse it across
- * request/responses. This would allow a single [Faraday.t] to be allocated for
+ * request/responses. This would allow a single [Encoder.t] to be allocated for
  * the body and reused. The [response_state] type could then be inlined into
  * the [Reqd.t] record, with dummy values occuping the fields for [response].
  * Something like this:
