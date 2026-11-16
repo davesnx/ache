@@ -263,7 +263,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `tls-eio` keeps the cancellation of a read as the permanent error of the
   flow, so over TLS the 408 response and the `close_notify` alert were not
   sent and the handler raised `Eio.Cancel.Cancelled`.
-- The README has TLS quick starts for Eio, Lwt and Miou.
+- `docs/README.md` has TLS quick starts for Eio, Lwt and Miou.
 
 httpun history
 ==============

@@ -9,10 +9,10 @@
  (action
   (with-stdout-to
    README.md.gen
-   (run ./gen_readme.exe ../.. %{dep:../../README.md}))))
+   (run ./gen_readme.exe ../.. %{dep:../../docs/README.md}))))
 
 (rule
  (alias runtest)
  (package ache)
  (action
-  (diff ../../README.md README.md.gen)))
+  (diff ../../docs/README.md README.md.gen)))
