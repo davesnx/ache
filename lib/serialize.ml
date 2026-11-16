@@ -32,9 +32,24 @@
 open Faraday
 
 let write_space t = write_char t ' '
-let write_crlf t = write_string t "\r\n"
-let write_version t version = write_string t (Version.to_string version)
-let write_status t status = write_string t (Status.to_string status)
+let write_crlf t = LE.write_uint16 t 0x0a0d
+
+let write_version t (version : Version.t) =
+  match version with
+  | { major = 1; minor = 1 } -> LE.write_uint64 t 0x312e312f50545448L
+  | { major = 1; minor = 0 } -> LE.write_uint64 t 0x302e312f50545448L
+  | _ -> write_string t (Version.to_string version)
+
+let write_status t status =
+  let s = Status.to_string status in
+  if String.length s = 3
+  then (
+    LE.write_uint16
+      t
+      (Char.code (String.unsafe_get s 0)
+      lor (Char.code (String.unsafe_get s 1) lsl 8));
+    write_char t (String.unsafe_get s 2))
+  else write_string t s
 
 (* RFC 9110 §5.6.2 tchar *)
 let is_tchar = function
@@ -85,7 +100,7 @@ let rec write_fields t = function
   | [] -> ()
   | (name, value) :: rest ->
     write_string t name;
-    write_string t ": ";
+    LE.write_uint16 t 0x203a;
     write_string t value;
     write_crlf t;
     write_fields t rest
