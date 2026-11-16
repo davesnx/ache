@@ -49,6 +49,7 @@ module Deadline = struct
     ; mutable timer : unit Miou.t option
     }
 
+  let longest_sleep = 0.5
   let create () = { at = 0.; moved = Signal.create (); timer = None }
   let passed t = t.at <= Unix.gettimeofday ()
 
@@ -63,7 +64,8 @@ module Deadline = struct
              let rec loop () =
                Signal.wait_until t.moved (fun () -> not (passed t));
                while not (passed t) do
-                 Miou_unix.sleep (t.at -. Unix.gettimeofday ())
+                 Miou_unix.sleep
+                   (Float.min longest_sleep (t.at -. Unix.gettimeofday ()))
                done;
                Signal.wake expired;
                loop ()

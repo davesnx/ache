@@ -702,6 +702,107 @@ let test_head_timer_bounded () =
     Miou_unix.sleep 0.001;
     send socket "host: localhost\r\n\r\n")
 
+let check_connection_timers_bounded ~connections exchange =
+  let growth = ref 0 in
+  Miou_unix.run ~domains:0 (fun () ->
+    let listening = Miou_unix.tcpv4 () in
+    Miou_unix.bind_and_listen
+      ~backlog:16
+      listening
+      (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+    let addr = Unix.getsockname (Miou_unix.to_file_descr listening) in
+    let closed = ref 0 in
+    let server =
+      Miou.async (fun () ->
+        let orphans = Miou.orphans () in
+        let rec reap () =
+          match Miou.care orphans with
+          | Some (Some task) ->
+            let (_ : (unit, exn) result) = Miou.await task in
+            reap ()
+          | Some None | None -> ()
+        in
+        let rec accept () =
+          reap ();
+          let socket, peer = Miou_unix.accept listening in
+          ignore
+            (Miou.async ~orphans (fun () ->
+               Fun.protect
+                 ~finally:(fun () ->
+                   Miou_unix.close socket;
+                   incr closed)
+                 (fun () ->
+                    Ache_miou.Server.create_connection_handler
+                      ~idle_timeout:30.
+                      ~head_timeout:30.
+                      ~request_handler
+                      ~error_handler
+                      socket
+                      peer))
+             : unit Miou.t);
+          accept ()
+        in
+        accept ())
+    in
+    Fun.protect
+      ~finally:(fun () ->
+        Miou.cancel server;
+        Miou_unix.close listening)
+      (fun () ->
+         with_timeout 10.0 (fun () ->
+           let rec short_live_sleepers () =
+             Miou_unix.sleep 0.01;
+             short_live_sleepers ()
+           in
+           let live = Miou.async short_live_sleepers in
+           let opened = ref 0 in
+           let rec all_closed () =
+             if !closed < !opened
+             then (
+               Miou_unix.sleep 0.001;
+               all_closed ())
+           in
+           let exchanges n =
+             for _ = 1 to n do
+               let socket = connect addr in
+               incr opened;
+               Miou_unix.sleep 0.001;
+               exchange socket;
+               Miou_unix.close socket
+             done;
+             all_closed ()
+           in
+           exchanges (connections / 10);
+           let before = live_words () in
+           exchanges connections;
+           Miou_unix.sleep 0.6;
+           growth := live_words () - before;
+           Miou.cancel live)));
+  if !growth > connections
+  then
+    Alcotest.failf
+      "heap grew by %d words over %d connections"
+      !growth
+      connections
+
+let test_closed_connection_timers_bounded () =
+  check_connection_timers_bounded ~connections:1000 (fun socket ->
+    send socket "GET /hello HTTP/1.1\r\n";
+    Miou_unix.sleep 0.001;
+    send socket "host: localhost\r\nconnection: close\r\n\r\n";
+    Alcotest.(check string)
+      "response"
+      hello_response_close
+      (take socket (String.length hello_response_close)))
+
+let test_idle_connection_timers_bounded () =
+  check_connection_timers_bounded ~connections:1000 (fun socket ->
+    send socket get_hello;
+    Alcotest.(check string)
+      "response"
+      hello_response
+      (take socket (String.length hello_response)))
+
 let test_report_exn_raises () =
   with_server (fun addr ->
     let socket = connect addr in
@@ -741,6 +842,14 @@ let test_idle_timeout () =
     check_elapsed "stops waiting for the peer to close" ~from ~min:0.55 ~max:1.2;
     Miou_unix.close socket);
   Alcotest.(check int) "no error" 0 (List.length !server_errors)
+
+let test_idle_timeout_after_cancelled_connection () =
+  let client = ref None in
+  with_server ~idle_timeout:0.3 (fun addr ->
+    client := Some (connect addr);
+    Miou_unix.sleep 0.05);
+  Option.iter (fun socket -> Unix.close (Miou_unix.to_file_descr socket)) !client;
+  test_idle_timeout ()
 
 let test_idle_timeout_between_requests () =
   with_server ~idle_timeout:0.3 (fun addr ->
@@ -1100,5 +1209,14 @@ let () =
         ; ( "requests with split heads do not pile up head timers"
           , `Quick
           , test_head_timer_bounded )
+        ; ( "idle timeout fires after a connection was cancelled"
+          , `Quick
+          , test_idle_timeout_after_cancelled_connection )
+        ; ( "closed connections do not pile up timers"
+          , `Quick
+          , test_closed_connection_timers_bounded )
+        ; ( "keep-alive connections closed while idle do not pile up timers"
+          , `Quick
+          , test_idle_connection_timers_bounded )
         ] )
     ]
