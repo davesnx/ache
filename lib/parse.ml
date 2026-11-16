@@ -622,9 +622,9 @@ module Reader = struct
       | exception Local (Some respd) ->
         let request = Respd.request respd in
         if response.Response.status = `Switching_protocols
-        then respd.response_handler response (Body.Reader.create_empty ())
+        then Respd.handle_response respd response (Body.Reader.create_empty ())
         else if request.meth = `CONNECT && Status.is_successful response.status
-        then respd.response_handler response (create_body t)
+        then Respd.handle_response respd response (create_body t)
         else (
           match Response.body_length ~request_method:request.meth response with
           | `No_body when Status.is_informational response.status ->
@@ -633,7 +633,7 @@ module Reader = struct
           | `Error `Internal_server_error ->
             t.state <- Fail (`Invalid_response_body_length response)
           | `No_body | `Fixed 0L ->
-            respd.response_handler response (Body.Reader.create_empty ());
+            Respd.handle_response respd response (Body.Reader.create_empty ());
             t.state <- Done
           | (`Fixed _ | `Chunked | `Close_delimited) as encoding ->
             let body = create_body t in
@@ -642,7 +642,7 @@ module Reader = struct
               | `Fixed n -> Body (body, Fixed n)
               | `Chunked -> chunk_line t body
               | `Close_delimited -> Body (body, Close_delimited));
-            respd.response_handler response body)
+            Respd.handle_response respd response body)
     in
     create ~max_header_size ~request:false ~on_head ~fail:(function
       | (`Parse _ | `Header_too_large) as e -> e

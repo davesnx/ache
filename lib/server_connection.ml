@@ -151,37 +151,40 @@ let create
   let writer = Writer.create ~buffer_size:response_buffer_size () in
   let request_queue = Queue.create () in
   let response_body_buffer = Bigstringaf.create response_body_buffer_size in
-  let rec reader =
-    lazy (Reader.request ~max_header_size:config.max_header_size handler)
-  and handler request request_body =
-    let reqd =
-      Reqd.create
-        ~error_handler
-        ~upgrade:(upgrade (Lazy.force t))
-        ~reader:(Lazy.force reader)
-        ~writer
-        ~response_body_buffer
-        ~proxy:config.proxy
-        request
-        request_body
-    in
-    let call_handler = Queue.is_empty request_queue in
-    Queue.push reqd request_queue;
-    if call_handler then request_handler reqd
-  and t =
-    lazy
-      { reader = Lazy.force reader
-      ; writer
-      ; response_body_buffer
-      ; request_handler
-      ; error_handler
-      ; request_queue
-      ; error_code = No_error
-      ; config
-      ; upgraded = None
-      }
+  let self = ref None in
+  let handler request request_body =
+    match !self with
+    | None -> assert false
+    | Some (t, upgrade) ->
+      let reqd =
+        Reqd.create
+          ~error_handler
+          ~upgrade
+          ~reader:t.reader
+          ~writer
+          ~response_body_buffer
+          ~proxy:config.proxy
+          request
+          request_body
+      in
+      let call_handler = Queue.is_empty request_queue in
+      Queue.push reqd request_queue;
+      if call_handler then request_handler reqd
   in
-  Lazy.force t
+  let t =
+    { reader = Reader.request ~max_header_size:config.max_header_size handler
+    ; writer
+    ; response_body_buffer
+    ; request_handler
+    ; error_handler
+    ; request_queue
+    ; error_code = No_error
+    ; config
+    ; upgraded = None
+    }
+  in
+  self := Some (t, upgrade t);
+  t
 
 let set_error_and_handle ?request t error =
   if is_active t

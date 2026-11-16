@@ -28,46 +28,39 @@ type t =
   }
 
 let create ~error_handler ~writer ~response_handler request request_body =
-  let handler t =
-   fun response body ->
-    let t = Lazy.force t in
-    if t.persistent
-    then
-      t.persistent <-
-        Response.persistent_connection response
-        && not
-             (Headers.mem response.headers "transfer-encoding"
-             && (Headers.mem response.headers "content-length"
-                || Version.compare response.version Version.v1_1 < 0)
-             && Response.body_length
-                  ~request_method:request.Request.meth
-                  response
-                <> `No_body);
-    let next_request_state =
-      match request.Request.meth, response.status with
-      (* From RFC9110§6.4.1: * 2xx (Successful) responses to a CONNECT request
-         method (Section * 9.3.6) switch the connection to tunnel mode instead
-         of having * content. *)
-      | `CONNECT, #Status.successful | _, `Switching_protocols ->
-        Request_state.Upgraded response
-      | _ -> Received_response (response, body)
-    in
-    t.state <- next_request_state;
-    response_handler response body
+  { request
+  ; request_body
+  ; response_handler
+  ; error_handler
+  ; error_code = `Ok
+  ; writer
+  ; state = Uninitialized
+  ; persistent = Request.persistent_connection request
+  }
+
+let handle_response t response body =
+  let request = t.request in
+  if t.persistent
+  then
+    t.persistent <-
+      Response.persistent_connection response
+      && not
+           (Headers.mem response.headers "transfer-encoding"
+           && (Headers.mem response.headers "content-length"
+              || Version.compare response.version Version.v1_1 < 0)
+           && Response.body_length ~request_method:request.Request.meth response
+              <> `No_body);
+  let next_request_state =
+    match request.Request.meth, response.status with
+    (* From RFC9110§6.4.1: * 2xx (Successful) responses to a CONNECT request
+       method (Section * 9.3.6) switch the connection to tunnel mode instead of
+       having * content. *)
+    | `CONNECT, #Status.successful | _, `Switching_protocols ->
+      Request_state.Upgraded response
+    | _ -> Received_response (response, body)
   in
-  let rec t =
-    lazy
-      { request
-      ; request_body
-      ; response_handler = handler t
-      ; error_handler
-      ; error_code = `Ok
-      ; writer
-      ; state = Uninitialized
-      ; persistent = Request.persistent_connection request
-      }
-  in
-  Lazy.force t
+  t.state <- next_request_state;
+  t.response_handler response body
 
 let request { request; _ } = request
 
