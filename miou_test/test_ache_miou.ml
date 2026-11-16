@@ -848,7 +848,9 @@ let test_idle_timeout_after_cancelled_connection () =
   with_server ~idle_timeout:0.3 (fun addr ->
     client := Some (connect addr);
     Miou_unix.sleep 0.05);
-  Option.iter (fun socket -> Unix.close (Miou_unix.to_file_descr socket)) !client;
+  Option.iter
+    (fun socket -> Unix.close (Miou_unix.to_file_descr socket))
+    !client;
   test_idle_timeout ()
 
 let test_idle_timeout_between_requests () =
