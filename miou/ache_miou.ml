@@ -42,6 +42,37 @@ module Read_closed = struct
       Signal.wake t.ready)
 end
 
+module Deadline = struct
+  type t =
+    { mutable at : float
+    ; moved : Signal.t
+    ; mutable timer : unit Miou.t option
+    }
+
+  let create () = { at = 0.; moved = Signal.create (); timer = None }
+  let passed t = t.at <= Unix.gettimeofday ()
+
+  let set t at ~expired =
+    t.at <- at;
+    Signal.wake t.moved;
+    if Option.is_none t.timer
+    then
+      t.timer <-
+        Some
+          (Miou.async (fun () ->
+             let rec loop () =
+               Signal.wait_until t.moved (fun () -> not (passed t));
+               while not (passed t) do
+                 Miou_unix.sleep (t.at -. Unix.gettimeofday ())
+               done;
+               Signal.wake expired;
+               loop ()
+             in
+             loop ()))
+
+  let stop t = Option.iter Miou.cancel t.timer
+end
+
 module type IO = Ache_miou_intf.IO
 module type Server = Ache_miou_intf.Server
 module type Client = Ache_miou_intf.Client
@@ -67,7 +98,9 @@ module Make (Io : IO) = struct
       -> read_buffer_size:int
       -> read_closed:Read_closed.t
       -> interruptible:bool
-      -> timeout:([ `Read | `Linger ] -> (float * (unit -> unit)) option)
+      -> timeout:
+           ([ `Read | `Linger ]
+            -> ([ `Idle | `Head ] * float * (unit -> unit)) option)
       -> linger:bool
       -> t
       -> Io.socket
@@ -125,6 +158,8 @@ module Make (Io : IO) = struct
         await_or_raise waker
       in
       let read_buffer = Buffer.create read_buffer_size in
+      let idle_deadline = Deadline.create ()
+      and head_deadline = Deadline.create () in
       let pending_read = ref false
       and read_requested = ref false
       and read_result = ref None
@@ -162,19 +197,22 @@ module Make (Io : IO) = struct
               read_requested := true;
               start_reader ();
               Signal.wake request_read);
-            let timed_out = ref false in
-            let timer =
+            let deadline =
               Option.map
-                (fun (seconds, _) ->
-                   Miou.async (fun () ->
-                     Miou_unix.sleep seconds;
-                     timed_out := true;
-                     Signal.wake read_closed.ready))
+                (fun (kind, at, _) ->
+                   let deadline =
+                     match kind with
+                     | `Idle -> idle_deadline
+                     | `Head -> head_deadline
+                   in
+                   Deadline.set deadline at ~expired:read_closed.ready;
+                   deadline)
                 limit
             in
             Signal.wait_until read_closed.ready (fun () ->
-              Option.is_some !read_result || read_closed.closed || !timed_out);
-            Option.iter Miou.cancel timer);
+              Option.is_some !read_result
+              || read_closed.closed
+              || Option.fold ~none:false ~some:Deadline.passed deadline));
           match !read_result with
           | Some result ->
             read_result := None;
@@ -182,7 +220,7 @@ module Make (Io : IO) = struct
             (match result with Ok n -> Ok n | Error exn -> raise exn)
           | None when read_closed.closed -> raise End_of_file
           | None ->
-            Option.iter (fun (_, on_timeout) -> on_timeout ()) limit;
+            Option.iter (fun (_, _, on_timeout) -> on_timeout ()) limit;
             Error `Timeout)
       in
       let rec linger () =
@@ -249,7 +287,9 @@ module Make (Io : IO) = struct
           | exception _ ->
             failed := true;
             ignore (Miou.Computation.try_return stopped () : bool)));
-        Option.iter Miou.cancel !reader
+        Option.iter Miou.cancel !reader;
+        Deadline.stop idle_deadline;
+        Deadline.stop head_deadline
       and write_task () =
         match write_loop () with () -> () | exception exn -> fail exn
       in
@@ -342,18 +382,24 @@ module Make (Io : IO) = struct
         let timeout = function
           | `Linger ->
             Some
-              ( Option.value idle_timeout ~default:linger_without_idle_timeout
+              ( `Idle
+              , Unix.gettimeofday ()
+                +. Option.value
+                     idle_timeout
+                     ~default:linger_without_idle_timeout
               , ignore )
           | `Read when untimed -> None
           | `Read ->
             observe ();
             (match Ache.Server_connection.read_timeout connection with
             | Some (`Idle, on_timeout) ->
-              Option.map (fun seconds -> seconds, on_timeout) idle_timeout
+              Option.map
+                (fun seconds ->
+                   `Idle, Unix.gettimeofday () +. seconds, on_timeout)
+                idle_timeout
             | Some (`Head, on_timeout) ->
               Option.map
-                (fun deadline ->
-                   Float.max 0. (deadline -. Unix.gettimeofday ()), on_timeout)
+                (fun deadline -> `Head, deadline, on_timeout)
                 !head_deadline
             | None -> None)
         in

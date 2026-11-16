@@ -625,17 +625,18 @@ let test_idle_timeout () =
   check_server_sockets_closed ()
 
 let test_idle_timeout_between_requests () =
-  with_server ~idle_timeout:0.1 (fun connect ->
+  with_server ~idle_timeout:0.3 (fun connect ->
     connect () >>= fun socket ->
     write_all socket get_hello >>= fun () ->
     read_exactly socket (String.length hello_response) >>= fun first ->
     Alcotest.(check string) "first response" hello_response first;
+    Lwt_unix.sleep 0.2 >>= fun () ->
     write_all socket get_hello >>= fun () ->
     read_exactly socket (String.length hello_response) >>= fun second ->
     Alcotest.(check string) "second response" hello_response second;
     let since = Unix.gettimeofday () in
     read_all socket >>= fun rest ->
-    check_elapsed "idle after a response" ~since ~at_least:0.08;
+    check_elapsed "idle after a response" ~since ~at_least:0.25;
     Alcotest.(check string) "then closed" "" rest;
     Lwt_unix.close socket);
   Alcotest.(check int) "two requests" 2 !requests_seen
@@ -827,6 +828,51 @@ let test_head_timer_cancelled () =
     read_all socket >>= fun (_ : string) -> Lwt_unix.close socket);
   Alcotest.(check int) "no timer left" before (Lwt_engine.timer_count ())
 
+let live_words () =
+  Gc.full_major ();
+  (Gc.stat ()).live_words
+
+let check_timers_bounded ?idle_timeout ?head_timeout ~requests send =
+  let previous = Lwt_engine.get () in
+  Lwt_engine.set ~destroy:false (new Lwt_engine.select);
+  let growth = ref 0 in
+  Fun.protect
+    ~finally:(fun () -> Lwt_engine.set previous)
+    (fun () ->
+       with_server ?idle_timeout ?head_timeout (fun connect ->
+         let earlier_live_sleeper = Lwt_unix.sleep 20. in
+         connect () >>= fun socket ->
+         Lwt_unix.setsockopt socket Unix.TCP_NODELAY true;
+         let rec get_hellos n =
+           if n = 0
+           then Lwt.return_unit
+           else
+             send socket >>= fun () ->
+             read_exactly socket (String.length hello_response)
+             >>= fun response ->
+             if response <> hello_response
+             then Alcotest.failf "unexpected response %S" response;
+             get_hellos (n - 1)
+         in
+         get_hellos (requests / 10) >>= fun () ->
+         let before = live_words () in
+         get_hellos requests >>= fun () ->
+         growth := live_words () - before;
+         Lwt.cancel earlier_live_sleeper;
+         Lwt_unix.close socket));
+  if !growth > requests
+  then Alcotest.failf "heap grew by %d words over %d requests" !growth requests
+
+let test_idle_timer_bounded () =
+  check_timers_bounded ~idle_timeout:30. ~requests:10_000 (fun socket ->
+    write_all socket get_hello)
+
+let test_head_timer_bounded () =
+  check_timers_bounded ~head_timeout:30. ~requests:500 (fun socket ->
+    write_all socket "GET /hello HTTP/1.1\r\n" >>= fun () ->
+    Lwt_unix.sleep 0.001 >>= fun () ->
+    write_all socket "host: localhost\r\n\r\n")
+
 let test_failing_shutdown_and_close () =
   fail_read := false;
   fail_write := false;
@@ -981,5 +1027,11 @@ let () =
         ; ( "the head timer ends with the connection"
           , `Quick
           , test_head_timer_cancelled )
+        ; ( "keep-alive requests do not pile up idle timers"
+          , `Quick
+          , test_idle_timer_bounded )
+        ; ( "requests with split heads do not pile up head timers"
+          , `Quick
+          , test_head_timer_bounded )
         ] )
     ]

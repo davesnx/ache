@@ -665,6 +665,43 @@ module Raising = struct
   let shutdown _ = ()
 end
 
+let live_words () =
+  Gc.full_major ();
+  (Gc.stat ()).live_words
+
+let check_timers_bounded ?idle_timeout ?head_timeout ~requests send_request =
+  let growth = ref 0 in
+  with_server ?idle_timeout ?head_timeout (fun addr ->
+    let earlier_live_sleeper = Miou.async (fun () -> Miou_unix.sleep 20.) in
+    let socket = connect addr in
+    Unix.setsockopt (Miou_unix.to_file_descr socket) Unix.TCP_NODELAY true;
+    let get_hellos n =
+      for _ = 1 to n do
+        send_request socket;
+        let response = take socket (String.length hello_response) in
+        if response <> hello_response
+        then Alcotest.failf "unexpected response %S" response
+      done
+    in
+    get_hellos (requests / 10);
+    let before = live_words () in
+    get_hellos requests;
+    growth := live_words () - before;
+    Miou.cancel earlier_live_sleeper;
+    Miou_unix.close socket);
+  if !growth > requests
+  then Alcotest.failf "heap grew by %d words over %d requests" !growth requests
+
+let test_idle_timer_bounded () =
+  check_timers_bounded ~idle_timeout:30. ~requests:10_000 (fun socket ->
+    send socket get_hello)
+
+let test_head_timer_bounded () =
+  check_timers_bounded ~head_timeout:30. ~requests:500 (fun socket ->
+    send socket "GET /hello HTTP/1.1\r\n";
+    Miou_unix.sleep 0.001;
+    send socket "host: localhost\r\n\r\n")
+
 let test_report_exn_raises () =
   with_server (fun addr ->
     let socket = connect addr in
@@ -1057,5 +1094,11 @@ let () =
         ; ( "bytes sent before a delayed 101 reach the new protocol"
           , `Quick
           , test_upgrade_with_read_pending )
+        ; ( "keep-alive requests do not pile up idle timers"
+          , `Quick
+          , test_idle_timer_bounded )
+        ; ( "requests with split heads do not pile up head timers"
+          , `Quick
+          , test_head_timer_bounded )
         ] )
     ]

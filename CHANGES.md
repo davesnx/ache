@@ -37,6 +37,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   what the server rejects.
 - Bodies are delivered in linear time.
 - An obs-folded response field is joined once, in linear time.
+- `ache-lwt` and `ache-miou` keep one timer for each timeout on a connection,
+  not one for each read, so cancelled timers do not pile up in the heap.
 - Fixes httpun #95, #143, #150, #151, #154 to #165, and httpaf #18, #38,
   #86, #191, #192.
 

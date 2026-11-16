@@ -153,6 +153,28 @@ module IO_loop = struct
     >>= close
 end
 
+module Deadline = struct
+  type t =
+    { mutable at : float
+    ; mutable timer : unit Lwt.t
+    }
+
+  let create () = { at = 0.; timer = Lwt.return_unit }
+
+  let rec sleep t =
+    let left = t.at -. Unix.gettimeofday () in
+    if left > 0.
+    then Lwt_unix.sleep left >>= fun () -> sleep t
+    else Lwt.return_unit
+
+  let set t seconds =
+    t.at <- Unix.gettimeofday () +. seconds;
+    if not (Lwt.is_sleeping t.timer) then t.timer <- sleep t
+
+  let wait t = Lwt.protected t.timer
+  let stop t = Lwt.cancel t.timer
+end
+
 module Make (Io : IO) = struct
   module Server = struct
     type socket = Io.socket
@@ -177,11 +199,10 @@ module Make (Io : IO) = struct
       =
       check_timeout "idle_timeout" idle_timeout;
       check_timeout "head_timeout" head_timeout;
-      let head_timer = ref None in
-      let stop_head_timer () =
-        Option.iter Lwt.cancel !head_timer;
-        head_timer := None
-      in
+      let head_timer = Deadline.create ()
+      and head_armed = ref false
+      and idle_timer = Deadline.create () in
+      let stop_head_timer () = head_armed := false in
       let connection =
         Ache.Server_connection.create
           ~config
@@ -196,8 +217,10 @@ module Make (Io : IO) = struct
         | Some seconds ->
           (match Ache.Server_connection.read_timeout connection with
           | Some (`Head, _) ->
-            if Option.is_none !head_timer
-            then head_timer := Some (Lwt_unix.sleep seconds)
+            if not !head_armed
+            then (
+              head_armed := true;
+              Deadline.set head_timer seconds)
           | Some (`Idle, _) | None -> stop_head_timer ())
       in
       let module Observed = struct
@@ -219,12 +242,14 @@ module Make (Io : IO) = struct
         let limit =
           match Ache.Server_connection.read_timeout connection with
           | Some (`Idle, on_timeout) ->
-            Option.map (fun s -> Lwt_unix.sleep s, on_timeout) idle_timeout
-          | Some (`Head, on_timeout) ->
             Option.map
-              (fun timer -> Lwt.protected timer, on_timeout)
-              !head_timer
-          | None -> None
+              (fun seconds ->
+                 Deadline.set idle_timer seconds;
+                 Deadline.wait idle_timer, on_timeout)
+              idle_timeout
+          | Some (`Head, on_timeout) when !head_armed ->
+            Some (Deadline.wait head_timer, on_timeout)
+          | Some (`Head, _) | None -> None
         in
         match limit with
         | None -> IO_loop.untimed_read read
@@ -252,7 +277,8 @@ module Make (Io : IO) = struct
              ~close:(IO_loop.close_once Io.close socket)
              socket)
         (fun () ->
-           stop_head_timer ();
+           Deadline.stop head_timer;
+           Deadline.stop idle_timer;
            Lwt.return_unit)
   end
 
