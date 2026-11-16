@@ -57,7 +57,7 @@ module Tunnel = struct
   let next_read_operation t = if t.closed then `Close else `Read
 
   let read t bs ~off ~len =
-    t.received <- t.received ^ Bigstringaf.substring bs ~off ~len;
+    t.received <- t.received ^ Ache.Bigstring.substring bs ~off ~len;
     len
 
   let read_eof t bs ~off ~len =

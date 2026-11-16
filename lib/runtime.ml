@@ -34,13 +34,13 @@ module type ENGINE = sig
   type t
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
-  val read : t -> Bigstringaf.t -> off:int -> len:int -> int
-  val read_eof : t -> Bigstringaf.t -> off:int -> len:int -> int
+  val read : t -> Bigstring.t -> off:int -> len:int -> int
+  val read_eof : t -> Bigstring.t -> off:int -> len:int -> int
   val yield_reader : t -> (unit -> unit) -> unit
 
   val next_write_operation :
      t
-    -> [ `Write of Bigstringaf.t IOVec.t list | `Yield | `Close of int ]
+    -> [ `Write of Bigstring.t IOVec.t list | `Yield | `Close of int ]
 
   val report_write_result : t -> [ `Ok of int | `Closed ] -> unit
   val yield_writer : t -> (unit -> unit) -> unit
@@ -95,7 +95,7 @@ end
 
 module Buffer = struct
   type t =
-    { buffer : Bigstringaf.t
+    { buffer : Bigstring.t
     ; mutable off : int
     ; mutable len : int
     ; cap : int
@@ -103,7 +103,7 @@ module Buffer = struct
     }
 
   let create size =
-    let buffer = Bigstringaf.create size in
+    let buffer = Bigstring.create size in
     { buffer; off = 0; len = 0; cap = size; unread = false }
 
   let compress t =
@@ -113,7 +113,7 @@ module Buffer = struct
       t.len <- 0)
     else if t.off > 0
     then (
-      Bigstringaf.blit t.buffer ~src_off:t.off t.buffer ~dst_off:0 ~len:t.len;
+      Bigstring.blit t.buffer ~src_off:t.off t.buffer ~dst_off:0 ~len:t.len;
       t.off <- 0)
 
   let get t ~f =

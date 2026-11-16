@@ -29,7 +29,7 @@
   EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   ----------------------------------------------------------------------------*)
 
-type bigstring = Bigstringaf.t
+type bigstring = Bigstring.t
 
 type 'a iovec =
   { buffer : 'a
@@ -146,8 +146,8 @@ module Buffers = Deque (struct
     let sentinel =
       let deadbeef = "\222\173\190\239" in
       let len = String.length deadbeef in
-      let buffer = Bigstringaf.create len in
-      String.iteri (Bigstringaf.unsafe_set buffer) deadbeef;
+      let buffer = Bigstring.create len in
+      String.iteri (Bigstring.unsafe_set buffer) deadbeef;
       { buffer; off = 0; len }
   end)
 
@@ -187,7 +187,7 @@ let of_bigstring buffer =
   ; yield = false
   }
 
-let create size = of_bigstring (Bigstringaf.create size)
+let create size = of_bigstring (Bigstring.create size)
 let writable_exn t = if t.closed then failwith "cannot write to closed writer"
 
 let schedule_iovec t ?(off = 0) ~len buffer =
@@ -211,14 +211,14 @@ let flush_with_reason t f =
   else Flushes.enqueue (t.bytes_received, f) t.flushed
 
 let free_bytes_in_buffer t =
-  let buf_len = Bigstringaf.length t.buffer in
+  let buf_len = Bigstring.length t.buffer in
   buf_len - t.write_pos
 
 let schedule_bigstring t ?(off = 0) ?len a =
   writable_exn t;
   flush_buffer t;
   let len =
-    match len with None -> Bigstringaf.length a - off | Some len -> len
+    match len with None -> Bigstring.length a - off | Some len -> len
   in
   if len > 0 then schedule_iovec t ~off ~len a
 
@@ -226,7 +226,7 @@ let ensure_space t len =
   if free_bytes_in_buffer t < len
   then begin
     flush_buffer t;
-    t.buffer <- Bigstringaf.create (Int.max (Bigstringaf.length t.buffer) len);
+    t.buffer <- Bigstring.create (Int.max (Bigstring.length t.buffer) len);
     t.write_pos <- 0;
     t.scheduled_pos <- 0
   end
@@ -235,7 +235,7 @@ let write_string t ?(off = 0) ?len a =
   writable_exn t;
   let len = match len with None -> String.length a - off | Some len -> len in
   ensure_space t len;
-  Bigstringaf.unsafe_blit_from_string
+  Bigstring.unsafe_blit_from_string
     a
     ~src_off:off
     t.buffer
@@ -246,33 +246,19 @@ let write_string t ?(off = 0) ?len a =
 let write_bigstring t ?(off = 0) ?len a =
   writable_exn t;
   let len =
-    match len with None -> Bigstringaf.length a - off | Some len -> len
+    match len with None -> Bigstring.length a - off | Some len -> len
   in
   ensure_space t len;
-  Bigstringaf.unsafe_blit a ~src_off:off t.buffer ~dst_off:t.write_pos ~len;
+  Bigstring.unsafe_blit a ~src_off:off t.buffer ~dst_off:t.write_pos ~len;
   t.write_pos <- t.write_pos + len
 
 let write_char t c =
   writable_exn t;
   ensure_space t 1;
-  Bigstringaf.unsafe_set t.buffer t.write_pos c;
+  Bigstring.unsafe_set t.buffer t.write_pos c;
   t.write_pos <- t.write_pos + 1
 
 module LE = struct
-  external set_int16 :
-     Bigstringaf.t
-    -> int
-    -> int
-    -> unit
-    = "%caml_bigstring_set16u"
-
-  external set_int64 :
-     Bigstringaf.t
-    -> int
-    -> int64
-    -> unit
-    = "%caml_bigstring_set64u"
-
   external bswap16 : int -> int = "%bswap16"
   external bswap_int64 : int64 -> int64 = "%bswap_int64"
 
@@ -280,16 +266,16 @@ module LE = struct
     writable_exn t;
     ensure_space t 2;
     if Sys.big_endian
-    then set_int16 t.buffer t.write_pos (bswap16 i)
-    else set_int16 t.buffer t.write_pos i;
+    then Bigstring.unsafe_set_int16_ne t.buffer t.write_pos (bswap16 i)
+    else Bigstring.unsafe_set_int16_ne t.buffer t.write_pos i;
     t.write_pos <- t.write_pos + 2
 
   let write_uint64 t i =
     writable_exn t;
     ensure_space t 8;
     if Sys.big_endian
-    then set_int64 t.buffer t.write_pos (bswap_int64 i)
-    else set_int64 t.buffer t.write_pos i;
+    then Bigstring.unsafe_set_int64_ne t.buffer t.write_pos (bswap_int64 i)
+    else Bigstring.unsafe_set_int64_ne t.buffer t.write_pos i;
     t.write_pos <- t.write_pos + 8
 end
 
@@ -383,7 +369,7 @@ let serialize_to_string t =
     List.iter
       (function
         | { buffer; off; len } ->
-          Bigstringaf.unsafe_blit_to_bytes
+          Bigstring.unsafe_blit_to_bytes
             buffer
             ~src_off:off
             bytes

@@ -1,7 +1,8 @@
 let () =
   Alcotest.run
     "ache unit tests"
-    [ "version", Test_version.tests
+    [ "bigstring", Test_bigstring.tests
+    ; "version", Test_version.tests
     ; "method", Test_method.tests
     ; "iovec", Test_iovec.tests
     ; "headers", Test_headers.tests

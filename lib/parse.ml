@@ -112,37 +112,36 @@ let digit = table (function '0' .. '9' -> true | _ -> false)
 let hex =
   table (function '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true | _ -> false)
 
-external bs_get64 : Bigstringaf.t -> int -> int64 = "%caml_bigstring_get64u"
 external bytes_set64 : bytes -> int -> int64 -> unit = "%caml_bytes_set64u"
 
 let[@inline] substring bs ~off ~len =
-  if len < 0 || off < 0 || Bigstringaf.length bs - off < len
+  if len < 0 || off < 0 || Bigstring.length bs - off < len
   then invalid_arg "Parse.substring";
   let b = Bytes.create len in
   if len <= 64
   then (
     let i = ref 0 in
     while !i + 8 <= len do
-      bytes_set64 b !i (bs_get64 bs (off + !i));
+      bytes_set64 b !i (Bigstring.unsafe_get_int64_ne bs (off + !i));
       i := !i + 8
     done;
     while !i < len do
-      Bytes.unsafe_set b !i (Bigstringaf.unsafe_get bs (off + !i));
+      Bytes.unsafe_set b !i (Bigstring.unsafe_get bs (off + !i));
       incr i
     done)
-  else Bigstringaf.unsafe_blit_to_bytes bs ~src_off:off b ~dst_off:0 ~len;
+  else Bigstring.unsafe_blit_to_bytes bs ~src_off:off b ~dst_off:0 ~len;
   Bytes.unsafe_to_string b
 
 (* Past [stop] every byte reads as NUL, which no rule accepts. *)
-let get bs stop i = if i < stop then Bigstringaf.unsafe_get bs i else '\000'
+let get bs stop i = if i < stop then Bigstring.unsafe_get bs i else '\000'
 
 let rec skip table bs stop i =
-  if i < stop && is table (Bigstringaf.unsafe_get bs i)
+  if i < stop && is table (Bigstring.unsafe_get bs i)
   then skip table bs stop (i + 1)
   else i
 
 let rec skip_zeros bs stop i =
-  if i < stop && Bigstringaf.unsafe_get bs i = '0'
+  if i < stop && Bigstring.unsafe_get bs i = '0'
   then skip_zeros bs stop (i + 1)
   else i
 
@@ -155,8 +154,7 @@ let fail_at ~eof o stop p message =
 
 let unexpected ~eof o bs stop p where =
   if p < stop
-  then
-    fail o (Printf.sprintf "unexpected %C in %s" (Bigstringaf.get bs p) where)
+  then fail o (Printf.sprintf "unexpected %C in %s" (Bigstring.get bs p) where)
   else if eof
   then fail o "unexpected end of input"
   else partial
@@ -175,16 +173,14 @@ let rec http_slash ~eof o bs stop p i where =
   then unexpected ~eof o bs stop (p + i) where
   else http_slash ~eof o bs stop p (i + 1) where
 
-external get_int32 : Bigstringaf.t -> int -> int32 = "%caml_bigstring_get32u"
-
 let http = if Sys.big_endian then 0x48545450l else 0x50545448l
 
 let version ~eof o bs stop p where =
   let p =
     if
       p + 5 <= stop
-      && Int32.equal (get_int32 bs p) http
-      && Bigstringaf.unsafe_get bs (p + 4) = '/'
+      && Int32.equal (Bigstring.unsafe_get_int32_ne bs p) http
+      && Bigstring.unsafe_get bs (p + 4) = '/'
     then p + 5
     else http_slash ~eof o bs stop p 0 where
   in
@@ -210,7 +206,7 @@ let version ~eof o bs stop p where =
 
 let rec same bs off s i =
   i = String.length s
-  || (Bigstringaf.unsafe_get bs (off + i) = String.unsafe_get s i
+  || (Bigstring.unsafe_get bs (off + i) = String.unsafe_get s i
      && same bs off s (i + 1))
 
 let literal bs off len s = String.length s = len && same bs off s 0
@@ -249,7 +245,7 @@ let request_line ~eof o bs off stop =
           substring bs ~off:(meth_end + 1) ~len:(target_end - meth_end - 1));
       p
 
-let digit_at bs i = Char.code (Bigstringaf.unsafe_get bs i) - 48
+let digit_at bs i = Char.code (Bigstring.unsafe_get bs i) - 48
 
 let status_line ~eof o bs off stop =
   let where = "status-line" in
@@ -271,7 +267,7 @@ let status_line ~eof o bs off stop =
     let n = code_end - p - 1 in
     if n = 0
     then fail_at ~eof o stop code_end "status-code empty"
-    else if n <> 3 || Bigstringaf.unsafe_get bs (p + 1) = '0'
+    else if n <> 3 || Bigstring.unsafe_get bs (p + 1) = '0'
     then
       fail_at
         ~eof
@@ -300,7 +296,7 @@ let status_line ~eof o bs off stop =
       q
 
 let rec trim_end bs off i =
-  if i > off && is space (Bigstringaf.unsafe_get bs (i - 1))
+  if i > off && is space (Bigstring.unsafe_get bs (i - 1))
   then trim_end bs off (i - 1)
   else i
 
@@ -395,7 +391,7 @@ let rec hex_number bs acc i stop =
   else
     hex_number
       bs
-      ((acc * 16) + hex_value (Bigstringaf.unsafe_get bs i))
+      ((acc * 16) + hex_value (Bigstring.unsafe_get bs i))
       (i + 1)
       stop
 
@@ -424,7 +420,7 @@ let chunk_size_line ~eof o bs off stop =
 module Grammar = struct
   let run parse value where input =
     let len = String.length input in
-    let bs = Bigstringaf.of_string input ~off:0 ~len in
+    let bs = Bigstring.of_string input ~off:0 ~len in
     let o = out () in
     let p = parse o bs len in
     if p = len
@@ -533,7 +529,7 @@ module Reader = struct
     ; mutable state : ('head, 'error) state
     ; mutable stage : stage
     ; mutable fed : int
-    ; mutable buffer : Bigstringaf.t
+    ; mutable buffer : Bigstring.t
     ; mutable buffered : int
     ; mutable paused : bool
     ; mutable closed : bool
@@ -552,7 +548,7 @@ module Reader = struct
     ; state = Done
     ; stage = Ended
     ; fed = 0
-    ; buffer = Bigstringaf.empty
+    ; buffer = Bigstring.empty
     ; buffered = 0
     ; paused = false
     ; closed = false
@@ -700,20 +696,20 @@ module Reader = struct
 
   let save t bs off len =
     let size = t.buffered + len in
-    if size > Bigstringaf.length t.buffer
+    if size > Bigstring.length t.buffer
     then (
       let buffer =
-        Bigstringaf.create (Int.max 256 (Int.max size (2 * t.buffered)))
+        Bigstring.create (Int.max 256 (Int.max size (2 * t.buffered)))
       in
-      Bigstringaf.blit t.buffer ~src_off:0 buffer ~dst_off:0 ~len:t.buffered;
+      Bigstring.blit t.buffer ~src_off:0 buffer ~dst_off:0 ~len:t.buffered;
       t.buffer <- buffer);
-    Bigstringaf.blit bs ~src_off:off t.buffer ~dst_off:t.buffered ~len;
+    Bigstring.blit bs ~src_off:off t.buffer ~dst_off:t.buffered ~len;
     t.buffered <- size
 
   let drop t =
     t.fed <- 0;
     t.buffered <- 0;
-    if Bigstringaf.length t.buffer > 4096 then t.buffer <- Bigstringaf.empty
+    if Bigstring.length t.buffer > 4096 then t.buffer <- Bigstring.empty
 
   let finish t body =
     Body.Reader.close body;
@@ -737,7 +733,7 @@ module Reader = struct
     | Done | Head_done | Body _ | Fail _ | Cancelled_parse -> ()
 
   let failed t error =
-    t.buffer <- Bigstringaf.empty;
+    t.buffer <- Bigstring.empty;
     t.state <- Fail (t.fail error)
 
   let too_large t =
@@ -772,7 +768,7 @@ module Reader = struct
       let n =
         match t.stage with
         | Chunk_size when t.fed = 0 ->
-          let nl = Bigstringaf.memchr bs off '\n' take in
+          let nl = Bigstring.memchr bs off '\n' take in
           if nl < 0 then take else nl + 1 - off
         | _ -> take
       in
@@ -786,13 +782,13 @@ module Reader = struct
       | _ -> unfinished t bs ~off ~take more q
 
   let section t bs ~off ~len more =
-    if off < 0 || len < 0 || off > Bigstringaf.length bs - len
+    if off < 0 || len < 0 || off > Bigstring.length bs - len
     then invalid_arg "Ache: read range outside the buffer";
     let take = Int.min len (t.limit - t.fed) in
     if t.buffered = 0
     then parse_lines t bs ~off ~take more off
     else
-      let nl = Bigstringaf.memchr bs off '\n' take in
+      let nl = Bigstring.memchr bs off '\n' take in
       if nl < 0
       then unfinished t bs ~off ~take more off
       else (
@@ -847,7 +843,7 @@ module Reader = struct
       | _ -> t.state <- Body (body, Chunk_data remaining));
       n
     | Body (body, Chunk_crlf seen) ->
-      if Bigstringaf.get bs off <> if seen = 0 then '\r' else '\n'
+      if Bigstring.get bs off <> if seen = 0 then '\r' else '\n'
       then (
         failed t (`Parse "expected CRLF after chunk data");
         0)
@@ -885,7 +881,7 @@ module Reader = struct
     match t.state with
     | (Head | Body (_, (Chunk_line | Trailers))) when t.fed > 0 ->
       t.state <- Cancelled_parse;
-      t.buffer <- Bigstringaf.empty
+      t.buffer <- Bigstring.empty
     | Done | Head | Head_done | Body _ | Fail _ | Cancelled_parse -> ()
 
   let next t =

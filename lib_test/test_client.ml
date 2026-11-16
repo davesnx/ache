@@ -38,7 +38,9 @@ let rec pump ?(eof = false) t =
     | `Write iovecs ->
       List.iter
         (fun { IOVec.buffer; off; len } ->
-           Buffer.add_string t.written (Bigstringaf.substring buffer ~off ~len))
+           Buffer.add_string
+             t.written
+             (Ache.Bigstring.substring buffer ~off ~len))
         iovecs;
       Client_connection.report_write_result t.c (`Ok (IOVec.lengthv iovecs));
       true
@@ -49,14 +51,14 @@ let rec pump ?(eof = false) t =
     | `Read when eof && not t.eof_sent ->
       t.eof_sent <- true;
       let len = String.length t.pending in
-      let bs = Bigstringaf.of_string t.pending ~off:0 ~len in
+      let bs = Ache.Bigstring.of_string t.pending ~off:0 ~len in
       let n = Client_connection.read_eof t.c bs ~off:0 ~len in
       t.consumed <- t.consumed + n;
       t.pending <- String.sub t.pending n (len - n);
       true
     | `Read when String.length t.pending > 0 ->
       let len = String.length t.pending in
-      let bs = Bigstringaf.of_string t.pending ~off:0 ~len in
+      let bs = Ache.Bigstring.of_string t.pending ~off:0 ~len in
       let n = Client_connection.read t.c bs ~off:0 ~len in
       t.consumed <- t.consumed + n;
       t.pending <- String.sub t.pending n (len - n);
@@ -93,7 +95,7 @@ let send
                   ~on_error:(fun () -> ex.body_error <- true)
                   ~on_eof:(fun () -> ex.body_eof <- true)
                   ~on_read:(fun bs ~off ~len ->
-                    ex.body <- ex.body ^ Bigstringaf.substring bs ~off ~len;
+                    ex.body <- ex.body ^ Ache.Bigstring.substring bs ~off ~len;
                     loop ())
               in
               loop ())

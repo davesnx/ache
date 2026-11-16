@@ -7,7 +7,6 @@
   ache-eio-tls
   ache_test_certs
   alcotest
-  bigstringaf
   domain-name
   ipaddr
   eio

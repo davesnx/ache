@@ -1,11 +1,11 @@
 module type IO = sig
   type socket
 
-  val read : socket -> Bigstringaf.t -> off:int -> len:int -> int
+  val read : socket -> Ache.Bigstring.t -> off:int -> len:int -> int
 
   val writev :
      socket
-    -> Bigstringaf.t Ache.IOVec.t list
+    -> Ache.Bigstring.t Ache.IOVec.t list
     -> [ `Closed | `Ok of int ]
 
   val shutdown : socket -> Unix.shutdown_command -> unit

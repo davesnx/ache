@@ -17,7 +17,6 @@ bug-reports: "https://github.com/davesnx/ache/issues"
 depends: [
   "dune" {>= "3.17"}
   "ocaml" {>= "5.3"}
-  "bigstringaf"
   "alcotest" {with-test}
   "ocamlformat" {= "0.29.0" & with-dev-setup}
   "odoc" {with-doc}

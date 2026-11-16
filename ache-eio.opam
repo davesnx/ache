@@ -18,7 +18,6 @@ depends: [
   "dune" {>= "3.17"}
   "ocaml" {>= "5.3"}
   "ache" {= version}
-  "bigstringaf"
   "cstruct"
   "eio"
   "eio_main" {with-test}

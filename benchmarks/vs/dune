@@ -1,24 +1,23 @@
 (library
  (name vs)
- (modules vs)
- (libraries bigstringaf))
+ (modules vs))
 
 (library
  (name vs_ache)
  (modules vs_ache)
- (libraries ache bigstringaf vs))
+ (libraries ache vs))
 
 (library
  (name vs_httpun)
  (modules vs_httpun)
  (optional)
- (libraries bigstringaf httpun vs))
+ (libraries httpun vs))
 
 (library
  (name vs_httpaf)
  (modules vs_httpaf)
  (optional)
- (libraries bigstringaf httpaf vs))
+ (libraries httpaf vs))
 
 (library
  (name vs_lwt)
@@ -64,16 +63,7 @@
  (name core_bench)
  (modules core_bench)
  (optional)
- (libraries
-  ache
-  bigstringaf
-  httpaf
-  httpun
-  str
-  unix
-  vs_ache
-  vs_httpaf
-  vs_httpun))
+ (libraries ache httpaf httpun str unix vs_ache vs_httpaf vs_httpun))
 
 (executable
  (name server_ache_miou)

@@ -51,7 +51,7 @@ module Runtime : sig
 
   val do_write :
      t
-    -> (Server_connection.t -> Bigstringaf.t IOVec.t list -> 'a)
+    -> (Server_connection.t -> Ache.Bigstring.t IOVec.t list -> 'a)
     -> 'a
 
   val on_reader_unyield : t -> (unit -> unit) -> bool ref
@@ -222,7 +222,7 @@ let force_read_eof t str ~off ~len =
 
 let feed_string ?eof t str =
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   read ?eof t input ~off:0 ~len
 
 let read_string ?eof t str =
@@ -235,7 +235,7 @@ let force_read t str ~off ~len =
 
 let force_feed_string t str =
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   force_read t input ~off:0 ~len
 
 let force_read_string t str =
@@ -328,7 +328,7 @@ let echo_handler response reqd =
   let rec on_read buffer ~off ~len =
     Body.Writer.write_string
       response_body
-      (Bigstringaf.substring ~off ~len buffer);
+      (Ache.Bigstring.substring ~off ~len buffer);
     Body.Writer.flush response_body (function
       | `Closed -> assert false
       | `Written ->
@@ -384,14 +384,14 @@ let test_initial_reader_state () =
 
 let test_reader_is_closed_after_eof () =
   let t = create default_request_handler in
-  let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   connection_is_shutdown t;
 
   let t = create default_request_handler in
-  let c = read t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read with no input returns 0" 0 c;
-  let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   connection_is_shutdown t
 
@@ -406,7 +406,7 @@ let test_commit_parse_after_every_header () =
     ^ single_header
     ^ "host: a\r\nconnection: close\r\n\r\n"
   in
-  let bs = Bigstringaf.of_string r ~off:0 ~len:(String.length r) in
+  let bs = Ache.Bigstring.of_string r ~off:0 ~len:(String.length r) in
   let c = read t bs ~off:0 ~len:30 in
   Alcotest.(check int) "an incomplete head consumes all input" 30 c;
 
@@ -467,9 +467,12 @@ let test_asynchronous_response () =
         fun () ->
           Body.Reader.close (Reqd.request_body reqd);
           let data =
-            Bigstringaf.of_string ~off:0 ~len:response_body_length response_body
+            Ache.Bigstring.of_string
+              ~off:0
+              ~len:response_body_length
+              response_body
           in
-          let size = Bigstringaf.length data in
+          let size = Ache.Bigstring.length data in
           let response =
             Response.create `OK ~headers:(Headers.encoding_fixed size)
           in
@@ -1071,7 +1074,7 @@ let test_malformed conn =
   writer_yielded conn;
   let writer_woken_up = on_writer_unyield conn ignore in
   let len = String.length malformed_request_string in
-  let input = Bigstringaf.of_string malformed_request_string ~off:0 ~len in
+  let input = Ache.Bigstring.of_string malformed_request_string ~off:0 ~len in
   let c = read conn input ~off:0 ~len in
   Alcotest.(check int) "a failed head consumes the bytes it was given" len c;
   reader_errored conn;
@@ -1115,7 +1118,7 @@ let test_malformed_request_async_multiple_errors () =
   test_malformed t;
   !continue ();
   let len = String.length malformed_request_string in
-  let input = Bigstringaf.of_string malformed_request_string ~off:0 ~len in
+  let input = Ache.Bigstring.of_string malformed_request_string ~off:0 ~len in
   let c = force_read t input ~off:0 ~len in
   Alcotest.(check int) "read doesn't consume more input" 0 c;
   write_response
@@ -1125,7 +1128,7 @@ let test_malformed_request_async_multiple_errors () =
 
 let read_string_eof t str =
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   read_eof t input ~off:0 ~len
 
 let test_malformed_request_eof () =
@@ -1453,7 +1456,7 @@ let test_input_shrunk_chunked () =
 
   let str = "5\r\ninput\r\n" in
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   let just_read = force_read t input ~off:0 ~len in
   Alcotest.(check int) "chunk and its CRLF read" len just_read;
 
@@ -1505,7 +1508,7 @@ let test_respond_before_reading_entire_body_chunked_eof () =
 
   let str = "5\r\ninput\r\n" in
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   let just_read = read_eof t input ~off:0 ~len in
   Alcotest.(check int)
     "malformed chunked encoding read completely"
@@ -1543,7 +1546,7 @@ let test_finish_response_after_read_eof () =
 
   let str = "5\r\ninput\r\n" in
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   let just_read = force_read_eof t input ~off:0 ~len in
   Alcotest.(check int)
     "malformed chunked encoding read completely"
@@ -1784,7 +1787,7 @@ let test_finish_response_after_read_eof_well_formed () =
   let writer_woken_up = on_writer_unyield t ignore in
 
   let str = "hello" in
-  let bs = Bigstringaf.of_string ~off:0 ~len:(String.length str) str in
+  let bs = Ache.Bigstring.of_string ~off:0 ~len:(String.length str) str in
   let just_read = read_eof t bs ~off:0 ~len:(String.length str) in
   Alcotest.(check int) "EOF read" (String.length str) just_read;
   reader_closed t;
@@ -1837,7 +1840,7 @@ let test_finish_response_after_read_eof_malformed () =
   let writer_woken_up = on_writer_unyield t ignore in
 
   let str = "hello" in
-  let bs = Bigstringaf.of_string ~off:0 ~len:(String.length str) str in
+  let bs = Ache.Bigstring.of_string ~off:0 ~len:(String.length str) str in
   let just_read = read_eof t bs ~off:0 ~len:(String.length str) in
   Alcotest.(check int) "EOF read" (String.length str) just_read;
   reader_closed t;
@@ -1893,7 +1896,7 @@ let test_request_body_eof_response_not_sent () =
        ~headers:(Headers.of_list [ "content-length", "10" ]));
 
   let str = "hello" in
-  let bs = Bigstringaf.of_string ~off:0 ~len:(String.length str) str in
+  let bs = Ache.Bigstring.of_string ~off:0 ~len:(String.length str) str in
   let just_read = read_eof t bs ~off:0 ~len:(String.length str) in
   Alcotest.(check int) "EOF read" (String.length str) just_read;
   reader_closed t;
@@ -1946,7 +1949,7 @@ let test_request_body_eof_response_not_sent_empty_eof () =
        ~headers:(Headers.of_list [ "content-length", "10" ]));
 
   read_string t "hello";
-  let just_read = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let just_read = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "EOF read" 0 just_read;
   reader_closed t;
   Alcotest.(check bool) "Error handler was called" true !error_handler_called;
@@ -1993,7 +1996,7 @@ let test_race_condition_writer_issues_yield_after_reader_eof () =
   reader_yielded t;
   let reader_woken_up =
     on_reader_unyield t (fun () ->
-      ignore @@ read_eof t Bigstringaf.empty ~off:0 ~len:0;
+      ignore @@ read_eof t Ache.Bigstring.empty ~off:0 ~len:0;
       reader_closed t)
   in
   writer_yielded t;
@@ -2176,7 +2179,7 @@ let test_response_finished_before_body_read () =
         (Reqd.request_body reqd)
         ~on_read:(fun buf ~off ~len ->
           rev_body_chunks :=
-            Bigstringaf.substring buf ~off ~len :: !rev_body_chunks;
+            Ache.Bigstring.substring buf ~off ~len :: !rev_body_chunks;
           read_body ())
         ~on_eof:ignore
     in
@@ -2221,7 +2224,7 @@ let test_body_flush_fairness () =
       let request_body = Reqd.request_body reqd in
       let rec on_read buffer ~off ~len =
         rev_body_chunks :=
-          Bigstringaf.substring buffer ~off ~len :: !rev_body_chunks;
+          Ache.Bigstring.substring buffer ~off ~len :: !rev_body_chunks;
         continue :=
           fun () ->
             Body.Reader.schedule_read
@@ -2320,7 +2323,7 @@ let test_schedule_read_with_data_available () =
       ~on_error:(Helpers.body_must_complete __LOC__)
       body
       ~on_read:(fun buf ~off ~len ->
-        let actual = Bigstringaf.substring buf ~off ~len in
+        let actual = Ache.Bigstring.substring buf ~off ~len in
         did_read := true;
         Alcotest.(check string) "Body" expected actual)
       ~on_eof:(fun () -> assert false);
@@ -2661,7 +2664,7 @@ let test_write_response_after_read_eof () =
     ^ single_header
     ^ "host: a\r\nconnection: close\r\n\r\n"
   in
-  let bs = Bigstringaf.of_string r ~off:0 ~len:(String.length r) in
+  let bs = Ache.Bigstring.of_string r ~off:0 ~len:(String.length r) in
   let c = read t bs ~off:0 ~len:30 in
   Alcotest.(check int) "an incomplete head consumes all input" 30 c;
 
@@ -2722,7 +2725,9 @@ let test_invalid_response_head_writes_nothing () =
     Response.create ~headers:(Headers.of_list [ "X-A", "a\r\nB: 1" ]) `OK
   in
   let request = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
-  let bs = Bigstringaf.of_string request ~off:0 ~len:(String.length request) in
+  let bs =
+    Ache.Bigstring.of_string request ~off:0 ~len:(String.length request)
+  in
   let raised = ref [] in
   let conn =
     Server_connection.create (fun reqd ->
@@ -2736,7 +2741,7 @@ let test_invalid_response_head_writes_nothing () =
             Reqd.respond_with_bigstring
               reqd
               bad
-              (Bigstringaf.of_string "x" ~off:0 ~len:1))
+              (Ache.Bigstring.of_string "x" ~off:0 ~len:1))
         ; (fun reqd ->
             ignore (Reqd.respond_with_streaming reqd bad : Body.Writer.t))
         ];
@@ -2795,7 +2800,7 @@ module Raw = struct
   let read_op t = Server_connection.next_read_operation t.conn
 
   let read t ~eof len =
-    let bs = Bigstringaf.of_string t.pending ~off:0 ~len in
+    let bs = Ache.Bigstring.of_string t.pending ~off:0 ~len in
     let n =
       if eof
       then Server_connection.read_eof t.conn bs ~off:0 ~len
@@ -2910,7 +2915,8 @@ let reading_handler events reqd =
       ~on_error:(fun () -> events.failed <- events.failed + 1)
       ~on_eof:(fun () -> events.eof <- true)
       ~on_read:(fun bs ~off ~len ->
-        events.received <- events.received ^ Bigstringaf.substring bs ~off ~len;
+        events.received <-
+          events.received ^ Ache.Bigstring.substring bs ~off ~len;
         loop ())
   in
   loop ()
@@ -3121,7 +3127,7 @@ module Recorder = struct
   let next_read_operation t = if t.eof then `Close else `Read
 
   let read t bs ~off ~len =
-    t.got <- t.got ^ Bigstringaf.substring bs ~off ~len;
+    t.got <- t.got ^ Ache.Bigstring.substring bs ~off ~len;
     len
 
   let read_eof t bs ~off ~len =
@@ -3388,7 +3394,7 @@ let test_respond_on_closed_writer () =
           Reqd.respond_with_bigstring
             reqd
             (Response.create `OK)
-            (Bigstringaf.of_string "hello" ~off:0 ~len:5) )
+            (Ache.Bigstring.of_string "hello" ~off:0 ~len:5) )
     ; ( "respond_with_streaming"
       , fun reqd ->
           let body = Reqd.respond_with_streaming reqd (Response.create `OK) in
@@ -3596,7 +3602,7 @@ let test_after_write_closed () =
              ~on_eof:(fun () -> ended := "eof")
              ~on_error:(fun () -> ended := "error")
              ~on_read:(fun bs ~off ~len ->
-               received := !received ^ Bigstringaf.substring bs ~off ~len;
+               received := !received ^ Ache.Bigstring.substring bs ~off ~len;
                loop ())
          in
          loop ()

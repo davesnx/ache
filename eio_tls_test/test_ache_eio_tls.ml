@@ -40,7 +40,7 @@ module Echo = struct
   let next_read_operation t = if t.closed then `Close else `Read
 
   let read t bs ~off ~len =
-    if len > 0 then t.on_read t (Bigstringaf.substring bs ~off ~len);
+    if len > 0 then t.on_read t (Ache.Bigstring.substring bs ~off ~len);
     len
 
   let read_eof t bs ~off ~len =
@@ -55,7 +55,7 @@ module Echo = struct
     if len > 0
     then
       `Write
-        [ { IOVec.buffer = Bigstringaf.of_string t.pending ~off:0 ~len
+        [ { IOVec.buffer = Ache.Bigstring.of_string t.pending ~off:0 ~len
           ; off = 0
           ; len
           }
@@ -94,7 +94,7 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
     let rec on_read buffer ~off ~len =
       Body.Writer.write_string
         response_body
-        (Bigstringaf.substring buffer ~off ~len);
+        (Ache.Bigstring.substring buffer ~off ~len);
       Body.Writer.flush response_body (fun _ ->
         Body.Reader.schedule_read body ~on_eof ~on_error ~on_read)
     and on_eof () = Body.Writer.close response_body
@@ -279,7 +279,7 @@ let read_body body =
   let buf = Stdlib.Buffer.create 1024 in
   let p, u = Eio.Promise.create () in
   let rec on_read bs ~off ~len =
-    Stdlib.Buffer.add_string buf (Bigstringaf.substring bs ~off ~len);
+    Stdlib.Buffer.add_string buf (Ache.Bigstring.substring bs ~off ~len);
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   and on_eof () = Eio.Promise.resolve u (Ok (Stdlib.Buffer.contents buf))
   and on_error () =

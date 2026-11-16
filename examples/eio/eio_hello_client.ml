@@ -31,7 +31,7 @@ let () =
   let response_handler response body =
     Format.printf "%a@." Response.pp_hum response;
     let rec on_read buffer ~off ~len =
-      print_string (Bigstringaf.substring buffer ~off ~len);
+      print_string (Ache.Bigstring.substring buffer ~off ~len);
       Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
     and on_eof () = Eio.Promise.resolve_ok resolve_finished () in
     Body.Reader.schedule_read body ~on_read ~on_eof ~on_error

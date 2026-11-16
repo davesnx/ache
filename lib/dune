@@ -1,4 +1,6 @@
 (library
  (name ache)
  (public_name ache)
- (libraries bigstringaf))
+ (foreign_stubs
+  (language c)
+  (names ache_bigstring_stubs)))

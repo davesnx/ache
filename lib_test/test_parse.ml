@@ -19,7 +19,7 @@ let response_summary (r : Response.t) = Grammar_corpus.response_to_string r
 let read_body body ~on_done =
   let buf = Buffer.create 64 in
   let rec on_read bs ~off ~len =
-    Buffer.add_string buf (Bigstringaf.substring bs ~off ~len);
+    Buffer.add_string buf (Ache.Bigstring.substring bs ~off ~len);
     Body.Reader.schedule_read body ~on_error ~on_read ~on_eof
   and on_eof () = on_done (Buffer.contents buf)
   and on_error () = on_done ("incomplete: " ^ Buffer.contents buf) in
@@ -30,14 +30,14 @@ module Feeder = struct
     { mutable pending : string
     ; mutable consumed : int
     ; next_read_operation : unit -> [ `Read | `Yield | `Close ]
-    ; read : Bigstringaf.t -> off:int -> len:int -> int
-    ; read_eof : Bigstringaf.t -> off:int -> len:int -> int
+    ; read : Ache.Bigstring.t -> off:int -> len:int -> int
+    ; read_eof : Ache.Bigstring.t -> off:int -> len:int -> int
     ; drain : unit -> unit
     }
 
   let offer t f =
     let len = String.length t.pending in
-    let bs = Bigstringaf.of_string t.pending ~off:0 ~len in
+    let bs = Ache.Bigstring.of_string t.pending ~off:0 ~len in
     let n = f bs ~off:0 ~len in
     if n < 0 || n > len then Alcotest.failf "read consumed %d of %d bytes" n len;
     t.consumed <- t.consumed + n;
@@ -274,7 +274,7 @@ let test_pipelined_incomplete_head_consumed () =
   let consumed =
     Server_connection.read
       s.conn
-      (Bigstringaf.of_string input ~off:0 ~len)
+      (Ache.Bigstring.of_string input ~off:0 ~len)
       ~off:0
       ~len
   in
@@ -640,7 +640,7 @@ let test_many_small_chunks () =
     let body = Reqd.request_body reqd in
     let rec on_read bs ~off ~len =
       incr on_read_calls;
-      Buffer.add_string received (Bigstringaf.substring bs ~off ~len);
+      Buffer.add_string received (Ache.Bigstring.substring bs ~off ~len);
       Body.Reader.schedule_read
         ~on_error:(Helpers.body_must_complete __LOC__)
         body
@@ -657,7 +657,7 @@ let test_many_small_chunks () =
       ~on_eof
   in
   let conn = Server_connection.create handler in
-  let bs = Bigstringaf.of_string input ~off:0 ~len:(String.length input) in
+  let bs = Ache.Bigstring.of_string input ~off:0 ~len:(String.length input) in
   let consumed =
     Server_connection.read conn bs ~off:0 ~len:(String.length input)
   in
@@ -670,7 +670,7 @@ let collect_body body =
   let buf = Buffer.create 16 in
   let done_ = ref false in
   let rec on_read bs ~off ~len =
-    Buffer.add_string buf (Bigstringaf.substring bs ~off ~len);
+    Buffer.add_string buf (Ache.Bigstring.substring bs ~off ~len);
     Body.Reader.schedule_read
       ~on_error:(Helpers.body_must_complete __LOC__)
       body
@@ -741,7 +741,7 @@ let test_unread_body_backpressure () =
     Server_connection.create (fun reqd ->
       request_body := Some (Reqd.request_body reqd))
   in
-  let bs = Bigstringaf.of_string input ~off:0 ~len:(String.length input) in
+  let bs = Ache.Bigstring.of_string input ~off:0 ~len:(String.length input) in
   let fed = ref 0 in
   let read_some () =
     let len = min 4096 (String.length input - !fed) in
@@ -757,8 +757,8 @@ let test_unread_body_backpressure () =
   let eof = ref false in
   let body_reader = Option.get !request_body in
   let on_read bs ~off ~len =
-    held := (bs, off, len, Bigstringaf.substring bs ~off ~len) :: !held;
-    Buffer.add_string received (Bigstringaf.substring bs ~off ~len)
+    held := (bs, off, len, Ache.Bigstring.substring bs ~off ~len) :: !held;
+    Buffer.add_string received (Ache.Bigstring.substring bs ~off ~len)
   and on_eof () = eof := true in
   let rec loop rounds =
     if rounds > 100 then Alcotest.fail "body not read to the end";
@@ -781,7 +781,7 @@ let test_unread_body_backpressure () =
        Alcotest.(check bool)
          "delivered bytes are not overwritten"
          true
-         (String.equal copy (Bigstringaf.substring bs ~off ~len)))
+         (String.equal copy (Ache.Bigstring.substring bs ~off ~len)))
     !held
 
 module Reader = Ache_private.Parse.Reader
@@ -807,7 +807,12 @@ let response_reader ?(limit = 0x4000) () =
 
 let read_more more r s =
   let len = String.length s in
-  Reader.read_with_more r (Bigstringaf.of_string s ~off:0 ~len) ~off:0 ~len more
+  Reader.read_with_more
+    r
+    (Ache.Bigstring.of_string s ~off:0 ~len)
+    ~off:0
+    ~len
+    more
 
 let read r s = read_more Ache_private.Parse.Incomplete r s
 let read_eof r s = read_more Ache_private.Parse.Complete r s
@@ -1037,7 +1042,7 @@ let test_reader_empty_trailer_split () =
 let test_reader_end_past_len () =
   let head = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
   let input = "xx" ^ head in
-  let bs = Bigstringaf.of_string input ~off:0 ~len:(String.length input) in
+  let bs = Ache.Bigstring.of_string input ~off:0 ~len:(String.length input) in
   let r, heads, _ = reader () in
   let len = String.length head - 1 in
   Alcotest.(check int)

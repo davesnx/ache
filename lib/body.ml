@@ -31,7 +31,7 @@
 
 module Reader = struct
   type t =
-    { mutable buffer : Bigstringaf.t
+    { mutable buffer : Bigstring.t
     ; mutable off : int
     ; mutable len : int
     ; mutable closed : bool
@@ -41,7 +41,7 @@ module Reader = struct
     ; mutable failed : bool
     ; mutable discarding : bool
     ; mutable eof_has_been_called : bool
-    ; mutable on_read : Bigstringaf.t -> off:int -> len:int -> unit
+    ; mutable on_read : Bigstring.t -> off:int -> len:int -> unit
     ; when_ready_to_read : Optional_thunk.t
     }
 
@@ -50,7 +50,7 @@ module Reader = struct
   let default_on_read = Sys.opaque_identity (fun _ ~off:_ ~len:_ -> ())
 
   let create ~when_ready_to_read =
-    { buffer = Bigstringaf.empty
+    { buffer = Bigstring.empty
     ; off = 0
     ; len = 0
     ; closed = false
@@ -76,13 +76,13 @@ module Reader = struct
   let write t bs ~off ~len =
     if (not t.closed) && (not t.discarding) && len > 0
     then (
-      if Bigstringaf.length t.buffer - (t.off + t.len) < len
+      if Bigstring.length t.buffer - (t.off + t.len) < len
       then (
-        let buffer = Bigstringaf.create (Int.max 0x1000 ((2 * t.len) + len)) in
-        Bigstringaf.blit t.buffer ~src_off:t.off buffer ~dst_off:0 ~len:t.len;
+        let buffer = Bigstring.create (Int.max 0x1000 ((2 * t.len) + len)) in
+        Bigstring.blit t.buffer ~src_off:t.off buffer ~dst_off:0 ~len:t.len;
         t.buffer <- buffer;
         t.off <- 0);
-      Bigstringaf.blit bs ~src_off:off t.buffer ~dst_off:(t.off + t.len) ~len;
+      Bigstring.blit bs ~src_off:off t.buffer ~dst_off:(t.off + t.len) ~len;
       t.len <- t.len + len)
 
   let reset_callbacks t =
@@ -132,7 +132,7 @@ module Reader = struct
 
   let discard t =
     t.discarding <- true;
-    t.buffer <- Bigstringaf.empty;
+    t.buffer <- Bigstring.empty;
     t.off <- 0;
     t.len <- 0
 
@@ -174,7 +174,7 @@ module Writer = struct
     of_encoder (Encoder.of_bigstring buffer) ~encoding
 
   let create_empty ~writer =
-    let t = create Bigstringaf.empty ~encoding:(`Fixed 0L) ~writer in
+    let t = create Bigstring.empty ~encoding:(`Fixed 0L) ~writer in
     Encoder.close t.encoder;
     t
 
@@ -211,13 +211,13 @@ module Writer = struct
   let write_bigstring t ?off ?len b =
     if not (Encoder.is_closed t.encoder)
     then (
-      reserve t (length ?off ?len (Bigstringaf.length b));
+      reserve t (length ?off ?len (Bigstring.length b));
       Encoder.write_bigstring ?off ?len t.encoder b)
 
-  let schedule_bigstring t ?off ?len (b : Bigstringaf.t) =
+  let schedule_bigstring t ?off ?len (b : Bigstring.t) =
     if not (Encoder.is_closed t.encoder)
     then (
-      reserve t (length ?off ?len (Bigstringaf.length b));
+      reserve t (length ?off ?len (Bigstring.length b));
       Encoder.schedule_bigstring ?off ?len t.encoder b)
 
   let ready_to_write t = Serialize.Writer.wakeup t.writer

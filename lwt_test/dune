@@ -1,4 +1,4 @@
 (test
  (name test_ache_lwt)
  (package ache-lwt)
- (libraries ache ache-lwt alcotest bigstringaf lwt lwt.unix unix))
+ (libraries ache ache-lwt alcotest lwt lwt.unix unix))

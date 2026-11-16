@@ -54,7 +54,7 @@ module Reader : sig
 
   val read_with_more :
      (_, _) t
-    -> Bigstringaf.t
+    -> Bigstring.t
     -> off:int
     -> len:int
     -> more

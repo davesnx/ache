@@ -1,4 +1,4 @@
 (library
  (name oracle)
  (modules oracle)
- (libraries ache bigstringaf))
+ (libraries ache))

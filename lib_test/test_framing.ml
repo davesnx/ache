@@ -16,7 +16,7 @@ let rec pump s =
       let len = String.length s.pending in
       len > 0
       &&
-      let bs = Bigstringaf.of_string s.pending ~off:0 ~len in
+      let bs = Ache.Bigstring.of_string s.pending ~off:0 ~len in
       let n = Server_connection.read s.conn bs ~off:0 ~len in
       s.pending <- String.sub s.pending n (len - n);
       n > 0
@@ -31,7 +31,7 @@ let rec pump s =
       let n =
         List.fold_left
           (fun n { IOVec.buffer; off; len } ->
-             Buffer.add_string s.out (Bigstringaf.substring buffer ~off ~len);
+             Buffer.add_string s.out (Ache.Bigstring.substring buffer ~off ~len);
              n + len)
           0
           iovecs
@@ -81,7 +81,7 @@ let with_bigstring ?headers status body reqd =
   Reqd.respond_with_bigstring
     reqd
     (response ?headers status)
-    (Bigstringaf.of_string body ~off:0 ~len:(String.length body))
+    (Ache.Bigstring.of_string body ~off:0 ~len:(String.length body))
 
 let flushed = ref []
 
@@ -433,7 +433,7 @@ let client ?(meth = `GET) input =
         body
         ~on_eof:(fun () -> r.eof <- true)
         ~on_read:(fun bs ~off ~len ->
-          r.body <- r.body ^ Bigstringaf.substring bs ~off ~len;
+          r.body <- r.body ^ Ache.Bigstring.substring bs ~off ~len;
           loop ())
     in
     loop ()
@@ -458,7 +458,7 @@ let client ?(meth = `GET) input =
     match Client_connection.next_read_operation conn with
     | `Read when String.length input > 0 ->
       let len = String.length input in
-      let bs = Bigstringaf.of_string input ~off:0 ~len in
+      let bs = Ache.Bigstring.of_string input ~off:0 ~len in
       let n = Client_connection.read conn bs ~off:0 ~len in
       if n > 0 then feed (String.sub input n (len - n))
     | _ -> ()
@@ -568,7 +568,7 @@ let informational_then_final interim reqd =
       ~on_eof:(fun () ->
         with_string `OK ("got " ^ Buffer.contents received) reqd)
       ~on_read:(fun bs ~off ~len ->
-        Buffer.add_string received (Bigstringaf.substring bs ~off ~len);
+        Buffer.add_string received (Ache.Bigstring.substring bs ~off ~len);
         loop ())
   in
   loop ()
@@ -780,7 +780,7 @@ let test_client_cl_and_te_pipelined () =
             (fun { IOVec.buffer; off; len } ->
                Buffer.add_string
                  written
-                 (Bigstringaf.substring buffer ~off ~len))
+                 (Ache.Bigstring.substring buffer ~off ~len))
             iovecs;
           Client_connection.report_write_result
             conn
@@ -792,7 +792,7 @@ let test_client_cl_and_te_pipelined () =
         match Client_connection.next_read_operation conn with
         | `Read when String.length input > 0 ->
           let len = String.length input in
-          let bs = Bigstringaf.of_string input ~off:0 ~len in
+          let bs = Ache.Bigstring.of_string input ~off:0 ~len in
           let n = Client_connection.read conn bs ~off:0 ~len in
           String.sub input n (len - n)
         | _ -> input

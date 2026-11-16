@@ -2,7 +2,7 @@ open Ache
 open IOVec
 
 (* The length of the buffer is ignored by iovec operations *)
-let buffer = Bigstringaf.empty
+let buffer = Ache.Bigstring.empty
 
 let test_lengthv () =
   Alcotest.(check int) "lengthv [] = 0" (lengthv []) 0;

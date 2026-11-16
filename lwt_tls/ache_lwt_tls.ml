@@ -98,7 +98,7 @@ module Io = struct
     let length, strings =
       List.fold_left_map
         (fun acc { Ache.IOVec.buffer; off; len } ->
-           acc + len, Bigstringaf.substring buffer ~off ~len)
+           acc + len, Ache.Bigstring.substring buffer ~off ~len)
         0
         iovecs
     in

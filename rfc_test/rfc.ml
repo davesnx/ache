@@ -32,7 +32,7 @@ let iovecs_to_string iovecs =
   let buf = Buffer.create 256 in
   List.iter
     (fun { IOVec.buffer; off; len } ->
-       Buffer.add_string buf (Bigstringaf.substring buffer ~off ~len))
+       Buffer.add_string buf (Ache.Bigstring.substring buffer ~off ~len))
     iovecs;
   Buffer.contents buf
 
@@ -69,13 +69,13 @@ module type Connection = sig
   type t
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
-  val read : t -> Bigstringaf.t -> off:int -> len:int -> int
-  val read_eof : t -> Bigstringaf.t -> off:int -> len:int -> int
+  val read : t -> Ache.Bigstring.t -> off:int -> len:int -> int
+  val read_eof : t -> Ache.Bigstring.t -> off:int -> len:int -> int
   val yield_reader : t -> (unit -> unit) -> unit
 
   val next_write_operation :
      t
-    -> [ `Write of Bigstringaf.t IOVec.t list | `Yield | `Close of int ]
+    -> [ `Write of Ache.Bigstring.t IOVec.t list | `Yield | `Close of int ]
 
   val report_write_result : t -> [ `Ok of int | `Closed ] -> unit
   val yield_writer : t -> (unit -> unit) -> unit
@@ -111,7 +111,7 @@ module Driver (Under_test : Connection) = struct
     | `Read ->
       t.read_op <- `Read;
       let len = String.length t.pending in
-      let bs = Bigstringaf.of_string t.pending ~off:0 ~len in
+      let bs = Ache.Bigstring.of_string t.pending ~off:0 ~len in
       if t.eof_requested && not t.eof_delivered
       then (
         t.eof_delivered <- true;
@@ -343,7 +343,7 @@ module Server = struct
           on_complete ex.body)
         ~on_error:(fun () -> ex.body_cut <- true)
         ~on_read:(fun bs ~off ~len ->
-          ex.body <- ex.body ^ Bigstringaf.substring bs ~off ~len;
+          ex.body <- ex.body ^ Ache.Bigstring.substring bs ~off ~len;
           loop ())
     in
     loop ()
@@ -468,7 +468,7 @@ module Client = struct
                ~on_eof:(fun () -> ex.body_eof <- true)
                ~on_error:(fun () -> ex.body_cut <- true)
                ~on_read:(fun bs ~off ~len ->
-                 ex.body <- ex.body ^ Bigstringaf.substring bs ~off ~len;
+                 ex.body <- ex.body ^ Ache.Bigstring.substring bs ~off ~len;
                  loop ())
            in
            loop ()

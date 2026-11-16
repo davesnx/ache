@@ -27,7 +27,7 @@ end
 
 let feed_string t str =
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   read t input ~off:0 ~len
 
 let read_string t str =
@@ -132,7 +132,7 @@ let test_commit_parse_after_every_header () =
     (* Each header is 30 bytes *)
     response_line ^ single_header ^ single_header ^ "connection: close\r\n\r\n"
   in
-  let bs = Bigstringaf.of_string r ~off:0 ~len:(String.length r) in
+  let bs = Ache.Bigstring.of_string r ~off:0 ~len:(String.length r) in
   let c = read t bs ~off:0 ~len:(String.length response_line + 15) in
   Alcotest.(check int)
     "an incomplete head consumes all input"
@@ -204,7 +204,7 @@ let test_get () =
   write_request t request';
   read_response t response;
   writer_closed t;
-  let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   connection_is_shutdown t;
 
@@ -243,7 +243,7 @@ let test_head () =
   Body.Writer.close body;
   write_request t request';
   read_response t response;
-  let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   connection_is_shutdown t;
   Alcotest.(check bool) "error handler not called" false !error_handler_called
@@ -283,7 +283,7 @@ let test_get_last_close () =
   read_response t response;
 
   writer_closed t;
-  let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   connection_is_shutdown t
 
@@ -329,7 +329,7 @@ let test_response_eof () =
   Body.Writer.close body;
   write_request t request';
   reader_ready t;
-  let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   connection_is_shutdown t;
   Alcotest.(check (option string))
@@ -586,7 +586,7 @@ let test_partial_input () =
   let len = feed_string t "HTTP/1.1 200 OK\r\nC" in
   Alcotest.(check int) "partial read" 18 len;
   read_string t "onnection: close\r\n\r\n";
-  let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   shutdown t;
   reader_closed t;
@@ -618,7 +618,7 @@ let test_empty_fixed_body () =
   read_response
     t
     (Response.create ~headers:(Headers.of_list [ "Connection", "close" ]) `OK);
-  let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   reader_closed t
 
@@ -656,7 +656,7 @@ let test_fixed_body () =
   read_response
     t
     (Response.create ~headers:(Headers.of_list [ "Connection", "close" ]) `OK);
-  let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   reader_closed t;
   writer_closed t
@@ -934,7 +934,7 @@ let test_eof_with_another_pipelined_request () =
 
   let str = "rest." in
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   let just_read = read_eof t input ~off:0 ~len in
   Alcotest.(check int)
     "Rest of the response read completely, server EOF"
@@ -992,7 +992,7 @@ let test_eof_handler_response_body_not_closed () =
 
   let str = "rest." in
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   let just_read = read_eof t input ~off:0 ~len in
   Alcotest.(check int)
     "server EOF after delivering the first part of the response"
@@ -1048,7 +1048,7 @@ let test_eof_handler_closed_response_body () =
 
   let str = "rest." in
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   let just_read = read_eof t input ~off:0 ~len in
   Alcotest.(check int)
     "Rest of the response read completely, server EOF"
@@ -1425,7 +1425,7 @@ let test_response_arrives_before_body_uploaded () =
     t;
   let str = "hello" in
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   let just_read = read t input ~off:0 ~len in
   Alcotest.(check int) "reads the first chunk" len just_read;
   reader_yielded t;
@@ -1456,7 +1456,7 @@ let test_response_arrives_before_body_uploaded () =
 
   let str = "hello" in
   let len = String.length str in
-  let input = Bigstringaf.of_string str ~off:0 ~len in
+  let input = Ache.Bigstring.of_string str ~off:0 ~len in
   let just_read = read_eof t input ~off:0 ~len in
   Alcotest.(check int)
     "server EOF after delivering the entire response"
@@ -1512,7 +1512,7 @@ let test_race_condition_writer_issues_yield_after_reader_eof () =
   reader_yielded t;
   yield_reader t (fun () ->
     reader_woken_up := true;
-    ignore @@ read_eof t Bigstringaf.empty ~off:0 ~len:0;
+    ignore @@ read_eof t Ache.Bigstring.empty ~off:0 ~len:0;
     reader_closed t);
   writer_closed t;
   Alcotest.(check bool) "Reader woken up" true !reader_woken_up;
@@ -1641,7 +1641,7 @@ let test_304_not_modified () =
   Body.Writer.close body;
   write_request t request';
   read_response t response;
-  let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   connection_is_shutdown t;
   Alcotest.(check bool) "error handler not called" false !error_handler_called
@@ -1668,7 +1668,7 @@ let test_empty_content_length_body_closed () =
     (Body.Writer.is_closed body);
   write_request t request';
   read_response t response;
-  let c = read_eof t Bigstringaf.empty ~off:0 ~len:0 in
+  let c = read_eof t Ache.Bigstring.empty ~off:0 ~len:0 in
   Alcotest.(check int) "read_eof with no input returns 0" 0 c;
   connection_is_shutdown t
 
@@ -1702,7 +1702,7 @@ let test_schedule_read_with_data_available () =
       ~on_error:(Helpers.body_must_complete __LOC__)
       body
       ~on_read:(fun buf ~off ~len ->
-        let actual = Bigstringaf.substring buf ~off ~len in
+        let actual = Ache.Bigstring.substring buf ~off ~len in
         did_read := true;
         Alcotest.(check string) "Body" expected actual)
       ~on_eof:(fun () -> assert false);

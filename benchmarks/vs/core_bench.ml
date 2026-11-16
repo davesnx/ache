@@ -3,7 +3,7 @@ module type CONN = sig
   type iovec
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
-  val read : t -> Bigstringaf.t -> off:int -> len:int -> int
+  val read : t -> Ache.Bigstring.t -> off:int -> len:int -> int
 
   val next_write_operation :
      t
@@ -37,7 +37,7 @@ module Drive (Connection : CONN) = struct
     | `Yield | `Close _ -> written
 
   let feed ~first conn input capture =
-    let total = Bigstringaf.length input in
+    let total = Ache.Bigstring.length input in
     let rec go off want stalled written =
       if off >= total
       then drain conn capture written
@@ -70,25 +70,25 @@ module Ache_lib : LIB = struct
   module Server = struct
     include Server_connection
 
-    type iovec = Bigstringaf.t IOVec.t
+    type iovec = Ache.Bigstring.t IOVec.t
 
     let lengthv = IOVec.lengthv
 
     let capture b =
       List.iter (fun { IOVec.buffer; off; len } ->
-        Buffer.add_string b (Bigstringaf.substring buffer ~off ~len))
+        Buffer.add_string b (Ache.Bigstring.substring buffer ~off ~len))
   end
 
   module Client = struct
     include Client_connection
 
-    type iovec = Bigstringaf.t IOVec.t
+    type iovec = Ache.Bigstring.t IOVec.t
 
     let lengthv = IOVec.lengthv
 
     let capture b =
       List.iter (fun { IOVec.buffer; off; len } ->
-        Buffer.add_string b (Bigstringaf.substring buffer ~off ~len))
+        Buffer.add_string b (Ache.Bigstring.substring buffer ~off ~len))
   end
 
   let server () =
@@ -129,25 +129,25 @@ module Httpun_lib : LIB = struct
   module Server = struct
     include Server_connection
 
-    type iovec = Bigstringaf.t IOVec.t
+    type iovec = Ache.Bigstring.t IOVec.t
 
     let lengthv = IOVec.lengthv
 
     let capture b =
       List.iter (fun { IOVec.buffer; off; len } ->
-        Buffer.add_string b (Bigstringaf.substring buffer ~off ~len))
+        Buffer.add_string b (Ache.Bigstring.substring buffer ~off ~len))
   end
 
   module Client = struct
     include Client_connection
 
-    type iovec = Bigstringaf.t IOVec.t
+    type iovec = Ache.Bigstring.t IOVec.t
 
     let lengthv = IOVec.lengthv
 
     let capture b =
       List.iter (fun { IOVec.buffer; off; len } ->
-        Buffer.add_string b (Bigstringaf.substring buffer ~off ~len))
+        Buffer.add_string b (Ache.Bigstring.substring buffer ~off ~len))
   end
 
   let server () =
@@ -184,19 +184,19 @@ module Httpaf_lib : LIB = struct
   module Server = struct
     include Server_connection
 
-    type iovec = Bigstringaf.t IOVec.t
+    type iovec = Ache.Bigstring.t IOVec.t
 
     let lengthv = IOVec.lengthv
 
     let capture b =
       List.iter (fun { IOVec.buffer; off; len } ->
-        Buffer.add_string b (Bigstringaf.substring buffer ~off ~len))
+        Buffer.add_string b (Ache.Bigstring.substring buffer ~off ~len))
   end
 
   module Client = struct
     include Client_connection
 
-    type iovec = Bigstringaf.t IOVec.t
+    type iovec = Ache.Bigstring.t IOVec.t
 
     let next_read_operation t =
       (next_read_operation t :> [ `Read | `Yield | `Close ])
@@ -205,7 +205,7 @@ module Httpaf_lib : LIB = struct
 
     let capture b =
       List.iter (fun { IOVec.buffer; off; len } ->
-        Buffer.add_string b (Bigstringaf.substring buffer ~off ~len))
+        Buffer.add_string b (Ache.Bigstring.substring buffer ~off ~len))
   end
 
   let server () =
@@ -404,7 +404,7 @@ let scenarios =
   ]
 
 let bigstring_of_string s =
-  Bigstringaf.of_string s ~off:0 ~len:(String.length s)
+  Ache.Bigstring.of_string s ~off:0 ~len:(String.length s)
 
 let ends_with ~suffix s =
   let n = String.length suffix

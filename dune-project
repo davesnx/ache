@@ -27,7 +27,6 @@
  (depends
   (ocaml
    (>= 5.3))
-  bigstringaf
   (alcotest :with-test)
   (ocamlformat
    (and
@@ -47,7 +46,6 @@
    (>= 5.3))
   (ache
    (= :version))
-  bigstringaf
   cstruct
   eio
   (eio_main :with-test)
@@ -94,7 +92,6 @@
    (>= 5.3))
   (ache
    (= :version))
-  bigstringaf
   lwt
   (alcotest :with-test)))
 
@@ -111,7 +108,6 @@
    (>= 5.3))
   (ache
    (= :version))
-  bigstringaf
   (miou
    (>= 0.10.0))
   (alcotest :with-test)))
@@ -131,7 +127,6 @@
    (= :version))
   (ache-lwt
    (= :version))
-  bigstringaf
   domain-name
   ipaddr
   lwt
@@ -159,7 +154,6 @@
    (= :version))
   (ache-miou
    (= :version))
-  bigstringaf
   domain-name
   ipaddr
   (miou

@@ -74,7 +74,7 @@ let feed conn bs reads =
       0
       reads
   in
-  if start <> Bigstringaf.length bs then failwith "input not consumed";
+  if start <> Ache.Bigstring.length bs then failwith "input not consumed";
   drain conn
 
 let reads_of_size size total =
@@ -88,7 +88,7 @@ let reads_of_size size total =
   go 0 []
 
 let bench name input reads iterations =
-  let bs = Bigstringaf.of_string input ~off:0 ~len:(String.length input) in
+  let bs = Ache.Bigstring.of_string input ~off:0 ~len:(String.length input) in
   let conn = Server_connection.create request_handler in
   for _ = 1 to min 1000 iterations do
     feed conn bs reads

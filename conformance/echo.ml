@@ -5,7 +5,7 @@ let request_handler reqd =
   let request_body = Reqd.request_body reqd in
   let body = Buffer.create 128 in
   let rec on_read buffer ~off ~len =
-    Buffer.add_string body (Bigstringaf.substring buffer ~off ~len);
+    Buffer.add_string body (Ache.Bigstring.substring buffer ~off ~len);
     Body.Reader.schedule_read request_body ~on_eof ~on_error ~on_read
   and on_error () = prerr_endline "request body cut short"
   and on_eof () =

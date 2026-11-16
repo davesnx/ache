@@ -18,7 +18,6 @@ depends: [
   "dune" {>= "3.17"}
   "ocaml" {>= "5.3"}
   "ache" {= version}
-  "bigstringaf"
   "miou" {>= "0.10.0"}
   "alcotest" {with-test}
   "odoc" {with-doc}

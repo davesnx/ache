@@ -32,7 +32,7 @@ end
 
 module Write_operation = struct
   type t =
-    [ `Write of Bigstringaf.t IOVec.t list
+    [ `Write of Ache.Bigstring.t IOVec.t list
     | `Yield
     | `Close of int
     ]
@@ -43,7 +43,7 @@ module Write_operation = struct
     let dst_off = ref 0 in
     List.iter
       (fun { IOVec.buffer; off = src_off; len } ->
-         Bigstringaf.unsafe_blit_to_bytes
+         Ache.Bigstring.unsafe_blit_to_bytes
            buffer
            ~src_off
            bytes

@@ -81,7 +81,7 @@ let create_request_body ~request t =
   | `Fixed 0L -> Body.Writer.create_empty ~writer:t.writer
   | (`Fixed _ | `Chunked) as encoding ->
     Body.Writer.create
-      (Bigstringaf.create t.config.request_body_buffer_size)
+      (Bigstring.create t.config.request_body_buffer_size)
       ~encoding
       ~writer:t.writer
   | `Error `Bad_request ->

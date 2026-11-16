@@ -1,4 +1,4 @@
 (tests
  (names test_rfc9110 test_rfc9112)
  (package ache)
- (libraries ache alcotest bigstringaf))
+ (libraries ache alcotest))

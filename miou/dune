@@ -1,4 +1,4 @@
 (library
  (name ache_miou)
  (public_name ache-miou)
- (libraries ache bigstringaf miou miou.unix unix))
+ (libraries ache miou miou.unix unix))

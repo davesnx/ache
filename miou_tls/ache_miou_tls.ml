@@ -109,7 +109,7 @@ module Io = struct
     if available > 0
     then (
       let n = min len available in
-      Bigstringaf.blit_from_string
+      Ache.Bigstring.blit_from_string
         t.plain
         ~src_off:t.plain_off
         buffer
@@ -132,7 +132,7 @@ module Io = struct
       let length, strings =
         List.fold_left_map
           (fun acc { Ache.IOVec.buffer; off; len } ->
-             acc + len, Bigstringaf.substring buffer ~off ~len)
+             acc + len, Ache.Bigstring.substring buffer ~off ~len)
           0
           iovecs
       in

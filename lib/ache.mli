@@ -36,6 +36,7 @@
 
 (** {2 Basic HTTP Types} *)
 
+module Bigstring : module type of Bigstring
 module IOVec : module type of IOVec
 module Version : module type of Version
 module Method : module type of Method
@@ -53,13 +54,13 @@ module Runtime : sig
     type t
 
     val next_read_operation : t -> [ `Read | `Yield | `Close ]
-    val read : t -> Bigstringaf.t -> off:int -> len:int -> int
-    val read_eof : t -> Bigstringaf.t -> off:int -> len:int -> int
+    val read : t -> Bigstring.t -> off:int -> len:int -> int
+    val read_eof : t -> Bigstring.t -> off:int -> len:int -> int
     val yield_reader : t -> (unit -> unit) -> unit
 
     val next_write_operation :
        t
-      -> [ `Write of Bigstringaf.t IOVec.t list | `Yield | `Close of int ]
+      -> [ `Write of Bigstring.t IOVec.t list | `Yield | `Close of int ]
 
     val report_write_result : t -> [ `Ok of int | `Closed ] -> unit
     val yield_writer : t -> (unit -> unit) -> unit
@@ -84,7 +85,7 @@ module Body : sig
        t
       -> on_eof:(unit -> unit)
       -> on_error:(unit -> unit)
-      -> on_read:(Bigstringaf.t -> off:int -> len:int -> unit)
+      -> on_read:(Bigstring.t -> off:int -> len:int -> unit)
       -> unit
     (** [schedule_read t ~on_eof ~on_error ~on_read] schedules one read of
         [t]. Exactly one of the three callbacks is called, once:
@@ -130,12 +131,12 @@ module Body : sig
         possible, this write will be combined with previous and/or subsequent
         writes before transmission. *)
 
-    val write_bigstring : t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
+    val write_bigstring : t -> ?off:int -> ?len:int -> Bigstring.t -> unit
     (** [write_bigstring w ?off ?len bs] copies [bs] into an internal buffer. If
         possible, this write will be combined with previous and/or subsequent
         writes before transmission. *)
 
-    val schedule_bigstring : t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
+    val schedule_bigstring : t -> ?off:int -> ?len:int -> Bigstring.t -> unit
     (** [schedule_bigstring w ?off ?len bs] schedules [bs] to be transmitted at
         the next opportunity without performing a copy. [bs] should not be
         modified until a subsequent call to {!flush} has successfully completed.
@@ -371,7 +372,7 @@ module Reqd : sig
       written yet are dropped and every pending flush gets [`Closed]. *)
 
   val respond_with_string : t -> Response.t -> string -> unit
-  val respond_with_bigstring : t -> Response.t -> Bigstringaf.t -> unit
+  val respond_with_bigstring : t -> Response.t -> Bigstring.t -> unit
 
   val respond_with_streaming :
      ?flush_headers_immediately:bool
@@ -510,13 +511,13 @@ module Server_connection : sig
   (** [next_read_operation t] returns a value describing the next operation that
       the caller should conduct on behalf of the connection. *)
 
-  val read : t -> Bigstringaf.t -> off:int -> len:int -> int
+  val read : t -> Bigstring.t -> off:int -> len:int -> int
   (** [read t bigstring ~off ~len] reads bytes of input from the provided range
       of [bigstring] and returns the number of bytes consumed by the connection.
       {!read} should be called after {!next_read_operation} returns a [`Read]
       value and additional input is available for the connection to consume. *)
 
-  val read_eof : t -> Bigstringaf.t -> off:int -> len:int -> int
+  val read_eof : t -> Bigstring.t -> off:int -> len:int -> int
   (** [read_eof t bigstring ~off ~len] reads bytes of input from the provided
       range of [bigstring] and returns the number of bytes consumed by the
       connection. {!read_eof} should be called after {!next_read_operation}
@@ -531,7 +532,7 @@ module Server_connection : sig
 
   val next_write_operation :
      t
-    -> [ `Write of Bigstringaf.t IOVec.t list | `Yield | `Close of int ]
+    -> [ `Write of Bigstring.t IOVec.t list | `Yield | `Close of int ]
   (** [next_write_operation t] returns a value describing the next operation
       that the caller should conduct on behalf of the connection. *)
 
@@ -668,13 +669,13 @@ module Client_connection : sig
   (** [next_read_operation t] returns a value describing the next operation that
       the caller should conduct on behalf of the connection. *)
 
-  val read : t -> Bigstringaf.t -> off:int -> len:int -> int
+  val read : t -> Bigstring.t -> off:int -> len:int -> int
   (** [read t bigstring ~off ~len] reads bytes of input from the provided range
       of [bigstring] and returns the number of bytes consumed by the connection.
       {!read} should be called after {!next_read_operation} returns a [`Read]
       value and additional input is available for the connection to consume. *)
 
-  val read_eof : t -> Bigstringaf.t -> off:int -> len:int -> int
+  val read_eof : t -> Bigstring.t -> off:int -> len:int -> int
   (** [read_eof t bigstring ~off ~len] reads bytes of input from the provided
       range of [bigstring] and returns the number of bytes consumed by the
       connection. {!read_eof} should be called after {!next_read_operation}
@@ -684,7 +685,7 @@ module Client_connection : sig
 
   val next_write_operation :
      t
-    -> [ `Write of Bigstringaf.t IOVec.t list | `Yield | `Close of int ]
+    -> [ `Write of Bigstring.t IOVec.t list | `Yield | `Close of int ]
   (** [next_write_operation t] returns a value describing the next operation
       that the caller should conduct on behalf of the connection. *)
 
@@ -742,7 +743,7 @@ module Ache_private : sig
       type t
 
       val create : int -> t
-      val get : t -> f:(Bigstringaf.t -> off:int -> len:int -> int) -> int
+      val get : t -> f:(Bigstring.t -> off:int -> len:int -> int) -> int
 
       val unread : t -> bool
       (** [unread t] is [true] when the last {!get} consumed some bytes and
@@ -752,7 +753,7 @@ module Ache_private : sig
 
       val put :
          t
-        -> f:(Bigstringaf.t -> off:int -> len:int -> (int -> unit) -> unit)
+        -> f:(Bigstring.t -> off:int -> len:int -> (int -> unit) -> unit)
         -> (int -> unit)
         -> unit
     end
@@ -807,7 +808,7 @@ module Ache_private : sig
 
       val read_with_more :
          (_, _) t
-        -> Bigstringaf.t
+        -> Bigstring.t
         -> off:int
         -> len:int
         -> more

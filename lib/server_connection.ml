@@ -60,7 +60,7 @@ type t =
   { config : Config.t
   ; reader : Reader.request
   ; writer : Writer.t
-  ; response_body_buffer : Bigstringaf.t
+  ; response_body_buffer : Bigstring.t
   ; request_handler : request_handler
   ; error_handler : error_handler
   ; request_queue : Reqd.t Queue.t
@@ -141,7 +141,7 @@ let upgrade t (Runtime.Impl ((module Engine), engine) as impl) =
   t.upgraded <- Some impl;
   shutdown t;
   if eof
-  then ignore (Engine.read_eof engine Bigstringaf.empty ~off:0 ~len:0 : int)
+  then ignore (Engine.read_eof engine Bigstring.empty ~off:0 ~len:0 : int)
 
 let create
       ?(config = Config.default)
@@ -151,7 +151,7 @@ let create
   let { Config.response_buffer_size; response_body_buffer_size; _ } = config in
   let writer = Writer.create ~buffer_size:response_buffer_size () in
   let request_queue = Queue.create () in
-  let response_body_buffer = Bigstringaf.create response_body_buffer_size in
+  let response_body_buffer = Bigstring.create response_body_buffer_size in
   let self = ref None in
   let handler request request_body =
     match !self with

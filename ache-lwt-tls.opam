@@ -19,7 +19,6 @@ depends: [
   "ocaml" {>= "5.3"}
   "ache" {= version}
   "ache-lwt" {= version}
-  "bigstringaf"
   "domain-name"
   "ipaddr"
   "lwt"

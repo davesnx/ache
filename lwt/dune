@@ -1,4 +1,4 @@
 (library
  (name ache_lwt)
  (public_name ache-lwt)
- (libraries ache bigstringaf lwt lwt.unix unix))
+ (libraries ache lwt lwt.unix unix))

@@ -48,6 +48,11 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   (RFC 9112 §8). Exactly one of `on_eof` and `on_error` ends a body. A
   close-delimited response body still ends with `on_eof`. Add `~on_error`
   to every call.
+- ache no longer depends on bigstringaf. `Ache.Bigstring.t` replaces
+  `Bigstringaf.t` in the API. It is the same Bigarray type, so buffers from
+  bigstringaf, Cstruct, Eio and Lwt_bytes pass without a conversion.
+  `Ache.Bigstring` has the buffer functions that ache and its runtimes use,
+  with its own C stubs for blits and `memchr`.
 
 ### Server
 

@@ -55,7 +55,7 @@ let serve ?config ?(chunk = max_int) ?(mode = Immediate) ?(eof = false) input =
         ~on_eof:(fun () ->
           match Reqd.error_code reqd with None -> respond reqd | Some _ -> ())
         ~on_read:(fun bs ~off ~len ->
-          ex.body <- ex.body ^ Bigstringaf.substring bs ~off ~len;
+          ex.body <- ex.body ^ Ache.Bigstring.substring bs ~off ~len;
           loop ())
     in
     loop ()
@@ -84,13 +84,13 @@ let serve ?config ?(chunk = max_int) ?(mode = Immediate) ?(eof = false) input =
       then (
         eof_sent := true;
         ignore
-          (Server_connection.read_eof conn Bigstringaf.empty ~off:0 ~len:0
+          (Server_connection.read_eof conn Ache.Bigstring.empty ~off:0 ~len:0
            : int);
         true)
       else
         len > 0
         &&
-        let bs = Bigstringaf.of_string !pending ~off:0 ~len in
+        let bs = Ache.Bigstring.of_string !pending ~off:0 ~len in
         let n = Server_connection.read conn bs ~off:0 ~len in
         pending := String.sub !pending n (String.length !pending - n);
         let progress = n > 0 || not !stalled in

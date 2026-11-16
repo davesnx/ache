@@ -90,7 +90,7 @@ module Run (Parser : module type of Ache_private.Parse) = struct
         b.reader
         ~on_read:(fun bs ~off ~len ->
           progress := true;
-          Buffer.add_string b.buffer (Bigstringaf.substring bs ~off ~len))
+          Buffer.add_string b.buffer (Ache.Bigstring.substring bs ~off ~len))
         ~on_eof:(fun () -> b.finish <- "eof")
         ~on_error:(fun () -> b.finish <- "error");
       if !progress then drain b)
@@ -173,7 +173,7 @@ module Run (Parser : module type of Ache_private.Parse) = struct
     let pending = ref "" in
     let offer more =
       let len = String.length !pending in
-      let bs = Bigstringaf.of_string !pending ~off:0 ~len in
+      let bs = Ache.Bigstring.of_string !pending ~off:0 ~len in
       let n = read bs ~off:0 ~len more in
       if n < 0 || n > len then failwith "read consumed outside its bytes";
       pending := String.sub !pending n (len - n);

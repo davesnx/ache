@@ -1,7 +1,7 @@
 (executable
  (name parse_bench)
  (modules parse_bench)
- (libraries ache bigstringaf))
+ (libraries ache))
 
 (alias
  (name benchmarks)

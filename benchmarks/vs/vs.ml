@@ -1,3 +1,6 @@
+type bigstring =
+  (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+
 module type HTTP = sig
   type reqd
   type reader
@@ -11,14 +14,14 @@ module type HTTP = sig
   val schedule_read :
      reader
     -> on_eof:(unit -> unit)
-    -> on_read:(Bigstringaf.t -> off:int -> len:int -> unit)
+    -> on_read:(bigstring -> off:int -> len:int -> unit)
     -> unit
 
   val response : [ `OK | `Not_found ] -> (string * string) list -> response
   val respond_with_string : reqd -> response -> string -> unit
-  val respond_with_bigstring : reqd -> response -> Bigstringaf.t -> unit
+  val respond_with_bigstring : reqd -> response -> bigstring -> unit
   val respond_with_streaming : reqd -> response -> writer
-  val write_bigstring : writer -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
+  val write_bigstring : writer -> ?off:int -> ?len:int -> bigstring -> unit
   val flush : writer -> (flushed -> unit) -> unit
   val close_writer : writer -> unit
   val writer_is_closed : writer -> bool
@@ -60,13 +63,13 @@ let settings () =
   ; response_body_buffer_size = !response_body_buffer_size
   }
 
-let bigstrings : (int, Bigstringaf.t) Hashtbl.t = Hashtbl.create 16
+let bigstrings : (int, bigstring) Hashtbl.t = Hashtbl.create 16
 
 let bigstring size =
   match Hashtbl.find bigstrings size with
   | b -> b
   | exception Not_found ->
-    let b = Bigstringaf.create size in
+    let b = Bigarray.Array1.create Bigarray.char Bigarray.c_layout size in
     Bigarray.Array1.fill b 'x';
     Hashtbl.add bigstrings size b;
     b
@@ -85,8 +88,8 @@ let gc_json () =
 
 module Make (Http : HTTP) = struct
   type action =
-    | Fixed of Http.response * Bigstringaf.t
-    | Stream of Http.response * Bigstringaf.t * int
+    | Fixed of Http.response * bigstring
+    | Stream of Http.response * bigstring * int
     | Sink
     | Echo
     | Gc_stat

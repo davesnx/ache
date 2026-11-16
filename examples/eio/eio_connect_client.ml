@@ -10,7 +10,7 @@ let http_handler ~on_eof response response_body =
       exit 1
     in
     let rec on_read bs ~off ~len =
-      Bigstringaf.substring ~off ~len bs |> print_string;
+      Ache.Bigstring.substring ~off ~len bs |> print_string;
       flush stdout;
       Body.Reader.schedule_read response_body ~on_read ~on_eof ~on_error
     in

@@ -4,7 +4,6 @@
  (libraries
   ache
   ache-miou
-  bigstringaf
   domain-name
   ipaddr
   miou

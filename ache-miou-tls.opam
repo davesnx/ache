@@ -19,7 +19,6 @@ depends: [
   "ocaml" {>= "5.3"}
   "ache" {= version}
   "ache-miou" {= version}
-  "bigstringaf"
   "domain-name"
   "ipaddr"
   "miou" {>= "0.10.0"}

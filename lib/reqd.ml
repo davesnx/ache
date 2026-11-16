@@ -75,7 +75,7 @@ type t =
   ; request_body : Body.Reader.t
   ; reader : Reader.request
   ; writer : Writer.t
-  ; response_body_buffer : Bigstringaf.t
+  ; response_body_buffer : Bigstring.t
   ; error_handler : error_handler
   ; upgrade : Runtime.impl -> unit
   ; mutable persistent : bool
@@ -168,7 +168,7 @@ let respond_with_string t response str =
   | Fixed _ ->
     failwith "ache.Reqd.respond_with_string: response already complete"
 
-let respond_with_bigstring t response (bstr : Bigstringaf.t) =
+let respond_with_bigstring t response (bstr : Bigstring.t) =
   if t.error_code <> `Ok
   then
     failwith
@@ -179,7 +179,7 @@ let respond_with_bigstring t response (bstr : Bigstringaf.t) =
     let response, encoding =
       frame
         ~fn:"ache.Reqd.respond_with_bigstring"
-        ~length:(Some (Bigstringaf.length bstr))
+        ~length:(Some (Bigstring.length bstr))
         t
         response
     in
