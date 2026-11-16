@@ -840,8 +840,9 @@ README check makes sure that the code in this file is the same as the
 compiled examples.
 
 `conformance/` runs the [h1spec](https://github.com/uNetworking/h1spec)
-requests against an Eio and a Lwt echo server. It has not been run with h1spec
-yet: the CI `conformance` job exists and has never run.
+requests against an Eio and a Lwt echo server. On 2026-11-16, h1spec at
+`f0a5650` (under Node 22 with `conformance/deno_shim.mjs`) passed 33 of 33
+checks on both servers.
 
 ## Migrating from httpun 0.2
 
