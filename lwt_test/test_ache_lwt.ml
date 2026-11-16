@@ -665,24 +665,16 @@ let test_head_timeout_408 () =
     (status_line (head_timeout ()))
 
 let test_head_deadline () =
-  with_server ~head_timeout:0.2 (fun connect ->
+  with_server ~head_timeout:0.4 (fun connect ->
     connect () >>= fun socket ->
     let since = Unix.gettimeofday () in
-    let rec trickle n =
-      if n = 0
-      then Lwt.return_unit
-      else
-        Lwt.catch
-          (fun () ->
-             write_all socket "a: b\r\n" >>= fun () ->
-             Lwt_unix.sleep 0.05 >>= fun () -> trickle (n - 1))
-          (fun (_ : exn) -> Lwt.return_unit)
-    in
     write_all socket "GET /hello HTTP/1.1\r\n" >>= fun () ->
-    Lwt.both (trickle 40) (read_all socket) >>= fun ((), output) ->
+    Lwt_unix.sleep 0.2 >>= fun () ->
+    write_all socket "a: b\r\n" >>= fun () ->
+    read_all socket >>= fun output ->
     let elapsed = Unix.gettimeofday () -. since in
-    if elapsed > 1.0
-    then Alcotest.failf "trickled head rejected after %.3f s, not 0.2 s" elapsed;
+    if elapsed < 0.35 || elapsed > 0.55
+    then Alcotest.failf "head rejected after %.3f s, not 0.4 s" elapsed;
     Alcotest.(check bool)
       "4xx status line"
       true
