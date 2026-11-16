@@ -96,10 +96,12 @@ module Server : sig
       serves HTTP/1.1 on [addr] with one accept loop in each of [domains]
       domains: the calling domain and [domains - 1] domains started with
       [domain_mgr]. Each domain opens its own listening socket on [addr] with
-      [SO_REUSEADDR] and [SO_REUSEPORT], and the kernel spreads new
-      connections between them. Domains share no socket and no state of
-      ache. [addr] must name a fixed port: with port 0, each domain listens on
-      a different port.
+      [SO_REUSEADDR] and [SO_REUSEPORT]. On Linux, the kernel spreads new
+      connections between these sockets. On macOS and FreeBSD,
+      [SO_REUSEPORT] does not spread TCP connections: one socket gets them,
+      so [run] works but only one domain accepts. Domains share no socket and
+      no state of ache. [addr] must name a fixed port: with port 0, each
+      domain listens on a different port.
 
       Each loop is [Eio.Net.run_server] with [on_error] and the handler from
       {!create_connection_handler}, which takes [config], [clock],

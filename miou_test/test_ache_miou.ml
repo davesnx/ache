@@ -1143,6 +1143,13 @@ let domain_handler (_ : Unix.sockaddr) reqd =
        `OK)
     body
 
+let kernel_spreads_connections =
+  match
+    In_channel.with_open_text "/proc/sys/kernel/ostype" In_channel.input_all
+  with
+  | ostype -> String.trim ostype = "Linux"
+  | exception Sys_error _ -> false
+
 let check_domain_response seen response =
   let body =
     match String.split_on_char '\n' response |> List.rev with
@@ -1207,13 +1214,19 @@ let test_server_run_domains () =
                   send socket get_close;
                   read_all socket)
            in
-           while Hashtbl.length seen < 2 do
+           let batch () =
              List.iter
                (fun response ->
                   check_domain_response seen (Result.get_ok response))
                (Miou.await_all (List.init 16 (fun _ -> Miou.async get)))
-           done;
-           Alcotest.(check int) "domains that served" 2 (Hashtbl.length seen))))
+           in
+           batch ();
+           if kernel_spreads_connections
+           then (
+             while Hashtbl.length seen < 2 do
+               batch ()
+             done;
+             Alcotest.(check int) "domains that served" 2 (Hashtbl.length seen)))))
 
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
@@ -1258,7 +1271,7 @@ let () =
         ; ( "an exception from report_exn ends the connection"
           , `Quick
           , test_report_exn_raises )
-        ; ( "Server.run with 2 domains serves from both"
+        ; ( "Server.run with 2 domains serves, from both on Linux"
           , `Quick
           , test_server_run_domains )
         ] )

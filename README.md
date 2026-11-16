@@ -9,7 +9,8 @@ a connection. Three runtimes drive it on sockets:
 - `ache-miou`, for [Miou](https://github.com/robur-coop/miou)
 
 With `ache-eio` and `ache-miou`, `Server.run` serves on every CPU core: one
-accept loop in each domain, each on its own `SO_REUSEPORT` socket.
+accept loop in each domain, each on its own `SO_REUSEPORT` socket. The
+kernel spreads connections between the domains on Linux, not on macOS.
 
 `ache-eio-tls`, `ache-lwt-tls` and `ache-miou-tls` add TLS (see
 [TLS](docs/ache.md#tls)).

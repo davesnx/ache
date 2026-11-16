@@ -1211,6 +1211,13 @@ let domain_handler (_ : Eio.Net.Sockaddr.stream) reqd =
        `OK)
     body
 
+let kernel_spreads_connections =
+  match
+    In_channel.with_open_text "/proc/sys/kernel/ostype" In_channel.input_all
+  with
+  | ostype -> String.trim ostype = "Linux"
+  | exception Sys_error _ -> false
+
 let check_domain_response seen response =
   let body =
     match String.split_on_char '\n' response |> List.rev with
@@ -1271,12 +1278,18 @@ let test_server_run_domains () =
                Eio.Time.sleep (Eio.Stdenv.clock env) 0.01;
                get ()
            in
-           while Hashtbl.length seen < 2 do
+           let batch () =
              Eio.Fiber.List.iter
                (fun () -> check_domain_response seen (get ()))
                (List.init 16 (fun _ -> ()))
-           done;
-           Alcotest.(check int) "domains that served" 2 (Hashtbl.length seen))))
+           in
+           batch ();
+           if kernel_spreads_connections
+           then (
+             while Hashtbl.length seen < 2 do
+               batch ()
+             done;
+             Alcotest.(check int) "domains that served" 2 (Hashtbl.length seen)))))
 
 let () =
   Alcotest.run
@@ -1299,7 +1312,7 @@ let () =
         ; ( "run_server takes the partially applied handler"
           , `Quick
           , test_run_server )
-        ; ( "Server.run with 2 domains serves from both"
+        ; ( "Server.run with 2 domains serves, from both on Linux"
           , `Quick
           , test_server_run_domains )
         ; ( "normal close with trailing bytes shuts each direction once"

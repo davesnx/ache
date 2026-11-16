@@ -55,10 +55,12 @@ module Server : sig
       [addr] with one accept loop in each of [domains] Miou domains: the
       domain of the caller and [domains - 1] other domains of [Miou_unix.run].
       Each domain opens its own listening socket on [addr] with
-      [SO_REUSEADDR] and [SO_REUSEPORT], and the kernel spreads new
-      connections between them. Domains share no socket and no state of
-      ache. [addr] must name a fixed port: with port 0, each domain listens on
-      a different port.
+      [SO_REUSEADDR] and [SO_REUSEPORT]. On Linux, the kernel spreads new
+      connections between these sockets. On macOS and FreeBSD,
+      [SO_REUSEPORT] does not spread TCP connections: one socket gets them,
+      so [run] works but only one domain accepts. Domains share no socket and
+      no state of ache. [addr] must name a fixed port: with port 0, each
+      domain listens on a different port.
 
       Call it inside [Miou_unix.run]. Each accepted socket is served in its
       own task, in the domain that accepted it, by the handler from

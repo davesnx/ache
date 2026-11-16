@@ -116,8 +116,11 @@ Hello, world!
 `Ache_eio.Server.run` runs one accept loop in each of `~domains` domains
 (by default `Domain.recommended_domain_count ()`). Each domain listens on
 its own socket with `SO_REUSEPORT`, so the domains share no socket and no
-state, and the kernel spreads connections between them. The handlers run
-in several domains at the same time. The address must have a fixed port.
+state. On Linux, the kernel spreads connections between these sockets. On
+macOS and FreeBSD, `SO_REUSEPORT` does not spread TCP connections: one
+socket gets them, so `run` works but only one domain accepts. The handlers
+run in several domains at the same time. The address must have a fixed
+port.
 
 <!-- example: examples/eio/eio_multicore_server.ml -->
 ```ocaml
