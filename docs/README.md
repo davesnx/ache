@@ -803,9 +803,9 @@ that each change fixes.
   one package, `ache-lwt`. The async and mirage runtimes are removed.
 - Message heads, chunk-size lines and trailer sections are parsed by a
   hand-written parser in place of Angstrom. Bodies are framed by a small state machine.
-- [Faraday](https://github.com/inhabitedtype/faraday) 0.8.2 is vendored in
-  `vendor/faraday` and compiled inside `ache`. A program can also link the
-  opam `faraday` package.
+- A reduced copy of [Faraday](https://github.com/inhabitedtype/faraday) 0.8.2
+  is vendored in `vendor/faraday` and compiled inside `ache`. A program can
+  also link the opam `faraday` package.
 - There is no gluten. `ache-eio`, `ache-lwt` and `ache-miou` have their own
   I/O loops.
   `Ache.Runtime.S` is the interface that a runtime drives, and
@@ -980,5 +980,5 @@ checks on all three servers.
 ## License
 
 BSD-3-Clause, with the copyright lines of httpaf and httpun. See
-[LICENSE](../LICENSE). `vendor/faraday` is an unmodified copy of Faraday 0.8.2
-under its own BSD-3-Clause license in `vendor/faraday/LICENSE`.
+[LICENSE](../LICENSE). `vendor/faraday` is derived from Faraday 0.8.2, under
+the same license.

@@ -154,8 +154,9 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - A hand-written parser replaces Angstrom for message heads, chunk-size
   lines and trailer sections. Bodies are framed by hand.
   `Ache_private.Parse.Grammar` exposes the head grammars.
-- Faraday 0.8.2 is vendored in `vendor/faraday` and compiled inside `ache`,
-  which can be linked with the opam `faraday` package.
+- A reduced copy of Faraday 0.8.2 is vendored in `vendor/faraday` and
+  compiled inside `ache`, which can be linked with the opam `faraday`
+  package. The values that ache does not use are removed.
 - Field lines in requests, responses and trailers: the name is a token
   directly followed by `:`, and values and reason phrases accept only HTAB,
   SP, VCHAR and obs-text. A bare LF or bare CR line end and an obs-fold in a

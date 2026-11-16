@@ -199,7 +199,6 @@ module Writer = struct
   let write_request t request = write_request t.encoder request
   let write_response t response = write_response t.encoder response
   let write_string t ?off ?len string = write_string t.encoder ?off ?len string
-  let write_bytes t ?off ?len bytes = write_bytes t.encoder ?off ?len bytes
 
   let write_bigstring t ?off ?len bigstring =
     write_bigstring t.encoder ?off ?len bigstring
