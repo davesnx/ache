@@ -78,7 +78,7 @@ module IO_loop = struct
     | _ -> ()
 
   let start : type t.
-    (module Ache.Runtime.S with type t = t)
+    (module Ache.Runtime.ENGINE with type t = t)
     -> read_buffer_size:int
     -> read_closed:unit Promise.t * unit Promise.u
     -> timed_read:

@@ -799,7 +799,7 @@ let integrity_tests =
   ]
 
 let timeout_action s =
-  Server_connection.read_timeout s.Server.driver.Server.D.conn
+  Server_connection.read_timeout s.Server.driver.Server.Driver.conn
 
 let timeout_tests =
   [ test

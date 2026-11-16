@@ -239,15 +239,16 @@ let tests =
   ; test
       "§9.3.2 server MUST NOT: no content in an error response to HEAD"
       (fun () ->
-         let module D = Server.D in
+         let module Driver = Server.Driver in
          let d =
-           D.make (Server_connection.create (fun _ -> Alcotest.fail "handler"))
+           Driver.make
+             (Server_connection.create (fun _ -> Alcotest.fail "handler"))
          in
-         D.feed
+         Driver.feed
            d
            (req ~headers:[ "Host", "a"; "Content-Length", "abc" ] "HEAD" "/");
-         match Wire.split_head (D.output d) with
-         | None -> Alcotest.failf "no response in %S" (D.output d)
+         match Wire.split_head (Driver.output d) with
+         | None -> Alcotest.failf "no response in %S" (Driver.output d)
          | Some (line, _, rest) ->
            Alcotest.(check string) "status" "HTTP/1.1 400 Bad Request" line;
            Alcotest.(check string) "no content" "" rest)

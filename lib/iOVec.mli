@@ -29,7 +29,7 @@
   EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   ----------------------------------------------------------------------------*)
 
-type 'a t = 'a Faraday.iovec =
+type 'a t = 'a Encoder.iovec =
   { buffer : 'a
   ; off : int
   ; len : int

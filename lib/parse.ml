@@ -112,6 +112,27 @@ let digit = table (function '0' .. '9' -> true | _ -> false)
 let hex =
   table (function '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true | _ -> false)
 
+external bs_get64 : Bigstringaf.t -> int -> int64 = "%caml_bigstring_get64u"
+external bytes_set64 : bytes -> int -> int64 -> unit = "%caml_bytes_set64u"
+
+let[@inline] substring bs ~off ~len =
+  if len < 0 || off < 0 || Bigstringaf.length bs - off < len
+  then invalid_arg "Parse.substring";
+  let b = Bytes.create len in
+  if len <= 64
+  then (
+    let i = ref 0 in
+    while !i + 8 <= len do
+      bytes_set64 b !i (bs_get64 bs (off + !i));
+      i := !i + 8
+    done;
+    while !i < len do
+      Bytes.unsafe_set b !i (Bigstringaf.unsafe_get bs (off + !i));
+      incr i
+    done)
+  else Bigstringaf.unsafe_blit_to_bytes bs ~src_off:off b ~dst_off:0 ~len;
+  Bytes.unsafe_to_string b
+
 (* Past [stop] every byte reads as NUL, which no rule accepts. *)
 let get bs stop i = if i < stop then Bigstringaf.unsafe_get bs i else '\000'
 
@@ -206,7 +227,7 @@ let methods =
   ]
 
 let rec meth bs off len = function
-  | [] -> Method.of_string (Bigstringaf.substring bs ~off ~len)
+  | [] -> Method.of_string (substring bs ~off ~len)
   | (s, m) :: rest -> if literal bs off len s then m else meth bs off len rest
 
 let request_line ~eof o bs off stop =
@@ -225,10 +246,7 @@ let request_line ~eof o bs off stop =
       then (
         o.meth <- meth bs off (meth_end - off) methods;
         o.text <-
-          Bigstringaf.substring
-            bs
-            ~off:(meth_end + 1)
-            ~len:(target_end - meth_end - 1));
+          substring bs ~off:(meth_end + 1) ~len:(target_end - meth_end - 1));
       p
 
 let digit_at bs i = Char.code (Bigstringaf.unsafe_get bs i) - 48
@@ -264,7 +282,7 @@ let status_line ~eof o bs off stop =
            (if n > 3
             then "status-code too long: %S"
             else "invalid status-code: %S")
-           (Bigstringaf.substring bs ~off:(p + 1) ~len:n))
+           (substring bs ~off:(p + 1) ~len:n))
     else if get bs stop code_end <> ' '
     then unexpected ~eof o bs stop code_end where
     else
@@ -278,10 +296,7 @@ let status_line ~eof o bs off stop =
             + (10 * digit_at bs (p + 2))
             + digit_at bs (p + 3));
         o.text <-
-          Bigstringaf.substring
-            bs
-            ~off:(code_end + 1)
-            ~len:(reason_end - code_end - 1));
+          substring bs ~off:(code_end + 1) ~len:(reason_end - code_end - 1));
       q
 
 let rec trim_end bs off i =
@@ -307,18 +322,13 @@ let field_line ~eof ~obs_fold o bs off stop =
     (if p >= 0
      then
        let value =
-         Bigstringaf.substring
-           bs
-           ~off:start
-           ~len:(trim_end bs start value_end - start)
+         substring bs ~off:start ~len:(trim_end bs start value_end - start)
        in
        match o.fields with
        | (name, previous) :: rest when fold ->
          o.fields <- (name, String.trim (previous ^ " " ^ value)) :: rest
        | fields ->
-         o.fields <-
-           (Bigstringaf.substring bs ~off ~len:(name_end - off), value)
-           :: fields);
+         o.fields <- (substring bs ~off ~len:(name_end - off), value) :: fields);
     p
 
 let rec fields ~eof ~obs_fold o bs p stop where =
@@ -404,7 +414,7 @@ let chunk_size_line ~eof o bs off stop =
       digits_end
       (Printf.sprintf
          "chunk-size too long: %S"
-         (Bigstringaf.substring bs ~off:digits ~len:(digits_end - digits)))
+         (substring bs ~off:digits ~len:(digits_end - digits)))
   else
     let p = chunk_ext ~eof o bs stop digits_end where in
     let p = if p < 0 then p else end_line ~eof o bs stop p where in

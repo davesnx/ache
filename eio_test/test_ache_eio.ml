@@ -77,6 +77,10 @@ let stream_flush_closed : unit Eio.Promise.u option ref = ref None
 let requests_seen = ref 0
 let pending_upgrade : Reqd.t option ref = ref None
 
+exception Respond_later
+
+let late_error_response : (unit -> unit) option ref = ref None
+
 let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
   incr requests_seen;
   let request = Reqd.request reqd in
@@ -131,6 +135,7 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
     loop ()
   | `GET, "/upgrade-later" -> pending_upgrade := Some reqd
   | `GET, "/raise" -> failwith "handler failed"
+  | `GET, "/raise-later" -> raise Respond_later
   | `POST, "/partial" ->
     let rec on_read _ ~off:_ ~len:_ =
       Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
@@ -150,7 +155,11 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
 
 let error_handler (_ : Eio.Net.Sockaddr.stream) ?request:_ error start_response =
   server_errors := error :: !server_errors;
-  Body.Writer.close (start_response Headers.empty)
+  match error with
+  | `Exn Respond_later ->
+    late_error_response :=
+      Some (fun () -> Body.Writer.close (start_response Headers.empty))
+  | _ -> Body.Writer.close (start_response Headers.empty)
 
 let connections_done : unit Eio.Stream.t = Eio.Stream.create max_int
 let real_sleep : (float -> unit) ref = ref (fun (_ : float) -> ())
@@ -791,6 +800,31 @@ let test_handler_exception () =
     Eio.Stream.take connections_done);
   check_shutdowns ()
 
+let rec respond_late () =
+  match !late_error_response with
+  | Some respond ->
+    late_error_response := None;
+    respond ()
+  | None ->
+    !real_sleep 0.01;
+    respond_late ()
+
+let test_late_error_response () =
+  late_error_response := None;
+  with_server (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    Eio.Flow.copy_string
+      "GET /raise-later HTTP/1.1\r\nhost: localhost\r\n\r\n"
+      socket;
+    !real_sleep 0.05;
+    respond_late ();
+    Alcotest.(check string)
+      "status line"
+      "HTTP/1.1 500 Internal Server Error"
+      (status_line (read_all socket));
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
 let test_run_server () =
   Eio_main.run (fun env ->
     Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 10.0 (fun () ->
@@ -1191,6 +1225,7 @@ let () =
           , `Quick
           , test_close_with_trailing_bytes )
         ; "request handler exception", `Quick, test_handler_exception
+        ; "late error response", `Quick, test_late_error_response
         ; ( "cancelling the connection fiber is not an error"
           , `Quick
           , test_cancel_is_not_an_error )

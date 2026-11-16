@@ -30,7 +30,7 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module type S = sig
+module type ENGINE = sig
   type t
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
@@ -49,7 +49,7 @@ module type S = sig
   val shutdown : t -> unit
 end
 
-type impl = Impl : (module S with type t = 't) * 't -> impl
+type impl = Impl : (module ENGINE with type t = 't) * 't -> impl
 
 let make runtime t = Impl (runtime, t)
 
@@ -59,27 +59,38 @@ module Upgradable = struct
   let create impl = { impl }
 
   let upgrade t impl' =
-    let (Impl ((module P), p)) = t.impl in
+    let (Impl ((module Engine), engine)) = t.impl in
     t.impl <- impl';
-    P.shutdown p
+    Engine.shutdown engine
 
-  let next_read_operation { impl = Impl ((module P), p) } =
-    P.next_read_operation p
+  let next_read_operation { impl = Impl ((module Engine), engine) } =
+    Engine.next_read_operation engine
 
-  let read { impl = Impl ((module P), p) } = P.read p
-  let read_eof { impl = Impl ((module P), p) } = P.read_eof p
-  let yield_reader { impl = Impl ((module P), p) } = P.yield_reader p
+  let read { impl = Impl ((module Engine), engine) } = Engine.read engine
 
-  let next_write_operation { impl = Impl ((module P), p) } =
-    P.next_write_operation p
+  let read_eof { impl = Impl ((module Engine), engine) } =
+    Engine.read_eof engine
 
-  let report_write_result { impl = Impl ((module P), p) } =
-    P.report_write_result p
+  let yield_reader { impl = Impl ((module Engine), engine) } =
+    Engine.yield_reader engine
 
-  let yield_writer { impl = Impl ((module P), p) } = P.yield_writer p
-  let report_exn { impl = Impl ((module P), p) } = P.report_exn p
-  let is_closed { impl = Impl ((module P), p) } = P.is_closed p
-  let shutdown { impl = Impl ((module P), p) } = P.shutdown p
+  let next_write_operation { impl = Impl ((module Engine), engine) } =
+    Engine.next_write_operation engine
+
+  let report_write_result { impl = Impl ((module Engine), engine) } =
+    Engine.report_write_result engine
+
+  let yield_writer { impl = Impl ((module Engine), engine) } =
+    Engine.yield_writer engine
+
+  let report_exn { impl = Impl ((module Engine), engine) } =
+    Engine.report_exn engine
+
+  let is_closed { impl = Impl ((module Engine), engine) } =
+    Engine.is_closed engine
+
+  let shutdown { impl = Impl ((module Engine), engine) } =
+    Engine.shutdown engine
 end
 
 module Buffer = struct

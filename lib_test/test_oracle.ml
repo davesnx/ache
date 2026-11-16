@@ -110,7 +110,7 @@ let same_outcome input k e a =
 
 let cases = lazy (load data)
 
-module R = Run (Ache.Ache_private.Parse)
+module Parse_oracle = Run (Ache.Ache_private.Parse)
 
 let test_size () =
   let cases = Lazy.force cases in
@@ -130,7 +130,7 @@ let check name differs =
 
 let test_grammar () =
   check "grammar" (fun c ->
-    let g = R.grammar c.input in
+    let g = Parse_oracle.grammar c.input in
     not
       (same_result c.grammar.request g.request
       && same_result c.grammar.response g.response
@@ -139,7 +139,7 @@ let test_grammar () =
 
 let test_reader () =
   check "reader" (fun c ->
-    let now = R.case c.kind ~limit:c.limit c.input in
+    let now = Parse_oracle.case c.kind ~limit:c.limit c.input in
     not
       (Array.for_all
          Fun.id
@@ -149,7 +149,7 @@ let test_reader () =
 
 let test_splits_end_as_one_read () =
   check "split" (fun c ->
-    let now = R.case c.kind ~limit:c.limit c.input in
+    let now = Parse_oracle.case c.kind ~limit:c.limit c.input in
     let one = now.outcomes.(0) in
     not
       (Array.for_all

@@ -74,7 +74,7 @@ let response_to_string { Response.version; status; reason; headers } =
        reason
        (headers_to_string headers))
 
-module Run (P : module type of Ache_private.Parse) = struct
+module Run (Parser : module type of Ache_private.Parse) = struct
   type body =
     { reader : Body.Reader.t
     ; head : string
@@ -97,11 +97,13 @@ module Run (P : module type of Ache_private.Parse) = struct
 
   let grammar input =
     let map f = Result.map f in
-    { request = map request_to_string (P.Grammar.request input)
-    ; response = map response_to_string (P.Grammar.response input)
-    ; chunk_size = map Int64.to_string (P.Grammar.chunk_size input)
+    { request = map request_to_string (Parser.Grammar.request input)
+    ; response = map response_to_string (Parser.Grammar.response input)
+    ; chunk_size = map Int64.to_string (Parser.Grammar.chunk_size input)
     ; trailers =
-        map (fun h -> summary (headers_to_string h)) (P.Grammar.trailers input)
+        map
+          (fun h -> summary (headers_to_string h))
+          (Parser.Grammar.trailers input)
     }
 
   let request_error = function
@@ -142,13 +144,13 @@ module Run (P : module type of Ache_private.Parse) = struct
       match kind with
       | Request ->
         let r =
-          P.Reader.request ~max_header_size:limit (fun request body ->
+          Parser.Reader.request ~max_header_size:limit (fun request body ->
             collect (request_to_string request) body)
         in
-        ( P.Reader.read_with_more r
+        ( Parser.Reader.read_with_more r
         , fun () ->
             next_of
-              (match P.Reader.next r with
+              (match Parser.Reader.next r with
               | `Error e -> `Error (request_error e)
               | (`Read | `Start | `Close) as n -> n) )
       | Response meth ->
@@ -160,11 +162,11 @@ module Run (P : module type of Ache_private.Parse) = struct
                (fun response body -> collect (response_to_string response) body))
             queue
         done;
-        let r = P.Reader.response ~max_header_size:limit queue in
-        ( P.Reader.read_with_more r
+        let r = Parser.Reader.response ~max_header_size:limit queue in
+        ( Parser.Reader.read_with_more r
         , fun () ->
             next_of
-              (match P.Reader.next r with
+              (match Parser.Reader.next r with
               | `Error e -> `Error (response_error e)
               | (`Read | `Start | `Close) as n -> n) )
     in
@@ -178,7 +180,7 @@ module Run (P : module type of Ache_private.Parse) = struct
       n
     in
     let rec feed () =
-      if !pending <> "" && offer P.Incomplete > 0 then feed ()
+      if !pending <> "" && offer Parser.Incomplete > 0 then feed ()
     in
     let snapshot () =
       { next = next ()
@@ -195,7 +197,7 @@ module Run (P : module type of Ache_private.Parse) = struct
         chunks
     in
     let pre = snapshot () in
-    ignore (offer P.Complete : int);
+    ignore (offer Parser.Complete : int);
     let post = snapshot () in
     let messages =
       List.rev_map

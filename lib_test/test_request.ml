@@ -86,10 +86,10 @@ let test_body_length () =
     (req `GET Headers.(of_list [ "transfer-encoding", "CHUNKED" ]))
 
 let check_rejected name ~expect request =
-  let f = Faraday.create 0x100 in
+  let f = Encoder.create 0x100 in
   Alcotest.check_raises name (Invalid_argument expect) (fun () ->
     Ache_private.Serialize.write_request f request);
-  Alcotest.(check int) (name ^ ": nothing written") 0 (Faraday.pending_bytes f)
+  Alcotest.(check int) (name ^ ": nothing written") 0 (Encoder.pending_bytes f)
 
 let test_serialize_rejects_invalid_head () =
   List.iter

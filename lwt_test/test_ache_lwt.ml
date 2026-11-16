@@ -89,6 +89,10 @@ let stream response_body =
 
 let requests_seen = ref 0
 
+exception Respond_later
+
+let late_error_response : (unit -> unit) option ref = ref None
+
 let request_handler (_ : Unix.sockaddr) reqd =
   incr requests_seen;
   let request = Reqd.request reqd in
@@ -138,6 +142,7 @@ let request_handler (_ : Unix.sockaddr) reqd =
            stream (Reqd.respond_with_streaming reqd (Response.create `OK)))
         !stream_start)
   | `GET, "/raise" -> failwith "handler failed"
+  | `GET, "/raise-later" -> raise Respond_later
   | `POST, "/partial" ->
     let rec on_read _ ~off:_ ~len:_ =
       Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
@@ -157,7 +162,11 @@ let request_handler (_ : Unix.sockaddr) reqd =
 
 let error_handler (_ : Unix.sockaddr) ?request:_ error start_response =
   server_errors := error :: !server_errors;
-  Body.Writer.close (start_response Headers.empty)
+  match error with
+  | `Exn Respond_later ->
+    late_error_response :=
+      Some (fun () -> Body.Writer.close (start_response Headers.empty))
+  | _ -> Body.Writer.close (start_response Headers.empty)
 
 open Lwt.Infix
 
@@ -664,6 +673,28 @@ let test_head_timeout_408 () =
     "HTTP/1.1 408 Request Timeout"
     (status_line (head_timeout ()))
 
+let rec respond_late () =
+  match !late_error_response with
+  | Some respond ->
+    late_error_response := None;
+    respond ();
+    Lwt.return_unit
+  | None -> Lwt_unix.sleep 0.01 >>= respond_late
+
+let test_late_error_response () =
+  late_error_response := None;
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket "GET /raise-later HTTP/1.1\r\nhost: localhost\r\n\r\n"
+    >>= fun () ->
+    Lwt_unix.sleep 0.05 >>= respond_late >>= fun () ->
+    read_all socket >>= fun output ->
+    Alcotest.(check string)
+      "status line"
+      "HTTP/1.1 500 Internal Server Error"
+      (status_line output);
+    Lwt_unix.close socket)
+
 let test_head_deadline () =
   with_server ~head_timeout:0.4 (fun connect ->
     connect () >>= fun socket ->
@@ -907,6 +938,7 @@ let () =
         ; "read failure ends the connection", `Quick, test_read_failure
         ; "write failure ends the connection", `Quick, test_write_failure
         ; "request handler exception", `Quick, test_handler_exception
+        ; "late error response", `Quick, test_late_error_response
         ; ( "client shutdown closes the socket once"
           , `Quick
           , test_client_shutdown_closes_once )

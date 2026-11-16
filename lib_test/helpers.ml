@@ -1,20 +1,20 @@
 open Ache
-module Faraday = Ache_private.Faraday
+module Encoder = Ache_private.Encoder
 
 let maybe_serialize_body f body =
-  match body with None -> () | Some body -> Faraday.write_string f body
+  match body with None -> () | Some body -> Encoder.write_string f body
 
 let request_to_string ?body r =
-  let f = Faraday.create 0x1000 in
+  let f = Encoder.create 0x1000 in
   Ache_private.Serialize.write_request f r;
   maybe_serialize_body f body;
-  Faraday.serialize_to_string f
+  Encoder.serialize_to_string f
 
 let response_to_string ?body r =
-  let f = Faraday.create 0x1000 in
+  let f = Encoder.create 0x1000 in
   Ache_private.Serialize.write_response f r;
   maybe_serialize_body f body;
-  Faraday.serialize_to_string f
+  Encoder.serialize_to_string f
 
 module Read_operation = struct
   type t =

@@ -63,7 +63,7 @@ module Make (Io : IO) = struct
     let shutdown = Io.shutdown
 
     let start : type t.
-      (module Ache.Runtime.S with type t = t)
+      (module Ache.Runtime.ENGINE with type t = t)
       -> read_buffer_size:int
       -> read_closed:Read_closed.t
       -> interruptible:bool
@@ -237,7 +237,18 @@ module Make (Io : IO) = struct
         | `Close _ -> shutdown_once SHUTDOWN_SEND
       in
       let read_task () =
-        (match read_loop () with () -> () | exception exn -> fail exn);
+        (match read_loop () with
+        | () -> ()
+        | exception (Miou.Cancelled as exn) -> raise exn
+        | exception exn ->
+          (match Runtime.report_exn t exn with
+          | () ->
+            shutdown_once SHUTDOWN_RECEIVE;
+            Read_closed.close read_closed
+          | exception (Miou.Cancelled as exn) -> raise exn
+          | exception _ ->
+            failed := true;
+            ignore (Miou.Computation.try_return stopped () : bool)));
         Option.iter Miou.cancel !reader
       and write_task () =
         match write_loop () with () -> () | exception exn -> fail exn

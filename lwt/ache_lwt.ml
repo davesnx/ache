@@ -64,7 +64,7 @@ module IO_loop = struct
 
   let start : type t fd.
     (module IO with type socket = fd)
-    -> (module Ache.Runtime.S with type t = t)
+    -> (module Ache.Runtime.ENGINE with type t = t)
     -> t
     -> read_buffer_size:int
     -> timed_read:((unit -> int Lwt.t) -> (int, [ `Timeout ]) result Lwt.t)
@@ -87,6 +87,19 @@ module IO_loop = struct
       Lwt.return_unit
     in
     let read_loop_exited, notify_read_loop_exited = Lwt.wait () in
+    let read_loop_done () =
+      if Lwt.is_sleeping read_loop_exited
+      then Lwt.wakeup_later notify_read_loop_exited ();
+      (try Io.shutdown_receive socket with _ -> ());
+      Lwt.return_unit
+    in
+    let read_failed exn =
+      match Runtime.report_exn t exn with
+      | () -> read_loop_done ()
+      | exception _ ->
+        if Lwt.is_sleeping failed then Lwt.wakeup_later notify_failed ();
+        Lwt.return_unit
+    in
     let rec read_loop () =
       let rec read_loop_step () =
         match Runtime.next_read_operation t with
@@ -112,12 +125,9 @@ module IO_loop = struct
         | `Yield ->
           Runtime.yield_reader t read_loop;
           Lwt.return_unit
-        | `Close ->
-          Lwt.wakeup_later notify_read_loop_exited ();
-          (try Io.shutdown_receive socket with _ -> ());
-          Lwt.return_unit
+        | `Close -> read_loop_done ()
       in
-      Lwt.async (fun () -> Lwt.catch read_loop_step fail)
+      Lwt.async (fun () -> Lwt.catch read_loop_step read_failed)
     in
     let writev = Io.writev socket in
     let write_loop_exited, notify_write_loop_exited = Lwt.wait () in

@@ -9,9 +9,9 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `ache-eio`, and `httpun-lwt` and `httpun-lwt-unix` become `ache-lwt`.
   `httpun-async` and `httpun-mirage` are removed.
 - No gluten dependency. Request handlers in the runtimes take `Reqd.t` in
-  place of `Reqd.t Gluten.reqd`. The new `Ache.Runtime` has `module type S`,
-  the interface a runtime drives, and `Runtime.make` to pack a protocol as a
-  `Runtime.impl`.
+  place of `Reqd.t Gluten.reqd`. The new `Ache.Runtime` has
+  `module type ENGINE`, the interface a runtime drives, and `Runtime.make` to
+  pack a protocol as a `Runtime.impl`.
 - `Reqd.respond_with_upgrade` takes a `Runtime.impl` in place of a
   `unit -> unit` callback. When the 101 is written, the connection hands the
   socket and its unread input to that protocol. `Ache_eio.Client.upgrade` and
@@ -154,8 +154,9 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - A hand-written parser replaces Angstrom for message heads, chunk-size
   lines and trailer sections. Bodies are framed by hand.
   `Ache_private.Parse.Grammar` exposes the head grammars.
-- Faraday 0.8.2 is vendored in `vendor/faraday` and compiled inside `ache`,
-  which can be linked with the opam `faraday` package.
+- ache's buffered writer, `Encoder`, comes from Faraday 0.8.2. The values
+  that ache does not use are removed. ache does not depend on the opam
+  `faraday` package.
 - Field lines in requests, responses and trailers: the name is a token
   directly followed by `:`, and values and reason phrases accept only HTAB,
   SP, VCHAR and obs-text. A bare LF or bare CR line end and an obs-fold in a
@@ -190,7 +191,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   that is already closed) reports `` `Closed ``. In `ache-lwt` a read that
   fails with `ECONNRESET`, `ENOTCONN` or `EBADF` is end of input.
 - A `shutdown` or `close` of the flow that raises, and an exception from
-  `Runtime.S.report_exn`, end the connection; the handler returns normally.
+  `Runtime.ENGINE.report_exn`, end the connection; the handler returns normally.
 - `yield_reader` and `yield_writer` on a closed side call their callback at
   once in place of raising.
 - `ache-eio`: with `?clock`, a server that stops reading drops input until

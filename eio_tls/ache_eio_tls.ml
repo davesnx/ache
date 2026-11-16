@@ -52,9 +52,13 @@ module Guarded = struct
   let close t = Eio.Resource.close t.tls
 end
 
-let two_way (type t) (module F : Eio.Flow.Pi.TWO_WAY with type t = t) close =
+let two_way
+      (type t)
+      (module Tls_flow : Eio.Flow.Pi.TWO_WAY with type t = t)
+      close
+  =
   Eio.Resource.handler
-    (Eio.Resource.bindings (Eio.Flow.Pi.two_way (module F))
+    (Eio.Resource.bindings (Eio.Flow.Pi.two_way (module Tls_flow))
     @ [ H (Eio.Resource.Close, close) ])
 
 let tcp_handler = two_way (module Tcp) Tcp.close
