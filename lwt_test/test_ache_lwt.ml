@@ -821,12 +821,15 @@ let test_pipelined_head_deadline () =
 let test_head_timer_cancelled () =
   let before = Lwt_engine.timer_count () in
   with_server ~head_timeout:30. (fun connect ->
-    connect () >>= fun socket ->
-    write_all socket "GET /hello HTTP/1.1\r\nHo" >>= fun () ->
-    Lwt_unix.sleep 0.05 >>= fun () ->
-    Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
-    read_all socket >>= fun (_ : string) -> Lwt_unix.close socket);
-  Alcotest.(check int) "no timer left" before (Lwt_engine.timer_count ())
+    List.init 5 Fun.id
+    |> Lwt_list.iter_s (fun (_ : int) ->
+      connect () >>= fun socket ->
+      write_all socket "GET /hello HTTP/1.1\r\nHo" >>= fun () ->
+      Lwt_unix.sleep 0.05 >>= fun () ->
+      Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
+      read_all socket >>= fun (_ : string) -> Lwt_unix.close socket));
+  let left = Lwt_engine.timer_count () - before in
+  if left > 1 then Alcotest.failf "%d timers left after 5 connections" left
 
 let live_words () =
   Gc.full_major ();
@@ -872,6 +875,89 @@ let test_head_timer_bounded () =
     write_all socket "GET /hello HTTP/1.1\r\n" >>= fun () ->
     Lwt_unix.sleep 0.001 >>= fun () ->
     write_all socket "host: localhost\r\n\r\n")
+
+let check_connection_timers_bounded ~connections exchange =
+  let previous = Lwt_engine.get () in
+  Lwt_engine.set ~destroy:false (new Lwt_engine.select);
+  let growth = ref 0 in
+  Fun.protect
+    ~finally:(fun () -> Lwt_engine.set previous)
+    (fun () ->
+       run (fun () ->
+         let listening = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+         Lwt_unix.setsockopt listening Unix.SO_REUSEADDR true;
+         Lwt_unix.bind listening Unix.(ADDR_INET (inet_addr_loopback, 0))
+         >>= fun () ->
+         Lwt_unix.listen listening 16;
+         let addr = Lwt_unix.getsockname listening in
+         let open_connections = ref 0 in
+         let rec accept () =
+           Lwt_unix.accept listening >>= fun (socket, client_addr) ->
+           incr open_connections;
+           Lwt.async (fun () ->
+             Ache_lwt.Server.create_connection_handler
+               ~idle_timeout:30.
+               ~head_timeout:30.
+               ~request_handler
+               ~error_handler
+               client_addr
+               socket
+             >|= fun () -> decr open_connections);
+           accept ()
+         in
+         let acceptor = accept () in
+         let earlier_live_sleeper = Lwt_unix.sleep 20. in
+         let rec all_closed () =
+           if !open_connections = 0
+           then Lwt.return_unit
+           else Lwt_unix.sleep 0.001 >>= all_closed
+         in
+         let rec exchanges n =
+           if n = 0
+           then all_closed ()
+           else
+             let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+             Lwt_unix.connect socket addr >>= fun () ->
+             Lwt_unix.sleep 0.001 >>= fun () ->
+             exchange socket >>= fun () ->
+             Lwt_unix.close socket >>= fun () -> exchanges (n - 1)
+         in
+         exchanges (connections / 10) >>= fun () ->
+         let before = live_words () in
+         exchanges connections >>= fun () ->
+         growth := live_words () - before;
+         Lwt.cancel earlier_live_sleeper;
+         Lwt.cancel acceptor;
+         Lwt_unix.close listening));
+  if !growth > connections
+  then
+    Alcotest.failf
+      "heap grew by %d words over %d connections"
+      !growth
+      connections
+
+let test_closed_connection_timers_bounded () =
+  check_connection_timers_bounded ~connections:1000 (fun socket ->
+    write_all socket "GET /hello HTTP/1.1\r\n" >>= fun () ->
+    Lwt_unix.sleep 0.001 >>= fun () ->
+    write_all socket "host: localhost\r\nconnection: close\r\n\r\n"
+    >>= fun () ->
+    read_all socket >>= fun output ->
+    Alcotest.(check string)
+      "response"
+      "HTTP/1.1 200 OK\r\n\
+       content-length: 11\r\n\
+       connection: close\r\n\
+       \r\n\
+       hello world"
+      output;
+    Lwt.return_unit)
+
+let test_idle_connection_timers_bounded () =
+  check_connection_timers_bounded ~connections:1000 (fun socket ->
+    write_all socket get_hello >>= fun () ->
+    read_exactly socket (String.length hello_response) >|= fun response ->
+    Alcotest.(check string) "response" hello_response response)
 
 let test_failing_shutdown_and_close () =
   fail_read := false;
@@ -1033,5 +1119,11 @@ let () =
         ; ( "requests with split heads do not pile up head timers"
           , `Quick
           , test_head_timer_bounded )
+        ; ( "closed connections do not pile up timers"
+          , `Quick
+          , test_closed_connection_timers_bounded )
+        ; ( "keep-alive connections closed while idle do not pile up timers"
+          , `Quick
+          , test_idle_connection_timers_bounded )
         ] )
     ]

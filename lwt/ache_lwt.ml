@@ -153,26 +153,80 @@ module IO_loop = struct
     >>= close
 end
 
-module Deadline = struct
+module Timeout = struct
   type t =
-    { mutable at : float
-    ; mutable timer : unit Lwt.t
+    { queue : queue
+    ; mutable at : float
+    ; mutable prev : t
+    ; mutable next : t
+    ; mutable expired : unit Lwt.t * unit Lwt.u
     }
 
-  let create () = { at = 0.; timer = Lwt.return_unit }
+  and queue =
+    { seconds : float
+    ; root : t
+    ; mutable sleeping : bool
+    }
 
-  let rec sleep t =
-    let left = t.at -. Unix.gettimeofday () in
-    if left > 0.
-    then Lwt_unix.sleep left >>= fun () -> sleep t
-    else Lwt.return_unit
+  let queues : (float, queue) Hashtbl.t = Hashtbl.create 2
 
-  let set t seconds =
-    t.at <- Unix.gettimeofday () +. seconds;
-    if not (Lwt.is_sleeping t.timer) then t.timer <- sleep t
+  let create seconds =
+    let queue =
+      match Hashtbl.find_opt queues seconds with
+      | Some queue -> queue
+      | None ->
+        let rec queue = { seconds; root; sleeping = false }
+        and root =
+          { queue
+          ; at = infinity
+          ; prev = root
+          ; next = root
+          ; expired = Lwt.wait ()
+          }
+        in
+        Hashtbl.add queues seconds queue;
+        queue
+    in
+    let rec t = { queue; at = 0.; prev = t; next = t; expired = Lwt.wait () } in
+    t
 
-  let wait t = Lwt.protected t.timer
-  let stop t = Lwt.cancel t.timer
+  let stop t =
+    t.prev.next <- t.next;
+    t.next.prev <- t.prev;
+    t.prev <- t;
+    t.next <- t
+
+  let rec run queue () =
+    let now = Unix.gettimeofday () in
+    let rec expire () =
+      let t = queue.root.next in
+      if t != queue.root && t.at <= now
+      then (
+        stop t;
+        Lwt.wakeup_later (snd t.expired) ();
+        expire ())
+    in
+    expire ();
+    let front = queue.root.next in
+    if front == queue.root
+    then queue.sleeping <- false
+    else Lwt.on_success (Lwt_unix.sleep (front.at -. now)) (run queue)
+
+  let set t =
+    let queue = t.queue in
+    stop t;
+    if not (Lwt.is_sleeping (fst t.expired)) then t.expired <- Lwt.wait ();
+    t.at <- Unix.gettimeofday () +. queue.seconds;
+    t.prev <- queue.root.prev;
+    t.next <- queue.root;
+    queue.root.prev.next <- t;
+    queue.root.prev <- t;
+    if not queue.sleeping
+    then (
+      queue.sleeping <- true;
+      Lwt.on_success (Lwt_unix.sleep queue.seconds) (run queue))
+
+  let expired t = Lwt.protected (fst t.expired)
 end
 
 module Make (Io : IO) = struct
@@ -199,10 +253,13 @@ module Make (Io : IO) = struct
       =
       check_timeout "idle_timeout" idle_timeout;
       check_timeout "head_timeout" head_timeout;
-      let head_timer = Deadline.create ()
+      let head_timer = Option.map Timeout.create head_timeout
       and head_armed = ref false
-      and idle_timer = Deadline.create () in
-      let stop_head_timer () = head_armed := false in
+      and idle_timer = Option.map Timeout.create idle_timeout in
+      let stop_head_timer () =
+        head_armed := false;
+        Option.iter Timeout.stop head_timer
+      in
       let connection =
         Ache.Server_connection.create
           ~config
@@ -212,15 +269,15 @@ module Make (Io : IO) = struct
              request_handler client_addr reqd)
       in
       let observe () =
-        match head_timeout with
+        match head_timer with
         | None -> ()
-        | Some seconds ->
+        | Some timer ->
           (match Ache.Server_connection.read_timeout connection with
           | Some (`Head, _) ->
             if not !head_armed
             then (
               head_armed := true;
-              Deadline.set head_timer seconds)
+              Timeout.set timer)
           | Some (`Idle, _) | None -> stop_head_timer ())
       in
       let module Observed = struct
@@ -239,24 +296,27 @@ module Make (Io : IO) = struct
       in
       let timed_read read =
         observe ();
+        let reading = IO_loop.untimed_read read in
         let limit =
-          match Ache.Server_connection.read_timeout connection with
-          | Some (`Idle, on_timeout) ->
-            Option.map
-              (fun seconds ->
-                 Deadline.set idle_timer seconds;
-                 Deadline.wait idle_timer, on_timeout)
-              idle_timeout
-          | Some (`Head, on_timeout) when !head_armed ->
-            Some (Deadline.wait head_timer, on_timeout)
-          | Some (`Head, _) | None -> None
+          if not (Lwt.is_sleeping reading)
+          then None
+          else
+            match
+              Ache.Server_connection.read_timeout connection, idle_timer
+            with
+            | Some (`Idle, on_timeout), Some timer ->
+              Timeout.set timer;
+              Some (timer, on_timeout)
+            | Some (`Head, on_timeout), _ when !head_armed ->
+              Option.map (fun timer -> timer, on_timeout) head_timer
+            | (Some ((`Idle | `Head), _) | None), _ -> None
         in
         match limit with
-        | None -> IO_loop.untimed_read read
+        | None -> reading
         | Some (timer, on_timeout) ->
           Lwt.pick
-            [ IO_loop.untimed_read read
-            ; ( timer >|= fun () ->
+            [ reading
+            ; ( Timeout.expired timer >|= fun () ->
                 on_timeout ();
                 Error `Timeout )
             ]
@@ -277,8 +337,8 @@ module Make (Io : IO) = struct
              ~close:(IO_loop.close_once Io.close socket)
              socket)
         (fun () ->
-           Deadline.stop head_timer;
-           Deadline.stop idle_timer;
+           Option.iter Timeout.stop head_timer;
+           Option.iter Timeout.stop idle_timer;
            Lwt.return_unit)
   end
 
