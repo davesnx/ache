@@ -19,7 +19,6 @@ depends: [
   "ocaml" {>= "5.3"}
   "bigstringaf"
   "alcotest" {with-test}
-  "faraday" {with-test}
   "ocamlformat" {= "0.29.0" & with-dev-setup}
   "odoc" {with-doc}
 ]

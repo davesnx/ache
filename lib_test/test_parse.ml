@@ -415,15 +415,15 @@ let test_large_header_small_reads () =
   Alcotest.(check int) "consumed" (String.length input) s.feeder.consumed
 
 let test_chunk_size_overflow () =
-  let module G = Ache_private.Parse.Grammar in
+  let module Grammar = Ache_private.Parse.Grammar in
   Alcotest.(check (result int64 string))
     "15 hex digits"
     (Ok 0xfffffffffffffffL)
-    (G.chunk_size "fffffffffffffff\r\n");
+    (Grammar.chunk_size "fffffffffffffff\r\n");
   Alcotest.(check (result int64 string))
     "16 hex digits"
     (Error {|chunk-size too long: "ffffffffffffffff"|})
-    (G.chunk_size "ffffffffffffffff\r\n");
+    (Grammar.chunk_size "ffffffffffffffff\r\n");
   let s =
     run_server
       [ "POST / HTTP/1.1\r\n\

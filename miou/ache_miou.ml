@@ -63,7 +63,7 @@ module Make (Io : IO) = struct
     let shutdown = Io.shutdown
 
     let start : type t.
-      (module Ache.Runtime.S with type t = t)
+      (module Ache.Runtime.ENGINE with type t = t)
       -> read_buffer_size:int
       -> read_closed:Read_closed.t
       -> interruptible:bool

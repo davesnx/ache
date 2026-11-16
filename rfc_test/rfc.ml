@@ -81,9 +81,9 @@ module type Connection = sig
   val yield_writer : t -> (unit -> unit) -> unit
 end
 
-module Driver (C : Connection) = struct
+module Driver (Under_test : Connection) = struct
   type t =
-    { conn : C.t
+    { conn : Under_test.t
     ; mutable pending : string
     ; mutable eof_requested : bool
     ; mutable eof_delivered : bool
@@ -107,7 +107,7 @@ module Driver (C : Connection) = struct
     }
 
   let read_step t =
-    match C.next_read_operation t.conn with
+    match Under_test.next_read_operation t.conn with
     | `Read ->
       t.read_op <- `Read;
       let len = String.length t.pending in
@@ -115,12 +115,12 @@ module Driver (C : Connection) = struct
       if t.eof_requested && not t.eof_delivered
       then (
         t.eof_delivered <- true;
-        let consumed = C.read_eof t.conn bs ~off:0 ~len in
+        let consumed = Under_test.read_eof t.conn bs ~off:0 ~len in
         t.pending <- String.sub t.pending consumed (len - consumed);
         true)
       else if len > 0
       then (
-        let consumed = C.read t.conn bs ~off:0 ~len in
+        let consumed = Under_test.read t.conn bs ~off:0 ~len in
         t.pending <- String.sub t.pending consumed (len - consumed);
         consumed > 0)
       else false
@@ -129,26 +129,26 @@ module Driver (C : Connection) = struct
       if not t.reader_parked
       then (
         t.reader_parked <- true;
-        C.yield_reader t.conn (fun () -> t.reader_parked <- false));
+        Under_test.yield_reader t.conn (fun () -> t.reader_parked <- false));
       false
     | `Close ->
       t.read_op <- `Close;
       false
 
   let write_step t =
-    match C.next_write_operation t.conn with
+    match Under_test.next_write_operation t.conn with
     | `Write iovecs ->
       t.write_op <- `Write;
       let s = iovecs_to_string iovecs in
       Buffer.add_string t.output s;
-      C.report_write_result t.conn (`Ok (String.length s));
+      Under_test.report_write_result t.conn (`Ok (String.length s));
       true
     | `Yield ->
       t.write_op <- `Yield;
       if not t.writer_parked
       then (
         t.writer_parked <- true;
-        C.yield_writer t.conn (fun () -> t.writer_parked <- false));
+        Under_test.yield_writer t.conn (fun () -> t.writer_parked <- false));
       false
     | `Close _ ->
       t.write_op <- `Close;
@@ -317,7 +317,7 @@ end
 let contains s sub = Option.is_some (Wire.index_from s 0 sub)
 
 module Server = struct
-  module D = Driver (Server_connection)
+  module Driver = Driver (Server_connection)
 
   type exchange =
     { reqd : Reqd.t
@@ -328,7 +328,7 @@ module Server = struct
     }
 
   type t =
-    { driver : D.t
+    { driver : Driver.t
     ; mutable exchanges : exchange list
     ; mutable errors : Server_connection.error list
     }
@@ -407,25 +407,25 @@ module Server = struct
     let conn =
       Server_connection.create ?config ~error_handler request_handler
     in
-    let s = { driver = D.make conn; exchanges = []; errors = [] } in
+    let s = { driver = Driver.make conn; exchanges = []; errors = [] } in
     state := Some s;
     s
 
   let run ?config ?handler ?error_handler ?(eof = false) input =
     let s = create ?config ?handler ?error_handler () in
-    D.feed s.driver input;
-    if eof then D.close_input s.driver;
+    Driver.feed s.driver input;
+    if eof then Driver.close_input s.driver;
     s
 
-  let feed s input = D.feed s.driver input
-  let close_input s = D.close_input s.driver
-  let pump s = D.pump s.driver
-  let output s = D.output s.driver
-  let take_output s = D.take_output s.driver
+  let feed s input = Driver.feed s.driver input
+  let close_input s = Driver.close_input s.driver
+  let pump s = Driver.pump s.driver
+  let output s = Driver.output s.driver
+  let take_output s = Driver.take_output s.driver
   let read_op s = s.driver.read_op
   let write_op s = s.driver.write_op
-  let is_closed s = D.is_closed s.driver
-  let unconsumed s = D.unconsumed s.driver
+  let is_closed s = Driver.is_closed s.driver
+  let unconsumed s = Driver.unconsumed s.driver
   let handler_calls s = List.length s.exchanges
   let requests s = List.map (fun ex -> ex.request) s.exchanges
   let statuses ?methods s = Wire.statuses ?methods (output s)
@@ -433,7 +433,7 @@ module Server = struct
 end
 
 module Client = struct
-  module D = Driver (Client_connection)
+  module Driver = Driver (Client_connection)
 
   type exchange =
     { request : Request.t
@@ -445,7 +445,7 @@ module Client = struct
     ; mutable errors : string list
     }
 
-  type t = { driver : D.t }
+  type t = { driver : Driver.t }
 
   let error_to_string = function
     | `Malformed_response _ -> "Malformed_response"
@@ -454,7 +454,7 @@ module Client = struct
     | `Exn exn -> "Exn " ^ Printexc.to_string exn
 
   let create ?config () =
-    { driver = D.make (Client_connection.create ?config ()) }
+    { driver = Driver.make (Client_connection.create ?config ()) }
 
   let request ?body ?(close_body = true) t request =
     let rec ex =
@@ -497,18 +497,18 @@ module Client = struct
     let ex = Lazy.force ex in
     Option.iter (fun b -> Body.Writer.write_string ex.writer b) body;
     if close_body then Body.Writer.close ex.writer;
-    D.pump t.driver;
+    Driver.pump t.driver;
     ex
 
-  let feed t input = D.feed t.driver input
-  let close_input t = D.close_input t.driver
-  let pump t = D.pump t.driver
-  let written t = D.output t.driver
-  let take_written t = D.take_output t.driver
+  let feed t input = Driver.feed t.driver input
+  let close_input t = Driver.close_input t.driver
+  let pump t = Driver.pump t.driver
+  let written t = Driver.output t.driver
+  let take_written t = Driver.take_output t.driver
   let read_op t = t.driver.read_op
   let write_op t = t.driver.write_op
-  let is_closed t = D.is_closed t.driver
-  let unconsumed t = D.unconsumed t.driver
+  let is_closed t = Driver.is_closed t.driver
+  let unconsumed t = Driver.unconsumed t.driver
 
   let statuses ex =
     List.map (fun r -> Status.to_code r.Response.status) ex.responses

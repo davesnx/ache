@@ -107,9 +107,11 @@ let tests =
          check_open "connection open" s)
   ; test "§10.2.4 server SHOULD NOT: library adds no Server field" (fun () ->
       let app = Server.run ~handler:(Server.respond ~body:"x" `OK) (get "/") in
-      let module D = Server.D in
-      let d = D.make (Server_connection.create (fun _ -> ())) in
-      D.feed d (req ~headers:[ "Host", "a"; "Content-Length", "x" ] "GET" "/");
+      let module Driver = Server.Driver in
+      let d = Driver.make (Server_connection.create (fun _ -> ())) in
+      Driver.feed
+        d
+        (req ~headers:[ "Host", "a"; "Content-Length", "x" ] "GET" "/");
       List.iter
         (fun (label, out) ->
            match Wire.split_head out with
@@ -121,5 +123,5 @@ let tests =
                (Wire.has_header
                   { Wire.start_line; headers; body = "" }
                   "server"))
-        [ "application 200", Server.output app; "library 400", D.output d ])
+        [ "application 200", Server.output app; "library 400", Driver.output d ])
   ]

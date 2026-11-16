@@ -111,11 +111,11 @@ let bench name input reads iterations =
     (direct_major /. n)
 
 let bench_serialize name write iterations =
-  let f = Ache_private.Faraday.create 0x1000 in
+  let f = Ache_private.Encoder.create 0x1000 in
   let run () =
     write f;
-    ignore (Ache_private.Faraday.operation f);
-    Ache_private.Faraday.shift f (Ache_private.Faraday.pending_bytes f)
+    ignore (Ache_private.Encoder.operation f);
+    Ache_private.Encoder.shift f (Ache_private.Encoder.pending_bytes f)
   in
   for _ = 1 to 1000 do
     run ()

@@ -29,7 +29,7 @@
   EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   ----------------------------------------------------------------------------*)
 
-open Faraday
+open Encoder
 
 let write_space t = write_char t ' '
 let write_crlf t = LE.write_uint16 t 0x0a0d
@@ -178,7 +178,7 @@ module Writer = struct
     { buffer : Bigstringaf.t
       (* The buffer that the encoder uses for buffered writes. Managed by the *
          control module for the encoder. *)
-    ; encoder : Faraday.t
+    ; encoder : Encoder.t
       (* The encoder that handles encoding for writes. Uses the [buffer] *
          referenced above internally. *)
     ; mutable drained_bytes : int
@@ -192,14 +192,13 @@ module Writer = struct
 
   let create ?(buffer_size = 0x800) () =
     let buffer = Bigstringaf.create buffer_size in
-    let encoder = Faraday.of_bigstring buffer in
+    let encoder = Encoder.of_bigstring buffer in
     { buffer; encoder; drained_bytes = 0; wakeup = Optional_thunk.none }
 
-  let faraday t = t.encoder
+  let encoder t = t.encoder
   let write_request t request = write_request t.encoder request
   let write_response t response = write_response t.encoder response
   let write_string t ?off ?len string = write_string t.encoder ?off ?len string
-  let write_bytes t ?off ?len bytes = write_bytes t.encoder ?off ?len bytes
 
   let write_bigstring t ?off ?len bigstring =
     write_bigstring t.encoder ?off ?len bigstring
@@ -219,7 +218,7 @@ module Writer = struct
     write_crlf t.encoder
 
   let on_wakeup t k =
-    if Faraday.is_closed t.encoder
+    if Encoder.is_closed t.encoder
     then failwith "on_wakeup on closed writer"
     else if Optional_thunk.is_some t.wakeup
     then failwith "on_wakeup: only one callback can be registered at a time"
@@ -244,19 +243,19 @@ module Writer = struct
   let unyield t =
     (* This would be better implemented by a function that just takes the
        encoder out of a yielded state if it's in that state. Requires a change
-       to the faraday library. *)
+       to Encoder. *)
     flush t (fun _reason -> ())
 
-  let yield t = Faraday.yield t.encoder
-  let close t = Faraday.close t.encoder
+  let yield t = Encoder.yield t.encoder
+  let close t = Encoder.close t.encoder
 
   let close_and_drain t =
-    Faraday.close t.encoder;
-    let drained = Faraday.drain t.encoder in
+    Encoder.close t.encoder;
+    let drained = Encoder.drain t.encoder in
     t.drained_bytes <- t.drained_bytes + drained;
     wakeup t
 
-  let is_closed t = Faraday.is_closed t.encoder
+  let is_closed t = Encoder.is_closed t.encoder
   let drained_bytes t = t.drained_bytes
 
   let report_result t result =
@@ -266,7 +265,7 @@ module Writer = struct
 
   let next t =
     (* assert (Optional_thunk.is_none t.wakeup); *)
-    match Faraday.operation t.encoder with
+    match Encoder.operation t.encoder with
     | `Close -> `Close (drained_bytes t)
     | `Yield -> `Yield
     | `Writev iovecs -> `Write iovecs
