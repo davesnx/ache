@@ -9,8 +9,8 @@ a connection. Three runtimes drive it on sockets:
 - `ache-miou`, for [Miou](https://github.com/robur-coop/miou)
 
 `ache-eio-tls`, `ache-lwt-tls` and `ache-miou-tls` add TLS (see
-[TLS](docs/README.md#tls)).
+[TLS](docs/ache.md#tls)).
 
 Status: experimental. The API can change before 1.0.
 
-Documentation: [docs/README.md](docs/README.md).
+Documentation: [docs/ache.md](docs/ache.md).

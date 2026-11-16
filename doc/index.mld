@@ -48,5 +48,5 @@ and pipelines only behind requests with an idempotent method. See
 
 {1 Examples}
 
-[docs/README.md] and the [examples/] directory of the repository have
+[docs/ache.md] and the [examples/] directory of the repository have
 complete servers and clients for Eio, Lwt and Miou.

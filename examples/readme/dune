@@ -7,12 +7,23 @@
   (glob_files ../lwt/*.ml)
   (glob_files ../miou/*.ml))
  (action
-  (with-stdout-to
-   README.md.gen
-   (run ./gen_readme.exe ../.. %{dep:../../docs/README.md}))))
+  (progn
+   (with-stdout-to
+    ache-eio.md.gen
+    (run ./gen_readme.exe ../.. %{dep:../../docs/ache-eio.md}))
+   (with-stdout-to
+    ache-lwt.md.gen
+    (run ./gen_readme.exe ../.. %{dep:../../docs/ache-lwt.md}))
+   (with-stdout-to
+    ache-miou.md.gen
+    (run ./gen_readme.exe ../.. %{dep:../../docs/ache-miou.md}))))
+ (targets ache-eio.md.gen ache-lwt.md.gen ache-miou.md.gen))
 
 (rule
  (alias runtest)
  (package ache)
  (action
-  (diff ../../docs/README.md README.md.gen)))
+  (progn
+   (diff ../../docs/ache-eio.md ache-eio.md.gen)
+   (diff ../../docs/ache-lwt.md ache-lwt.md.gen)
+   (diff ../../docs/ache-miou.md ache-miou.md.gen))))
