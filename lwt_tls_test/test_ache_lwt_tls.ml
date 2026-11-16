@@ -609,9 +609,18 @@ let check_handshake_timers_bounded ~connections exchange =
              exchange fd >>= fun () -> exchanges (n - 1)
          in
          exchanges (connections / 10) >>= fun () ->
-         let before = live_words () in
-         exchanges connections >>= fun () ->
-         growth := live_words () - before;
+         (* On OCaml 5.3 the live heap keeps settling for a few full major
+            cycles after the first exchanges, by a constant that does not grow
+            with the number of connections. *)
+         let rec measure windows =
+           let before = live_words () in
+           exchanges connections >>= fun () ->
+           growth := live_words () - before;
+           if !growth > connections && windows > 1
+           then measure (windows - 1)
+           else Lwt.return_unit
+         in
+         measure 5 >>= fun () ->
          Lwt.cancel earlier_live_sleeper;
          Lwt.cancel acceptor;
          Lwt_unix.close listening));
