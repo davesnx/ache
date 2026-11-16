@@ -21,12 +21,13 @@ parses and serializes messages and keeps the state of a connection.
    {{:https://ocaml.org/p/ache-miou/latest/doc/Ache_miou/index.html}[Ache_miou]},
    which runs ache on [Miou_unix] sockets. A Miou application must ignore
    [SIGPIPE].}
-{- [ache-eio-tls] and [ache-lwt-tls]:
-   {{:https://ocaml.org/p/ache-eio-tls/latest/doc/Ache_eio_tls/index.html}[Ache_eio_tls]}
+{- [ache-eio-tls], [ache-lwt-tls] and [ache-miou-tls]:
+   {{:https://ocaml.org/p/ache-eio-tls/latest/doc/Ache_eio_tls/index.html}[Ache_eio_tls]},
+   {{:https://ocaml.org/p/ache-lwt-tls/latest/doc/Ache_lwt_tls/index.html}[Ache_lwt_tls]}
    and
-   {{:https://ocaml.org/p/ache-lwt-tls/latest/doc/Ache_lwt_tls/index.html}[Ache_lwt_tls]},
-   which run [ache-eio] and [ache-lwt] over TLS with ocaml-tls. There is no
-   OpenSSL runtime.}}
+   {{:https://ocaml.org/p/ache-miou-tls/latest/doc/Ache_miou_tls/index.html}[Ache_miou_tls]},
+   which run [ache-eio], [ache-lwt] and [ache-miou] over TLS with ocaml-tls.
+   There is no OpenSSL runtime.}}
 
 {1 What ache checks}
 

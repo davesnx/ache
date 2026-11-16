@@ -1,0 +1,16 @@
+(test
+ (name test_ache_miou_tls)
+ (package ache-miou-tls)
+ (libraries
+  ache
+  ache-miou-tls
+  ache_test_certs
+  alcotest
+  bigstringaf
+  domain-name
+  ipaddr
+  miou
+  miou.unix
+  tls
+  tls-miou-unix
+  unix))

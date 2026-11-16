@@ -103,7 +103,7 @@
  (name ache-miou)
  (synopsis "Miou runtime for ache")
  (description
-  "Runs ache HTTP/1.1 servers and clients on Miou_unix sockets. The application must ignore SIGPIPE.")
+  "Runs ache HTTP/1.1 servers and clients on Miou_unix sockets. The Make functor accepts any other socket type, such as a TLS socket. The application must ignore SIGPIPE.")
  (documentation "https://ocaml.org/p/ache-miou/latest/doc/index.html")
  (tags
   (http http-server http-client web miou))
@@ -139,6 +139,35 @@
   (tls
    (>= 2.1.5))
   (tls-lwt
+   (>= 2.1.5))
+  (x509 :with-test)
+  (ptime :with-test)
+  (mirage-crypto-rng :with-test)
+  (alcotest :with-test)))
+
+(package
+ (name ache-miou-tls)
+ (synopsis "TLS for the Miou runtime of ache")
+ (description
+  "Runs ache HTTP/1.1 servers and clients over TLS on Miou_unix sockets, with ocaml-tls. A client reports a response that ends at the close of the connection without a TLS close_notify as an error. The application must ignore SIGPIPE.")
+ (documentation "https://ocaml.org/p/ache-miou-tls/latest/doc/index.html")
+ (tags
+  (http http-server http-client web miou tls))
+ (depends
+  (ocaml
+   (>= 5.3))
+  (ache
+   (= :version))
+  (ache-miou
+   (= :version))
+  bigstringaf
+  domain-name
+  ipaddr
+  (miou
+   (>= 0.10.0))
+  (tls
+   (>= 2.1.5))
+  (tls-miou-unix
    (>= 2.1.5))
   (x509 :with-test)
   (ptime :with-test)

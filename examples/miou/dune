@@ -2,6 +2,20 @@
  (libraries ache ache-miou miou miou.unix unix)
  (names miou_hello_server miou_hello_client))
 
+(executables
+ (libraries
+  ache
+  ache-miou-tls
+  domain-name
+  mirage-crypto-rng.unix
+  miou
+  miou.unix
+  ptime.clock.os
+  tls
+  unix
+  x509)
+ (names miou_tls_hello_server miou_tls_hello_client))
+
 (alias
  (name examples)
  (deps

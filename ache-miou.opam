@@ -2,7 +2,7 @@
 opam-version: "2.0"
 synopsis: "Miou runtime for ache"
 description:
-  "Runs ache HTTP/1.1 servers and clients on Miou_unix sockets. The application must ignore SIGPIPE."
+  "Runs ache HTTP/1.1 servers and clients on Miou_unix sockets. The Make functor accepts any other socket type, such as a TLS socket. The application must ignore SIGPIPE."
 maintainer: ["David Sancho <dsnxmoreno@gmail.com>"]
 authors: [
   "David Sancho <dsnxmoreno@gmail.com>"

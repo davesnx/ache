@@ -209,7 +209,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   timeout it does not wait, like `ache-eio` without a clock.
   `Client.shutdown` returns when the connection has ended and must be called
   by the task that created the connection. The application must ignore
-  `SIGPIPE`.
+  `SIGPIPE`. `Make (Io)` over `module type IO` runs the same server and
+  client on another socket type.
 
 ### Fixes of upstream issues
 
@@ -240,15 +241,18 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 
 ### TLS
 
-- New packages `ache-eio-tls` (module `Ache_eio_tls`, over `tls-eio`) and
-  `ache-lwt-tls` (module `Ache_lwt_tls`, over `tls-lwt`). Each has a server
+- New packages `ache-eio-tls` (module `Ache_eio_tls`, over `tls-eio`),
+  `ache-lwt-tls` (module `Ache_lwt_tls`, over `tls-lwt`) and `ache-miou-tls`
+  (module `Ache_miou_tls`, over `Tls.Engine`, with the exceptions of
+  `tls-miou-unix`). Each has a server
   handler that does the handshake on the accepted socket (limited by the
   smaller of `?idle_timeout` and `?head_timeout`) and a client constructor
   that takes a `Tls.Config.client` and a required `~peer`: the host name or
   IP address that the certificate must prove, or the explicit
   `` `Insecure_no_name_check ``. A client reports a response that ends at the close of the
   connection without a TLS `close_notify` alert as
-  `` `Exn Ache_eio_tls.Truncated `` or `` `Exn Ache_lwt_tls.Truncated ``,
+  `` `Exn Ache_eio_tls.Truncated ``, `` `Exn Ache_lwt_tls.Truncated `` or
+  `` `Exn Ache_miou_tls.Truncated ``,
   so a cut response body calls `on_error`. A complete response with
   `Content-Length` or chunked framing, and a request that got no byte of its
   response (`` `Connection_closed ``), are not affected.
@@ -259,7 +263,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `tls-eio` keeps the cancellation of a read as the permanent error of the
   flow, so over TLS the 408 response and the `close_notify` alert were not
   sent and the handler raised `Eio.Cancel.Cancelled`.
-- The README has TLS quick starts for Eio and Lwt.
+- The README has TLS quick starts for Eio, Lwt and Miou.
 
 httpun history
 ==============

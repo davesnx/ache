@@ -8,8 +8,7 @@ a connection. Three runtimes drive it on sockets:
 - `ache-lwt`, for [Lwt](https://github.com/ocsigen/lwt)
 - `ache-miou`, for [Miou](https://github.com/robur-coop/miou)
 
-`ache-eio-tls` and `ache-lwt-tls` add TLS (see [TLS](#tls)). There is no TLS
-package for `ache-miou`.
+`ache-eio-tls`, `ache-lwt-tls` and `ache-miou-tls` add TLS (see [TLS](#tls)).
 
 ache is a fork of [httpun](https://github.com/anmonteiro/httpun), which is a
 fork of [httpaf](https://github.com/inhabitedtype/httpaf). It keeps their
@@ -37,7 +36,7 @@ ache is not on opam yet. Pin it from GitHub:
 ```sh
 opam pin add ache https://github.com/davesnx/ache.git
 opam pin add ache-eio https://github.com/davesnx/ache.git  # or ache-lwt, ache-miou
-opam pin add ache-eio-tls https://github.com/davesnx/ache.git  # or ache-lwt-tls, for TLS
+opam pin add ache-eio-tls https://github.com/davesnx/ache.git  # or ache-lwt-tls, ache-miou-tls, for TLS
 ```
 
 ache needs OCaml 5.3 or later.
@@ -369,8 +368,10 @@ The output is the same as with Eio.
 ## TLS
 
 TLS uses [ocaml-tls](https://github.com/mirleft/ocaml-tls): `ache-eio-tls`
-runs `ache-eio` over `tls-eio`, and `ache-lwt-tls` runs `ache-lwt` over
-`tls-lwt`. OpenSSL (`lwt_ssl`) is not supported.
+runs `ache-eio` over `tls-eio`, `ache-lwt-tls` runs `ache-lwt` over
+`tls-lwt`, and `ache-miou-tls` runs `ache-miou` over the protocol engine of
+ocaml-tls (`Tls.Engine`), with the exceptions of `tls-miou-unix`. OpenSSL
+(`lwt_ssl`) is not supported.
 
 The examples load a certificate from PEM files. To make a test CA and a
 certificate for `localhost` and `127.0.0.1` (the repository has no key
@@ -638,12 +639,170 @@ let () =
      Ache_lwt_tls.Client.shutdown client)
 ```
 
+The same with Miou. As with `ache-miou`, the caller owns the socket and
+closes it after the server handler returns, or after `Client.shutdown`; this
+is also true when the handshake fails. `create_connection_handler_with_fd`
+returns when the handshake fails, and `create_connection_with_fd` raises
+`` Tls_miou_unix.Tls_failure (`Error (`AuthenticationFailure _)) `` when the
+certificate is rejected.
+
+<!-- example: examples/miou/miou_tls_hello_server.ml -->
+```ocaml
+open Ache
+
+let request_handler _client_address reqd =
+  let body = "Hello, TLS!\n" in
+  let headers = Headers.of_list [ "content-type", "text/plain" ] in
+  Reqd.respond_with_string reqd (Response.create ~headers `OK) body
+
+let error_handler _client_address ?request:_ error start_response =
+  let body = start_response Headers.empty in
+  (match error with
+  | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
+  | #Status.standard as status ->
+    Body.Writer.write_string body (Status.default_reason_phrase status));
+  Body.Writer.close body
+
+let get_ok = function
+  | Ok value -> value
+  | Error (`Msg message) -> failwith message
+
+let read_file path = In_channel.with_open_bin path In_channel.input_all
+
+let rec clean_up orphans =
+  match Miou.care orphans with
+  | None | Some None -> ()
+  | Some (Some connection) ->
+    (match Miou.await connection with
+    | Ok () -> ()
+    | Error exn -> prerr_endline ("connection error: " ^ Printexc.to_string exn));
+    clean_up orphans
+
+let () =
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  let port = int_of_string Sys.argv.(1) in
+  let cert = Sys.argv.(2)
+  and key = Sys.argv.(3) in
+  Mirage_crypto_rng_unix.use_default ();
+  let certificates =
+    get_ok (X509.Certificate.decode_pem_multiple (read_file cert))
+  and private_key = get_ok (X509.Private_key.decode_pem (read_file key)) in
+  let tls =
+    get_ok
+      (Tls.Config.server ~certificates:(`Single (certificates, private_key)) ())
+  in
+  let handler =
+    Ache_miou_tls.Server.create_connection_handler_with_fd
+      ~tls
+      ~request_handler
+      ~error_handler
+  in
+  Miou_unix.run @@ fun () ->
+  let socket = Miou_unix.tcpv4 () in
+  Miou_unix.bind_and_listen
+    ~backlog:128
+    socket
+    Unix.(ADDR_INET (inet_addr_loopback, port));
+  Printf.printf "Listening on https://127.0.0.1:%d\n%!" port;
+  let orphans = Miou.orphans () in
+  let rec accept () =
+    clean_up orphans;
+    let client, client_address = Miou_unix.accept socket in
+    ignore
+      (Miou.async ~orphans (fun () ->
+         Fun.protect
+           ~finally:(fun () -> Miou_unix.close client)
+           (fun () -> handler client client_address))
+       : unit Miou.t);
+    accept ()
+  in
+  accept ()
+```
+
+<!-- example: examples/miou/miou_tls_hello_client.ml -->
+```ocaml
+open Ache
+
+let error_handler error =
+  let message =
+    match error with
+    | `Malformed_response message -> message
+    | `Invalid_response_body_length _ -> "invalid response body length"
+    | `Connection_closed -> "connection closed before the response"
+    | `Exn exn -> Printexc.to_string exn
+  in
+  prerr_endline ("request failed: " ^ message);
+  exit 1
+
+let get_ok = function
+  | Ok value -> value
+  | Error (`Msg message) -> failwith message
+
+let () =
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  let port = int_of_string Sys.argv.(1) in
+  let ca = Sys.argv.(2) in
+  Mirage_crypto_rng_unix.use_default ();
+  let authenticator =
+    let cas =
+      get_ok
+        (X509.Certificate.decode_pem_multiple
+           (In_channel.with_open_bin ca In_channel.input_all))
+    in
+    X509.Authenticator.chain_of_trust
+      ~time:(fun () -> Some (Ptime_clock.now ()))
+      cas
+  in
+  let tls = get_ok (Tls.Config.client ~authenticator ()) in
+  Miou_unix.run @@ fun () ->
+  let socket = Miou_unix.tcpv4 () in
+  Miou_unix.connect socket Unix.(ADDR_INET (inet_addr_loopback, port));
+  let host = Domain_name.(host_exn (of_string_exn "localhost")) in
+  let client =
+    Ache_miou_tls.Client.create_connection_with_fd
+      ~tls
+      ~peer:(`Host host)
+      socket
+  in
+  let finished = Miou.Computation.create () in
+  let on_error () =
+    ignore
+      (Miou.Computation.try_cancel
+         finished
+         (Failure "response body cut short", Printexc.get_callstack 0)
+       : bool)
+  in
+  let response_handler response body =
+    Format.printf "%a@." Response.pp_hum response;
+    let rec on_read buffer ~off ~len =
+      print_string (Bigstringaf.substring buffer ~off ~len);
+      Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+    and on_eof () = ignore (Miou.Computation.try_return finished () : bool) in
+    Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
+  in
+  let headers =
+    Headers.of_list [ "host", Printf.sprintf "localhost:%d" port ]
+  in
+  let request_body =
+    Ache_miou_tls.Client.request
+      client
+      (Request.create ~headers `GET "/")
+      ~error_handler
+      ~response_handler
+  in
+  Body.Writer.close request_body;
+  Miou.Computation.await_exn finished;
+  Ache_miou_tls.Client.shutdown client;
+  Miou_unix.close socket
+```
+
 A response without `Content-Length` or `Transfer-Encoding: chunked` ends when
 the connection closes. Over TLS, only a `close_notify` alert proves that the
 peer closed the connection; without it, an attacker can cut the response.
-The clients of `ache-eio-tls` and `ache-lwt-tls` report such a response as
-cut: the body gets `on_error`, and the error handler gets
-`` `Exn Ache_eio_tls.Truncated `` or `` `Exn Ache_lwt_tls.Truncated ``. In
+The clients of `ache-eio-tls`, `ache-lwt-tls` and `ache-miou-tls` report
+such a response as cut: the body gets `on_error`, and the error handler gets
+`` `Exn Ache_eio_tls.Truncated ``, `` `Exn Ache_lwt_tls.Truncated `` or
+`` `Exn Ache_miou_tls.Truncated ``. In
 every other case the end of TCP without `close_notify` counts as the end of
 the input, as without TLS: a complete response with `Content-Length` or
 chunked framing is not an error, and a request that got no byte of its
@@ -798,7 +957,9 @@ httpun rejected chunk extensions and trailers.
   documentation has the full contract. The Lwt server does not wait for the
   peer to close after the last response.
 - **Miou.** The application must ignore `SIGPIPE`. `Ache_miou.Server` and
-  `Ache_miou.Client` use `Miou_unix.file_descr`. Run the server handler in
+  `Ache_miou.Client` use `Miou_unix.file_descr`, and `ache-miou-tls` a TLS
+  socket. For another socket type, implement `Ache_miou.IO` and apply
+  `Ache_miou.Make`. Run the server handler in
   its own task for each accepted socket, and close the socket when it
   returns. Timeouts use `Miou_unix.sleep` and need no clock. With
   `?idle_timeout` or `?head_timeout`, when the server stops reading it reads
@@ -815,7 +976,7 @@ httpun rejected chunk extensions and trailers.
 
 | Suite | Tests |
 |---|---|
-| `lib_test`: core unit tests | 279 |
+| `lib_test`: core unit tests | 280 |
 | `rfc_test`: RFC 9110 | 159 |
 | `rfc_test`: RFC 9112 | 178 |
 | `eio_test`: Eio on loopback sockets | 33 |
@@ -823,6 +984,7 @@ httpun rejected chunk extensions and trailers.
 | `lwt_test`: Lwt on loopback sockets | 25 |
 | `lwt_tls_test`: `ache-lwt-tls` on loopback sockets | 24 |
 | `miou_test`: Miou on loopback sockets | 28 |
+| `miou_tls_test`: `ache-miou-tls` on loopback sockets | 33 |
 
 The RFC suites start from each sentence of RFC 9110 and RFC 9112 §2–§11 that
 has a requirement keyword (MUST, SHOULD, MAY and others), plus definitions
