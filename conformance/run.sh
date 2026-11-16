@@ -72,7 +72,7 @@ else
   tail -n 1 "$work/shim.out"
 fi
 
-(cd "$root" && dune build "./conformance/h1spec_$runtime.exe")
+(cd "$root" && dune build --root . "./conformance/h1spec_$runtime.exe")
 
 "$server" -p 0 >"$work/server.out" 2>"$work/server.err" &
 pid=$!
