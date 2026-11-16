@@ -171,6 +171,8 @@ module Timeout = struct
   let queues : (float, queue) Hashtbl.t = Hashtbl.create 2
 
   let create seconds =
+    if not (seconds > 0.)
+    then invalid_arg "Ache_lwt.Timeout.create: seconds must be positive";
     let queue =
       match Hashtbl.find_opt queues seconds with
       | Some queue -> queue

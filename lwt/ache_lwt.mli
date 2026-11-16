@@ -59,6 +59,45 @@ module type Client = Ache_lwt_intf.Client
 (** [Client.upgrade t impl] shuts down the HTTP state of [t] and hands reading
     and writing on its socket to [impl]. *)
 
+(** Timeouts that share one Lwt timer for each length.
+
+    With Lwt's [select] and [poll] engines, a cancelled [Lwt_unix.sleep] stays
+    in memory until no other sleep in the engine ends before it. A server that
+    starts a sleep for each connection and cancels it when the connection ends
+    keeps about (connections per second × timeout) cancelled sleeps. [Timeout]
+    puts all timeouts of one length in one queue, in deadline order, with one
+    sleep for the front of the queue that is never cancelled. [set] and [stop]
+    do not start or cancel a sleep.
+
+    The servers of [ache-lwt] and [ache-lwt-tls] use [Timeout] for
+    [idle_timeout], [head_timeout] and the TLS handshake. Use it only from the
+    thread that runs Lwt. *)
+module Timeout : sig
+  type t
+
+  val create : float -> t
+  (** [create seconds] is a timeout of [seconds] that is not set. Timeouts with
+      equal [seconds] share one queue, which stays allocated for the life of
+      the program.
+
+      @raise Invalid_argument if [seconds] is not positive. *)
+
+  val set : t -> unit
+  (** [set t] sets the deadline of [t] to now + [seconds], also when [t] is
+      already set. *)
+
+  val stop : t -> unit
+  (** [stop t] removes the deadline of [t]. It does nothing when [t] is not
+      set. *)
+
+  val expired : t -> unit Lwt.t
+  (** [expired t] resolves when the deadline of [t] passes. A [set] before the
+      deadline moves it. After [stop], the promise stays pending until a later
+      [set] and its deadline. After the promise resolved, [set t] starts a new
+      deadline: call [expired t] again to wait for it. Cancelling the promise
+      does not change [t]. *)
+end
+
 module Make (Io : IO) : sig
   module Server : Server with type socket = Io.socket and type addr = Io.addr
   module Client : Client with type socket = Io.socket

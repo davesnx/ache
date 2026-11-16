@@ -155,10 +155,18 @@ module Server = struct
       match handshake_limit idle_timeout head_timeout with
       | None -> handshake
       | Some seconds ->
-        Lwt.pick
-          [ handshake
-          ; (Lwt_unix.sleep seconds >>= fun () -> Lwt.fail Lwt_unix.Timeout)
-          ]
+        let timer = Ache_lwt.Timeout.create seconds in
+        Ache_lwt.Timeout.set timer;
+        Lwt.finalize
+          (fun () ->
+             Lwt.pick
+               [ handshake
+               ; ( Ache_lwt.Timeout.expired timer >>= fun () ->
+                   Lwt.fail Lwt_unix.Timeout )
+               ])
+          (fun () ->
+             Ache_lwt.Timeout.stop timer;
+             Lwt.return_unit)
     in
     Lwt.try_bind
       (fun () -> handshake)

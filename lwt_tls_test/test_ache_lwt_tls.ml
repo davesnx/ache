@@ -559,6 +559,85 @@ let test_handshake_no_timeout () =
     Alcotest.(check bool) "still open after 0.5 s" true (state = `Open);
     Lwt_unix.close fd)
 
+let live_words () =
+  Gc.full_major ();
+  (Gc.stat ()).live_words
+
+let check_handshake_timers_bounded ~connections exchange =
+  let previous = Lwt_engine.get () in
+  Lwt_engine.set ~destroy:false (new Lwt_engine.select);
+  let growth = ref 0 in
+  Fun.protect
+    ~finally:(fun () -> Lwt_engine.set previous)
+    (fun () ->
+       run (fun () ->
+         let listening = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+         Lwt_unix.setsockopt listening Unix.SO_REUSEADDR true;
+         Lwt_unix.bind listening Unix.(ADDR_INET (inet_addr_loopback, 0))
+         >>= fun () ->
+         Lwt_unix.listen listening 16;
+         let addr = Lwt_unix.getsockname listening in
+         let open_connections = ref 0 in
+         let rec accept () =
+           Lwt_unix.accept listening >>= fun (fd, client_addr) ->
+           incr open_connections;
+           Lwt.async (fun () ->
+             Ache_lwt_tls.Server.create_connection_handler_with_fd
+               ~idle_timeout:30.
+               ~head_timeout:30.
+               ~tls:server_config
+               ~request_handler
+               ~error_handler
+               client_addr
+               fd
+             >|= fun () -> decr open_connections);
+           accept ()
+         in
+         let acceptor = accept () in
+         let earlier_live_sleeper = Lwt_unix.sleep 20. in
+         let rec all_closed () =
+           if !open_connections = 0
+           then Lwt.return_unit
+           else Lwt_unix.sleep 0.001 >>= all_closed
+         in
+         let rec exchanges n =
+           if n = 0
+           then all_closed ()
+           else
+             let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+             Lwt_unix.connect fd addr >>= fun () ->
+             exchange fd >>= fun () -> exchanges (n - 1)
+         in
+         exchanges (connections / 10) >>= fun () ->
+         let before = live_words () in
+         exchanges connections >>= fun () ->
+         growth := live_words () - before;
+         Lwt.cancel earlier_live_sleeper;
+         Lwt.cancel acceptor;
+         Lwt_unix.close listening));
+  if !growth > connections
+  then
+    Alcotest.failf
+      "heap grew by %d words over %d connections"
+      !growth
+      connections
+
+let test_handshake_timers_bounded () =
+  check_handshake_timers_bounded ~connections:300 (fun fd ->
+    raw_client fd >>= fun raw ->
+    raw_write
+      raw
+      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+    >>= fun () ->
+    raw_read_until_eof raw >>= fun (output, _) ->
+    if not (String.ends_with ~suffix:"/hello" output)
+    then Alcotest.failf "unexpected response %S" output;
+    raw_close raw)
+
+let test_cut_handshake_timers_bounded () =
+  check_handshake_timers_bounded ~connections:1000 (fun fd ->
+    Lwt_unix.sleep 0.001 >>= fun () -> Lwt_unix.close fd)
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
@@ -639,5 +718,13 @@ let () =
             test_peer_insecure
         ; Alcotest.test_case "idle timeout" `Quick test_idle_timeout
         ; Alcotest.test_case "head timeout" `Quick test_head_timeout
+        ; Alcotest.test_case
+            "completed handshakes do not pile up timers"
+            `Quick
+            test_handshake_timers_bounded
+        ; Alcotest.test_case
+            "handshakes cut by the client do not pile up timers"
+            `Quick
+            test_cut_handshake_timers_bounded
         ] )
     ]

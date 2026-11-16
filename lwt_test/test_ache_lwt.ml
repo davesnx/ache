@@ -1054,6 +1054,84 @@ let test_report_exn_raises () =
     until_closed ());
   Alcotest.(check int) "close called once" 1 !closes
 
+let expired_after timer =
+  let since = Unix.gettimeofday () in
+  Ache_lwt.Timeout.expired timer >|= fun () -> Unix.gettimeofday () -. since
+
+let check_between name ~min ~max elapsed =
+  if elapsed < min || elapsed > max
+  then Alcotest.failf "%s: %.3f s, expected %.3f to %.3f s" name elapsed min max
+
+let test_timeout_expires () =
+  run (fun () ->
+    let timer = Ache_lwt.Timeout.create 0.1 in
+    Ache_lwt.Timeout.set timer;
+    expired_after timer >|= check_between "expired" ~min:0.1 ~max:0.5)
+
+let test_timeout_set_moves_deadline () =
+  run (fun () ->
+    let timer = Ache_lwt.Timeout.create 0.2 in
+    Ache_lwt.Timeout.set timer;
+    let expired = expired_after timer in
+    Lwt_unix.sleep 0.1 >>= fun () ->
+    Ache_lwt.Timeout.set timer;
+    expired >>= fun elapsed ->
+    check_between "moved deadline" ~min:0.3 ~max:0.7 elapsed;
+    Ache_lwt.Timeout.set timer;
+    expired_after timer >|= check_between "set again" ~min:0.2 ~max:0.6)
+
+let test_timeout_stop () =
+  run (fun () ->
+    let timer = Ache_lwt.Timeout.create 0.05 in
+    Ache_lwt.Timeout.set timer;
+    let expired = Ache_lwt.Timeout.expired timer in
+    Ache_lwt.Timeout.stop timer;
+    Ache_lwt.Timeout.stop timer;
+    Lwt_unix.sleep 0.2 >>= fun () ->
+    Alcotest.(check bool) "pending after stop" true (Lwt.is_sleeping expired);
+    let since = Unix.gettimeofday () in
+    Ache_lwt.Timeout.set timer;
+    expired >|= fun () ->
+    check_between
+      "set after stop"
+      ~min:0.05
+      ~max:0.4
+      (Unix.gettimeofday () -. since))
+
+let test_timeout_lengths () =
+  run (fun () ->
+    let short = Ache_lwt.Timeout.create 0.05
+    and long = Ache_lwt.Timeout.create 0.25 in
+    Ache_lwt.Timeout.set long;
+    Ache_lwt.Timeout.set short;
+    let long_expired = expired_after long in
+    expired_after short >>= fun elapsed ->
+    check_between "short" ~min:0.05 ~max:0.2 elapsed;
+    Alcotest.(check bool) "long pending" true (Lwt.is_sleeping long_expired);
+    long_expired >|= check_between "long" ~min:0.25 ~max:0.6)
+
+let test_timeout_cancelled_expired () =
+  run (fun () ->
+    let timer = Ache_lwt.Timeout.create 0.1 in
+    Ache_lwt.Timeout.set timer;
+    let since = Unix.gettimeofday () in
+    Lwt.pick [ Ache_lwt.Timeout.expired timer; Lwt.return_unit ] >>= fun () ->
+    Lwt.cancel (Ache_lwt.Timeout.expired timer);
+    Ache_lwt.Timeout.expired timer >|= fun () ->
+    check_between
+      "after cancel"
+      ~min:0.1
+      ~max:0.5
+      (Unix.gettimeofday () -. since))
+
+let test_timeout_create_must_be_positive () =
+  List.iter
+    (fun seconds ->
+       match Ache_lwt.Timeout.create seconds with
+       | (_ : Ache_lwt.Timeout.t) -> Alcotest.failf "accepted %g" seconds
+       | exception Invalid_argument _ -> ())
+    [ 0.; -1.; Float.nan ]
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
@@ -1125,5 +1203,17 @@ let () =
         ; ( "keep-alive connections closed while idle do not pile up timers"
           , `Quick
           , test_idle_connection_timers_bounded )
+        ] )
+    ; ( "Timeout"
+      , [ "expires after its deadline", `Quick, test_timeout_expires
+        ; "set moves the deadline", `Quick, test_timeout_set_moves_deadline
+        ; "stop keeps it from expiring", `Quick, test_timeout_stop
+        ; "two lengths expire in order", `Quick, test_timeout_lengths
+        ; ( "cancelling expired does not change it"
+          , `Quick
+          , test_timeout_cancelled_expired )
+        ; ( "create rejects a length that is not positive"
+          , `Quick
+          , test_timeout_create_must_be_positive )
         ] )
     ]

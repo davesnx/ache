@@ -916,6 +916,105 @@ let test_client_shutdown_with_pending_read () =
   Alcotest.(check int) "one error" 1 (List.length !errors);
   check_no_handler_error ()
 
+let live_words () =
+  Gc.full_major ();
+  (Gc.stat ()).live_words
+
+let check_handshake_timers_bounded ~connections exchange =
+  let growth = ref 0 in
+  Miou_unix.run ~domains:0 (fun () ->
+    let listening = Miou_unix.tcpv4 () in
+    Miou_unix.bind_and_listen
+      ~backlog:16
+      listening
+      (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+    let addr = Unix.getsockname (Miou_unix.to_file_descr listening) in
+    let closed = ref 0 in
+    let handler =
+      Ache_miou_tls.Server.create_connection_handler_with_fd
+        ~idle_timeout:30.
+        ~head_timeout:30.
+        ~tls:server_config
+        ~request_handler
+        ~error_handler
+    in
+    let server =
+      Miou.async (fun () ->
+        let orphans = Miou.orphans () in
+        let rec reap () =
+          match Miou.care orphans with
+          | Some (Some task) ->
+            let (_ : (unit, exn) result) = Miou.await task in
+            reap ()
+          | Some None | None -> ()
+        in
+        let rec accept () =
+          reap ();
+          let socket, peer = Miou_unix.accept listening in
+          ignore
+            (Miou.async ~orphans (fun () ->
+               Fun.protect
+                 ~finally:(fun () ->
+                   Miou_unix.close socket;
+                   incr closed)
+                 (fun () -> handler socket peer))
+             : unit Miou.t);
+          accept ()
+        in
+        accept ())
+    in
+    Fun.protect
+      ~finally:(fun () ->
+        Miou.cancel server;
+        Miou_unix.close listening)
+      (fun () ->
+         with_timeout 10.0 (fun () ->
+           let rec short_live_sleepers () =
+             Miou_unix.sleep 0.01;
+             short_live_sleepers ()
+           in
+           let live = Miou.async short_live_sleepers in
+           let opened = ref 0 in
+           let rec all_closed () =
+             if !closed < !opened
+             then (
+               Miou_unix.sleep 0.001;
+               all_closed ())
+           in
+           let exchanges n =
+             for _ = 1 to n do
+               let fd = Miou_unix.tcpv4 () in
+               Miou_unix.connect fd addr;
+               incr opened;
+               Fun.protect
+                 ~finally:(fun () -> Miou_unix.close fd)
+                 (fun () -> exchange fd)
+             done;
+             all_closed ()
+           in
+           exchanges (connections / 10);
+           let before = live_words () in
+           exchanges connections;
+           Miou_unix.sleep 0.6;
+           growth := live_words () - before;
+           Miou.cancel live)));
+  if !growth > connections
+  then
+    Alcotest.failf
+      "heap grew by %d words over %d connections"
+      !growth
+      connections
+
+let test_handshake_timers_bounded () =
+  check_handshake_timers_bounded ~connections:300 (fun fd ->
+    let raw = raw_client fd in
+    raw_close_notify raw)
+
+let test_cut_handshake_timers_bounded () =
+  check_handshake_timers_bounded
+    ~connections:1000
+    (fun (_ : Miou_unix.file_descr) -> Miou_unix.sleep 0.001)
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
@@ -1023,5 +1122,13 @@ let () =
             "Client.shutdown with a read pending"
             `Quick
             test_client_shutdown_with_pending_read
+        ; Alcotest.test_case
+            "completed handshakes do not pile up timers"
+            `Quick
+            test_handshake_timers_bounded
+        ; Alcotest.test_case
+            "handshakes cut by the client do not pile up timers"
+            `Quick
+            test_cut_handshake_timers_bounded
         ] )
     ]

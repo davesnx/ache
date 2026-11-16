@@ -30,6 +30,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - `Reqd.respond_with_informational`, for `100 Continue` and `103 Early Hints`.
 - Server timeouts `?idle_timeout` and `?head_timeout`, and
   `Config.max_header_size`.
+- `Ache_lwt.Timeout`: timeouts that share one Lwt timer for each length, so
+  that cancelled timers do not pile up with the `select` and `poll` engines.
 
 ### Changed
 
@@ -40,7 +42,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - `ache-lwt` shares one timer for each timeout value among all connections,
   and `ache-miou` keeps one timer for each timeout on a connection that
   sleeps at most 0.5 s at a time, so cancelled timers do not pile up in the
-  heap.
+  heap. The TLS handshake timeout does the same: `ache-lwt-tls` uses
+  `Ache_lwt.Timeout`, and `ache-miou-tls` sleeps at most 0.5 s at a time.
 - Fixes httpun #95, #143, #150, #151, #154 to #165, and httpaf #18, #38,
   #86, #191, #192.
 

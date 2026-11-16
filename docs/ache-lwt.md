@@ -113,6 +113,38 @@ and `writev` returns `` `Closed `` when the peer is gone. The `Ache_lwt.IO`
 documentation has the full contract. The Lwt server does not wait for the
 peer to close after the last response.
 
+### Timeouts
+
+With Lwt's `select` and `poll` engines, a cancelled `Lwt_unix.sleep` stays in
+memory until no other sleep ends before it. A server that starts one sleep
+for each connection and cancels it when the connection ends then keeps
+about (connections per second × timeout) cancelled sleeps. The libev engine
+frees a cancelled sleep at once.
+
+`Ache_lwt.Timeout` avoids this. All timeouts of one length share one queue,
+in deadline order, and one sleep for the front of the queue that is never
+cancelled. `set` and `stop` only move an entry in the queue. The servers of
+`ache-lwt` and `ache-lwt-tls` use it for `?idle_timeout`, `?head_timeout` and
+the TLS handshake. An application can use it for its own timeouts:
+
+```ocaml
+let read_with_timeout timeout read =
+  Ache_lwt.Timeout.set timeout;
+  Lwt.finalize
+    (fun () ->
+      Lwt.pick
+        [ Lwt.map Option.some (read ())
+        ; Lwt.map (fun () -> None) (Ache_lwt.Timeout.expired timeout)
+        ])
+    (fun () ->
+      Ache_lwt.Timeout.stop timeout;
+      Lwt.return_unit)
+```
+
+Create the timeout once, for example with `Ache_lwt.Timeout.create 30.`, and
+reuse it for each read. Cancelling the `expired` promise, as `Lwt.pick` does,
+does not change the timeout.
+
 ## TLS
 
 To make the test certificates, and for the TLS notes, see

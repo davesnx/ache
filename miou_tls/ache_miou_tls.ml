@@ -170,6 +170,18 @@ let handshake_limit idle_timeout head_timeout =
   | Some seconds, None | None, Some seconds -> Some seconds
   | Some idle, Some head -> Some (Float.min idle head)
 
+let longest_sleep = 0.5
+
+let sleep_until at =
+  let rec loop () =
+    let left = at -. Unix.gettimeofday () in
+    if left > 0.
+    then (
+      Miou_unix.sleep (Float.min longest_sleep left);
+      loop ())
+  in
+  loop ()
+
 module Server = struct
   include Server
 
@@ -194,8 +206,9 @@ module Server = struct
         match handshake_limit idle_timeout head_timeout with
         | None -> []
         | Some seconds ->
+          let at = Unix.gettimeofday () +. seconds in
           [ Miou.async (fun () ->
-              Miou_unix.sleep seconds;
+              sleep_until at;
               None)
           ]
       in
