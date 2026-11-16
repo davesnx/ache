@@ -237,7 +237,18 @@ module Make (Io : IO) = struct
         | `Close _ -> shutdown_once SHUTDOWN_SEND
       in
       let read_task () =
-        (match read_loop () with () -> () | exception exn -> fail exn);
+        (match read_loop () with
+        | () -> ()
+        | exception (Miou.Cancelled as exn) -> raise exn
+        | exception exn ->
+          (match Runtime.report_exn t exn with
+          | () ->
+            shutdown_once SHUTDOWN_RECEIVE;
+            Read_closed.close read_closed
+          | exception (Miou.Cancelled as exn) -> raise exn
+          | exception _ ->
+            failed := true;
+            ignore (Miou.Computation.try_return stopped () : bool)));
         Option.iter Miou.cancel !reader
       and write_task () =
         match write_loop () with () -> () | exception exn -> fail exn

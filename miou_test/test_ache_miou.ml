@@ -85,6 +85,10 @@ let stream_flush_closed : unit Miou.Computation.t option ref = ref None
 let requests_seen = ref 0
 let pending_upgrade : Reqd.t option ref = ref None
 
+exception Respond_later
+
+let late_error_response : (unit -> unit) option ref = ref None
+
 let request_handler (_ : Unix.sockaddr) reqd =
   incr requests_seen;
   let request = Reqd.request reqd in
@@ -138,6 +142,7 @@ let request_handler (_ : Unix.sockaddr) reqd =
     loop ()
   | `GET, "/upgrade-later" -> pending_upgrade := Some reqd
   | `GET, "/raise" -> failwith "handler failed"
+  | `GET, "/raise-later" -> raise Respond_later
   | `POST, "/partial" ->
     let rec on_read _ ~off:_ ~len:_ =
       Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
@@ -157,7 +162,11 @@ let request_handler (_ : Unix.sockaddr) reqd =
 
 let error_handler (_ : Unix.sockaddr) ?request:_ error start_response =
   server_errors := error :: !server_errors;
-  Body.Writer.close (start_response Headers.empty)
+  match error with
+  | `Exn Respond_later ->
+    late_error_response :=
+      Some (fun () -> Body.Writer.close (start_response Headers.empty))
+  | _ -> Body.Writer.close (start_response Headers.empty)
 
 let connections_done = ref 0
 let connections_taken = ref 0
@@ -534,6 +543,29 @@ let test_handler_exception () =
   with_server (fun addr ->
     let socket = connect addr in
     send socket "GET /raise HTTP/1.1\r\nhost: localhost\r\n\r\n";
+    Alcotest.(check string)
+      "status line"
+      "HTTP/1.1 500 Internal Server Error"
+      (status_line (read_all socket));
+    Miou_unix.close socket;
+    wait_connection_done ())
+
+let rec respond_late () =
+  match !late_error_response with
+  | Some respond ->
+    late_error_response := None;
+    respond ()
+  | None ->
+    Miou_unix.sleep 0.01;
+    respond_late ()
+
+let test_late_error_response () =
+  late_error_response := None;
+  with_server (fun addr ->
+    let socket = connect addr in
+    send socket "GET /raise-later HTTP/1.1\r\nhost: localhost\r\n\r\n";
+    Miou_unix.sleep 0.05;
+    respond_late ();
     Alcotest.(check string)
       "status line"
       "HTTP/1.1 500 Internal Server Error"
@@ -976,6 +1008,7 @@ let () =
           , `Quick
           , test_close_with_trailing_bytes )
         ; "request handler exception", `Quick, test_handler_exception
+        ; "late error response", `Quick, test_late_error_response
         ; ( "cancelling the connection task is not an error"
           , `Quick
           , test_cancel_is_not_an_error )
