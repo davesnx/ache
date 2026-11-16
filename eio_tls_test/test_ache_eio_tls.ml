@@ -222,7 +222,7 @@ let with_listener env sw handler f =
       (`Tcp (Eio.Net.Ipaddr.V4.loopback, 0))
   in
   let handlers_done = ref 0 in
-  let accepted = ref 0 in
+  let connected = ref 0 in
   Eio.Fiber.fork_daemon ~sw (fun () ->
     let rec accept () =
       Eio.Net.accept_fork
@@ -230,7 +230,6 @@ let with_listener env sw handler f =
         listening
         ~on_error:(fun exn -> handler_errors := exn :: !handler_errors)
         (fun socket addr ->
-           incr accepted;
            Fun.protect
              ~finally:(fun () -> incr handlers_done)
              (fun () -> handler socket addr));
@@ -238,17 +237,18 @@ let with_listener env sw handler f =
     in
     accept ());
   let connect sw =
+    incr connected;
     Eio.Net.connect ~sw (Eio.Stdenv.net env) (Eio.Net.listening_addr listening)
   in
   f connect;
   let rec wait n =
-    if !handlers_done < !accepted && n > 0
+    if !handlers_done < !connected && n > 0
     then (
       Eio.Time.sleep (Eio.Stdenv.clock env) 0.01;
       wait (n - 1))
   in
   wait 500;
-  Alcotest.(check int) "connection handlers returned" !accepted !handlers_done
+  Alcotest.(check int) "connection handlers returned" !connected !handlers_done
 
 let with_server ?(timeouts = false) ?idle_timeout ?head_timeout f =
   server_errors := [];

@@ -154,14 +154,13 @@ let with_listener handler f =
       listening
       (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
     let addr = Unix.getsockname (Miou_unix.to_file_descr listening) in
-    let accepted = ref 0
+    let connected = ref 0
     and handlers_done = ref 0 in
     let server =
       Miou.async (fun () ->
         let orphans = Miou.orphans () in
         let rec accept () =
           let socket, peer = Miou_unix.accept listening in
-          incr accepted;
           ignore
             (Miou.async ~orphans (fun () ->
                (try handler socket peer with
@@ -175,6 +174,7 @@ let with_listener handler f =
         accept ())
     in
     let connect () =
+      incr connected;
       let socket = Miou_unix.tcpv4 () in
       Miou_unix.connect socket addr;
       socket
@@ -187,7 +187,7 @@ let with_listener handler f =
          with_timeout 10.0 (fun () ->
            f connect;
            let rec wait n =
-             if !handlers_done < !accepted && n > 0
+             if !handlers_done < !connected && n > 0
              then (
                Miou_unix.sleep 0.01;
                wait (n - 1))
@@ -195,7 +195,7 @@ let with_listener handler f =
            wait 500;
            Alcotest.(check int)
              "connection handlers returned"
-             !accepted
+             !connected
              !handlers_done)));
   Alcotest.(check int) "no file descriptor leaked" fds (open_fds ())
 
