@@ -226,27 +226,31 @@ let ensure_space t len =
   if free_bytes_in_buffer t < len
   then begin
     flush_buffer t;
-    t.buffer <- Bigstringaf.create (max (Bigstringaf.length t.buffer) len);
+    t.buffer <- Bigstringaf.create (Int.max (Bigstringaf.length t.buffer) len);
     t.write_pos <- 0;
     t.scheduled_pos <- 0
   end
 
-let write_gen t ~length ~blit ?(off = 0) ?len a =
+let write_string t ?(off = 0) ?len a =
   writable_exn t;
-  let len = match len with None -> length a - off | Some len -> len in
+  let len = match len with None -> String.length a - off | Some len -> len in
   ensure_space t len;
-  blit a ~src_off:off t.buffer ~dst_off:t.write_pos ~len;
+  Bigstringaf.unsafe_blit_from_string
+    a
+    ~src_off:off
+    t.buffer
+    ~dst_off:t.write_pos
+    ~len;
   t.write_pos <- t.write_pos + len
 
-let write_string =
-  let length = String.length in
-  let blit = Bigstringaf.unsafe_blit_from_string in
-  fun t ?off ?len a -> write_gen t ~length ~blit ?off ?len a
-
-let write_bigstring =
-  let length = Bigstringaf.length in
-  let blit = Bigstringaf.unsafe_blit in
-  fun t ?off ?len a -> write_gen t ~length ~blit ?off ?len a
+let write_bigstring t ?(off = 0) ?len a =
+  writable_exn t;
+  let len =
+    match len with None -> Bigstringaf.length a - off | Some len -> len
+  in
+  ensure_space t len;
+  Bigstringaf.unsafe_blit a ~src_off:off t.buffer ~dst_off:t.write_pos ~len;
+  t.write_pos <- t.write_pos + len
 
 let write_char t c =
   writable_exn t;

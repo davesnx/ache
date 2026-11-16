@@ -78,7 +78,7 @@ module Reader = struct
     then (
       if Bigstringaf.length t.buffer - (t.off + t.len) < len
       then (
-        let buffer = Bigstringaf.create (max 0x1000 ((2 * t.len) + len)) in
+        let buffer = Bigstringaf.create (Int.max 0x1000 ((2 * t.len) + len)) in
         Bigstringaf.blit t.buffer ~src_off:t.off buffer ~dst_off:0 ~len:t.len;
         t.buffer <- buffer;
         t.off <- 0);
