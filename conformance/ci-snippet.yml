@@ -4,7 +4,7 @@ h1spec:
   strategy:
     fail-fast: false
     matrix:
-      runtime: [eio, lwt]
+      runtime: [eio, lwt, miou]
   steps:
     - uses: actions/checkout@v4
     - uses: actions/checkout@v4

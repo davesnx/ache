@@ -96,6 +96,7 @@ jobs:
         runtime:
           - eio
           - lwt
+          - miou
 
     steps:
       - uses: actions/checkout@v4

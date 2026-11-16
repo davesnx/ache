@@ -1,3 +1,14 @@
 (executables
- (names h1spec_eio h1spec_lwt)
- (libraries ache ache-eio ache-lwt ache_examples eio_main lwt lwt.unix unix))
+ (names h1spec_eio h1spec_lwt h1spec_miou)
+ (libraries
+  ache
+  ache-eio
+  ache-lwt
+  ache-miou
+  ache_examples
+  eio_main
+  lwt
+  lwt.unix
+  miou
+  miou.unix
+  unix))

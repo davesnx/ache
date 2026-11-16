@@ -3,7 +3,7 @@ set -eu
 
 usage() {
   echo "usage: H1SPEC=/path/to/http_test.ts $0 REPORT_FILE" >&2
-  echo "  RUNTIME=eio|lwt (default eio)" >&2
+  echo "  RUNTIME=eio|lwt|miou (default eio)" >&2
   echo "  NODE=node binary >= 22.18 (default node); runs h1spec with deno_shim.mjs" >&2
   echo "  DENO=deno binary; when set, runs h1spec with Deno instead of Node" >&2
   exit 2
@@ -17,8 +17,8 @@ deno=${DENO:-}
 h1spec_rev=f0a5650a20c575fbea0f7179a3a9cfa50f20ba6e
 
 case $runtime in
-  eio | lwt) ;;
-  *) echo "RUNTIME must be eio or lwt, got: $runtime" >&2; exit 2 ;;
+  eio | lwt | miou) ;;
+  *) echo "RUNTIME must be eio, lwt or miou, got: $runtime" >&2; exit 2 ;;
 esac
 
 if [ -z "${H1SPEC:-}" ] || [ ! -f "$H1SPEC" ]; then

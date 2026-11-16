@@ -223,7 +223,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - httpun #155: `Body.Writer.flush` callbacks get `` `Closed `` when the peer
   is gone.
 - httpun #156: `conformance/` holds h1spec echo servers and a runner. h1spec
-  passes 33 of 33 checks on the Eio and Lwt servers.
+  passes 33 of 33 checks on the Eio, Lwt and Miou servers.
 - httpun #157, #159: invalid field names and control characters in field
   values get 400.
 - httpun #158, #162: missing or repeated `Host` gets 400.
