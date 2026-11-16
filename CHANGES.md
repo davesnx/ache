@@ -36,6 +36,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - Strict parsing and framing after RFC 9110 and RFC 9112. `docs/ache.md` lists
   what the server rejects.
 - Bodies are delivered in linear time.
+- An obs-folded response field is joined once, in linear time.
 - Fixes httpun #95, #143, #150, #151, #154 to #165, and httpaf #18, #38,
   #86, #191, #192.
 

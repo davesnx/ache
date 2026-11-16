@@ -42,6 +42,7 @@ type out =
   ; mutable version : Version.t
   ; mutable status : Status.t
   ; mutable fields : (string * string) list
+  ; mutable folds : string list
   ; mutable size : int
   ; mutable error : string
   }
@@ -52,11 +53,24 @@ let out () =
   ; version = Version.v1_1
   ; status = `OK
   ; fields = []
+  ; folds = []
   ; size = 0
   ; error = ""
   }
 
+let join_folds o =
+  match o.fields with
+  | (name, first) :: rest ->
+    let parts = List.filter (fun s -> s <> "") (first :: List.rev o.folds) in
+    o.fields <- (name, String.concat " " parts) :: rest;
+    o.folds <- []
+  | [] -> o.folds <- []
+
+let[@inline] close_fold o =
+  match o.folds with [] -> () | _ :: _ -> join_folds o
+
 let request_of o =
+  close_fold o;
   { Request.meth = o.meth
   ; target = o.text
   ; version = o.version
@@ -64,6 +78,7 @@ let request_of o =
   }
 
 let response_of o =
+  close_fold o;
   { Response.version = o.version
   ; status = o.status
   ; reason = o.text
@@ -320,11 +335,12 @@ let field_line ~eof ~obs_fold o bs off stop =
        let value =
          substring bs ~off:start ~len:(trim_end bs start value_end - start)
        in
-       match o.fields with
-       | (name, previous) :: rest when fold ->
-         o.fields <- (name, String.trim (previous ^ " " ^ value)) :: rest
-       | fields ->
-         o.fields <- (substring bs ~off ~len:(name_end - off), value) :: fields);
+       if fold
+       then o.folds <- value :: o.folds
+       else (
+         close_fold o;
+         o.fields <-
+           (substring bs ~off ~len:(name_end - off), value) :: o.fields));
     p
 
 let rec fields ~eof ~obs_fold o bs p stop where =

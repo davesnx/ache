@@ -353,6 +353,38 @@ let obs_fold_value () =
       (Headers.to_list response.headers)
   | Error e -> Alcotest.failf "rejected: %s" e
 
+let obs_fold_parts () =
+  match
+    Ache_private.Parse.Grammar.response
+      "HTTP/1.1 200 OK\r\nX-A:\r\n 2\r\nX-B: b\r\n \r\n c \r\n\r\n"
+  with
+  | Ok response ->
+    Alcotest.(check (list (pair string string)))
+      "fields"
+      [ "X-A", "2"; "X-B", "b c" ]
+      (Headers.to_list response.headers)
+  | Error e -> Alcotest.failf "rejected: %s" e
+
+let obs_fold_many_lines () =
+  let folds = 4000 in
+  let head =
+    "HTTP/1.1 200 OK\r\nX-A: a\r\n"
+    ^ String.concat "" (List.init folds (fun _ -> " b\r\n"))
+    ^ "\r\n"
+  in
+  let before = Gc.allocated_bytes () in
+  let response = Ache_private.Parse.Grammar.response head in
+  let allocated = Gc.allocated_bytes () -. before in
+  (match response with
+  | Ok response ->
+    Alcotest.(check int)
+      "value length"
+      (1 + (2 * folds))
+      (String.length (Headers.get_exn response.headers "X-A"))
+  | Error e -> Alcotest.failf "rejected: %s" e);
+  if allocated > 4e6
+  then Alcotest.failf "%d folded lines allocated %.0f bytes" folds allocated
+
 let obs_fold_request_rejected () =
   match
     Ache_private.Parse.Grammar.request
@@ -741,6 +773,8 @@ let tests =
   ; both "pending requests after a malformed response" pending_after_malformed
   ; both "obs-fold in a response" obs_fold
   ; "obs-fold value", `Quick, obs_fold_value
+  ; "obs-fold parts", `Quick, obs_fold_parts
+  ; "obs-fold on many lines", `Quick, obs_fold_many_lines
   ; "obs-fold in a request is rejected", `Quick, obs_fold_request_rejected
   ; both "reader stops after 101 and 2xx to CONNECT" stops_after_upgrade
   ; both
