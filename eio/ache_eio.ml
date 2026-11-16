@@ -221,7 +221,16 @@ module IO_loop = struct
               ignore (Promise.try_resolve resolve_read_closed () : bool);
               if result = `Eof && not !send_shut then report_exn End_of_file)
         in
-        match read_loop_step () with () -> () | exception exn -> fail exn
+        match read_loop_step () with
+        | () -> ()
+        | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+        | exception exn ->
+          (match Runtime.report_exn t exn with
+          | () ->
+            shutdown_once `Receive;
+            ignore (Promise.try_resolve resolve_read_closed () : bool)
+          | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+          | exception _ -> ignore (Promise.try_resolve resolve_failed () : bool))
     in
     let rec write_loop () =
       let rec write_loop_step () =
