@@ -214,7 +214,7 @@ let respond_with_informational t (response : Response.t) =
        transfer-encoding in a 1xx";
   match t.response_state with
   | Waiting ->
-    if Version.compare t.request.version Version.v1_1 >= 0
+    if Message.at_least_v1_1 t.request.version
     then (
       write_response t response;
       Writer.wakeup t.writer)

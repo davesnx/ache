@@ -109,60 +109,29 @@ let final_coding = function
      | [] -> Some ""
      | coding :: _ -> Some coding )
 
-let rec digits_from s i =
-  i = String.length s
-  ||
-  match String.unsafe_get s i with
-  | '0' .. '9' -> digits_from s (i + 1)
-  | _ -> false
-
-let rec int_of_digits s i acc =
-  if i = String.length s
-  then acc
-  else
-    int_of_digits
-      s
-      (i + 1)
-      ((acc * 10) + Char.code (String.unsafe_get s i) - Char.code '0')
-
-let max_int_digits = if Sys.int_size >= 63 then 18 else 9
-
-let content_length_of_string s =
-  if String.length s > 0 && String.length s <= max_int_digits && digits_from s 0
-  then Int64.of_int (int_of_digits s 0 0)
-  else Message.content_length_of_string s
-
-let unique_lengths headers = function
-  | [] -> []
-  | [ len ] as lengths when String.length len > 0 && digits_from len 0 ->
-    lengths
-  | _ -> Message.unique_content_length_values headers
-
-let length_of_fields ~proxy headers f : Body_length.t =
+let length_of_fields ~proxy f : Body_length.t =
   match final_coding f.codings with
   | Some coding when Headers.ci_equal coding "chunked" -> `Chunked
   | Some _ -> `Close_delimited
   | None ->
-    (match unique_lengths headers f.lengths with
+    (match f.lengths with
     | [] -> `Close_delimited
-    | [ len ] ->
-      let len = content_length_of_string len in
+    | value :: values ->
+      let len = Message.content_length value values in
       if len >= 0L
       then `Fixed len
       else if proxy
       then proxy_error
-      else server_error
-    | _ -> if proxy then proxy_error else server_error)
+      else server_error)
 
 let persistent_of_options version options =
   match options with
-  | [] -> Version.(compare version v1_1) >= 0
+  | [] -> Message.at_least_v1_1 version
   | options ->
     if Message.has_member options "close"
     then false
     else
-      Version.(compare version v1_1) >= 0
-      || Message.has_member options "keep-alive"
+      Message.at_least_v1_1 version || Message.has_member options "keep-alive"
 
 let length_without_fields ~request_method status : Body_length.t option =
   match status, request_method with
@@ -176,7 +145,7 @@ let body_length ?(proxy = false) ~request_method { status; headers; _ } :
   =
   match length_without_fields ~request_method status with
   | Some length -> length
-  | None -> length_of_fields ~proxy headers (fields headers)
+  | None -> length_of_fields ~proxy (fields headers)
 
 let frame ~fn ~proxy ~request_method ~request_version ~persistent ~length t =
   let reject reason = invalid_arg (Printf.sprintf "%s: %s" fn reason) in
@@ -186,7 +155,7 @@ let frame ~fn ~proxy ~request_method ~request_version ~persistent ~length t =
   let f = fields t.headers in
   let has_length = f.lengths <> [] in
   let has_coding = f.codings <> [] in
-  let http_1_1 = Version.compare request_version Version.v1_1 >= 0 in
+  let http_1_1 = Message.at_least_v1_1 request_version in
   let tunnel = request_method = `CONNECT && Status.is_successful t.status in
   let persists = persistent && persistent_of_options t.version f.options in
   (* RFC 9112 §6.2 *)
@@ -205,7 +174,7 @@ let frame ~fn ~proxy ~request_method ~request_version ~persistent ~length t =
   let body_length =
     match length_without_fields ~request_method t.status with
     | Some length -> length
-    | None -> length_of_fields ~proxy t.headers f
+    | None -> length_of_fields ~proxy f
   in
   let t, encoding =
     match body_length with

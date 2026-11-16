@@ -70,12 +70,11 @@ let body_length { headers; _ } : Body_length.t =
       | last :: _ when Headers.ci_equal last "chunked" -> `Chunked
       | _ -> bad_request
   else
-    match Message.unique_content_length_values headers with
+    match Headers.get_multi headers "content-length" with
     | [] -> `Fixed 0L
-    | [ len ] ->
-      let len = Message.content_length_of_string len in
+    | value :: values ->
+      let len = Message.content_length value values in
       if len >= 0L then `Fixed len else bad_request
-    | _ -> bad_request
 
 type error =
   [ `Bad_request
@@ -186,7 +185,7 @@ let target_fits_method meth target =
 let transfer_coding_error { version; headers; _ } =
   if not (Headers.mem headers "transfer-encoding")
   then None
-  else if Version.compare version Version.v1_1 < 0
+  else if not (Message.at_least_v1_1 version)
   then Some `Bad_request
   else
     match List.rev (transfer_codings headers) with
@@ -203,7 +202,7 @@ let received_body_length ({ meth; target; version; headers } as t) =
   then Error `Http_version_not_supported
   else
     match Headers.get_multi headers "host" with
-    | [] when Version.compare version Version.v1_1 >= 0 -> Error `Bad_request
+    | [] when Message.at_least_v1_1 version -> Error `Bad_request
     | _ :: _ :: _ -> Error `Bad_request
     | [ host ] when not (is_host_field host) -> Error `Bad_request
     | _ when not (target_fits_method meth target) -> Error `Bad_request

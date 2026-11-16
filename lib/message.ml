@@ -74,33 +74,78 @@ let rec has_member values token =
   | [] -> false
   | value :: values -> has_member_from value token 0 || has_member values token
 
+let at_least_v1_1 ({ major; minor } : Version.t) =
+  major > 1 || (major = 1 && minor >= 1)
+
 let persistent_connection ?(proxy = false) version headers =
   let _ = proxy in
   (* XXX(seliopou): use proxy argument in the case of HTTP/1.0 as per
      https://tools.ietf.org/html/rfc7230#section-6.3 *)
   match Headers.get_multi headers "connection" with
-  | [] -> Version.(compare version v1_1) >= 0
+  | [] -> at_least_v1_1 version
   | options ->
     if has_member options "close"
     then false
-    else Version.(compare version v1_1) >= 0 || has_member options "keep-alive"
-
-let sort_uniq xs =
-  (* Though {!List.sort_uniq} performs a check on the input length and returns *
-     immediately for lists of length less than [2], it still allocates closures
-     * before it does that check! To avoid that just do our own checking here to
-     * avoid the allocations in the common case. *)
-  match xs with
-  | [] | [ _ ] -> xs
-  | _ -> List.sort_uniq String.compare xs
-
-let unique_content_length_values headers =
-  sort_uniq (list_members (Headers.get_multi headers "content-length"))
+    else at_least_v1_1 version || has_member options "keep-alive"
 
 let is_digit = function '0' .. '9' -> true | _ -> false
 
-(* RFC 9110 §8.6: Content-Length = 1*DIGIT. [-1L] marks an invalid value. *)
-let content_length_of_string s =
-  if s <> "" && String.for_all is_digit s
-  then Option.value (Int64.of_string_opt s) ~default:(-1L)
+let rec same_chars a i stop b j =
+  i = stop
+  || (String.unsafe_get a i = String.unsafe_get b j
+     && same_chars a (i + 1) stop b (j + 1))
+
+let rec members_equal_from value start reference first last =
+  let stop = member_end value start in
+  let member_first = skip_forward value start stop in
+  let member_last = skip_backward value member_first stop in
+  member_last - member_first = last - first
+  && same_chars value member_first member_last reference first
+  && (stop = String.length value
+     || members_equal_from value (stop + 1) reference first last)
+
+let rec values_equal values reference first last =
+  match values with
+  | [] -> true
+  | value :: values ->
+    members_equal_from value 0 reference first last
+    && values_equal values reference first last
+
+let rec digits_value s i stop acc =
+  if i = stop
+  then acc
+  else
+    match String.unsafe_get s i with
+    | '0' .. '9' as c ->
+      digits_value s (i + 1) stop ((acc * 10) + Char.code c - Char.code '0')
+    | _ -> -1
+
+let rec all_digits s i stop =
+  i = stop || (is_digit s.[i] && all_digits s (i + 1) stop)
+
+let max_int_digits = if Sys.int_size >= 63 then 18 else 9
+
+let content_length_of_span s first last =
+  if first = last
+  then -1L
+  else if last - first <= max_int_digits
+  then Int64.of_int (digits_value s first last 0)
+  else if all_digits s first last
+  then
+    Option.value
+      (Int64.of_string_opt (String.sub s first (last - first)))
+      ~default:(-1L)
+  else -1L
+
+(* RFC 9110 §8.6, RFC 9112 §6.3: Content-Length = 1*DIGIT; a list of identical
+   values is one value. [-1L] marks an invalid value. *)
+let content_length value values =
+  let stop = member_end value 0 in
+  let first = skip_forward value 0 stop in
+  let last = skip_backward value first stop in
+  if
+    (stop = String.length value
+    || members_equal_from value (stop + 1) value first last)
+    && values_equal values value first last
+  then content_length_of_span value first last
   else -1L

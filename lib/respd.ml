@@ -47,7 +47,7 @@ let handle_response t response body =
       && not
            (Headers.mem response.headers "transfer-encoding"
            && (Headers.mem response.headers "content-length"
-              || Version.compare response.version Version.v1_1 < 0)
+              || not (Message.at_least_v1_1 response.version))
            && Response.body_length ~request_method:request.Request.meth response
               <> `No_body);
   let next_request_state =
