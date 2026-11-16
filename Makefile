@@ -14,6 +14,12 @@ help: ## Print this help message
 build: ## Build the project, including non installable libraries and executables
 	$(DUNE) build --root . --profile=dev @all
 
+CI_BUILD_DIRS = $(filter-out _% benchmarks/,$(wildcard */))
+
+.PHONY: build-ci
+build-ci: ## Build like build, without benchmarks/vs, whose comparison libraries CI does not install
+	$(DUNE) build --root . --profile=dev @@all @@benchmarks/all $(CI_BUILD_DIRS:%/=@%/all)
+
 .PHONY: build-prod
 build-prod: ## Build for production (--profile=prod)
 	$(DUNE) build --root . --profile=prod

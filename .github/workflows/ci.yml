@@ -56,7 +56,7 @@ jobs:
         uses: ml-in-barcelona/gh-ci-action/dune-cache/load@v1.2.0
 
       - name: Build
-        run: make build
+        run: make build-ci
 
       - name: Check formatting
         run: make format-check
