@@ -562,8 +562,10 @@ module Reader = struct
 
   let wakeup t =
     let f = t.wakeup in
-    t.wakeup <- Optional_thunk.none;
-    Optional_thunk.call_if_some f
+    if Optional_thunk.is_some f
+    then (
+      t.wakeup <- Optional_thunk.none;
+      Optional_thunk.call_if_some f)
 
   let create_body t =
     Body.Reader.create

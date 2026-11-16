@@ -87,9 +87,9 @@ module Reader = struct
 
   let reset_callbacks t =
     t.read_scheduled <- false;
-    t.on_eof <- default_on_eof;
-    t.on_error <- default_on_error;
-    t.on_read <- default_on_read
+    if t.on_eof != default_on_eof then t.on_eof <- default_on_eof;
+    if t.on_error != default_on_error then t.on_error <- default_on_error;
+    if t.on_read != default_on_read then t.on_read <- default_on_read
 
   let rec do_execute_read t ~on_error on_eof on_read =
     if t.len > 0
