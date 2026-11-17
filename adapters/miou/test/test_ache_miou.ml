@@ -88,6 +88,7 @@ let pending_upgrade : Request_descriptor.t option ref = ref None
 exception Respond_later
 
 let late_error_response : (unit -> unit) option ref = ref None
+let big_body = String.make (16 * 1024 * 1024) 'a'
 
 let request_handler (_ : Unix.sockaddr) reqd =
   incr requests_seen;
@@ -142,6 +143,16 @@ let request_handler (_ : Unix.sockaddr) reqd =
         | `Closed -> Option.iter (fun c -> resolve c ()) !stream_flush_closed)
     in
     loop ()
+  | `GET, "/big" ->
+    Body.Reader.close body;
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create
+         ~headers:
+           (Headers.of_list
+              [ "content-length", string_of_int (String.length big_body) ])
+         `OK)
+      big_body
   | `GET, "/upgrade-later" -> pending_upgrade := Some reqd
   | `GET, "/raise" -> failwith "handler failed"
   | `GET, "/raise-later" -> raise Respond_later
@@ -641,6 +652,61 @@ let test_linger_ends_at_peer_close () =
     wait_connection_done ();
     check_elapsed "returns at the peer close" ~from ~min:0. ~max:1.)
 
+let half_close_during_large_response ?idle_timeout ?head_timeout () =
+  with_server ?idle_timeout ?head_timeout (fun addr ->
+    let socket = connect addr in
+    send socket "GET /big HTTP/1.1\r\nhost: localhost\r\n\r\n";
+    shutdown_send socket;
+    Miou_unix.sleep 0.2;
+    let output = read_all socket in
+    Miou_unix.close socket;
+    let head =
+      Printf.sprintf
+        "HTTP/1.1 200 OK\r\ncontent-length: %d\r\n\r\n"
+        (String.length big_body)
+    in
+    Alcotest.(check int)
+      "bytes received"
+      (String.length head + String.length big_body)
+      (String.length output);
+    Alcotest.(check string)
+      "head"
+      head
+      (String.sub output 0 (String.length head));
+    wait_connection_done ());
+  Alcotest.(check int) "no error" 0 (List.length !server_errors)
+
+let test_half_close_large_response_idle_timeout () =
+  half_close_during_large_response ~idle_timeout:5. ()
+
+let test_half_close_large_response_head_timeout () =
+  half_close_during_large_response ~head_timeout:5. ()
+
+let test_linger_not_renewed_by_input () =
+  with_server ~idle_timeout:0.3 (fun addr ->
+    let socket = connect addr in
+    send
+      socket
+      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n";
+    Alcotest.(check string)
+      "response"
+      hello_response_close
+      (take socket (String.length hello_response_close));
+    let from = Unix.gettimeofday () in
+    let rec trickle () =
+      if !connections_done > !connections_taken
+      then incr connections_taken
+      else if Unix.gettimeofday () -. from > 3.
+      then Alcotest.fail "still lingering 3 s after the response"
+      else (
+        (try send socket "x" with Unix.Unix_error _ -> ());
+        Miou_unix.sleep 0.1;
+        trickle ())
+    in
+    trickle ();
+    check_elapsed "linger" ~from ~min:0.25 ~max:1.5;
+    Miou_unix.close socket)
+
 module Raising = struct
   type t = { mutable sent : bool }
 
@@ -1134,6 +1200,38 @@ let test_upgrade_with_read_pending () =
     wait_connection_done ();
     Miou_unix.close socket)
 
+let test_client_shutdown_with_blocked_write () =
+  Miou_unix.run ~domains:0 (fun () ->
+    with_timeout 5.0 (fun () ->
+      let client_end, server_end =
+        Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0
+      in
+      let client_end = Miou_unix.of_file_descr client_end
+      and server_end = Miou_unix.of_file_descr server_end in
+      let client = Ache_miou.Client.create_connection client_end in
+      let size = 4 * 1024 * 1024 in
+      let request_body =
+        Ache_miou.Client.request
+          client
+          (Request.create
+             ~headers:
+               (Headers.of_list
+                  [ "host", "localhost"; "content-length", string_of_int size ])
+             `POST
+             "/")
+          ~error_handler:ignore
+          ~response_handler:(fun _ _ -> Alcotest.fail "unexpected response")
+      in
+      Body.Writer.write_string request_body (String.make size 'a');
+      Body.Writer.flush request_body ignore;
+      Miou_unix.sleep 0.1;
+      let from = Unix.gettimeofday () in
+      Ache_miou.Client.shutdown client;
+      check_elapsed "Client.shutdown" ~from ~min:0. ~max:1.;
+      Alcotest.(check bool) "closed" true (Ache_miou.Client.is_closed client);
+      Miou_unix.close client_end;
+      Miou_unix.close server_end))
+
 let domain_handler (_ : Unix.sockaddr) reqd =
   let body = string_of_int (Stdlib.Domain.self () :> int) in
   Request_descriptor.respond_with_string
@@ -1314,8 +1412,136 @@ let test_server_run_tcp_nodelay ?tcp_nodelay expected () =
                   (nodelay_response expected)
                   (read_all socket)))))
 
+let free_port () =
+  let socket = Unix.socket PF_INET SOCK_STREAM 0 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close socket)
+    (fun () ->
+       Unix.bind socket (ADDR_INET (Unix.inet_addr_loopback, 0));
+       match Unix.getsockname socket with
+       | ADDR_INET (_, port) -> port
+       | ADDR_UNIX _ -> assert false)
+
+let accept_error_server_env = "ACHE_MIOU_TEST_ACCEPT_ERROR_PORT"
+
+let accept_error_server port =
+  let seen = ref false in
+  Miou_unix.run ~domains:0 (fun () ->
+    Ache_miou.Server.run
+      ~domains:1
+      ~on_error:(function
+        | Unix.Unix_error ((EMFILE | ENFILE), "accept", _) -> seen := true
+        | exn -> raise exn)
+      ~request_handler:(fun _ reqd ->
+        Request_descriptor.respond_with_string
+          reqd
+          (Response.create
+             ~headers:(Headers.of_list [ "content-length", "1" ])
+             `OK)
+          (if !seen then "1" else "0"))
+      ~error_handler
+      (Unix.ADDR_INET (Unix.inet_addr_loopback, port)))
+
+let test_server_run_accept_error () =
+  let port = free_port () in
+  let child =
+    Unix.create_process_env
+      "/bin/sh"
+      [| "/bin/sh"; "-c"; "ulimit -n 64 && exec \"$0\""; Sys.executable_name |]
+      (Array.append
+         (Unix.environment ())
+         [| Printf.sprintf "%s=%d" accept_error_server_env port |])
+      Unix.stdin
+      Unix.stdout
+      Unix.stderr
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      Unix.kill child Sys.sigkill;
+      ignore (Unix.waitpid [] child : int * Unix.process_status))
+    (fun () ->
+       Miou_unix.run ~domains:0 (fun () ->
+         with_timeout 20.0 (fun () ->
+           let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, port) in
+           let response body =
+             "HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n" ^ body
+           in
+           let get socket =
+             send socket get_hello;
+             take socket (String.length (response "0"))
+           in
+           let first = connect_retrying addr in
+           Alcotest.(check string) "before" (response "0") (get first);
+           let held = List.init 100 (fun _ -> connect addr) in
+           Miou_unix.sleep 1.0;
+           Alcotest.(check string)
+             "a live connection is served after EMFILE"
+             (response "1")
+             (get first);
+           List.iter Miou_unix.close held;
+           let fresh = connect addr in
+           Alcotest.(check string)
+             "accepts again when descriptors are free"
+             (response "1")
+             (get fresh);
+           Miou_unix.close fresh;
+           Miou_unix.close first)))
+
+exception Error_handler_failed
+
+let test_server_run_on_error () =
+  let errors = ref [] in
+  Miou_unix.run ~domains:0 (fun () ->
+    let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, free_port ()) in
+    let request_handler (_ : Unix.sockaddr) _reqd = failwith "handler failed" in
+    let error_handler (_ : Unix.sockaddr) ?request:_ error start_response =
+      match error with
+      | `Exn _ -> raise Error_handler_failed
+      | _ -> Body.Writer.close (start_response Headers.empty)
+    in
+    let server =
+      Miou.async (fun () ->
+        Ache_miou.Server.run
+          ~domains:1
+          ~on_error:(fun exn -> errors := exn :: !errors)
+          ~request_handler
+          ~error_handler
+          addr)
+    in
+    Fun.protect
+      ~finally:(fun () -> Miou.cancel server)
+      (fun () ->
+         with_timeout 10.0 (fun () ->
+           let reset = connect_retrying addr in
+           send reset "GET /hello HTTP/1.1\r\nHo";
+           Unix.setsockopt_optint
+             (Miou_unix.to_file_descr reset)
+             Unix.SO_LINGER
+             (Some 0);
+           Miou_unix.close reset;
+           let socket = connect addr in
+           send socket get_hello;
+           Alcotest.(check string) "no response" "" (read_all socket);
+           Miou_unix.close socket;
+           let from = Unix.gettimeofday () in
+           while !errors = [] && Unix.gettimeofday () -. from < 3. do
+             Miou_unix.sleep 0.01
+           done;
+           Miou_unix.sleep 0.3)));
+  match !errors with
+  | [ Error_handler_failed ] -> ()
+  | errors ->
+    Alcotest.failf
+      "on_error got [%s], expected [Error_handler_failed]"
+      (String.concat "; " (List.map Printexc.to_string errors))
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  Option.iter
+    (fun port ->
+       accept_error_server (int_of_string port);
+       exit 0)
+    (Sys.getenv_opt accept_error_server_env);
   Alcotest.run
     "ache-miou loopback"
     [ ( "loopback"
@@ -1354,6 +1580,15 @@ let () =
         ; ( "lingering ends when the peer closes"
           , `Quick
           , test_linger_ends_at_peer_close )
+        ; ( "a half-close does not cut a large response (idle_timeout)"
+          , `Quick
+          , test_half_close_large_response_idle_timeout )
+        ; ( "a half-close does not cut a large response (head_timeout)"
+          , `Quick
+          , test_half_close_large_response_head_timeout )
+        ; ( "input during lingering does not extend it"
+          , `Quick
+          , test_linger_not_renewed_by_input )
         ; ( "an exception from report_exn ends the connection"
           , `Quick
           , test_report_exn_raises )
@@ -1366,6 +1601,12 @@ let () =
         ; ( "Server.run ~tcp_nodelay:true"
           , `Quick
           , test_server_run_tcp_nodelay ~tcp_nodelay:true true )
+        ; ( "Server.run keeps serving after EMFILE on accept"
+          , `Quick
+          , test_server_run_accept_error )
+        ; ( "Server.run gives an error_handler exception to on_error"
+          , `Quick
+          , test_server_run_on_error )
         ] )
     ; ( "timeouts"
       , [ "idle connection is closed", `Quick, test_idle_timeout
@@ -1393,6 +1634,9 @@ let () =
         ; ( "Client.shutdown with a read pending"
           , `Quick
           , test_client_shutdown_with_pending_read )
+        ; ( "Client.shutdown with a write blocked"
+          , `Quick
+          , test_client_shutdown_with_blocked_write )
         ; ( "bytes sent before a delayed 101 reach the new protocol"
           , `Quick
           , test_upgrade_with_read_pending )
