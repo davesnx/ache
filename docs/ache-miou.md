@@ -217,8 +217,11 @@ core connection and starts the two loops as two child tasks:
 - **The reader task.** As in `ache-eio`, a read with a timeout goes through
   a separate reader task, and only the wait is stopped when the timeout
   fires. The client always reads through it, so `Client.shutdown` can stop
-  the wait. Every other read is direct. The reader task starts only on the
-  first read that needs it, so a server without timeouts never starts it.
+  the wait. A server read of a request body before its response is
+  complete also goes through it, so that the write task can stop the wait
+  when the response completes (see [Timeouts](ache.md#timeouts)). Every
+  other read is direct. The reader task starts only on the first read that
+  needs it.
 - **Timers.** A timer sleeps at most 0.5 s at a time and then checks its
   deadline again. A cancelled sleep stays in Miou's timer heap until it
   ends, so a short sleep keeps that heap small.

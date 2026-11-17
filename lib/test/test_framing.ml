@@ -259,12 +259,12 @@ let cases =
     , req "CONNECT"
     , with_string `OK "tunnel"
     , "HTTP/1.1 200 OK\r\n\r\ntunnel"
-    , "other" )
+    , "closed" )
   ; ( "CONNECT 200, streaming"
     , req "CONNECT"
     , streaming `OK "tunnel"
     , "HTTP/1.1 200 OK\r\n\r\ntunnel"
-    , "other" )
+    , "closed" )
   ; ( "CONNECT 404, string"
     , req "CONNECT"
     , with_string `Not_found "no"

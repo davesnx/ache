@@ -5,6 +5,7 @@ type t =
   ; response_body_buffer_size : int
   ; max_header_size : int
   ; proxy : bool
+  ; max_pending_output : int
   }
 
 let default =
@@ -14,4 +15,5 @@ let default =
   ; response_body_buffer_size = 0x1000
   ; max_header_size = 0x4000
   ; proxy = false
+  ; max_pending_output = 0x10000
   }

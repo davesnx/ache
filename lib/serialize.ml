@@ -276,6 +276,7 @@ module Writer = struct
     wakeup t
 
   let is_closed t = Encoder.is_closed t.encoder
+  let pending_bytes t = Encoder.pending_bytes t.encoder
   let drained_bytes t = t.drained_bytes
 
   let report_result t result =

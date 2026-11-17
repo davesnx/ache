@@ -316,8 +316,11 @@ module Request_descriptor : sig
 
       No body is sent in a response to [HEAD] or with status 1xx, 204 or 304
       (RFC 9112 §6.3). A [HEAD] or 304 response can carry the [Content-Length]
-      of the matching [GET] response. A 2xx response to [CONNECT] starts a
-      tunnel: its body bytes are sent as they are.
+      of the matching [GET] response. To start a tunnel for a [CONNECT]
+      request, use {!respond_with_upgrade}. The body of a 2xx response to
+      [CONNECT] given to another [respond_with_*] function is sent as it is,
+      then the connection closes, and the bytes after the [CONNECT] request
+      are not read.
 
       ache adds:
       - [Content-Length] to a string or bigstring response that has neither
@@ -397,12 +400,23 @@ module Request_descriptor : sig
         if the status is not 1xx, is 101, or the response has
         [Content-Length] or [Transfer-Encoding]. *)
 
-  val respond_with_upgrade : t -> Headers.t -> Runtime.impl -> unit
-  (** [respond_with_upgrade t headers impl] responds with
-      [101 Switching Protocols] and [headers]. When the response has been
-      written, the connection shuts down its HTTP state and hands reading and
-      writing to [impl]. Input that the connection has not consumed goes to
-      [impl]. *)
+  val respond_with_upgrade :
+     ?status:Status.successful
+    -> t
+    -> Headers.t
+    -> Runtime.impl
+    -> unit
+  (** [respond_with_upgrade ?status t headers impl] responds with
+      [101 Switching Protocols] and [headers]. To a [CONNECT] request it
+      responds with [status] instead (default [`OK]), which starts a tunnel
+      (RFC 9110 §9.3.6). When the response has been written, the connection
+      shuts down its HTTP state and hands reading and writing to [impl].
+      Input that the connection has not consumed goes to [impl].
+
+      @raise Invalid_argument
+        if [status] is given for a request that is not [CONNECT], or, for a
+        [CONNECT] request, if [headers] has [Content-Length] or
+        [Transfer-Encoding] or an invalid field. *)
 
   (** {3 Exception Handling} *)
 
@@ -424,6 +438,11 @@ module Config : sig
               a [501], [414] or [431] response, see
               {!Server_connection.create}. *)
     ; proxy : bool
+    ; max_pending_output : int
+      (** Server: while more response bytes than this wait to be written, the
+          connection reads and dispatches no new request. A client that
+          pipelines requests and does not read the responses then stops
+          being read. Default is [65536]. *)
     }
 
   val default : t
@@ -493,15 +512,24 @@ module Server_connection : sig
       After a request that may switch protocols ([CONNECT], or an [Upgrade]
       field with the [upgrade] connection option), the connection reads
       nothing past the end of that request until its response is decided
-      (RFC 9110 §7.8, §9.3.6). After a 101 response, or a 2xx response to
-      [CONNECT], those bytes are not read as HTTP: a 101 hands them to the
-      new protocol. After any other response, they are read as the next
-      request. When the input ends before a 101 is written, the new protocol
-      gets end of input after the switch.
+      (RFC 9110 §7.8, §9.3.6). After {!Request_descriptor.respond_with_upgrade}
+      (a 101, or a 2xx to [CONNECT]), those bytes go to the new protocol.
+      After a 2xx response to [CONNECT] sent another way, they are not read,
+      and the connection closes when the response is written. After any
+      other response, they are read as the next request. When the input ends
+      before the upgrade response is written, the new protocol gets end of
+      input after the switch.
 
       Once the write side has closed (a failed write or a closing
       response), no new request is read or dispatched: the request in
-      progress still receives its body, then the reader closes.
+      progress still receives its body, within the limit that
+      {!read_timeout} gives, then the reader closes.
+
+      While more than [Config.max_pending_output] bytes of responses are not
+      written, the connection reads no new request, and does not call
+      [request_handler] for a pipelined request that it has read. When
+      [request_handler] raises for a pipelined request, that request gets
+      the error response, as if {!Request_descriptor.report_exn} was called.
 
       When the response is complete and no read is scheduled on the request
       body, the connection reads the rest of the body to find the next
@@ -575,7 +603,7 @@ module Server_connection : sig
 
   (**/**)
 
-  val read_timeout : t -> ([ `Idle | `Head ] * (unit -> unit)) option
+  val read_timeout : t -> ([ `Idle | `Head | `Body ] * (unit -> unit)) option
   (** [read_timeout t] tells a runtime which read timeout applies while it
       waits for input on [t], and the action to run when that timeout expires.
       - [Some (`Idle, close)]: no request is in progress. [close] closes the
@@ -583,8 +611,17 @@ module Server_connection : sig
       - [Some (`Head, reject)]: a request head is partly read. [reject] calls
         [error_handler] with [`Request_timeout] (408) and closes the connection
         after the error response. The request handler is not called.
-      - [None]: a request body is being read, a response is in progress, or
-        the connection is closing or upgraded. No timeout applies. *)
+      - [Some (`Body, close)]: the response is complete, and the rest of the
+        request body has not arrived. The application reads it, or the
+        connection drops it to find the next request. A runtime waits for it
+        at most its idle timeout; a runtime without an idle timeout calls
+        [close] instead of waiting. [close] calls the body's [on_error] and
+        closes the connection after its pending output.
+      - [None]: a request is in progress and its response is not complete,
+        or the connection is closing or upgraded. No timeout applies. The
+        answer can change to [Some (`Body, _)] while the runtime waits for
+        input, when the response completes. A runtime asks again each time
+        its write loop waits or ends. *)
 end
 
 (** {2 Client Connection} *)

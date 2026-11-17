@@ -71,6 +71,7 @@ type t =
        shutdown. Holds on to the response body created by the error handler *
        that might be streaming to the client. *)
   ; mutable upgraded : Runtime.impl option
+  ; mutable reader_waits_for_output : bool
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
@@ -114,13 +115,7 @@ let shutdown_reader t =
 
 let shutdown_writer t =
   if is_active t
-  then (
-    let reqd = current_reqd_exn t in
-    (* XXX(dpatti): I'm not sure I understand why we close the *request* body
-       here. Maybe we can write a test such that removing this line causes it to
-       fail? *)
-    Request_descriptor.fail_request_body reqd;
-    Request_descriptor.flush_response_body reqd);
+  then Request_descriptor.flush_response_body (current_reqd_exn t);
   (match t.error_code with
   | Error { response_state; _ } ->
     Response_state.flush_response_body response_state
@@ -184,6 +179,7 @@ let create
     ; error_code = No_error
     ; config
     ; upgraded = None
+    ; reader_waits_for_output = false
     }
   in
   self := Some (t, upgrade t);
@@ -270,7 +266,17 @@ let advance_request_queue t =
   if Queue.is_empty t.request_queue && not (Writer.is_closed t.writer)
   then Reader.resume t.reader;
   if not (Queue.is_empty t.request_queue)
-  then t.request_handler (Queue.peek t.request_queue)
+  then
+    let reqd = Queue.peek t.request_queue in
+    match t.request_handler reqd with
+    | () -> ()
+    | exception exn -> Request_descriptor.report_exn reqd exn
+
+let output_full t = Writer.pending_bytes t.writer > t.config.max_pending_output
+
+let wait_for_output t =
+  t.reader_waits_for_output <- true;
+  `Yield
 
 let rec _next_read_operation t =
   if not (is_active t)
@@ -280,6 +286,8 @@ let rec _next_read_operation t =
     | No_error when Writer.is_closed t.writer ->
       shutdown t;
       `Close
+    | No_error when output_full t && not (Reader.is_closed t.reader) ->
+      wait_for_output t
     | No_error ->
       let next = Reader.next t.reader in
       (match next with
@@ -325,6 +333,9 @@ and _final_read_operation_for t reqd =
       shutdown_reader t;
       `Close
     | _, (Wait | Ready) -> `Yield
+    | (`Read | `Start | `Error _), Complete
+      when output_full t && not (Reader.is_closed t.reader) ->
+      wait_for_output t
     | `Read, Complete ->
       advance_request_queue t;
       `Read
@@ -383,18 +394,8 @@ let rec _next_write_operation t =
       | No_error -> Writer.next t.writer
       | Error _ -> _next_write_operation t)
     | No_error -> Writer.next t.writer
-    | Error { request; response_state } ->
-      (match
-         let request_method =
-           Option.value
-             ~default:`GET
-             (Option.map (fun (t : Request.t) -> t.meth) request)
-         in
-         Response_state.output_state
-           response_state
-           ~request_method
-           ~writer:t.writer
-       with
+    | Error { response_state; _ } ->
+      (match Response_state.output_state response_state ~writer:t.writer with
       | Wait -> `Yield
       | Ready ->
         Response_state.flush_response_body response_state;
@@ -431,6 +432,7 @@ and _final_write_operation_for t reqd =
          need to handle. *)
       wakeup_reader t;
       Writer.next t.writer
+    | Complete when output_full t -> Writer.next t.writer
     | Complete ->
       advance_request_queue t;
       wakeup_reader t;
@@ -440,7 +442,7 @@ let next_write_operation t = _next_write_operation t
 
 let report_write_result t result =
   Writer.report_result t.writer result;
-  match result with
+  (match result with
   | `Ok _ -> ()
   | `Closed ->
     Reader.pause t.reader;
@@ -449,7 +451,11 @@ let report_write_result t result =
     (match t.error_code with
     | Error { response_state; _ } ->
       Response_state.flush_response_body response_state
-    | No_error -> ())
+    | No_error -> ()));
+  if t.reader_waits_for_output && not (output_full t)
+  then (
+    t.reader_waits_for_output <- false;
+    wakeup_reader t)
 
 let next_read_operation t =
   match t.upgraded with
@@ -516,4 +522,12 @@ let read_timeout t =
     | `Start -> Some (`Idle, fun () -> shutdown t)
     | `Read -> Some (`Head, fun () -> set_error_and_handle t `Request_timeout)
     | `Close | `Error _ -> None)
+  | None, No_error ->
+    let reqd = current_reqd_exn t in
+    (match
+       Request_descriptor.output_state reqd, Request_descriptor.input_state reqd
+     with
+    | Complete, (Wait | Ready) when not (Reader.is_closed t.reader) ->
+      Some (`Body, fun () -> shutdown t)
+    | _ -> None)
   | _ -> None

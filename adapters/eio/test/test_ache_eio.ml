@@ -76,6 +76,8 @@ let partial_body_cut = ref false
 let stream_flush_closed : unit Eio.Promise.u option ref = ref None
 let requests_seen = ref 0
 let pending_upgrade : Request_descriptor.t option ref = ref None
+let pending_response : Request_descriptor.t option ref = ref None
+let pending_body_failed = ref false
 
 exception Respond_later
 
@@ -136,6 +138,25 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
     in
     loop ()
   | `GET, "/upgrade-later" -> pending_upgrade := Some reqd
+  | `CONNECT, _ ->
+    Request_descriptor.respond_with_upgrade reqd Headers.empty (echo_server ())
+  | `POST, "/early-close" ->
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers:(Headers.of_list [ "connection", "close" ]) `OK)
+      "no"
+  | `POST, "/early-413" ->
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create `Content_too_large)
+      "no"
+  | `POST, "/respond-later" ->
+    let rec on_read _ ~off:_ ~len:_ =
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () = Alcotest.fail "a cut body completed"
+    and on_error () = pending_body_failed := true in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
+    pending_response := Some reqd
   | `GET, "/raise" -> failwith "handler failed"
   | `GET, "/raise-later" -> raise Respond_later
   | `POST, "/partial" ->
@@ -340,6 +361,58 @@ let test_many_requests_bounded_stack () =
          Eio.Stream.take connections_done;
          Alcotest.(check int) "responses" requests !received;
          Alcotest.(check int) "server errors" 0 (List.length !server_errors)))
+
+let test_connect_tunnel () =
+  with_server (fun ~sw ~net addr ->
+    let client =
+      Ache_eio.Client.create_connection ~sw (Eio.Net.connect ~sw net addr)
+    in
+    let answered, resolve_answered = Eio.Promise.create () in
+    let request_body =
+      Ache_eio.Client.request
+        client
+        (Request.create
+           ~headers:(Headers.of_list [ "host", "localhost:443" ])
+           `CONNECT
+           "localhost:443")
+        ~error_handler:client_error_handler
+        ~response_handler:(fun response _body ->
+          Eio.Promise.resolve resolve_answered response)
+    in
+    Body.Writer.close request_body;
+    let response = Eio.Promise.await answered in
+    Alcotest.(check int) "status" 200 (Status.to_code response.status);
+    let message = "hello through the tunnel" in
+    let echoed, resolve_echoed = Eio.Promise.create () in
+    let received = Stdlib.Buffer.create 16 in
+    let tunnel_client =
+      Echo.create ~pending:message (fun t s ->
+        Stdlib.Buffer.add_string received s;
+        if Stdlib.Buffer.length received >= String.length message
+        then (
+          Echo.shutdown t;
+          Eio.Promise.resolve resolve_echoed (Stdlib.Buffer.contents received)))
+    in
+    Ache_eio.Client.upgrade client (Runtime.make (module Echo) tunnel_client);
+    Alcotest.(check string) "echoed" message (Eio.Promise.await echoed);
+    Eio.Promise.await (Ache_eio.Client.shutdown client))
+
+let test_connect_tunnel_bytes_after_head () =
+  with_server (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string
+      "CONNECT localhost:443 HTTP/1.1\r\nhost: localhost:443\r\n\r\nping"
+      socket;
+    let expected = "HTTP/1.1 200 OK\r\n\r\nping" in
+    Alcotest.(check string)
+      "200, then the bytes sent with the head come back"
+      expected
+      (Eio.Buf_read.take (String.length expected) reader);
+    Eio.Flow.copy_string "pong" socket;
+    Alcotest.(check string) "later bytes" "pong" (Eio.Buf_read.take 4 reader);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
 
 let test_upgrade () =
   with_server (fun ~sw ~net addr ->
@@ -699,6 +772,92 @@ let test_slow_body_not_cut () =
     Eio.Flow.close socket;
     Eio.Stream.take connections_done);
   Alcotest.(check int) "no error" 0 (List.length !server_errors)
+
+let unread_body_request target =
+  Printf.sprintf
+    "POST %s HTTP/1.1\r\nhost: localhost\r\ncontent-length: 100000\r\n\r\nabc"
+    target
+
+let early_close_response =
+  "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nno"
+
+let early_413_response =
+  "HTTP/1.1 413 Content Too Large\r\ncontent-length: 2\r\n\r\nno"
+
+let test_unread_body_without_idle_timeout () =
+  List.iter
+    (fun (target, response) ->
+       with_server (fun ~sw ~net addr ->
+         let socket = Eio.Net.connect ~sw net addr in
+         Eio.Flow.copy_string (unread_body_request target) socket;
+         Alcotest.(check string)
+           (target ^ ": response, then the connection closes")
+           response
+           (read_all socket);
+         Eio.Stream.take connections_done;
+         Eio.Flow.close socket))
+    [ "/early-close", early_close_response; "/early-413", early_413_response ]
+
+let test_unread_body_idle_timeout () =
+  let clock = Eio_mock.Clock.make () in
+  with_server ~clock ~idle_timeout:0.1 (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string (unread_body_request "/early-413") socket;
+    Alcotest.(check string)
+      "response"
+      early_413_response
+      (Eio.Buf_read.take (String.length early_413_response) reader);
+    advance clock;
+    Alcotest.(check (float 0.))
+      "closed at the idle timeout"
+      0.1
+      (Eio.Time.now clock);
+    Alcotest.(check bool) "closed" true (Eio.Buf_read.at_end_of_input reader);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
+let respond_while_body_read_pending ?clock ?idle_timeout () =
+  pending_response := None;
+  pending_body_failed := false;
+  with_server ?clock ?idle_timeout (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string (unread_body_request "/respond-later") socket;
+    let rec respond () =
+      match !pending_response with
+      | Some reqd ->
+        Request_descriptor.respond_with_string reqd (Response.create `OK) "late"
+      | None ->
+        !real_sleep 0.001;
+        respond ()
+    in
+    respond ();
+    let response = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nlate" in
+    Alcotest.(check string)
+      "response"
+      response
+      (Eio.Buf_read.take (String.length response) reader);
+    Option.iter
+      (fun clock ->
+         advance clock;
+         Alcotest.(check (float 0.))
+           "closed at the idle timeout"
+           0.1
+           (Eio.Time.now clock))
+      clock;
+    Alcotest.(check bool) "closed" true (Eio.Buf_read.at_end_of_input reader);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done);
+  Alcotest.(check bool) "request body failed" true !pending_body_failed
+
+let test_respond_while_body_read_pending () = respond_while_body_read_pending ()
+
+let test_respond_while_body_read_pending_idle_timeout () =
+  respond_while_body_read_pending
+    ~clock:(Eio_mock.Clock.make ())
+    ~idle_timeout:0.1
+    ()
 
 let test_no_timeout_configured () =
   with_server (fun ~sw ~net addr ->
@@ -1421,6 +1580,12 @@ let () =
           , `Quick
           , test_many_requests_bounded_stack )
         ; "101 upgrade to an echo protocol", `Quick, test_upgrade
+        ; ( "CONNECT tunnel through respond_with_upgrade and Client.upgrade"
+          , `Quick
+          , test_connect_tunnel )
+        ; ( "CONNECT tunnel gets the bytes sent with the head"
+          , `Quick
+          , test_connect_tunnel_bytes_after_head )
         ; ( "an incomplete token sent with the upgrade request reaches the new \
              protocol"
           , `Quick
@@ -1484,6 +1649,18 @@ let () =
           , test_head_deadline )
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
+        ; ( "unread body after the response, no idle_timeout: closes"
+          , `Quick
+          , test_unread_body_without_idle_timeout )
+        ; ( "unread body after the response: idle_timeout"
+          , `Quick
+          , test_unread_body_idle_timeout )
+        ; ( "response while a body read waits, no idle_timeout: closes"
+          , `Quick
+          , test_respond_while_body_read_pending )
+        ; ( "response while a body read waits: idle_timeout"
+          , `Quick
+          , test_respond_while_body_read_pending_idle_timeout )
         ; "a timeout needs a clock", `Quick, test_timeout_needs_clock
         ; ( "when the timeout arguments are checked"
           , `Quick

@@ -92,6 +92,8 @@ let requests_seen = ref 0
 exception Respond_later
 
 let late_error_response : (unit -> unit) option ref = ref None
+let pending_response : Request_descriptor.t option ref = ref None
+let pending_body_failed = ref false
 
 let request_handler (_ : Unix.sockaddr) reqd =
   incr requests_seen;
@@ -127,6 +129,8 @@ let request_handler (_ : Unix.sockaddr) reqd =
     and on_eof () = Body.Writer.close response_body
     and on_error () = failwith "request body cut short" in
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+  | `CONNECT, _ ->
+    Request_descriptor.respond_with_upgrade reqd Headers.empty (echo_server ())
   | `GET, "/upgrade" ->
     Body.Reader.close body;
     Request_descriptor.respond_with_upgrade
@@ -149,6 +153,23 @@ let request_handler (_ : Unix.sockaddr) reqd =
         !stream_start)
   | `GET, "/raise" -> failwith "handler failed"
   | `GET, "/raise-later" -> raise Respond_later
+  | `POST, "/early-close" ->
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers:(Headers.of_list [ "connection", "close" ]) `OK)
+      "no"
+  | `POST, "/early-413" ->
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create `Content_too_large)
+      "no"
+  | `POST, "/respond-later" ->
+    let rec on_read _ ~off:_ ~len:_ =
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () = Alcotest.fail "a cut body completed"
+    and on_error () = pending_body_failed := true in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
+    pending_response := Some reqd
   | `POST, "/partial" ->
     let rec on_read _ ~off:_ ~len:_ =
       Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
@@ -389,6 +410,24 @@ let read_exactly socket n =
       | k -> go (off + k)
   in
   go 0
+
+let test_connect_tunnel_bytes_after_head () =
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    write_all
+      socket
+      "CONNECT localhost:443 HTTP/1.1\r\nhost: localhost:443\r\n\r\nping"
+    >>= fun () ->
+    let expected = "HTTP/1.1 200 OK\r\n\r\nping" in
+    read_exactly socket (String.length expected) >>= fun first ->
+    Alcotest.(check string)
+      "200, then the bytes sent with the head come back"
+      expected
+      first;
+    write_all socket "pong" >>= fun () ->
+    read_exactly socket 4 >>= fun second ->
+    Alcotest.(check string) "later bytes" "pong" second;
+    Lwt_unix.close socket)
 
 let test_upgrade_incomplete_token_reaches_new_protocol () =
   with_server (fun connect ->
@@ -739,6 +778,73 @@ let test_slow_body_not_cut () =
     Alcotest.(check string) "second half" "world" second;
     Lwt_unix.close socket);
   Alcotest.(check int) "no error" 0 (List.length !server_errors)
+
+let unread_body_request target =
+  Printf.sprintf
+    "POST %s HTTP/1.1\r\nhost: localhost\r\ncontent-length: 100000\r\n\r\nabc"
+    target
+
+let early_close_response =
+  "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nno"
+
+let early_413_response =
+  "HTTP/1.1 413 Content Too Large\r\ncontent-length: 2\r\n\r\nno"
+
+let test_unread_body_without_idle_timeout () =
+  List.iter
+    (fun (target, response) ->
+       with_server (fun connect ->
+         connect () >>= fun socket ->
+         write_all socket (unread_body_request target) >>= fun () ->
+         read_all socket >>= fun output ->
+         Alcotest.(check string)
+           (target ^ ": response, then the connection closes")
+           response
+           output;
+         Lwt_unix.close socket))
+    [ "/early-close", early_close_response; "/early-413", early_413_response ]
+
+let test_unread_body_idle_timeout () =
+  with_server ~idle_timeout:0.3 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (unread_body_request "/early-413") >>= fun () ->
+    read_exactly socket (String.length early_413_response) >>= fun first ->
+    Alcotest.(check string) "response" early_413_response first;
+    let since = Unix.gettimeofday () in
+    read_all socket >>= fun rest ->
+    check_elapsed "closed at the idle timeout" ~since ~at_least:0.25;
+    Alcotest.(check string) "then closed" "" rest;
+    Lwt_unix.close socket)
+
+let respond_while_body_read_pending ?idle_timeout ~at_least () =
+  pending_response := None;
+  pending_body_failed := false;
+  with_server ?idle_timeout (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (unread_body_request "/respond-later") >>= fun () ->
+    let rec respond () =
+      match !pending_response with
+      | Some reqd ->
+        Request_descriptor.respond_with_string reqd (Response.create `OK) "late";
+        Lwt.return_unit
+      | None -> Lwt_unix.sleep 0.001 >>= respond
+    in
+    respond () >>= fun () ->
+    let response = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nlate" in
+    read_exactly socket (String.length response) >>= fun first ->
+    Alcotest.(check string) "response" response first;
+    let since = Unix.gettimeofday () in
+    read_all socket >>= fun rest ->
+    check_elapsed "closed" ~since ~at_least;
+    Alcotest.(check string) "then closed" "" rest;
+    Lwt_unix.close socket);
+  Alcotest.(check bool) "request body failed" true !pending_body_failed
+
+let test_respond_while_body_read_pending () =
+  respond_while_body_read_pending ~at_least:0. ()
+
+let test_respond_while_body_read_pending_idle_timeout () =
+  respond_while_body_read_pending ~idle_timeout:0.3 ~at_least:0.25 ()
 
 let test_no_timeout_configured () =
   with_server (fun connect ->
@@ -1147,6 +1253,9 @@ let () =
         ; "POST echo larger than the read buffer", `Quick, test_post_echo
         ; "two pipelined requests", `Quick, test_pipelined
         ; "101 upgrade to an echo protocol", `Quick, test_upgrade
+        ; ( "CONNECT tunnel gets the bytes sent with the head"
+          , `Quick
+          , test_connect_tunnel_bytes_after_head )
         ; ( "an incomplete token sent with the upgrade request reaches the new \
              protocol"
           , `Quick
@@ -1187,6 +1296,18 @@ let () =
           , test_head_deadline )
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
+        ; ( "unread body after the response, no idle_timeout: closes"
+          , `Quick
+          , test_unread_body_without_idle_timeout )
+        ; ( "unread body after the response: idle_timeout"
+          , `Quick
+          , test_unread_body_idle_timeout )
+        ; ( "response while a body read waits, no idle_timeout: closes"
+          , `Quick
+          , test_respond_while_body_read_pending )
+        ; ( "response while a body read waits: idle_timeout"
+          , `Quick
+          , test_respond_while_body_read_pending_idle_timeout )
         ; "a timeout must be positive", `Quick, test_timeout_must_be_positive
         ; ( "when the timeout arguments are checked"
           , `Quick

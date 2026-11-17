@@ -223,10 +223,14 @@ read loop asks it to, and keeps the result until the read loop takes it.
   permanent error, and every later operation on that connection fails.
 - The client always reads through the reader fiber, so `Client.shutdown` can
   stop the wait without cancelling the read.
+- A server read of a request body before its response is complete goes
+  through the reader fiber, with or without `?clock`, so that the write
+  loop can stop the wait when the response completes (see
+  [Timeouts](ache.md#timeouts)).
 - Every other read is direct: the read loop calls `single_read` itself. A
-  server without `?clock` has no timeouts, so all its reads are direct. With
-  a clock, the reads of a request body and of pipelined requests are direct,
-  and the reads that wait for a new request head use the reader fiber.
+  server without `?clock` has no timeouts, so its other reads are direct.
+  With a clock, the reads of pipelined requests are direct, and the reads
+  that wait for a new request head use the reader fiber.
 
 A direct read saves two fiber switches and an `Eio.Condition` handoff for
 each read, and the objects of one read die young. In alternating runs of a

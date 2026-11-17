@@ -85,6 +85,7 @@ module IO_loop = struct
          ([ `Read | `Linger ]
           -> ((unit -> int) -> (int, [ `Timeout ]) result) option)
     -> linger:bool
+    -> ?writer_waits:(unit -> unit)
     -> t
     -> _ Eio.Flow.two_way
     -> unit
@@ -94,6 +95,7 @@ module IO_loop = struct
      ?read_closed
      ~timeout
      ~linger:lingers
+     ?(writer_waits = ignore)
      t
      socket ->
     Switch.run @@ fun sw ->
@@ -249,11 +251,14 @@ module IO_loop = struct
           Runtime.report_write_result t write_result;
           write_loop_step ()
         | `Yield ->
+          writer_waits ();
           let p, u = Promise.create () in
           Runtime.yield_writer t (fun () -> Promise.resolve u ());
           Promise.await p;
           write_loop_step ()
-        | `Close _ -> shutdown_once `Send
+        | `Close _ ->
+          writer_waits ();
+          shutdown_once `Send
       in
       match write_loop_step () with () -> () | exception exn -> fail exn
     in
@@ -309,7 +314,7 @@ module Server = struct
           | Some (`Head, _) ->
             if Option.is_none !head_deadline
             then head_deadline := Some (Eio.Time.now clock +. seconds)
-          | Some (`Idle, _) | None -> head_deadline := None)
+          | Some ((`Idle | `Body), _) | None -> head_deadline := None)
         | _ -> ()
       in
       let module Observed = struct
@@ -342,7 +347,7 @@ module Server = struct
               | `Read ->
                 observe ();
                 (match Ache.Server_connection.read_timeout connection with
-                | Some (`Idle, on_timeout) ->
+                | Some ((`Idle | `Body), on_timeout) ->
                   Option.map (fun s -> s, on_timeout) idle_timeout
                 | Some (`Head, on_timeout) ->
                   Option.map
@@ -361,11 +366,38 @@ module Server = struct
                    Error `Timeout)
               limit
       in
+      let writer_waits = Eio.Condition.create () in
+      let rec until_response_complete () =
+        match Ache.Server_connection.read_timeout connection with
+        | Some (`Body, on_timeout) ->
+          Option.iter
+            (fun clock -> Option.iter (Eio.Time.sleep clock) idle_timeout)
+            clock;
+          on_timeout ();
+          Error `Timeout
+        | Some ((`Idle | `Head), _) | None ->
+          Eio.Condition.await_no_mutex writer_waits;
+          until_response_complete ()
+      in
+      let timeout phase =
+        match phase, Ache.Server_connection.read_timeout connection with
+        | `Read, Some (`Body, on_timeout) when Option.is_none idle_timeout ->
+          Some
+            (fun _ ->
+              on_timeout ();
+              Error `Timeout)
+        | `Read, None ->
+          Some
+            (fun read ->
+              Fiber.first (fun () -> Ok (read ())) until_response_complete)
+        | _ -> timeout phase
+      in
       IO_loop.start
         (module Observed)
         ~read_buffer_size:config.read_buffer_size
         ~timeout
         ~linger:(Option.is_some clock)
+        ~writer_waits:(fun () -> Eio.Condition.broadcast writer_waits)
         connection
         socket
 

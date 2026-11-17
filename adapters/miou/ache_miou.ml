@@ -102,7 +102,7 @@ module Make (Io : IO) = struct
       -> interruptible:bool
       -> timeout:
            ([ `Read | `Linger ]
-            -> ([ `Idle | `Head ] * float * (unit -> unit)) option)
+            -> ([ `Idle | `Head | `Response ] * float * (unit -> unit)) option)
       -> linger:bool
       -> t
       -> Io.socket
@@ -163,6 +163,7 @@ module Make (Io : IO) = struct
       let idle_deadline = Deadline.create ()
       and head_deadline = Deadline.create () in
       let pending_read = ref false
+      and writer_waited = ref false
       and read_requested = ref false
       and read_result = ref None
       and request_read = Signal.create ()
@@ -187,6 +188,9 @@ module Make (Io : IO) = struct
                  loop ()))
       in
       let timed_read limit =
+        let until_response =
+          match limit with Some (`Response, _, _) -> true | _ -> false
+        in
         if (not interruptible) && Option.is_none limit && not !pending_read
         then Ok (read socket read_buffer)
         else (
@@ -200,30 +204,40 @@ module Make (Io : IO) = struct
               start_reader ();
               Signal.wake request_read);
             let deadline =
-              Option.map
-                (fun (kind, at, _) ->
-                   let deadline =
-                     match kind with
-                     | `Idle -> idle_deadline
-                     | `Head -> head_deadline
-                   in
-                   Deadline.set deadline at ~expired:read_closed.ready;
-                   deadline)
-                limit
+              Option.bind limit (fun (kind, at, _) ->
+                let deadline =
+                  match kind with
+                  | `Idle -> Some idle_deadline
+                  | `Head -> Some head_deadline
+                  | `Response -> None
+                in
+                Option.iter
+                  (fun deadline ->
+                     Deadline.set deadline at ~expired:read_closed.ready)
+                  deadline;
+                deadline)
             in
             Signal.wait_until read_closed.ready (fun () ->
               Option.is_some !read_result
               || read_closed.closed
-              || Option.fold ~none:false ~some:Deadline.passed deadline));
+              || Option.fold ~none:false ~some:Deadline.passed deadline
+              || (until_response && !writer_waited)));
           match !read_result with
           | Some result ->
             read_result := None;
             pending_read := false;
             (match result with Ok n -> Ok n | Error exn -> raise exn)
           | None when read_closed.closed -> raise End_of_file
+          | None when until_response ->
+            writer_waited := false;
+            Error `Timeout
           | None ->
             Option.iter (fun (_, _, on_timeout) -> on_timeout ()) limit;
             Error `Timeout)
+      in
+      let writer_waits () =
+        writer_waited := true;
+        Signal.wake read_closed.ready
       in
       let rec linger () =
         match timed_read (timeout `Linger) with
@@ -272,9 +286,12 @@ module Make (Io : IO) = struct
           Runtime.report_write_result t (writev socket io_vectors);
           write_loop ()
         | `Yield ->
+          writer_waits ();
           yield Runtime.yield_writer;
           write_loop ()
-        | `Close _ -> shutdown_once SHUTDOWN_SEND
+        | `Close _ ->
+          writer_waits ();
+          shutdown_once SHUTDOWN_SEND
       in
       let read_task () =
         (match read_loop () with
@@ -365,7 +382,7 @@ module Make (Io : IO) = struct
             | Some (`Head, _) ->
               if Option.is_none !head_deadline
               then head_deadline := Some (Unix.gettimeofday () +. seconds)
-            | Some (`Idle, _) | None -> head_deadline := None)
+            | Some ((`Idle | `Body), _) | None -> head_deadline := None)
         in
         let module Observed = struct
           include Ache.Server_connection
@@ -390,7 +407,6 @@ module Make (Io : IO) = struct
                      idle_timeout
                      ~default:linger_without_idle_timeout
               , ignore )
-          | `Read when untimed -> None
           | `Read ->
             observe ();
             (match Ache.Server_connection.read_timeout connection with
@@ -403,7 +419,12 @@ module Make (Io : IO) = struct
               Option.map
                 (fun deadline -> `Head, deadline, on_timeout)
                 !head_deadline
-            | None -> None)
+            | Some (`Body, on_timeout) ->
+              Some
+                ( `Idle
+                , Unix.gettimeofday () +. Option.value idle_timeout ~default:0.
+                , on_timeout )
+            | None -> Some (`Response, infinity, ignore))
         in
         IO_loop.start
           (module Observed)

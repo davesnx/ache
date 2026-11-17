@@ -148,7 +148,10 @@ It creates the core connection and starts the two loops:
   the read buffer, then gives the new bytes to the core.
 - **Timeouts.** A timed read is `Lwt.pick` of the socket read and
   `Ache_lwt.Timeout.expired`. See [Timeouts](#timeouts) for why the timers
-  are shared.
+  are shared. A read of a request body before its response is complete is
+  `Lwt.pick` of the socket read and a wait for the write loop, which
+  then gives the limit for the rest of the body (see
+  [Timeouts](ache.md#timeouts)).
 - **Errors.** If a write fails, or the core raises in `report_exn`, the
   connection resolves `failed`, and `Lwt.choose` closes the socket.
 
