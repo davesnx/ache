@@ -9,7 +9,7 @@ parses and serializes messages and keeps the state of a connection.
 
 {ul
 {- [ache]: {!Ache}, the core. Start with {!Ache.Server_connection},
-   {!Ache.Client_connection}, {!Ache.Reqd} and {!Ache.Body}.}
+   {!Ache.Client_connection}, {!Ache.Request_descriptor} and {!Ache.Body}.}
 {- [ache-eio]:
    {{:https://ocaml.org/p/ache-eio/latest/doc/Ache_eio/index.html}[Ache_eio]},
    which runs ache on any Eio two-way flow.}
@@ -39,8 +39,8 @@ by default).
 
 ache sets the framing of each response: it adds [Content-Length],
 [Transfer-Encoding: chunked] and [Connection: close] where needed, and the
-[respond_with_*] functions of {!Ache.Reqd} raise [Invalid_argument] for a
-response that cannot be sent correctly.
+[respond_with_*] functions of {!Ache.Request_descriptor} raise
+[Invalid_argument] for a response that cannot be sent correctly.
 
 The client gives [`Connection_closed] to each request that got no response,
 and pipelines only behind requests with an idempotent method. See

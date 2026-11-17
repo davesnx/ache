@@ -49,7 +49,7 @@ let no_body_server_test ~status ~streaming =
     then (
       fun ex ->
         let w =
-          Reqd.respond_with_streaming
+          Request_descriptor.respond_with_streaming
             ex.Server.reqd
             (Response.create (Status.of_code status))
         in
@@ -57,7 +57,7 @@ let no_body_server_test ~status ~streaming =
         Body.Writer.close w)
     else
       fun ex ->
-        Reqd.respond_with_string
+        Request_descriptor.respond_with_string
           ex.Server.reqd
           (Response.create (Status.of_code status))
           "hello"
@@ -207,7 +207,7 @@ let content_tests =
   ; test "§6.4.1 server DEF: no body bytes after a 100 head" (fun () ->
       let handler ex =
         match
-          Reqd.respond_with_string
+          Request_descriptor.respond_with_string
             ex.Server.reqd
             (Response.create `Continue)
             "hello"

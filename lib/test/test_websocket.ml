@@ -290,7 +290,7 @@ let test_upgrade_rejected_responds_nothing () =
     Server_connection.create (fun reqd ->
       result :=
         Some (Websocket.upgrade reqd (fun _ -> Alcotest.fail "handler called"));
-      Reqd.respond_with_string
+      Request_descriptor.respond_with_string
         reqd
         (Response.create
            ~headers:(Headers.of_list [ "content-length", "0" ])

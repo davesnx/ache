@@ -18,7 +18,10 @@ open Ache
 let request_handler _client_address reqd =
   let body = "Hello, world!\n" in
   let headers = Headers.of_list [ "content-type", "text/plain" ] in
-  Reqd.respond_with_string reqd (Response.create ~headers `OK) body
+  Request_descriptor.respond_with_string
+    reqd
+    (Response.create ~headers `OK)
+    body
 
 let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
@@ -132,7 +135,10 @@ let request_handler _client_address reqd =
           | exn -> Lwt.reraise exn))
   | Error _ ->
     let headers = Headers.of_list [ "content-length", "0" ] in
-    Reqd.respond_with_string reqd (Response.create ~headers `Bad_request) ""
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers `Bad_request)
+      ""
 ```
 
 - `upgrade` checks the handshake and responds with `101`, as
@@ -207,13 +213,6 @@ It creates the core connection and starts the two loops:
 - **Errors.** If a write fails, or the core raises in `report_exn`, the
   connection resolves `failed`, and `Lwt.choose` closes the socket.
 
-### Several cores
-
-Lwt runs on one domain. Lwt 6 adds `Lwt_direct`, for direct-style code on
-top of Lwt promises, but no public API to run Lwt on several domains. To use
-more cores, run more processes; with `SO_REUSEPORT` they can listen on the
-same port.
-
 ## Runtime notes
 
 The application must ignore `SIGPIPE`. `Ache_lwt.Server` and
@@ -273,7 +272,10 @@ open Ache
 let request_handler _client_address reqd =
   let body = "Hello, TLS!\n" in
   let headers = Headers.of_list [ "content-type", "text/plain" ] in
-  Reqd.respond_with_string reqd (Response.create ~headers `OK) body
+  Request_descriptor.respond_with_string
+    reqd
+    (Response.create ~headers `OK)
+    body
 
 let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in

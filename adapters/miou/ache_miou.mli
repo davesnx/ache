@@ -48,7 +48,7 @@ module Server : sig
     -> ?backlog:int
     -> ?tcp_nodelay:bool
     -> on_error:(exn -> unit)
-    -> request_handler:(Unix.sockaddr -> Ache.Reqd.t -> unit)
+    -> request_handler:(Unix.sockaddr -> Ache.Request_descriptor.t -> unit)
     -> error_handler:(Unix.sockaddr -> Ache.Server_connection.error_handler)
     -> Unix.sockaddr
     -> unit

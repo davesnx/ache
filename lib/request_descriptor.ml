@@ -47,13 +47,13 @@ type error_handler =
 module Reader = Parse.Reader
 module Writer = Serialize.Writer
 
-(* XXX(seliopou): The current design assumes that a new [Reqd.t] will be
+(* XXX(seliopou): The current design assumes that a new [Request_descriptor.t] will be
  * allocated for each new request/response on a connection. This is wasteful,
  * as it creates garbage on persistent connections. A better approach would be
- * to allocate a single [Reqd.t] per connection and reuse it across
+ * to allocate a single [Request_descriptor.t] per connection and reuse it across
  * request/responses. This would allow a single [Encoder.t] to be allocated for
  * the body and reused. The [response_state] type could then be inlined into
- * the [Reqd.t] record, with dummy values occuping the fields for [response].
+ * the [Request_descriptor.t] record, with dummy values occuping the fields for [response].
  * Something like this:
  *
  * {[
@@ -117,7 +117,8 @@ let response { response_state; _ } =
 
 let response_exn { response_state; _ } =
   match response_state with
-  | Waiting -> failwith "ache.Reqd.response_exn: response has not started"
+  | Waiting ->
+    failwith "ache.Request_descriptor.response_exn: response has not started"
   | Streaming (response, _) | Fixed response | Upgrade response -> response
 
 let frame ~fn ~length t (response : Response.t) =
@@ -152,12 +153,13 @@ let respond_with_string t response str =
   if t.error_code <> `Ok
   then
     failwith
-      "ache.Reqd.respond_with_string: invalid state, currently handling error";
+      "ache.Request_descriptor.respond_with_string: invalid state, currently \
+       handling error";
   match t.response_state with
   | Waiting ->
     let response, encoding =
       frame
-        ~fn:"ache.Reqd.respond_with_string"
+        ~fn:"ache.Request_descriptor.respond_with_string"
         ~length:(Some (String.length str))
         t
         response
@@ -168,21 +170,23 @@ let respond_with_string t response str =
     t.response_state <- Fixed response;
     Writer.wakeup t.writer
   | Streaming _ | Upgrade _ ->
-    failwith "ache.Reqd.respond_with_string: response already started"
+    failwith
+      "ache.Request_descriptor.respond_with_string: response already started"
   | Fixed _ ->
-    failwith "ache.Reqd.respond_with_string: response already complete"
+    failwith
+      "ache.Request_descriptor.respond_with_string: response already complete"
 
 let respond_with_bigstring t response (bstr : Bigstring.t) =
   if t.error_code <> `Ok
   then
     failwith
-      "ache.Reqd.respond_with_bigstring: invalid state, currently handling \
-       error";
+      "ache.Request_descriptor.respond_with_bigstring: invalid state, \
+       currently handling error";
   match t.response_state with
   | Waiting ->
     let response, encoding =
       frame
-        ~fn:"ache.Reqd.respond_with_bigstring"
+        ~fn:"ache.Request_descriptor.respond_with_bigstring"
         ~length:(Some (Bigstring.length bstr))
         t
         response
@@ -193,28 +197,32 @@ let respond_with_bigstring t response (bstr : Bigstring.t) =
     t.response_state <- Fixed response;
     Writer.wakeup t.writer
   | Streaming _ | Upgrade _ ->
-    failwith "ache.Reqd.respond_with_bigstring: response already started"
+    failwith
+      "ache.Request_descriptor.respond_with_bigstring: response already started"
   | Fixed _ ->
-    failwith "ache.Reqd.respond_with_bigstring: response already complete"
+    failwith
+      "ache.Request_descriptor.respond_with_bigstring: response already \
+       complete"
 
 let respond_with_informational t (response : Response.t) =
   if t.error_code <> `Ok
   then
     failwith
-      "ache.Reqd.respond_with_informational: invalid state, currently handling \
-       error";
+      "ache.Request_descriptor.respond_with_informational: invalid state, \
+       currently handling error";
   if
     (not (Status.is_informational response.status))
     || Status.to_code response.status = 101
   then
     invalid_arg
-      "ache.Reqd.respond_with_informational: the status must be 1xx and not 101";
+      "ache.Request_descriptor.respond_with_informational: the status must be \
+       1xx and not 101";
   if
     Headers.mem response.headers "content-length"
     || Headers.mem response.headers "transfer-encoding"
   then
     invalid_arg
-      "ache.Reqd.respond_with_informational: content-length or \
+      "ache.Request_descriptor.respond_with_informational: content-length or \
        transfer-encoding in a 1xx";
   match t.response_state with
   | Waiting ->
@@ -223,15 +231,23 @@ let respond_with_informational t (response : Response.t) =
       write_response t response;
       Writer.wakeup t.writer)
   | Streaming _ | Upgrade _ ->
-    failwith "ache.Reqd.respond_with_informational: response already started"
+    failwith
+      "ache.Request_descriptor.respond_with_informational: response already \
+       started"
   | Fixed _ ->
-    failwith "ache.Reqd.respond_with_informational: response already complete"
+    failwith
+      "ache.Request_descriptor.respond_with_informational: response already \
+       complete"
 
 let unsafe_respond_with_streaming ~flush_headers_immediately t response =
   match t.response_state with
   | Waiting ->
     let response, encoding =
-      frame ~fn:"ache.Reqd.respond_with_streaming" ~length:None t response
+      frame
+        ~fn:"ache.Request_descriptor.respond_with_streaming"
+        ~length:None
+        t
+        response
     in
     let response_body =
       Body.Writer.create t.response_body_buffer ~encoding ~writer:t.writer
@@ -243,16 +259,19 @@ let unsafe_respond_with_streaming ~flush_headers_immediately t response =
     if flush_headers_immediately then Writer.wakeup t.writer;
     response_body
   | Streaming _ | Upgrade _ ->
-    failwith "ache.Reqd.respond_with_streaming: response already started"
+    failwith
+      "ache.Request_descriptor.respond_with_streaming: response already started"
   | Fixed _ ->
-    failwith "ache.Reqd.respond_with_streaming: response already complete"
+    failwith
+      "ache.Request_descriptor.respond_with_streaming: response already \
+       complete"
 
 let respond_with_streaming ?(flush_headers_immediately = false) t response =
   if t.error_code <> `Ok
   then
     failwith
-      "ache.Reqd.respond_with_streaming: invalid state, currently handling \
-       error";
+      "ache.Request_descriptor.respond_with_streaming: invalid state, \
+       currently handling error";
   unsafe_respond_with_streaming ~flush_headers_immediately t response
 
 let unsafe_respond_with_upgrade t headers impl =
@@ -273,15 +292,18 @@ let unsafe_respond_with_upgrade t headers impl =
     Body.Reader.close t.request_body;
     Writer.wakeup t.writer
   | Streaming _ | Upgrade _ ->
-    failwith "ache.Reqd.respond_with_upgrade: response already started"
+    failwith
+      "ache.Request_descriptor.respond_with_upgrade: response already started"
   | Fixed _ ->
-    failwith "ache.Reqd.respond_with_upgrade: response already complete"
+    failwith
+      "ache.Request_descriptor.respond_with_upgrade: response already complete"
 
 let respond_with_upgrade t headers impl =
   if t.error_code <> `Ok
   then
     failwith
-      "ache.Reqd.respond_with_upgrade: invalid state, currently handling error";
+      "ache.Request_descriptor.respond_with_upgrade: invalid state, currently \
+       handling error";
   unsafe_respond_with_upgrade t headers impl
 
 let report_error t error =

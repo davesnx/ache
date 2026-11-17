@@ -1,7 +1,7 @@
 open Ache
 
 module Http = struct
-  type reqd = Reqd.t
+  type reqd = Request_descriptor.t
   type reader = Body.Reader.t
   type writer = Body.Writer.t
   type response = Response.t
@@ -11,8 +11,8 @@ module Http = struct
     | `Closed
     ]
 
-  let target reqd = (Reqd.request reqd).Request.target
-  let request_body = Reqd.request_body
+  let target reqd = (Request_descriptor.request reqd).Request.target
+  let request_body = Request_descriptor.request_body
 
   let schedule_read reader ~on_eof ~on_read =
     Body.Reader.schedule_read reader ~on_eof ~on_error:ignore ~on_read
@@ -20,11 +20,11 @@ module Http = struct
   let response status headers =
     Response.create ~headers:(Headers.of_list headers) (status :> Status.t)
 
-  let respond_with_string = Reqd.respond_with_string
-  let respond_with_bigstring = Reqd.respond_with_bigstring
+  let respond_with_string = Request_descriptor.respond_with_string
+  let respond_with_bigstring = Request_descriptor.respond_with_bigstring
 
   let respond_with_streaming reqd response =
-    Reqd.respond_with_streaming reqd response
+    Request_descriptor.respond_with_streaming reqd response
 
   let write_bigstring = Body.Writer.write_bigstring
   let flush = Body.Writer.flush

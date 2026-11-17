@@ -50,7 +50,10 @@ module Reader : sig
       field with the [upgrade] connection option), the reader consumes nothing
       past the end of that message until {!resume}. *)
 
-  val response : max_header_size:int -> Respd.t Queue.t -> response
+  val response :
+     max_header_size:int
+    -> Response_descriptor.t Queue.t
+    -> response
 
   val read_with_more :
      (_, _) t

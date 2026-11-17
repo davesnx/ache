@@ -53,12 +53,14 @@ let check_registered codes =
        let handler ex =
          match n with
          | 101 ->
-           Reqd.respond_with_upgrade
+           Request_descriptor.respond_with_upgrade
              ex.Server.reqd
              Headers.empty
              (Runtime.make (module Idle_protocol) ())
          | n when n < 200 ->
-           Reqd.respond_with_informational ex.reqd (Response.create s)
+           Request_descriptor.respond_with_informational
+             ex.reqd
+             (Response.create s)
          | _ -> Server.respond_raw s ex
        in
        let written = Server.output (Server.run ~handler (get "/")) in
@@ -298,7 +300,7 @@ let tests =
            (Server.run
               ~handler:(fun ex ->
                 let body =
-                  Reqd.respond_with_streaming
+                  Request_descriptor.respond_with_streaming
                     ex.reqd
                     (Response.create `Not_modified)
                 in

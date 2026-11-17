@@ -108,7 +108,7 @@ module Websocket : sig
 
   val upgrade :
      ?max_message_size:int
-    -> Ache.Reqd.t
+    -> Ache.Request_descriptor.t
     -> (t, Ache.Websocket.handshake_error) result
   (** [upgrade ?max_message_size reqd] is {!Ache.Websocket.upgrade}: it
       responds with [101] when the request is a valid opening handshake. When

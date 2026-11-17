@@ -136,12 +136,12 @@ let late_error_response : (unit -> unit) option ref = ref None
 
 let request_handler (_ : Unix.sockaddr) reqd =
   incr requests_seen;
-  let request = Reqd.request reqd in
-  let body = Reqd.request_body reqd in
+  let request = Request_descriptor.request reqd in
+  let body = Request_descriptor.request_body reqd in
   match request.meth, request.target with
   | `GET, "/hello" ->
     Body.Reader.close body;
-    Reqd.respond_with_string
+    Request_descriptor.respond_with_string
       reqd
       (Response.create
          ~headers:(Headers.of_list [ "content-length", "11" ])
@@ -155,7 +155,9 @@ let request_handler (_ : Unix.sockaddr) reqd =
         ]
     in
     let response_body =
-      Reqd.respond_with_streaming reqd (Response.create ~headers `OK)
+      Request_descriptor.respond_with_streaming
+        reqd
+        (Response.create ~headers `OK)
     in
     let rec on_read buffer ~off ~len =
       Body.Writer.write_string
@@ -168,7 +170,7 @@ let request_handler (_ : Unix.sockaddr) reqd =
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | `GET, "/upgrade" ->
     Body.Reader.close body;
-    Reqd.respond_with_upgrade
+    Request_descriptor.respond_with_upgrade
       reqd
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (echo_server ())
@@ -178,7 +180,7 @@ let request_handler (_ : Unix.sockaddr) reqd =
       Lwt.async (fun () ->
         if request.target = "/ws-echo" then ws_echo ws else ws_flood ws)
     | Error _ ->
-      Reqd.respond_with_string
+      Request_descriptor.respond_with_string
         reqd
         (Response.create
            ~headers:(Headers.of_list [ "content-length", "0" ])
@@ -186,13 +188,17 @@ let request_handler (_ : Unix.sockaddr) reqd =
         "")
   | `GET, "/stream" ->
     Body.Reader.close body;
-    stream (Reqd.respond_with_streaming reqd (Response.create `OK))
+    stream
+      (Request_descriptor.respond_with_streaming reqd (Response.create `OK))
   | `GET, "/stream-late" ->
     Body.Reader.close body;
     Lwt.async (fun () ->
       Lwt.map
         (fun () ->
-           stream (Reqd.respond_with_streaming reqd (Response.create `OK)))
+           stream
+             (Request_descriptor.respond_with_streaming
+                reqd
+                (Response.create `OK)))
         !stream_start)
   | `GET, "/raise" -> failwith "handler failed"
   | `GET, "/raise-later" -> raise Respond_later
@@ -204,7 +210,7 @@ let request_handler (_ : Unix.sockaddr) reqd =
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | _, target ->
     Body.Reader.close body;
-    Reqd.respond_with_string
+    Request_descriptor.respond_with_string
       reqd
       (Response.create
          ~headers:

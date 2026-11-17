@@ -18,7 +18,7 @@ module type Server = sig
      ?config:Ache.Config.t
     -> ?idle_timeout:float
     -> ?head_timeout:float
-    -> request_handler:(Unix.sockaddr -> Ache.Reqd.t -> unit)
+    -> request_handler:(Unix.sockaddr -> Ache.Request_descriptor.t -> unit)
     -> error_handler:(Unix.sockaddr -> Ache.Server_connection.error_handler)
     -> socket
     -> Unix.sockaddr

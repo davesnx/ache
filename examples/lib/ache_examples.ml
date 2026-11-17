@@ -33,7 +33,7 @@ end
 
 module Server = struct
   let echo_post reqd =
-    match Reqd.request reqd with
+    match Request_descriptor.request reqd with
     | { Request.meth = `POST; headers; _ } ->
       let response =
         let content_type =
@@ -47,8 +47,10 @@ module Server = struct
                [ "content-type", content_type; "connection", "close" ])
           `OK
       in
-      let request_body = Reqd.request_body reqd in
-      let response_body = Reqd.respond_with_streaming reqd response in
+      let request_body = Request_descriptor.request_body reqd in
+      let response_body =
+        Request_descriptor.respond_with_streaming reqd response
+      in
       let rec on_read buffer ~off ~len =
         Body.Writer.write_bigstring response_body buffer ~off ~len;
         Body.Reader.schedule_read request_body ~on_eof ~on_error ~on_read
@@ -57,7 +59,7 @@ module Server = struct
       Body.Reader.schedule_read request_body ~on_eof ~on_error ~on_read
     | _ ->
       let headers = Headers.of_list [ "connection", "close" ] in
-      Reqd.respond_with_string
+      Request_descriptor.respond_with_string
         reqd
         (Response.create ~headers `Method_not_allowed)
         ""

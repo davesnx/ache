@@ -48,10 +48,10 @@ let fixed_post size =
 let response = Response.create `OK
 
 let request_handler reqd =
-  let body = Reqd.request_body reqd in
+  let body = Request_descriptor.request_body reqd in
   let rec on_read _ ~off:_ ~len:_ =
     Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
-  and on_eof () = Reqd.respond_with_string reqd response ""
+  and on_eof () = Request_descriptor.respond_with_string reqd response ""
   and on_error () = failwith "request body cut short" in
   Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
 

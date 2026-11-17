@@ -20,7 +20,10 @@ open Ache
 let request_handler _client_address reqd =
   let body = "Hello, world!\n" in
   let headers = Headers.of_list [ "content-type", "text/plain" ] in
-  Reqd.respond_with_string reqd (Response.create ~headers `OK) body
+  Request_descriptor.respond_with_string
+    reqd
+    (Response.create ~headers `OK)
+    body
 
 let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
@@ -145,7 +148,10 @@ open Ache
 let request_handler _client_address reqd =
   let body = "Hello, world!\n" in
   let headers = Headers.of_list [ "content-type", "text/plain" ] in
-  Reqd.respond_with_string reqd (Response.create ~headers `OK) body
+  Request_descriptor.respond_with_string
+    reqd
+    (Response.create ~headers `OK)
+    body
 
 let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
@@ -272,7 +278,10 @@ open Ache
 let request_handler _client_address reqd =
   let body = "Hello, TLS!\n" in
   let headers = Headers.of_list [ "content-type", "text/plain" ] in
-  Reqd.respond_with_string reqd (Response.create ~headers `OK) body
+  Request_descriptor.respond_with_string
+    reqd
+    (Response.create ~headers `OK)
+    body
 
 let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in

@@ -37,7 +37,8 @@ module Server : sig
     -> ?clock:_ Eio.Time.clock
     -> ?idle_timeout:float
     -> ?head_timeout:float
-    -> request_handler:(Eio.Net.Sockaddr.stream -> Ache.Reqd.t -> unit)
+    -> request_handler:
+         (Eio.Net.Sockaddr.stream -> Ache.Request_descriptor.t -> unit)
     -> error_handler:
          (Eio.Net.Sockaddr.stream -> Ache.Server_connection.error_handler)
     -> _ Eio.Flow.two_way
@@ -88,7 +89,8 @@ module Server : sig
     -> on_error:(exn -> unit)
     -> net:_ Eio.Net.t
     -> domain_mgr:_ Eio.Domain_manager.t
-    -> request_handler:(Eio.Net.Sockaddr.stream -> Ache.Reqd.t -> unit)
+    -> request_handler:
+         (Eio.Net.Sockaddr.stream -> Ache.Request_descriptor.t -> unit)
     -> error_handler:
          (Eio.Net.Sockaddr.stream -> Ache.Server_connection.error_handler)
     -> [ `Tcp of Eio.Net.Ipaddr.v4v6 * int ]

@@ -75,11 +75,11 @@ module Echo = struct
   let is_closed t = t.closed && t.pending = ""
 end
 
-let pending_upgrade : Reqd.t option ref = ref None
+let pending_upgrade : Request_descriptor.t option ref = ref None
 
 let request_handler (_ : Unix.sockaddr) reqd =
-  let request = Reqd.request reqd in
-  let body = Reqd.request_body reqd in
+  let request = Request_descriptor.request reqd in
+  let body = Request_descriptor.request_body reqd in
   match request.meth, request.target with
   | `POST, "/echo" ->
     let headers =
@@ -89,7 +89,9 @@ let request_handler (_ : Unix.sockaddr) reqd =
         ]
     in
     let response_body =
-      Reqd.respond_with_streaming reqd (Response.create ~headers `OK)
+      Request_descriptor.respond_with_streaming
+        reqd
+        (Response.create ~headers `OK)
     in
     let rec on_read buffer ~off ~len =
       Body.Writer.write_string
@@ -108,7 +110,7 @@ let request_handler (_ : Unix.sockaddr) reqd =
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | `GET, "/upgrade" ->
     Body.Reader.close body;
-    Reqd.respond_with_upgrade
+    Request_descriptor.respond_with_upgrade
       reqd
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (Runtime.make (module Echo) (Echo.create (fun t s -> Echo.send t s)))
@@ -116,7 +118,7 @@ let request_handler (_ : Unix.sockaddr) reqd =
   | `GET, "/raise" -> failwith "handler failed"
   | _, target ->
     Body.Reader.close body;
-    Reqd.respond_with_string reqd (Response.create `OK) target
+    Request_descriptor.respond_with_string reqd (Response.create `OK) target
 
 let error_handler (_ : Unix.sockaddr) ?request:_ error start_response =
   server_errors := error :: !server_errors;
@@ -865,7 +867,7 @@ let test_upgrade_with_read_pending () =
       Miou_unix.sleep 0.05;
       raw_write raw "ping";
       Miou_unix.sleep 0.05;
-      Reqd.respond_with_upgrade
+      Request_descriptor.respond_with_upgrade
         (Option.get !pending_upgrade)
         (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
         (Runtime.make (module Echo) (Echo.create (fun t s -> Echo.send t s)));

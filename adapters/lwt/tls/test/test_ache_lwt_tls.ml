@@ -9,8 +9,8 @@ let server_errors : Server_connection.error list ref = ref []
 let partial_body_cut = ref false
 
 let request_handler (_ : Unix.sockaddr) reqd =
-  let request = Reqd.request reqd in
-  let body = Reqd.request_body reqd in
+  let request = Request_descriptor.request reqd in
+  let body = Request_descriptor.request_body reqd in
   match request.meth, request.target with
   | `POST, "/echo" ->
     let headers =
@@ -20,7 +20,9 @@ let request_handler (_ : Unix.sockaddr) reqd =
         ]
     in
     let response_body =
-      Reqd.respond_with_streaming reqd (Response.create ~headers `OK)
+      Request_descriptor.respond_with_streaming
+        reqd
+        (Response.create ~headers `OK)
     in
     let rec on_read buffer ~off ~len =
       Body.Writer.write_string
@@ -39,7 +41,7 @@ let request_handler (_ : Unix.sockaddr) reqd =
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | _, target ->
     Body.Reader.close body;
-    Reqd.respond_with_string reqd (Response.create `OK) target
+    Request_descriptor.respond_with_string reqd (Response.create `OK) target
 
 let error_handler (_ : Unix.sockaddr) ?request:_ error start_response =
   server_errors := error :: !server_errors;

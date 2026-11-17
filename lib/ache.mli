@@ -98,7 +98,7 @@ module Body : sig
           or a shutdown of the connection in the middle of the body, an
           invalid framing, or an exception reported for the request. Such a
           body is incomplete (RFC 9112 §8). The cause goes to the connection's
-          error handler, and to {!Reqd.error_code} on a server.
+          error handler, and to {!Request_descriptor.error_code} on a server.
 
         Exactly one of [on_eof] and [on_error] ends a body. After it, no
         callback of [t] is called again, also for later [schedule_read]
@@ -287,7 +287,7 @@ module Response : sig
 end
 
 (** {2 Request Descriptor} *)
-module Reqd : sig
+module Request_descriptor : sig
   type t
 
   type error =
@@ -436,8 +436,8 @@ end
 
 module Server_connection : sig
   type t
-  type error = Reqd.error
-  type request_handler = Reqd.t -> unit
+  type error = Request_descriptor.error
+  type request_handler = Request_descriptor.t -> unit
 
   type error_handler =
     ?request:Request.t -> error -> (Headers.t -> Body.Writer.t) -> unit
@@ -484,7 +484,7 @@ module Server_connection : sig
       error response after the responses to those requests. A request that
       follows a request with [Connection: close] is not read.
 
-      The error response follows the framing rules of {!Reqd}: it has no body
+      The error response follows the framing rules of {!Request_descriptor}: it has no body
       in a response to [HEAD], and a body without [Content-Length] ends when
       the connection closes. When [error_handler] raises, for example because
       the head it gives is invalid, the connection drops its pending output
@@ -591,7 +591,7 @@ end
 (** {2 WebSocket Server} *)
 
 (** A WebSocket server connection (RFC 6455), for text messages, that runs
-    after a [101] response sent with {!Reqd.respond_with_upgrade}. It needs no
+    after a [101] response sent with {!Request_descriptor.respond_with_upgrade}. It needs no
     runtime code: every runtime drives it like {!Server_connection}.
 
     It has no extensions and no subprotocols. It does not check [Origin] or
@@ -672,7 +672,7 @@ module Websocket : sig
 
   val upgrade :
      ?max_message_size:int
-    -> Reqd.t
+    -> Request_descriptor.t
     -> (t -> handler)
     -> (unit, handshake_error) result
   (** [upgrade ?max_message_size reqd make_handler] checks the request of
@@ -898,7 +898,7 @@ module Ache_private : sig
     end
   end
 
-  module Respd : sig
+  module Response_descriptor : sig
     type t
 
     val awaiting : Request.t -> (Response.t -> Body.Reader.t -> unit) -> t
@@ -943,7 +943,10 @@ module Ache_private : sig
         -> (Request.t -> Body.Reader.t -> unit)
         -> request
 
-      val response : max_header_size:int -> Respd.t Queue.t -> response
+      val response :
+         max_header_size:int
+        -> Response_descriptor.t Queue.t
+        -> response
 
       val read_with_more :
          (_, _) t

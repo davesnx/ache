@@ -457,7 +457,7 @@ let default_max_message_size = 1 lsl 20
 let upgrade ?(max_message_size = default_max_message_size) reqd make_handler =
   if max_message_size < 1
   then invalid_arg "Ache.Websocket.upgrade: max_message_size must be positive";
-  match check_handshake (Reqd.request reqd) with
+  match check_handshake (Request_descriptor.request reqd) with
   | Error _ as error -> error
   | Ok accept ->
     let t =
@@ -502,7 +502,7 @@ let upgrade ?(max_message_size = default_max_message_size) reqd make_handler =
       let shutdown = shutdown
     end
     in
-    Reqd.respond_with_upgrade
+    Request_descriptor.respond_with_upgrade
       reqd
       (Headers.of_list
          [ "upgrade", "websocket"

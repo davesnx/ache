@@ -76,7 +76,7 @@ let partial_body_cut = ref false
 let stream_flush_closed : unit Eio.Promise.u option ref = ref None
 let requests_seen = ref 0
 let on_ws_closed : (int option -> unit) ref = ref ignore
-let pending_upgrade : Reqd.t option ref = ref None
+let pending_upgrade : Request_descriptor.t option ref = ref None
 
 exception Respond_later
 
@@ -84,12 +84,12 @@ let late_error_response : (unit -> unit) option ref = ref None
 
 let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
   incr requests_seen;
-  let request = Reqd.request reqd in
-  let body = Reqd.request_body reqd in
+  let request = Request_descriptor.request reqd in
+  let body = Request_descriptor.request_body reqd in
   match request.meth, request.target with
   | `GET, "/hello" ->
     Body.Reader.close body;
-    Reqd.respond_with_string
+    Request_descriptor.respond_with_string
       reqd
       (Response.create
          ~headers:(Headers.of_list [ "content-length", "11" ])
@@ -103,7 +103,9 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
         ]
     in
     let response_body =
-      Reqd.respond_with_streaming reqd (Response.create ~headers `OK)
+      Request_descriptor.respond_with_streaming
+        reqd
+        (Response.create ~headers `OK)
     in
     let rec on_read buffer ~off ~len =
       Body.Writer.write_string
@@ -116,7 +118,7 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | `GET, "/upgrade" ->
     Body.Reader.close body;
-    Reqd.respond_with_upgrade
+    Request_descriptor.respond_with_upgrade
       reqd
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (echo_server ())
@@ -136,7 +138,7 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
   | `GET, "/stream" ->
     Body.Reader.close body;
     let response_body =
-      Reqd.respond_with_streaming reqd (Response.create `OK)
+      Request_descriptor.respond_with_streaming reqd (Response.create `OK)
     in
     let chunk = String.make 65536 'x' in
     let rec loop () =
@@ -158,7 +160,7 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | _, target ->
     Body.Reader.close body;
-    Reqd.respond_with_string
+    Request_descriptor.respond_with_string
       reqd
       (Response.create
          ~headers:
@@ -1272,7 +1274,7 @@ let test_upgrade_with_read_pending () =
     !real_sleep 0.05;
     Eio.Flow.copy_string "ping" socket;
     !real_sleep 0.05;
-    Reqd.respond_with_upgrade
+    Request_descriptor.respond_with_upgrade
       (Option.get !pending_upgrade)
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (echo_server ());
@@ -1294,7 +1296,7 @@ let test_upgrade_with_read_pending () =
 
 let domain_handler (_ : Eio.Net.Sockaddr.stream) reqd =
   let body = string_of_int (Stdlib.Domain.self () :> int) in
-  Reqd.respond_with_string
+  Request_descriptor.respond_with_string
     reqd
     (Response.create
        ~headers:
@@ -1433,7 +1435,7 @@ let test_server_run_tcp_nodelay ?tcp_nodelay expected () =
       let body =
         string_of_bool (accepted_socket_nodelay ~server_port:port ~client_port)
       in
-      Reqd.respond_with_string
+      Request_descriptor.respond_with_string
         reqd
         (Response.create
            ~headers:

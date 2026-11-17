@@ -99,7 +99,8 @@ module Server : sig
     -> ?idle_timeout:float
     -> ?head_timeout:float
     -> tls:Tls.Config.server
-    -> request_handler:(Eio.Net.Sockaddr.stream -> Ache.Reqd.t -> unit)
+    -> request_handler:
+         (Eio.Net.Sockaddr.stream -> Ache.Request_descriptor.t -> unit)
     -> error_handler:
          (Eio.Net.Sockaddr.stream -> Ache.Server_connection.error_handler)
     -> [> Eio.Flow.two_way_ty | Eio.Resource.close_ty ] Eio.Resource.t

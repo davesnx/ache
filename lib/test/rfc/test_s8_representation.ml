@@ -81,7 +81,11 @@ let check_no_cl msg s =
   Alcotest.(check (option string)) msg None (Wire.header m "content-length")
 
 let streaming_empty status ex =
-  let w = Reqd.respond_with_streaming ex.Server.reqd (Response.create status) in
+  let w =
+    Request_descriptor.respond_with_streaming
+      ex.Server.reqd
+      (Response.create status)
+  in
   Body.Writer.close w
 
 let syntax_tests =
