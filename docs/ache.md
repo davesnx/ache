@@ -27,6 +27,8 @@ Status: experimental. The API can change before 1.0.
 | `ache-miou`, `ache-miou-tls` | [Miou](https://github.com/robur-coop/miou) | [ache-miou.md](ache-miou.md) |
 
 Each page has a quick start, a TLS example, and the notes for its runtime.
+[how-it-works.md](how-it-works.md) explains how the core and the runtimes
+run a connection.
 
 ## Install
 
