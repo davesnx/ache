@@ -85,7 +85,7 @@ let server_writes headers ?(reason = "OK") () =
     Server.run
       ~handler:(fun ex ->
         try
-          Reqd.respond_with_string
+          Request_descriptor.respond_with_string
             ex.reqd
             (Response.create
                ~reason

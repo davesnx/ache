@@ -6,9 +6,12 @@ let error_handler (_ : Eio.Net.Sockaddr.stream) =
   Ache_examples.Server.error_handler
 
 let request_handler env ~sw ~u flow (_ : Eio.Net.Sockaddr.stream) reqd =
-  match Reqd.request reqd with
+  match Request_descriptor.request reqd with
   | { Request.meth = `CONNECT; headers; _ } ->
-    Stdlib.Format.eprintf "x: %a@." Request.pp_hum (Reqd.request reqd);
+    Stdlib.Format.eprintf
+      "x: %a@."
+      Request.pp_hum
+      (Request_descriptor.request reqd);
     let host, port =
       let host_and_port = Headers.get_exn headers "host" in
       let[@ocaml.warning "-8"] [ host; port ] =
@@ -36,10 +39,10 @@ let request_handler env ~sw ~u flow (_ : Eio.Net.Sockaddr.stream) reqd =
              Eio.Promise.resolve_ok u ()));
       Eio.Promise.await p
     in
-    Reqd.respond_with_string reqd (Response.create `OK) ""
+    Request_descriptor.respond_with_string reqd (Response.create `OK) ""
   | _ ->
     let headers = Headers.of_list [ "connection", "close" ] in
-    Reqd.respond_with_string
+    Request_descriptor.respond_with_string
       reqd
       (Response.create ~headers `Method_not_allowed)
       ""

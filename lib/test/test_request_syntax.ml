@@ -23,19 +23,21 @@ let serve ?config ?(chunk = max_int) ?(mode = Immediate) ?(eof = false) input =
   let errors = ref [] in
   let later = ref [] in
   let ok reqd =
-    match (Reqd.request reqd).meth with
+    match (Request_descriptor.request reqd).meth with
     | `CONNECT -> Response.create `OK
     | _ ->
       Response.create ~headers:(Headers.of_list [ "content-length", "0" ]) `OK
   in
   let respond reqd =
     match mode with
-    | Immediate -> Reqd.respond_with_string reqd (ok reqd) ""
+    | Immediate -> Request_descriptor.respond_with_string reqd (ok reqd) ""
     | Deferred ->
-      later := (fun () -> Reqd.respond_with_string reqd (ok reqd) "") :: !later
+      later :=
+        (fun () -> Request_descriptor.respond_with_string reqd (ok reqd) "")
+        :: !later
     | Streaming ->
       let body =
-        Reqd.respond_with_streaming
+        Request_descriptor.respond_with_streaming
           ~flush_headers_immediately:true
           reqd
           (Response.create `OK)
@@ -43,17 +45,19 @@ let serve ?config ?(chunk = max_int) ?(mode = Immediate) ?(eof = false) input =
       later := (fun () -> Body.Writer.close body) :: !later
   in
   let request_handler reqd =
-    let ex = { request = Reqd.request reqd; body = "" } in
+    let ex = { request = Request_descriptor.request reqd; body = "" } in
     exchanges := ex :: !exchanges;
-    let body = Reqd.request_body reqd in
+    let body = Request_descriptor.request_body reqd in
     let rec loop () =
       Body.Reader.schedule_read
         body
         ~on_error:(fun () ->
-          if Reqd.error_code reqd = None
+          if Request_descriptor.error_code reqd = None
           then Alcotest.fail "request body cut without an error code")
         ~on_eof:(fun () ->
-          match Reqd.error_code reqd with None -> respond reqd | Some _ -> ())
+          match Request_descriptor.error_code reqd with
+          | None -> respond reqd
+          | Some _ -> ())
         ~on_read:(fun bs ~off ~len ->
           ex.body <- ex.body ^ Ache.Bigstring.substring bs ~off ~len;
           loop ())

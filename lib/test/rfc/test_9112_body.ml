@@ -126,7 +126,7 @@ let head_of s =
 
 let stream ?(headers = []) ?(writes = []) status ex =
   let w =
-    Reqd.respond_with_streaming
+    Request_descriptor.respond_with_streaming
       ex.Server.reqd
       (Response.create ~headers:(Headers.of_list headers) status)
   in

@@ -47,7 +47,7 @@ type t =
   { config : Config.t
   ; reader : Reader.response
   ; writer : Writer.t
-  ; request_queue : Respd.t Queue.t
+  ; request_queue : Response_descriptor.t Queue.t
     (* invariant: If [request_queue] is not empty, then the head of the queue
        has already written the request headers to the wire. *)
   }
@@ -97,7 +97,7 @@ let request
   Serialize.check_request request;
   let request_body = create_request_body ~request t in
   let respd =
-    Respd.create
+    Response_descriptor.create
       ~error_handler
       ~writer:t.writer
       ~response_handler
@@ -106,7 +106,7 @@ let request
   in
   let handle_now = Queue.is_empty t.request_queue in
   Queue.push respd t.request_queue;
-  if handle_now then Respd.write_request respd;
+  if handle_now then Response_descriptor.write_request respd;
 
   if not flush_headers_immediately then Writer.yield t.writer;
 
@@ -119,22 +119,24 @@ let request
 let fail_unanswered t =
   Queue.iter
     (fun respd ->
-       match respd.Respd.state with
+       match respd.Response_descriptor.state with
        | Uninitialized | Awaiting_response ->
-         Respd.report_error respd `Connection_closed
+         Response_descriptor.report_error respd `Connection_closed
        | Received_response _ | Upgraded _ | Closed -> ())
     t.request_queue
 
 let shutdown_reader t =
-  if is_active t then Respd.fail_response_body (current_respd_exn t);
+  if is_active t
+  then Response_descriptor.fail_response_body (current_respd_exn t);
   Reader.force_close t.reader;
   fail_unanswered t;
   wakeup_reader t
 
 let shutdown_writer t =
-  if is_active t then Respd.close_request_body (current_respd_exn t);
+  if is_active t
+  then Response_descriptor.close_request_body (current_respd_exn t);
   Writer.close t.writer;
-  Queue.iter Respd.flush_request_body t.request_queue;
+  Queue.iter Response_descriptor.flush_request_body t.request_queue;
   wakeup_writer t
 
 let shutdown t =
@@ -143,7 +145,9 @@ let shutdown t =
 
 let set_error_and_handle t error =
   let reading respd =
-    match respd.Respd.state, Respd.input_state respd with
+    match
+      respd.Response_descriptor.state, Response_descriptor.input_state respd
+    with
     | Awaiting_response, _ -> true
     | Received_response _, (Wait | Ready) -> true
     | Received_response _, Complete ->
@@ -151,7 +155,7 @@ let set_error_and_handle t error =
     | (Uninitialized | Upgraded _ | Closed), _ -> false
   in
   (match List.find_opt reading (List.of_seq (Queue.to_seq t.request_queue)) with
-  | Some respd -> Respd.report_error respd error
+  | Some respd -> Response_descriptor.report_error respd error
   | None -> ());
   (* From RFC7230§6.5: * A client sending a message body SHOULD monitor the
      network connection * for an error response while it is transmitting the
@@ -166,7 +170,7 @@ let report_exn t exn = set_error_and_handle t (`Exn exn)
 exception Local
 
 let pipelinable respd =
-  let request = Respd.request respd in
+  let request = Response_descriptor.request respd in
   (not (Reader.may_switch_protocols request))
   &&
   match request.meth with
@@ -185,10 +189,13 @@ let maybe_pipeline_queued_requests t =
              (match prev with
              | None -> ()
              | Some prev ->
-               (match respd.Respd.state, Respd.output_state prev with
+               (match
+                  ( respd.Response_descriptor.state
+                  , Response_descriptor.output_state prev )
+                with
                | Uninitialized, Complete when pipelinable prev ->
-                 Respd.write_request respd;
-                 Respd.flush_request_body respd
+                 Response_descriptor.write_request respd;
+                 Response_descriptor.flush_request_body respd
                | _ ->
                  (* bail early. If we can't pipeline this request, we can't
                     write * next ones either. *)
@@ -211,7 +218,7 @@ let advance_request_queue t =
     | Uninitialized ->
       (* Only write request if it hasn't been written to the wire yet (e.g. via
        * pipelining). *)
-      Respd.write_request respd;
+      Response_descriptor.write_request respd;
       wakeup_writer t
     | _ -> ()
 
@@ -222,19 +229,19 @@ let rec _next_read_operation t =
     Reader.next t.reader)
   else
     let respd = current_respd_exn t in
-    match Respd.input_state respd with
+    match Response_descriptor.input_state respd with
     | Wait -> `Yield
     | Ready -> Reader.next t.reader
     | Complete -> _final_read_operation_for t respd
 
 and _final_read_operation_for t respd =
   let next =
-    if not (Respd.persistent_connection respd)
+    if not (Response_descriptor.persistent_connection respd)
     then (
       shutdown t;
       Reader.next t.reader)
     else
-      match Respd.output_state respd with
+      match Response_descriptor.output_state respd with
       | Wait | Ready -> `Yield
       | Complete ->
         (match Reader.next t.reader with
@@ -266,7 +273,8 @@ let next_read_operation t =
 
 let read_with_more t bs ~off ~len more =
   let consumed = Reader.read_with_more t.reader bs ~off ~len more in
-  if is_active t then Respd.flush_response_body (current_respd_exn t);
+  if is_active t
+  then Response_descriptor.flush_response_body (current_respd_exn t);
   consumed
 
 let read t bs ~off ~len = read_with_more t bs ~off ~len Incomplete
@@ -285,15 +293,15 @@ let rec _next_write_operation t =
     Writer.next t.writer)
   else
     let respd = current_respd_exn t in
-    match Respd.output_state respd with
+    match Response_descriptor.output_state respd with
     | Wait -> `Yield
     | Ready ->
-      Respd.flush_request_body respd;
+      Response_descriptor.flush_request_body respd;
       Writer.next t.writer
     | Complete -> _final_write_operation_for t respd
 
 and _final_write_operation_for t respd =
-  if not (Respd.persistent_connection respd)
+  if not (Response_descriptor.persistent_connection respd)
   then (
     shutdown_writer t;
     Writer.next t.writer)
@@ -302,7 +310,7 @@ and _final_write_operation_for t respd =
        "pipeline" its * requests (i.e., send multiple requests without waiting
        for each * response). *)
     maybe_pipeline_queued_requests t;
-    match Respd.input_state respd with
+    match Response_descriptor.input_state respd with
     | Wait | Ready ->
       wakeup_reader t;
       Writer.next t.writer
@@ -320,4 +328,4 @@ let report_write_result t result =
   Writer.report_result t.writer result;
   match result with
   | `Ok _ -> ()
-  | `Closed -> Queue.iter Respd.flush_request_body t.request_queue
+  | `Closed -> Queue.iter Response_descriptor.flush_request_body t.request_queue

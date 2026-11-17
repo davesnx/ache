@@ -3,7 +3,7 @@ module Headers = Headers
 module IOVec = IOVec
 module Runtime = Runtime
 module Method = Method
-module Reqd = Reqd
+module Request_descriptor = Request_descriptor
 module Request = Request
 module Response = Response
 module Status = Status
@@ -21,20 +21,20 @@ module Ache_private = struct
     module Buffer = Runtime.Buffer
   end
 
-  module Respd = struct
-    type t = Respd.t
+  module Response_descriptor = struct
+    type t = Response_descriptor.t
 
     let awaiting request response_handler =
       let writer = Serialize.Writer.create () in
       let respd =
-        Respd.create
+        Response_descriptor.create
           ~error_handler:ignore
           ~writer
           ~response_handler
           request
           (Body.Writer.create_empty ~writer)
       in
-      Respd.write_request respd;
+      Response_descriptor.write_request respd;
       respd
   end
 

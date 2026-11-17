@@ -77,7 +77,7 @@ let upgrade_headers = [ "Upgrade", "echo"; "Connection", "Upgrade" ]
 
 let upgrade ?(before = ignore) tunnel (ex : Server.exchange) =
   before ex;
-  Reqd.respond_with_upgrade
+  Request_descriptor.respond_with_upgrade
     ex.reqd
     (Headers.of_list upgrade_headers)
     (Runtime.make (module Tunnel) tunnel)
@@ -291,7 +291,9 @@ let tests =
       (fun () ->
          let tunnel = { Tunnel.received = ""; closed = false } in
          let before (ex : Server.exchange) =
-           Reqd.respond_with_informational ex.reqd (Response.create `Continue)
+           Request_descriptor.respond_with_informational
+             ex.reqd
+             (Response.create `Continue)
          in
          let s =
            Server.run

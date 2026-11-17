@@ -12,7 +12,9 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   replaces gluten, and `Ache.Bigstring.t` replaces `Bigstringaf.t` (the same
   type).
 - `Body.Reader.schedule_read` takes a required `~on_error`.
-- `Reqd.respond_with_upgrade` and `Client.upgrade` take a `Runtime.impl`.
+- `Reqd` is `Request_descriptor`.
+- `Request_descriptor.respond_with_upgrade` and `Client.upgrade` take a
+  `Runtime.impl`.
 - `ache-eio`: `Server.create_connection_handler` takes no `~sw`, and can be
   given to `Eio.Net.run_server`.
 - `ache-lwt`: `Make (Io)` replaces the gluten functors. TLS moves to
@@ -27,7 +29,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 ### New
 
 - Packages `ache-miou`, `ache-eio-tls`, `ache-lwt-tls` and `ache-miou-tls`.
-- `Reqd.respond_with_informational`, for `100 Continue` and `103 Early Hints`.
+- `Request_descriptor.respond_with_informational`, for `100 Continue` and
+  `103 Early Hints`.
 - Server timeouts `?idle_timeout` and `?head_timeout`, and
   `Config.max_header_size`.
 - `Server.run` in `ache-eio` and `ache-miou`: one accept loop for each

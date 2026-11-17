@@ -320,7 +320,7 @@ module Server = struct
   module Driver = Driver (Server_connection)
 
   type exchange =
-    { reqd : Reqd.t
+    { reqd : Request_descriptor.t
     ; request : Request.t
     ; mutable body : string
     ; mutable body_complete : bool
@@ -334,7 +334,7 @@ module Server = struct
     }
 
   let read_body ex ~on_complete =
-    let body = Reqd.request_body ex.reqd in
+    let body = Request_descriptor.request_body ex.reqd in
     let rec loop () =
       Body.Reader.schedule_read
         body
@@ -354,19 +354,21 @@ module Server = struct
       then headers
       else headers @ [ "content-length", string_of_int (String.length body) ]
     in
-    Reqd.respond_with_string
+    Request_descriptor.respond_with_string
       ex.reqd
       (Response.create ~headers:(Headers.of_list headers) status)
       body
 
   let respond_raw ?(headers = []) ?(body = "") status ex =
-    Reqd.respond_with_string
+    Request_descriptor.respond_with_string
       ex.reqd
       (Response.create ~headers:(Headers.of_list headers) status)
       body
 
   let send_continue ex =
-    Reqd.respond_with_informational ex.reqd (Response.create `Continue)
+    Request_descriptor.respond_with_informational
+      ex.reqd
+      (Response.create `Continue)
 
   let respond_after_body ?headers ?body status ex =
     read_body ex ~on_complete:(fun _ -> respond ?headers ?body status ex)
@@ -390,7 +392,7 @@ module Server = struct
       let s = get () in
       let ex =
         { reqd
-        ; request = Reqd.request reqd
+        ; request = Request_descriptor.request reqd
         ; body = ""
         ; body_complete = false
         ; body_cut = false

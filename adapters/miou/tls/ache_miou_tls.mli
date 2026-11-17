@@ -92,7 +92,7 @@ module Server : sig
     -> ?idle_timeout:float
     -> ?head_timeout:float
     -> tls:Tls.Config.server
-    -> request_handler:(Unix.sockaddr -> Ache.Reqd.t -> unit)
+    -> request_handler:(Unix.sockaddr -> Ache.Request_descriptor.t -> unit)
     -> error_handler:(Unix.sockaddr -> Ache.Server_connection.error_handler)
     -> Miou_unix.file_descr
     -> Unix.sockaddr

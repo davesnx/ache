@@ -75,10 +75,10 @@ let response ?(headers = []) status =
   Response.create ~headers:(Headers.of_list headers) status
 
 let with_string ?headers status body reqd =
-  Reqd.respond_with_string reqd (response ?headers status) body
+  Request_descriptor.respond_with_string reqd (response ?headers status) body
 
 let with_bigstring ?headers status body reqd =
-  Reqd.respond_with_bigstring
+  Request_descriptor.respond_with_bigstring
     reqd
     (response ?headers status)
     (Ache.Bigstring.of_string body ~off:0 ~len:(String.length body))
@@ -86,7 +86,9 @@ let with_bigstring ?headers status body reqd =
 let flushed = ref []
 
 let streaming ?headers status body reqd =
-  let w = Reqd.respond_with_streaming reqd (response ?headers status) in
+  let w =
+    Request_descriptor.respond_with_streaming reqd (response ?headers status)
+  in
   Body.Writer.write_string w body;
   Body.Writer.flush w (fun r -> flushed := r :: !flushed);
   Body.Writer.close w
@@ -557,9 +559,11 @@ let expect_continue ?(version = "HTTP/1.1") () =
 let informational_then_final interim reqd =
   List.iter
     (fun status ->
-       Reqd.respond_with_informational reqd (Response.create status))
+       Request_descriptor.respond_with_informational
+         reqd
+         (Response.create status))
     interim;
-  let body = Reqd.request_body reqd in
+  let body = Request_descriptor.request_body reqd in
   let received = Buffer.create 5 in
   let rec loop () =
     Body.Reader.schedule_read
@@ -642,12 +646,14 @@ let test_informational_misuse () =
   only_raises "respond_with_string 100" (with_string `Continue "");
   only_raises "respond_with_bigstring 103" (with_bigstring `Early_hints "");
   only_raises "respond_with_streaming 100" (fun reqd ->
-    ignore (Reqd.respond_with_streaming reqd (response `Continue)));
+    ignore (Request_descriptor.respond_with_streaming reqd (response `Continue)));
   only_raises "respond_with_string 199" (with_string (`Code 199) "");
   only_raises "respond_with_informational 200" (fun reqd ->
-    Reqd.respond_with_informational reqd (response `OK));
+    Request_descriptor.respond_with_informational reqd (response `OK));
   only_raises "respond_with_informational 101" (fun reqd ->
-    Reqd.respond_with_informational reqd (response `Switching_protocols))
+    Request_descriptor.respond_with_informational
+      reqd
+      (response `Switching_protocols))
 
 let tests =
   tests
@@ -666,7 +672,7 @@ let test_pipelined_after_no_body () =
        let s =
          server
            (fun reqd ->
-              match (Reqd.request reqd).meth with
+              match (Request_descriptor.request reqd).meth with
               | `GET when !flushed = [] && first = "GET" ->
                 streaming first_status "hello" reqd
               | `HEAD -> streaming first_status "hello" reqd
@@ -692,7 +698,7 @@ let test_connect_refused_then_next () =
   let s =
     server
       (fun reqd ->
-         match (Reqd.request reqd).meth with
+         match (Request_descriptor.request reqd).meth with
          | `CONNECT -> with_string `Forbidden "no" reqd
          | _ -> with_string `OK "ok" reqd)
       (req "CONNECT" ^ req "GET")
@@ -896,7 +902,7 @@ let rejected =
   ; ( "103 informational, app CL"
     , req "GET"
     , fun reqd ->
-        Reqd.respond_with_informational
+        Request_descriptor.respond_with_informational
           reqd
           (response ~headers:[ "content-length", "0" ] `Early_hints) )
   ]
@@ -911,7 +917,8 @@ let test_rejected () =
            | () -> ()
            | exception Invalid_argument _ ->
              outcome := "Invalid_argument";
-             if (Reqd.request reqd).meth <> `CONNECT then ok_after reqd)
+             if (Request_descriptor.request reqd).meth <> `CONNECT
+             then ok_after reqd)
         input
     in
     Alcotest.(check string)
@@ -938,7 +945,7 @@ let test_invalid_content_length_message () =
     server
       (fun reqd ->
          match
-           Reqd.respond_with_string
+           Request_descriptor.respond_with_string
              reqd
              (response ~headers:[ "content-length", "abc" ] `OK)
              "ok"
@@ -949,17 +956,20 @@ let test_invalid_content_length_message () =
   in
   Alcotest.(check string)
     "message"
-    {|ache.Reqd.respond_with_string: invalid content-length "abc"|}
+    {|ache.Request_descriptor.respond_with_string: invalid content-length "abc"|}
     !raised
 
 let test_streaming_overflow () =
   let s =
     server
       (fun reqd ->
-         match (Reqd.request reqd).target, (Reqd.request reqd).meth with
+         match
+           ( (Request_descriptor.request reqd).target
+           , (Request_descriptor.request reqd).meth )
+         with
          | _, `POST ->
            let w =
-             Reqd.respond_with_streaming
+             Request_descriptor.respond_with_streaming
                reqd
                (response ~headers:[ "content-length", "3" ] `OK)
            in
@@ -987,7 +997,7 @@ let test_streaming_short () =
   let s =
     server
       (fun reqd ->
-         match (Reqd.request reqd).meth with
+         match (Request_descriptor.request reqd).meth with
          | `POST ->
            streaming ~headers:[ "content-length", "9" ] `OK "hello" reqd
          | _ -> ok_after reqd)

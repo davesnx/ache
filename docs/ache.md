@@ -127,8 +127,8 @@ httpun rejected chunk extensions and trailers.
   that is not a token, or a CR, LF or NUL in a field value or reason phrase.
   The body writer of a streaming response raises `Invalid_argument` for a
   write past its `Content-Length`.
-- `Reqd.respond_with_informational` sends `100 Continue`, `103 Early Hints`
-  or another interim response before the final response.
+- `Request_descriptor.respond_with_informational` sends `100 Continue`,
+  `103 Early Hints` or another interim response before the final response.
 - Only a 2xx response to `CONNECT` starts a tunnel. Another response to
   `CONNECT` lets the connection serve the next request.
 - `Status` has the codes of the IANA registry that httpun did not have (102,
@@ -176,7 +176,7 @@ section.
 
 ```
   your request_handler / error_handler
-              │  Reqd.t, Body, Headers
+              │  Request_descriptor.t, Body, Headers
               ▼
   ┌────────────────────────────────────────┐
   │ ache (lib/)          no I/O, no clock  │
@@ -232,7 +232,7 @@ same in all three runtimes.
 
 - `Read`: the runtime reads from the socket into the read buffer and gives
   the bytes to the core. While it parses, the core calls the
-  `request_handler` with a `Reqd.t` for each request head.
+  `request_handler` with a `Request_descriptor.t` for each request head.
 - `Write`: the core hands over a list of buffers (the response head and body
   parts). The runtime sends them with one system call and reports how many
   bytes went out.

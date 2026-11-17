@@ -79,13 +79,20 @@ let server ?config () =
   let rec s =
     lazy
       (let request_handler reqd =
-         read_body (Reqd.request_body reqd) ~on_done:(fun body ->
+         read_body (Request_descriptor.request_body reqd) ~on_done:(fun body ->
            let s = Lazy.force s in
            s.requests <-
-             (request_summary (Reqd.request reqd), body) :: s.requests;
-           match Reqd.error_code reqd, Reqd.response reqd with
+             (request_summary (Request_descriptor.request reqd), body)
+             :: s.requests;
+           match
+             ( Request_descriptor.error_code reqd
+             , Request_descriptor.response reqd )
+           with
            | None, None ->
-             Reqd.respond_with_string reqd (Response.create `OK) ""
+             Request_descriptor.respond_with_string
+               reqd
+               (Response.create `OK)
+               ""
            | _ -> ())
        in
        let error_handler ?request:_ error start_response =
@@ -637,7 +644,7 @@ let test_many_small_chunks () =
   let received = Buffer.create n in
   let eof = ref false in
   let handler reqd =
-    let body = Reqd.request_body reqd in
+    let body = Request_descriptor.request_body reqd in
     let rec on_read bs ~off ~len =
       incr on_read_calls;
       Buffer.add_string received (Ache.Bigstring.substring bs ~off ~len);
@@ -648,7 +655,7 @@ let test_many_small_chunks () =
         ~on_eof
     and on_eof () =
       eof := true;
-      Reqd.respond_with_string reqd (Response.create `OK) ""
+      Request_descriptor.respond_with_string reqd (Response.create `OK) ""
     in
     Body.Reader.schedule_read
       ~on_error:(Helpers.body_must_complete __LOC__)
@@ -687,8 +694,8 @@ let collect_body body =
 let test_pipelined_body_read_late () =
   let bodies = ref [] in
   let handler reqd =
-    bodies := Reqd.request_body reqd :: !bodies;
-    Reqd.respond_with_string reqd (Response.create `OK) ""
+    bodies := Request_descriptor.request_body reqd :: !bodies;
+    Request_descriptor.respond_with_string reqd (Response.create `OK) ""
   in
   let conn = Server_connection.create handler in
   let input =
@@ -739,7 +746,7 @@ let test_unread_body_backpressure () =
   let request_body = ref None in
   let conn =
     Server_connection.create (fun reqd ->
-      request_body := Some (Reqd.request_body reqd))
+      request_body := Some (Request_descriptor.request_body reqd))
   in
   let bs = Ache.Bigstring.of_string input ~off:0 ~len:(String.length input) in
   let fed = ref 0 in
@@ -800,8 +807,9 @@ let response_reader ?(limit = 0x4000) () =
   let heads = ref [] in
   let queue = Queue.create () in
   Queue.push
-    (Ache_private.Respd.awaiting (Request.create `GET "/") (fun response _ ->
-       heads := response_summary response :: !heads))
+    (Ache_private.Response_descriptor.awaiting
+       (Request.create `GET "/")
+       (fun response _ -> heads := response_summary response :: !heads))
     queue;
   Reader.response ~max_header_size:limit queue, heads
 

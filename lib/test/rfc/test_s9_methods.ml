@@ -222,7 +222,7 @@ let tests =
            Server.run
              ~handler:(fun ex ->
                let body =
-                 Reqd.respond_with_streaming
+                 Request_descriptor.respond_with_streaming
                    ex.reqd
                    (Response.create
                       ~headers:(Headers.of_list [ "content-length", "5" ])
@@ -306,7 +306,7 @@ let tests =
            Server.run
              ~handler:(fun ex ->
                let body =
-                 Reqd.respond_with_streaming
+                 Request_descriptor.respond_with_streaming
                    ~flush_headers_immediately:true
                    ex.reqd
                    (Response.create `OK)

@@ -1,8 +1,8 @@
 open Ache
 
 let request_handler reqd =
-  let { Request.headers; _ } = Reqd.request reqd in
-  let request_body = Reqd.request_body reqd in
+  let { Request.headers; _ } = Request_descriptor.request reqd in
+  let request_body = Request_descriptor.request_body reqd in
   let body = Buffer.create 128 in
   let rec on_read buffer ~off ~len =
     Buffer.add_string body (Ache.Bigstring.substring buffer ~off ~len);
@@ -18,7 +18,7 @@ let request_handler reqd =
       Headers.of_list
         (("content-length", Int.to_string (Buffer.length body)) :: content_type)
     in
-    Reqd.respond_with_string
+    Request_descriptor.respond_with_string
       reqd
       (Response.create ~headers `OK)
       (Buffer.contents body)

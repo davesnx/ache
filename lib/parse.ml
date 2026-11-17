@@ -631,24 +631,28 @@ module Reader = struct
     let on_head t =
       let response = response_of t.out in
       t.out.fields <- [];
-      let exception Local of Respd.t option in
+      let exception Local of Response_descriptor.t option in
       match
         Queue.iter
           (fun respd ->
-             if respd.Respd.state = Awaiting_response
+             if respd.Response_descriptor.state = Awaiting_response
              then raise (Local (Some respd))
-             else if not (Respd.persistent_connection respd)
+             else if not (Response_descriptor.persistent_connection respd)
              then raise (Local None))
           request_queue
       with
       | () -> t.state <- Fail `Unsolicited_response
       | exception Local None -> t.state <- Cancelled_parse
       | exception Local (Some respd) ->
-        let request = Respd.request respd in
+        let request = Response_descriptor.request respd in
         if response.Response.status = `Switching_protocols
-        then Respd.handle_response respd response (Body.Reader.create_empty ())
+        then
+          Response_descriptor.handle_response
+            respd
+            response
+            (Body.Reader.create_empty ())
         else if request.meth = `CONNECT && Status.is_successful response.status
-        then Respd.handle_response respd response (create_body t)
+        then Response_descriptor.handle_response respd response (create_body t)
         else (
           match Response.body_length ~request_method:request.meth response with
           | `No_body when Status.is_informational response.status ->
@@ -657,7 +661,10 @@ module Reader = struct
           | `Error `Internal_server_error ->
             t.state <- Fail (`Invalid_response_body_length response)
           | `No_body | `Fixed 0L ->
-            Respd.handle_response respd response (Body.Reader.create_empty ());
+            Response_descriptor.handle_response
+              respd
+              response
+              (Body.Reader.create_empty ());
             t.state <- Done
           | (`Fixed _ | `Chunked | `Close_delimited) as encoding ->
             let body = create_body t in
@@ -666,7 +673,7 @@ module Reader = struct
               | `Fixed n -> Body (body, Fixed n)
               | `Chunked -> chunk_line t body
               | `Close_delimited -> Body (body, Close_delimited));
-            Respd.handle_response respd response body)
+            Response_descriptor.handle_response respd response body)
     in
     create ~max_header_size ~request:false ~on_head ~fail:(function
       | (`Parse _ | `Header_too_large) as e -> e

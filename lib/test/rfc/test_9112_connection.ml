@@ -114,7 +114,7 @@ let check_smuggled_not_dispatched s =
 
 let echo_unless_error ex =
   Server.read_body ex ~on_complete:(fun body ->
-    if Option.is_none (Reqd.error_code ex.Server.reqd)
+    if Option.is_none (Request_descriptor.error_code ex.Server.reqd)
     then Server.respond ~body `OK ex)
 
 let smuggling_case (name, input, outcomes) =

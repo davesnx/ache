@@ -157,7 +157,7 @@ module Run (Parser : module type of Ache_private.Parse) = struct
         let queue = Queue.create () in
         for _ = 1 to 3 do
           Queue.push
-            (Ache_private.Respd.awaiting
+            (Ache_private.Response_descriptor.awaiting
                (Request.create meth "/")
                (fun response body -> collect (response_to_string response) body))
             queue

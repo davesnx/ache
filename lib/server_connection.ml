@@ -32,7 +32,7 @@
 module Reader = Parse.Reader
 module Writer = Serialize.Writer
 
-type request_handler = Reqd.t -> unit
+type request_handler = Request_descriptor.t -> unit
 
 type error =
   [ `Bad_gateway
@@ -63,7 +63,7 @@ type t =
   ; response_body_buffer : Bigstring.t
   ; request_handler : request_handler
   ; error_handler : error_handler
-  ; request_queue : Reqd.t Queue.t
+  ; request_queue : Request_descriptor.t Queue.t
     (* invariant: If [request_queue] is not empty, then the head of the queue
        has already had [request_handler] called on it. *)
   ; mutable error_code : error_code
@@ -88,7 +88,7 @@ let wakeup_reader t =
         its buffered bytes to the application. This fixes a pathological case
         where the body could buffer too much without a chance of executing
         scheduled reads. *)
-     Reqd.flush_request_body reqd);
+     Request_descriptor.flush_request_body reqd);
   Reader.wakeup t.reader
 
 let yield_writer t k =
@@ -108,7 +108,7 @@ let default_error_handler ?request:_ error handle =
   Body.Writer.close body
 
 let shutdown_reader t =
-  if is_active t then Reqd.fail_request_body (current_reqd_exn t);
+  if is_active t then Request_descriptor.fail_request_body (current_reqd_exn t);
   Reader.force_close t.reader;
   wakeup_reader t
 
@@ -119,8 +119,8 @@ let shutdown_writer t =
     (* XXX(dpatti): I'm not sure I understand why we close the *request* body
        here. Maybe we can write a test such that removing this line causes it to
        fail? *)
-    Reqd.fail_request_body reqd;
-    Reqd.flush_response_body reqd);
+    Request_descriptor.fail_request_body reqd;
+    Request_descriptor.flush_response_body reqd);
   (match t.error_code with
   | Error { response_state; _ } ->
     Response_state.flush_response_body response_state
@@ -130,7 +130,9 @@ let shutdown_writer t =
   wakeup_writer t
 
 let error_code t =
-  if is_active t then Reqd.error_code (current_reqd_exn t) else None
+  if is_active t
+  then Request_descriptor.error_code (current_reqd_exn t)
+  else None
 
 let shutdown t =
   shutdown_reader t;
@@ -158,7 +160,7 @@ let create
     | None -> assert false
     | Some (t, upgrade) ->
       let reqd =
-        Reqd.create
+        Request_descriptor.create
           ~error_handler
           ~upgrade
           ~reader:t.reader
@@ -192,7 +194,7 @@ let set_error_and_handle ?request t error =
   then (
     assert (request = None);
     let reqd = current_reqd_exn t in
-    Reqd.report_error reqd error)
+    Request_descriptor.report_error reqd error)
   else
     let status =
       match (error :> [ error | Status.standard ]) with
@@ -287,12 +289,12 @@ let rec _next_read_operation t =
       next)
   else
     let reqd = current_reqd_exn t in
-    match Reqd.input_state reqd with
+    match Request_descriptor.input_state reqd with
     | Wait ->
-      (match Reqd.output_state reqd with
+      (match Request_descriptor.output_state reqd with
       | Complete ->
-        if Option.is_some (Reqd.response reqd)
-        then Body.Reader.discard (Reqd.request_body reqd);
+        if Option.is_some (Request_descriptor.response reqd)
+        then Body.Reader.discard (Request_descriptor.request_body reqd);
         Reader.next t.reader
       | Wait | Ready ->
         (* `Wait` signals that we should add backpressure to the read channel, *
@@ -302,21 +304,23 @@ let rec _next_read_operation t =
            close. *)
         (match Reader.next t.reader with
         | `Error _ as operation
-          when not (Body.Reader.is_closed (Reqd.request_body reqd)) ->
+          when not
+                 (Body.Reader.is_closed (Request_descriptor.request_body reqd))
+          ->
           operation
         | _ -> `Yield))
     | Ready -> Reader.next t.reader
     | Complete -> _final_read_operation_for t reqd
 
 and _final_read_operation_for t reqd =
-  if not (Reqd.persistent_connection reqd)
+  if not (Request_descriptor.persistent_connection reqd)
   then (
     shutdown_reader t;
     match Reader.next t.reader with
     | `Error _ -> `Close
     | operation -> operation)
   else
-    match Reader.next t.reader, Reqd.output_state reqd with
+    match Reader.next t.reader, Request_descriptor.output_state reqd with
     | `Close, _ ->
       shutdown_reader t;
       `Close
@@ -355,7 +359,7 @@ let read_with_more t bs ~off ~len more =
     (if is_active t
      then
        let reqd = current_reqd_exn t in
-       Reqd.flush_request_body reqd);
+       Request_descriptor.flush_request_body reqd);
     consumed
   with
   | consumed ->
@@ -400,21 +404,21 @@ let rec _next_write_operation t =
         Writer.next t.writer)
   else
     let reqd = current_reqd_exn t in
-    match Reqd.output_state reqd with
+    match Request_descriptor.output_state reqd with
     | Wait -> Writer.next t.writer
     | Ready ->
-      Reqd.flush_response_body reqd;
+      Request_descriptor.flush_response_body reqd;
       Writer.next t.writer
     | Complete -> _final_write_operation_for t reqd
 
 and _final_write_operation_for t reqd =
-  if not (Reqd.persistent_connection reqd)
+  if not (Request_descriptor.persistent_connection reqd)
   then (
     shutdown_writer t;
     wakeup_reader t;
     Writer.next t.writer)
   else
-    match Reqd.input_state reqd with
+    match Request_descriptor.input_state reqd with
     | Wait ->
       wakeup_reader t;
       Writer.next t.writer
@@ -440,7 +444,8 @@ let report_write_result t result =
   | `Ok _ -> ()
   | `Closed ->
     Reader.pause t.reader;
-    if is_active t then Reqd.flush_response_body (current_reqd_exn t);
+    if is_active t
+    then Request_descriptor.flush_response_body (current_reqd_exn t);
     (match t.error_code with
     | Error { response_state; _ } ->
       Response_state.flush_response_body response_state
