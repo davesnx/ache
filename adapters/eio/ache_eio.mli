@@ -66,11 +66,22 @@ module Server : sig
       make the kernel reset the connection before the peer has read the
       response (RFC 9112 §9.6). With [clock], it waits at most
       [idle_timeout], or {!linger_without_idle_timeout} without
-      [idle_timeout], after its last write. Without [clock] it does not wait:
-      it shuts down the flow at once, and the handler returns.
+      [idle_timeout], after its last write; input from the peer does not
+      extend this time. A peer that closes its sending side (a half-close)
+      ends the wait; it is not an error, and the response is sent in full.
+      Without [clock] it does not wait: it shuts down the flow at once, and
+      the handler returns.
 
       A [shutdown] of [flow] that raises is ignored, so a flow without
       half-close (for example some TLS flows) ends the connection normally.
+
+      When [error_handler] raises, the connection closes, and after the
+      connection ends the handler raises the first such exception with its
+      backtrace, so that the [on_error] of [Eio.Net.run_server],
+      [Eio.Net.accept_fork] or {!run} gets it. An exception that the
+      connection gets from the core while it reports an error is raised in
+      the same way. A peer that closes or resets the connection is not an
+      error, and the handler returns normally.
 
       @raise Invalid_argument
         if a timeout is given without [clock] or a timeout is not positive.
@@ -106,9 +117,10 @@ module Server : sig
       no state of ache. [addr] must name a fixed port: with port 0, each
       domain listens on a different port.
 
-      Each loop is [Eio.Net.run_server] with [on_error] and the handler from
-      {!create_connection_handler}, which takes [config], [clock],
-      [idle_timeout], [head_timeout], [request_handler] and [error_handler].
+      Each loop accepts connections with [Eio.Net.accept_fork] and [on_error],
+      and serves them with the handler from {!create_connection_handler},
+      which takes [config], [clock], [idle_timeout], [head_timeout],
+      [request_handler] and [error_handler].
       [request_handler] and [error_handler] run in several domains at the
       same time.
 
@@ -119,8 +131,19 @@ module Server : sig
       [domains] defaults to [Domain.recommended_domain_count ()], [backlog]
       to 128, [tcp_nodelay] to [false].
 
+      [on_error] also gets the exception that a connection handler raises,
+      for example one that [error_handler] raised; see
+      {!create_connection_handler}.
+
+      When an accept fails with an error that can go away, for example
+      [EMFILE], [ENFILE] or [ECONNABORTED], the loop gives the exception to
+      [on_error], waits 50 ms and accepts again. The connections in progress
+      continue.
+
       [run] does not return. Cancel its fiber to stop all domains. If
-      [on_error] raises, or a listen or accept fails in one domain, [run]
+      [on_error] raises, a listen fails, or an accept fails because the
+      listening socket is not usable ([EBADF], [EINVAL], [ENOTSOCK],
+      [EFAULT], or an operation that is not available) in one domain, [run]
       cancels all domains and raises the exception.
 
       @raise Invalid_argument

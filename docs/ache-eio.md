@@ -180,7 +180,8 @@ that are forked in it: when the switch ends, they are cancelled.
 ### One connection
 
 `Server.create_connection_handler` is the function that
-`Eio.Net.run_server` calls in a new fiber for each accepted socket. It
+`Eio.Net.run_server`, or the accept loop of `Server.run`, calls in a new
+fiber for each accepted socket. It
 creates the core connection and runs the two loops in one switch:
 
 ```
@@ -211,6 +212,16 @@ creates the core connection and runs the two loops in one switch:
 - **Errors.** If a write fails, or the core raises in `report_exn`, the
   connection resolves `failed`. `Fiber.first` then cancels both loops, and
   the socket is shut down in both directions.
+- **Errors for `on_error`.** The core catches an exception that
+  `error_handler` raises and closes the connection, so the handler wraps
+  `error_handler` and keeps the first exception it raises, with its
+  backtrace. The loops keep the first exception that `report_exn` raises in
+  the same way. When the loops end, the handler raises the kept exception,
+  and `Eio.Net.run_server`, `Eio.Net.accept_fork` or `Server.run` gives it to
+  `on_error`. A peer that closes or resets the connection is the end of
+  input, not an error, and does not reach `on_error`. The client keeps its
+  behavior: an exception from `report_exn` ends the connection and is not
+  raised.
 
 ### The reader fiber
 
@@ -245,14 +256,29 @@ the peer closes, for at most `idle_timeout` (2 s without one). If the server
 closed with unread input, the kernel would reset the connection, and the
 peer could lose the response.
 
+The time limit is set once, when the linger starts: input from the peer
+does not extend it. If the limit ends while the response is still being
+written, a new limit starts, so that the linger ends at most `idle_timeout`
+after the last write. An end of input during the linger means that the peer
+stopped sending (a half-close). The linger then ends without an error, and
+the response continues to the end.
+
 ### Several domains
 
 `Server.run` starts the same handler on several domains. Each domain opens
 its own listening socket on the same port with `SO_REUSEPORT` and runs its
-own `Eio.Net.run_server`. The first domain is the caller's; the others start
+own accept loop. The first domain is the caller's; the others start
 with `Eio.Domain_manager.run`, and `Fiber.all` waits for all of them. The
 domains share no state, so a connection stays on the domain that accepted
 it.
+
+The accept loop is not `Eio.Net.run_server`, because an accept error would
+end `run_server`, and `Fiber.all` would then cancel every domain and its
+connections. Most accept errors go away when the cause goes away, for example
+`EMFILE` or `ENFILE` (too many open files) or `ECONNABORTED`. The loop gives
+such an error to `on_error`, waits 50 ms, and accepts again. Only errors
+that show the listening socket itself is not usable (`EBADF`, `EINVAL`,
+`ENOTSOCK`, `EFAULT`, or an operation that is not available) end the loop.
 
 ## Runtime notes
 
