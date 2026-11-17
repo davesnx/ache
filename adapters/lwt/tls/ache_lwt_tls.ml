@@ -11,23 +11,35 @@ type socket =
   ; mutable close_delimited : bool
   }
 
+let channel_buffer_size = 17 * 1024
+
 let channels fd ~tcp_eof ~closing =
   let input =
-    Lwt_io.make ~mode:Lwt_io.Input (fun buf off len ->
-      Lwt_bytes.read fd buf off len >|= fun n ->
-      if n = 0 then tcp_eof := true;
-      n)
+    Lwt_io.make
+      ~buffer:(Lwt_bytes.create channel_buffer_size)
+      ~mode:Lwt_io.Input
+      (fun buf off len ->
+         Lwt_bytes.read fd buf off len >|= fun n ->
+         if n = 0 then tcp_eof := true;
+         n)
   in
   let output =
-    Lwt_io.make ~mode:Lwt_io.Output (fun buf off len ->
-      if !closing
-      then
-        match
-          Unix.single_write_bigarray (Lwt_unix.unix_file_descr fd) buf off len
-        with
-        | n -> Lwt.return n
-        | exception exn -> Lwt.fail exn
-      else Lwt_bytes.write fd buf off len)
+    Lwt_io.make
+      ~buffer:(Lwt_bytes.create channel_buffer_size)
+      ~mode:Lwt_io.Output
+      (fun buf off len ->
+         if !closing
+         then
+           match
+             Unix.single_write_bigarray
+               (Lwt_unix.unix_file_descr fd)
+               buf
+               off
+               len
+           with
+           | n -> Lwt.return n
+           | exception exn -> Lwt.fail exn
+         else Lwt_bytes.write fd buf off len)
   in
   input, output
 

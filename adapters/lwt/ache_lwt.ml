@@ -110,7 +110,15 @@ module IO_loop = struct
             (fun () ->
                (if Buffer.unread read_buffer
                 then Lwt.return (Ok 0)
-                else timed_read (fun () -> read (module Io) socket read_buffer))
+                else
+                  let reading =
+                    timed_read (fun () -> read (module Io) socket read_buffer)
+                  in
+                  if Lwt.is_sleeping reading
+                  then reading
+                  else
+                    reading >>= fun result ->
+                    Lwt.pause () >|= fun () -> result)
                >|= function
                | Ok (_ : int) ->
                  let (_ : int) = Buffer.get read_buffer ~f:(Runtime.read t) in

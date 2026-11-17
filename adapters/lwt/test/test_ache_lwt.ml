@@ -1236,6 +1236,60 @@ let test_timeout_cancelled_expired () =
       ~max:0.5
       (Unix.gettimeofday () -. since))
 
+let test_flood_does_not_block_event_loop () =
+  let flood_seconds = 2.0 in
+  let batch = String.concat "" (List.init 200 (fun _ -> get_hello)) in
+  let max_gap = ref 0. in
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    let fd = Lwt_unix.unix_file_descr socket in
+    Unix.clear_nonblock fd;
+    let received = Atomic.make (-1) in
+    let writer =
+      Domain.spawn (fun () ->
+        let until = Unix.gettimeofday () +. flood_seconds in
+        (try
+           while Unix.gettimeofday () < until do
+             ignore (Unix.write_substring fd batch 0 (String.length batch))
+           done
+         with
+        | Unix.Unix_error _ -> ());
+        try Unix.shutdown fd Unix.SHUTDOWN_SEND with Unix.Unix_error _ -> ())
+    in
+    let (_ : unit Domain.t) =
+      Domain.spawn (fun () ->
+        let chunk = Bytes.create 65536 in
+        let rec go total =
+          match Unix.read fd chunk 0 (Bytes.length chunk) with
+          | 0 -> total
+          | n -> go (total + n)
+          | exception Unix.Unix_error _ -> total
+        in
+        Atomic.set received (go 0))
+    in
+    let flooding = ref true in
+    let rec ticker last =
+      Lwt_unix.sleep 0.01 >>= fun () ->
+      let now = Unix.gettimeofday () in
+      max_gap := Float.max !max_gap (now -. last);
+      if !flooding then ticker now else Lwt.return_unit
+    in
+    let ticking = ticker (Unix.gettimeofday ()) in
+    Lwt_unix.sleep flood_seconds >>= fun () ->
+    flooding := false;
+    ticking >>= fun () ->
+    let rec drained () =
+      if Atomic.get received >= 0
+      then Lwt.return_unit
+      else Lwt_unix.sleep 0.01 >>= drained
+    in
+    drained () >>= fun () ->
+    Domain.join writer;
+    if Atomic.get received = 0 then Alcotest.fail "no response";
+    Lwt_unix.close socket);
+  if !requests_seen = 0 then Alcotest.fail "no request served";
+  if !max_gap > 1.0 then Alcotest.failf "event loop blocked for %.3f s" !max_gap
+
 let test_timeout_create_must_be_positive () =
   List.iter
     (fun seconds ->
@@ -1252,6 +1306,9 @@ let () =
       , [ "GET", `Quick, test_get
         ; "POST echo larger than the read buffer", `Quick, test_post_echo
         ; "two pipelined requests", `Quick, test_pipelined
+        ; ( "a flooding client does not block the event loop"
+          , `Quick
+          , test_flood_does_not_block_event_loop )
         ; "101 upgrade to an echo protocol", `Quick, test_upgrade
         ; ( "CONNECT tunnel gets the bytes sent with the head"
           , `Quick
