@@ -80,9 +80,10 @@ module IO_loop = struct
   let start : type t.
     (module Ache.Runtime.ENGINE with type t = t)
     -> read_buffer_size:int
-    -> read_closed:unit Promise.t * unit Promise.u
-    -> timed_read:
-         ([ `Read | `Linger ] -> (unit -> int) -> (int, [ `Timeout ]) result)
+    -> ?read_closed:unit Promise.t * unit Promise.u
+    -> timeout:
+         ([ `Read | `Linger ]
+          -> ((unit -> int) -> (int, [ `Timeout ]) result) option)
     -> linger:bool
     -> t
     -> _ Eio.Flow.two_way
@@ -90,13 +91,15 @@ module IO_loop = struct
     =
    fun (module Runtime)
      ~read_buffer_size
-     ~read_closed
-     ~timed_read
+     ?read_closed
+     ~timeout
      ~linger:lingers
      t
      socket ->
     Switch.run @@ fun sw ->
-    let read_closed, resolve_read_closed = read_closed
+    let interruptible = Option.is_some read_closed in
+    let read_closed, resolve_read_closed =
+      match read_closed with Some p -> p | None -> Promise.create ()
     and receive_shut = ref false
     and send_shut = ref false
     and failed, resolve_failed = Promise.create () in
@@ -159,7 +162,7 @@ module IO_loop = struct
         then Some ()
         else None
       in
-      let read () =
+      let daemon_read () =
         if Option.is_none !read_result
         then (
           if Promise.is_resolved read_closed then raise End_of_file;
@@ -176,8 +179,14 @@ module IO_loop = struct
           pending_read := false;
           (match result with Ok n -> n | Error exn -> raise exn)
       in
+      let timed_read phase =
+        match timeout phase with
+        | Some limited -> limited daemon_read
+        | None when interruptible || !pending_read -> Ok (daemon_read ())
+        | None -> Ok (read socket read_buffer)
+      in
       let rec linger () =
-        match timed_read `Linger read with
+        match timed_read `Linger with
         | Ok (_ : int) ->
           let (_ : int) =
             Buffer.get read_buffer ~f:(fun _ ~off:_ ~len -> len)
@@ -191,7 +200,7 @@ module IO_loop = struct
           match Runtime.next_read_operation t with
           | `Read ->
             (match
-               if Buffer.unread read_buffer then Ok 0 else timed_read `Read read
+               if Buffer.unread read_buffer then Ok 0 else timed_read `Read
              with
             | Ok (_ : int) ->
               let (_ : int) =
@@ -254,7 +263,7 @@ module IO_loop = struct
          Promise.await failed;
          shutdown_once `All)
 
-  let untimed_read _ read = Ok (read ())
+  let no_timeout _ = None
 end
 
 module Server = struct
@@ -317,11 +326,11 @@ module Server = struct
           n
       end
       in
-      let timed_read =
+      let timeout =
         match clock with
-        | None -> IO_loop.untimed_read
+        | None -> IO_loop.no_timeout
         | Some clock ->
-          fun phase read ->
+          fun phase ->
             let limit =
               match phase with
               | `Linger ->
@@ -341,22 +350,21 @@ module Server = struct
                     !head_deadline
                 | None -> None)
             in
-            (match limit with
-            | None -> Ok (read ())
-            | Some (seconds, on_timeout) ->
-              (match
-                 Eio.Time.with_timeout clock seconds (fun () -> Ok (read ()))
-               with
-              | Ok n -> Ok n
-              | Error `Timeout ->
-                on_timeout ();
-                Error `Timeout))
+            Option.map
+              (fun (seconds, on_timeout) read ->
+                 match
+                   Eio.Time.with_timeout clock seconds (fun () -> Ok (read ()))
+                 with
+                 | Ok n -> Ok n
+                 | Error `Timeout ->
+                   on_timeout ();
+                   Error `Timeout)
+              limit
       in
       IO_loop.start
         (module Observed)
         ~read_buffer_size:config.read_buffer_size
-        ~read_closed:(Promise.create ())
-        ~timed_read
+        ~timeout
         ~linger:(Option.is_some clock)
         connection
         socket
@@ -440,7 +448,7 @@ module Client = struct
           (module Upgradable)
           ~read_buffer_size:config.read_buffer_size
           ~read_closed
-          ~timed_read:IO_loop.untimed_read
+          ~timeout:IO_loop.no_timeout
           ~linger:true
           runtime
           socket));

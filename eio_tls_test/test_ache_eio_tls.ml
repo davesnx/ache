@@ -868,6 +868,43 @@ let test_idle_timeout_then_request () =
   Alcotest.(check int) "no error" 0 (List.length !server_errors);
   check_no_handler_error ()
 
+let test_body_between_timed_reads () =
+  with_server
+    ~timeouts:true
+    ~idle_timeout:0.3
+    ~head_timeout:0.3
+    (fun env connect ->
+       Eio.Switch.run (fun sw ->
+         let raw = raw_client (connect sw) in
+         let reader = Eio.Buf_read.of_flow raw.tls ~max_size:65536 in
+         Eio.Flow.copy_string
+           "POST /echo HTTP/1.1\r\n\
+            host: localhost\r\n\
+            content-length: 6\r\n\
+            \r\n\
+            abc"
+           raw.tls;
+         Eio.Time.sleep (Eio.Stdenv.clock env) 0.05;
+         Eio.Flow.copy_string "def" raw.tls;
+         let echoed = "HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\nabcdef" in
+         Alcotest.(check string)
+           "echo response"
+           echoed
+           (Eio.Buf_read.take (String.length echoed) reader);
+         Eio.Flow.copy_string
+           "GET /a HTTP/1.1\r\nhost: localhost\r\n\r\n"
+           raw.tls;
+         let rest = Eio.Buf_read.take_all reader in
+         Alcotest.(check bool)
+           "second response"
+           true
+           (String.starts_with ~prefix:"HTTP/1.1 200 OK\r\n" rest
+           && String.ends_with ~suffix:"/a" rest);
+         Alcotest.(check bool) "close_notify" false !(raw.tcp_eof);
+         Eio.Flow.shutdown raw.tls `Send));
+  Alcotest.(check int) "no error" 0 (List.length !server_errors);
+  check_no_handler_error ()
+
 let test_client_shutdown_with_pending_read () =
   let server_saw = ref None in
   let errors = ref [] in
@@ -1090,6 +1127,10 @@ let () =
             "request after the idle timeout"
             `Quick
             test_idle_timeout_then_request
+        ; Alcotest.test_case
+            "a body read between timed reads, then the idle timeout"
+            `Quick
+            test_body_between_timed_reads
         ; Alcotest.test_case
             "Client.shutdown with a read pending"
             `Quick
