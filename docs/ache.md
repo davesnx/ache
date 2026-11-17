@@ -311,28 +311,28 @@ runtimes.
 
 | Suite | Tests |
 |---|---|
-| `lib_test`: core unit tests | 280 |
-| `rfc_test`: RFC 9110 | 159 |
-| `rfc_test`: RFC 9112 | 178 |
-| `eio_test`: Eio on loopback sockets | 33 |
-| `eio_tls_test`: `ache-eio-tls` on loopback sockets | 34 |
-| `lwt_test`: Lwt on loopback sockets | 25 |
-| `lwt_tls_test`: `ache-lwt-tls` on loopback sockets | 24 |
-| `miou_test`: Miou on loopback sockets | 28 |
-| `miou_tls_test`: `ache-miou-tls` on loopback sockets | 33 |
+| `lib/test`: core unit tests | 280 |
+| `lib/test/rfc`: RFC 9110 | 159 |
+| `lib/test/rfc`: RFC 9112 | 178 |
+| `adapters/eio/test`: Eio on loopback sockets | 33 |
+| `adapters/eio/tls/test`: `ache-eio-tls` on loopback sockets | 34 |
+| `adapters/lwt/test`: Lwt on loopback sockets | 25 |
+| `adapters/lwt/tls/test`: `ache-lwt-tls` on loopback sockets | 24 |
+| `adapters/miou/test`: Miou on loopback sockets | 28 |
+| `adapters/miou/tls/test`: `ache-miou-tls` on loopback sockets | 33 |
 
 The RFC suites start from each sentence of RFC 9110 and RFC 9112 §2–§11 that
 has a requirement keyword (MUST, SHOULD, MAY and others), plus definitions
-that a parser must follow. `rfc_test/COVERAGE.md` and
-`rfc_test/COVERAGE_9112.md` give each requirement its tests, or the reason it
-is out of scope:
+that a parser must follow. `lib/test/rfc/COVERAGE.md` and
+`lib/test/rfc/COVERAGE_9112.md` give each requirement its tests, or the reason
+it is out of scope:
 
 | RFC | Requirements | Tested | Out of scope |
 |---|---|---|---|
 | 9110 | 445 | 93 | 352 |
 | 9112 | 173 | 115 | 58 |
 
-No test is marked as a known failure (`rfc_test/KNOWN_FAILURES*.md`). The
+No test is marked as a known failure (`lib/test/rfc/KNOWN_FAILURES*.md`). The
 README check makes sure that the code in the three runtime pages is the same
 as the compiled examples.
 

@@ -203,9 +203,9 @@ core connection and starts the two loops as two child tasks:
   (`yield_reader` or `yield_writer`), and waits on a signal. The core calls
   the callback when it has work.
 - **Writes.** The write task sends all the buffers of one `Write` with one
-  `sendmsg` (a C stub in `miou/ache_miou_stubs.c`). When the socket buffer is
-  full, it waits until the socket can be written. On a file descriptor that
-  is not a socket, it writes each buffer in turn.
+  `sendmsg` (a C stub in `adapters/miou/ache_miou_stubs.c`). When the socket
+  buffer is full, it waits until the socket can be written. On a file
+  descriptor that is not a socket, it writes each buffer in turn.
 - **Reads.** The read task reads with `Miou_unix.read` into free space in the
   read buffer, then gives the new bytes to the core.
 - **The reader task.** As in `ache-eio`, a read with a timeout goes through
