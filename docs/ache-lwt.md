@@ -145,7 +145,16 @@ It creates the core connection and starts the two loops:
   [One write for each read](ache.md#one-write-for-each-read)), each
   pipelined response would be its own `writev`.
 - **Reads.** The read loop reads with `Lwt_bytes.read` into free space in
-  the read buffer, then gives the new bytes to the core.
+  the read buffer, then gives the new bytes to the core. When the read
+  completes without a wait, the loop calls `Lwt.pause` first. Without it, a
+  client that always has data ready keeps the read and write loops in one
+  chain of callbacks that does not return to `Lwt_main`, and no other
+  connection or timer runs.
+- **TLS.** `ache-lwt-tls` gives the `Lwt_io` channels under the TLS session
+  17 KiB buffers, a little more than one full TLS record (16 KiB of data,
+  its header and its padding). A large response goes out in about one write
+  for each record. With the default 4 KiB buffer, each record takes 4
+  writes.
 - **Timeouts.** A timed read is `Lwt.pick` of the socket read and
   `Ache_lwt.Timeout.expired`. See [Timeouts](#timeouts) for why the timers
   are shared.
