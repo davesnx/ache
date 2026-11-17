@@ -411,7 +411,9 @@ module Request_descriptor : sig
       responds with [status] instead (default [`OK]), which starts a tunnel
       (RFC 9110 §9.3.6). When the response has been written, the connection
       shuts down its HTTP state and hands reading and writing to [impl].
-      Input that the connection has not consumed goes to [impl].
+      Input that the connection has not consumed goes to [impl]. When the
+      response cannot be written, [impl] is shut down and never reads or
+      writes.
 
       @raise Invalid_argument
         if [status] is given for a request that is not [CONNECT], or, for a
@@ -622,6 +624,144 @@ module Server_connection : sig
         answer can change to [Some (`Body, _)] while the runtime waits for
         input, when the response completes. A runtime asks again each time
         its write loop waits or ends. *)
+end
+
+(** {2 WebSocket Server} *)
+
+(** A WebSocket server connection (RFC 6455), for text messages, that runs
+    after a [101] response sent with {!Request_descriptor.respond_with_upgrade}. It needs no
+    runtime code: every runtime drives it like {!Server_connection}.
+
+    It has no extensions and no subprotocols. It does not check [Origin] or
+    authentication: the request handler does that before
+    {!Websocket.upgrade}.
+
+    What the connection does on its own:
+    - it answers a ping with a pong that has the same payload;
+    - it reassembles a fragmented text message and gives it whole to
+      [on_message];
+    - when the client sends a close frame, it sends a close frame with the
+      same code, then closes the connection;
+    - it fails the connection, that is, it sends a close frame with a code
+      and closes the connection, with code [1002] for a protocol error (an
+      unmasked frame, an unknown opcode, a reserved bit set, a control frame
+      that is fragmented or longer than 125 bytes, a continuation frame
+      without a message to continue, a new data frame inside a fragmented
+      message, a payload length with the high bit set, a close frame with a
+      1-byte payload or an invalid code), [1007] for a text message or close
+      reason that is not valid UTF-8, [1009] for a message longer than
+      [max_message_size] (before it reads the payload), and [1003] for a
+      binary frame (RFC 6455 §7.4.1).
+
+    After it sends a close frame, the connection reads no more messages and
+    closes the TCP connection once the frame is written. It does not wait for
+    the client's close frame.
+
+    ache has no timeout on an upgraded connection. A client that stops
+    reading, or never answers a close frame, keeps the connection open until
+    the caller closes the socket, for example with its own timer.
+
+    Reading stops while more than 64 KiB of frames (messages, pongs and close
+    frames) are queued and not yet written, and starts again when the writes
+    bring it down to 64 KiB. A client that sends pings and does not read the
+    pongs therefore cannot make the queue grow without limit: no pong is
+    dropped. One read can add the pongs for the frames it holds, so the queue
+    can pass 64 KiB by at most that. *)
+module Websocket : sig
+  type t
+
+  type handshake_error =
+    [ `Not_get  (** Not a [GET] request of HTTP/1.1 or later. *)
+    | `Not_websocket
+      (** No [websocket] token in [Upgrade], or no [upgrade] token in
+          [Connection]. Tokens are compared without case. *)
+    | `Unsupported_version
+      (** [Sec-WebSocket-Version] is not one field with value [13]. Respond
+          with [426 Upgrade Required] and [Sec-WebSocket-Version: 13]
+          (RFC 6455 §4.4). *)
+    | `Invalid_key
+      (** [Sec-WebSocket-Key] is not one field with the base64 encoding of 16
+          bytes. *)
+    ]
+
+  val accept_key : string -> string
+  (** [accept_key key] is the [Sec-WebSocket-Accept] value for the
+      [Sec-WebSocket-Key] value [key]: the base64 encoding of the SHA-1 of
+      [key] and the GUID of RFC 6455 §1.3. *)
+
+  val check_handshake : Request.t -> (string, handshake_error) result
+  (** [check_handshake request] checks that [request] is a WebSocket opening
+      handshake (RFC 6455 §4.2.1) and returns the [Sec-WebSocket-Accept]
+      value. *)
+
+  type handler =
+    { on_message : string -> unit
+      (** Called with each whole text message, in order. *)
+    ; on_close : int option -> unit
+      (** Called once, when the connection is closed and no more messages
+          come. The argument is the code of the client's close frame, [1005]
+          for a close frame without a code, or [None] when the client sent no
+          valid close frame (end of input, a reset, a protocol error, or a
+          close that the server started). *)
+    }
+
+  val default_max_message_size : int
+  (** [1048576] bytes (1 MiB). *)
+
+  val upgrade :
+     ?max_message_size:int
+    -> Request_descriptor.t
+    -> (t -> handler)
+    -> (unit, handshake_error) result
+  (** [upgrade ?max_message_size reqd make_handler] checks the request of
+      [reqd] with {!check_handshake}. When it is valid, [upgrade] calls
+      [make_handler] with the new connection, then responds with [101] and
+      the headers [Upgrade: websocket], [Connection: Upgrade] and
+      [Sec-WebSocket-Accept], and returns [Ok ()]. The connection starts to
+      read and write when the [101] is written. Messages sent before that are
+      written after the [101].
+
+      When the request is not valid, [upgrade] responds with nothing and
+      returns the error: the caller responds, for example with [400].
+
+      [max_message_size] limits the length of a message, all fragments
+      together. Default {!default_max_message_size}.
+
+      @raise Invalid_argument if [max_message_size] is not positive. *)
+
+  val send_text : t -> string -> unit
+  (** [send_text t message] queues [message] as one text frame without a
+      mask. After the connection started to close, it does nothing. [message]
+      must be valid UTF-8: [send_text] does not check it. *)
+
+  val flush : t -> ([ `Written | `Closed ] -> unit) -> unit
+  (** [flush t k] calls [k `Written] when all frames queued before it are
+      written, and [k `Closed] when the connection closed first. After the
+      connection started to close, it calls [k `Closed] at once. *)
+
+  val close : t -> code:int -> unit
+  (** [close t ~code] sends a close frame with [code], stops reading
+      messages, and closes the connection when the frame is written. It does
+      nothing when the connection already started to close.
+
+      @raise Invalid_argument
+        if [code] is not one that an endpoint may send: [1000] to [1003],
+        [1007] to [1014], or [3000] to [4999]. *)
+
+  val pause_reading : t -> unit
+  (** [pause_reading t] stops reading from the client, so that no
+      [on_message] call comes until {!resume_reading}. Frames that the current
+      read already holds are still processed, so a few more messages can come
+      after the call. While reading is paused, a ping gets no pong and the end
+      of input is not seen. *)
+
+  val resume_reading : t -> unit
+  (** [resume_reading t] starts reading again after {!pause_reading}. Reading
+      can still wait for the writes, as above. *)
+
+  val is_closed : t -> bool
+  (** [is_closed t] is [true] once the connection is closed: [on_close] was
+      called and nothing more is written. *)
 end
 
 (** {2 Client Connection} *)

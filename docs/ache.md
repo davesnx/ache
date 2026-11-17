@@ -17,6 +17,8 @@ Status: experimental. The API can change before 1.0.
   response (see [Requests the server rejects](#requests-the-server-rejects)).
 - No dependencies: the core package `ache` needs only OCaml.
 - Runtimes for Eio, Lwt and Miou, each with TLS through ocaml-tls.
+- A WebSocket server (RFC 6455) for text messages, on every runtime (see
+  [WebSocket](#websocket)).
 
 ## Packages
 
@@ -171,6 +173,131 @@ httpun rejected chunk extensions and trailers.
 - `Client_connection.request` raises `Invalid_argument` for a method or field
   name that is not a token, a CR, LF or NUL in a field value, and a CR, LF,
   NUL or space in the target. Later requests are still sent.
+
+## WebSocket
+
+`Ache.Websocket` is a WebSocket server (RFC 6455) for text messages. It runs
+after a `101 Switching Protocols` response on the same connection, so it
+works on Eio, Lwt and Miou, with or without TLS, and needs no runtime code.
+`ache-lwt` adds a promise API on top of it (see
+[WebSocket in ache-lwt.md](ache-lwt.md#websocket)).
+
+### Upgrade a request
+
+Call `Websocket.upgrade` in the request handler. It checks the opening
+handshake (RFC 6455 §4.2.1):
+
+- a `GET` request of HTTP/1.1 or later;
+- a `websocket` token in `Upgrade` and an `upgrade` token in `Connection`,
+  compared without case;
+- one `Sec-WebSocket-Version` field with the value `13`;
+- one `Sec-WebSocket-Key` field with the base64 encoding of 16 bytes.
+
+When the handshake is valid, `upgrade` calls your function with the new
+connection, responds with `101`, `Upgrade: websocket`, `Connection: Upgrade`
+and `Sec-WebSocket-Accept`, and returns `Ok ()`. Your function returns the
+two callbacks: `on_message` gets each whole text message, and `on_close` is
+called once when the connection ends. When the handshake is not valid,
+`upgrade` responds nothing and returns the error, so that you send the
+response. `Websocket.check_handshake` does the same check without the
+upgrade.
+
+ache does not check `Origin`, cookies or tokens. Check them before you call
+`upgrade`.
+
+This handler echoes each message and closes the connection when the client
+sends `bye`:
+
+```ocaml
+open Ache
+
+let respond_empty reqd ?(headers = []) status =
+  let headers = Headers.of_list (("content-length", "0") :: headers) in
+  Request_descriptor.respond_with_string
+    reqd
+    (Response.create ~headers status)
+    ""
+
+let request_handler _client_address reqd =
+  let result =
+    Websocket.upgrade reqd (fun ws ->
+      { on_message =
+          (fun message ->
+            if message = "bye"
+            then Websocket.close ws ~code:1000
+            else Websocket.send_text ws message)
+      ; on_close = (fun _code -> ())
+      })
+  in
+  match result with
+  | Ok () -> ()
+  | Error `Unsupported_version ->
+    respond_empty
+      reqd
+      ~headers:[ "sec-websocket-version", "13" ]
+      `Upgrade_required
+  | Error (`Not_get | `Not_websocket | `Invalid_key) ->
+    respond_empty reqd `Bad_request
+```
+
+`send_text` queues one text frame. The connection writes it after the `101`,
+also when you call it from your function before the `101` is written.
+`send_text` does not check that the message is valid UTF-8. To know when the
+frames are written, call `Websocket.flush` with a callback: it gets
+`` `Written `` when all frames queued before it are written, or `` `Closed ``
+when the connection closed first.
+
+### What the connection does
+
+- It answers a ping with a pong that has the same payload.
+- It gives a fragmented message to `on_message` in one piece.
+- When the client sends a close frame, it sends a close frame with the same
+  code, then closes the connection. `on_close` gets the client's code, or
+  `Some 1005` for a close frame without a code.
+- `Websocket.close ws ~code` sends a close frame, stops reading, and closes
+  the connection when the frame is written. It does not wait for the
+  client's close frame.
+- It closes the connection with a code when the client breaks the protocol.
+  `on_close` then gets `None`:
+
+| Code | Cause |
+|---|---|
+| 1002 | An unmasked frame, an unknown opcode, a reserved bit, a control frame that is fragmented or longer than 125 bytes, a continuation frame without a message, a new message inside a fragmented one, a length with the high bit set, or a close frame with a 1-byte payload or an invalid code |
+| 1003 | A binary frame |
+| 1007 | A text message or close reason that is not valid UTF-8 |
+| 1009 | A message longer than `max_message_size` |
+
+`?max_message_size` of `upgrade` limits the length of a message, all
+fragments together. The default is `Websocket.default_max_message_size`,
+1 MiB. The connection checks the length in the frame header, before it reads
+the payload. Control frames do not count.
+
+### Backpressure
+
+The connection stops reading while more than 64 KiB of frames are queued
+and not written, and starts again when the writes bring the queue down to
+64 KiB. A client that sends pings and does not read the pongs cannot make the
+queue grow without limit, and no pong is dropped.
+
+To stop `on_message` calls, for example while your own queue is full, call
+`Websocket.pause_reading`, then `Websocket.resume_reading`. Frames that the
+current read already holds still reach `on_message`. While reading is
+paused, a ping gets no pong and the connection does not see the end of the
+input.
+
+### When the client is gone
+
+When a write fails because the client closed or reset the connection, the
+connection drops the frames it has not written, calls `on_close None`, and
+gives `` `Closed `` to each pending `flush`. Later calls to `send_text` do
+nothing, and `flush` gets `` `Closed `` at once, so a send loop that stops
+on `` `Closed `` ends. The connection writes nothing more, so the
+runtime loop ends and closes the socket. httpun-ws kept writing after this
+error, which made the server use 100% CPU
+([dream#467](https://github.com/camlworks/dream/issues/467)). Each runtime
+has a test for this case: `adapters/eio/test`, `adapters/lwt/test` and
+`adapters/miou/test` reset the connection while the server sends, and check
+that the connection ends within 1 second.
 
 ## How it works
 
@@ -331,6 +458,10 @@ runtimes.
   above.
 - While more than `Config.max_pending_output` bytes of responses wait to be
   written, the server reads no new request.
+- WebSocket: server only, text messages only. There are no extensions, no
+  subprotocols and no binary messages. ache has no timeout on an upgraded
+  connection: a client that stops reading, or never answers a close frame,
+  keeps the connection open until you close the socket.
 - The API is not stable before 1.0.
 
 ## Testing

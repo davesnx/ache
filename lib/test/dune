@@ -21,5 +21,6 @@
   test_status
   test_framing
   test_server_connection
-  test_version)
+  test_version
+  test_websocket)
  (name test_ache))
