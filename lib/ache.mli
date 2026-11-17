@@ -595,7 +595,8 @@ end
     runtime code: every runtime drives it like {!Server_connection}.
 
     It has no extensions and no subprotocols. It does not check [Origin] or
-    authentication: the request handler does that before {!upgrade}.
+    authentication: the request handler does that before
+    {!Websocket.upgrade}.
 
     What the connection does on its own:
     - it answers a ping with a pong that has the same payload;
