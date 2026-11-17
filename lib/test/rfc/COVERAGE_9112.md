@@ -6,8 +6,8 @@ body length rules, persistence rules, security considerations) that a parser or 
 must follow although the sentence has no keyword. `Ref` is the section and the sentence's
 position in it; `#D` rows are definitions.
 
-Test names are in `rfc_test/test_9112_*.ml`; a name followed by "(RFC 9110 suite)" is in
-`rfc_test/test_s*.ml`. Every listed test passes; see `KNOWN_FAILURES_9112.md`.
+Test names are in `lib/test/rfc/test_9112_*.ml`; a name followed by "(RFC 9110 suite)" is in
+`lib/test/rfc/test_s*.ml`. Every listed test passes; see `KNOWN_FAILURES_9112.md`.
 
 ## Counts
 

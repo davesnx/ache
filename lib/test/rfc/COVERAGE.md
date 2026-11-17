@@ -5,8 +5,8 @@ contains a BCP 14 keyword (the boilerplate in §2.2 excluded), plus rows with ke
 definitions (ABNF, registries, case rules) that a parser or generator must follow although the
 sentence has no keyword. `Ref` is the section and the sentence's position in it.
 
-Test names are in `rfc_test/test_s*.ml`; a name followed by "(RFC 9112 suite)" is in
-`rfc_test/test_9112_*.ml`. Every listed test passes; see `KNOWN_FAILURES.md`.
+Test names are in `lib/test/rfc/test_s*.ml`; a name followed by "(RFC 9112 suite)" is in
+`lib/test/rfc/test_9112_*.ml`. Every listed test passes; see `KNOWN_FAILURES.md`.
 
 ## Counts
 
