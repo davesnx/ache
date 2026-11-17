@@ -40,12 +40,20 @@ module type Server = sig
 
       Closing: when the connection stops reading (after a response with
       [Connection: close], an error response, or a timeout), it reads and
-      discards input until the peer closes, so that unread input does not
-      make the kernel reset the connection before the peer has read the
+      discards input until the peer stops sending, so that unread input does
+      not make the kernel reset the connection before the peer has read the
       response (RFC 9112 §9.6). With [idle_timeout] or [head_timeout], it
       waits at most [idle_timeout], or {!linger_without_idle_timeout} without
-      [idle_timeout], after its last write. Without a timeout it does not
-      wait: it shuts down reading at once, and the handler returns.
+      [idle_timeout], after it stops reading or after its last write,
+      whichever is later. Input that arrives does not extend this limit. When
+      the peer stops sending, the response in progress is still written.
+      Without a timeout it does not wait: it shuts down reading at once, and
+      the handler returns.
+
+      When [error_handler] raises, or the connection gets an exception that
+      it cannot give to [error_handler], the connection closes and the
+      handler raises that exception. A peer that resets or closes the
+      connection is not an exception.
 
       A [shutdown] of [socket] that fails is ignored.
 
@@ -77,7 +85,9 @@ module type Client = sig
     -> Ache.Body.Writer.t
 
   val shutdown : t -> unit
-  (** [shutdown t] closes the connection and waits for its task to end. Call
+  (** [shutdown t] closes the connection at once and waits for its task to
+      end. Output that is not yet written to the socket is dropped, so a
+      write that waits for a peer that does not read does not hold it. Call
       it from the task that called {!create_connection}, before that task
       returns: Miou requires a task to await the tasks it created. A second
       call does not wait. *)
