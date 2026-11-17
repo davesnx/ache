@@ -68,9 +68,17 @@ module Server : sig
       {!create_connection_handler}, which takes [config], [idle_timeout],
       [head_timeout], [request_handler] and [error_handler].
       [request_handler] and [error_handler] run in several domains at the
-      same time. When the handler of a connection raises, [on_error] is
-      called with the exception at once, in the task of the connection, and
-      the socket is closed.
+      same time. When the handler of a connection raises (see
+      {!create_connection_handler}), [on_error] is called with the exception
+      at once, in the task of the connection, and the socket is closed.
+
+      When [accept] fails because the process or the system has no free file
+      descriptors or memory ([EMFILE], [ENFILE], [ENOBUFS], [ENOMEM]),
+      [on_error] is called with the [Unix.Unix_error], in the accept loop of
+      that domain, and the loop waits 0.1 s and accepts again. For accept
+      errors about one connection ([ECONNABORTED], [EPERM], and network
+      errors), [on_error] is called the same way, and the loop accepts again
+      at once.
 
       When [tcp_nodelay] is [true], [run] sets [TCP_NODELAY] on each
       accepted socket before it is served, so that small writes are sent at
@@ -80,8 +88,8 @@ module Server : sig
       [n + 1]. [backlog] defaults to 128, [tcp_nodelay] to [false].
 
       [run] does not return. Cancel its task to stop all domains. If
-      [on_error] raises, or a listen or accept fails in one domain, [run]
-      cancels all domains and raises the exception.
+      [on_error] raises, or a listen or another accept error occurs in one
+      domain, [run] cancels all domains and raises the exception.
 
       @raise Invalid_argument
         if [domains] is less than 1 or more than the domains available, if

@@ -810,7 +810,8 @@ let timeout_tests =
          ignore (Server.take_output s);
          (match timeout_action s with
          | Some (`Idle, close) -> close ()
-         | Some (`Head, _) -> Alcotest.fail "head timeout between requests"
+         | Some ((`Head | `Body), _) ->
+           Alcotest.fail "head timeout between requests"
          | None -> Alcotest.fail "no timeout between requests");
          Server.pump s;
          Alcotest.(check string) "nothing written" "" (Server.output s);
@@ -822,7 +823,8 @@ let timeout_tests =
          let s = Server.run "GET / HTTP/1.1\r\nHo" in
          (match timeout_action s with
          | Some (`Head, reject) -> reject ()
-         | Some (`Idle, _) -> Alcotest.fail "idle timeout inside a head"
+         | Some ((`Idle | `Body), _) ->
+           Alcotest.fail "idle timeout inside a head"
          | None -> Alcotest.fail "no timeout inside a head");
          Server.pump s;
          check_rejected ~allowed:[ 408 ] s)

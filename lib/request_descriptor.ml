@@ -142,8 +142,12 @@ let write_response t response =
   then Serialize.check_response response
   else Writer.write_response t.writer response
 
-let commit_persistence t response =
-  if t.persistent then t.persistent <- Response.persistent_connection response;
+let commit_persistence t (response : Response.t) =
+  if t.persistent
+  then
+    t.persistent <-
+      Response.persistent_connection response
+      && not (t.request.meth = `CONNECT && Status.is_successful response.status);
   if not t.persistent then Reader.pause t.reader
 
 let has_body t encoding =
@@ -274,10 +278,23 @@ let respond_with_streaming ?(flush_headers_immediately = false) t response =
        currently handling error";
   unsafe_respond_with_streaming ~flush_headers_immediately t response
 
-let unsafe_respond_with_upgrade t headers impl =
+let unsafe_respond_with_upgrade ?status t headers impl =
+  let fn = "ache.Request_descriptor.respond_with_upgrade" in
   match t.response_state with
   | Waiting ->
-    let response = Response.create ~headers `Switching_protocols in
+    let response =
+      match t.request.meth, status with
+      | `CONNECT, status ->
+        let status = Option.value status ~default:`OK in
+        fst
+          (frame
+             ~fn
+             ~length:None
+             t
+             (Response.create ~headers (status :> Status.t)))
+      | _, None -> Response.create ~headers `Switching_protocols
+      | _, Some _ -> invalid_arg (fn ^ ": ~status is for a CONNECT request")
+    in
     let closed = Writer.is_closed t.writer in
     write_response t response;
     commit_persistence t response;
@@ -298,13 +315,13 @@ let unsafe_respond_with_upgrade t headers impl =
     failwith
       "ache.Request_descriptor.respond_with_upgrade: response already complete"
 
-let respond_with_upgrade t headers impl =
+let respond_with_upgrade ?status t headers impl =
   if t.error_code <> `Ok
   then
     failwith
       "ache.Request_descriptor.respond_with_upgrade: invalid state, currently \
        handling error";
-  unsafe_respond_with_upgrade t headers impl
+  unsafe_respond_with_upgrade ?status t headers impl
 
 let report_error t error =
   t.persistent <- false;
@@ -395,10 +412,6 @@ let input_state t : Io_state.t =
          && Body.Reader.is_closed t.request_body
          && not (Reader.is_closed t.reader) ->
     Wait
-  | (Fixed response | Streaming (response, _)), `CONNECT
-    when Status.is_successful response.status && not (Reader.is_closed t.reader)
-    ->
-    Wait
   | _ ->
     if Body.Reader.is_closed t.request_body
     then Complete
@@ -406,11 +419,8 @@ let input_state t : Io_state.t =
     then Ready
     else Wait
 
-let output_state { request; response_state; writer; _ } =
-  Response_state.output_state
-    response_state
-    ~request_method:request.meth
-    ~writer
+let output_state { response_state; writer; _ } =
+  Response_state.output_state response_state ~writer
 
 let flush_request_body t =
   if Body.Reader.has_pending_output t.request_body

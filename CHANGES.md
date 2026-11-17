@@ -15,6 +15,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - `Reqd` is `Request_descriptor`.
 - `Request_descriptor.respond_with_upgrade` and `Client.upgrade` take a
   `Runtime.impl`.
+- `Request_descriptor.respond_with_upgrade` on a `CONNECT` request sends a
+  2xx (`?status`, default `200`) and starts a tunnel. It sent `101`.
 - `ache-eio`: `Server.create_connection_handler` takes no `~sw`, and can be
   given to `Eio.Net.run_server`.
 - `ache-lwt`: `Make (Io)` replaces the gluten functors. TLS moves to
@@ -33,6 +35,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `103 Early Hints`.
 - Server timeouts `?idle_timeout` and `?head_timeout`, and
   `Config.max_header_size`.
+- `Config.max_pending_output` (64 KiB): while more response bytes wait to
+  be written, the server reads no new request.
 - `Server.run` in `ache-eio` and `ache-miou`: one accept loop for each
   domain, each on its own `SO_REUSEPORT` socket, with no state shared
   between domains.
@@ -60,6 +64,16 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `ache-miou` sends all buffers with one `sendmsg`, not one write per buffer.
 - The server stops reading new requests once a response will close the
   connection.
+- After a response that is sent before the request body has arrived, the
+  body is still delivered, within `?idle_timeout`. Without `?idle_timeout`,
+  the body gets `on_error` and the connection closes.
+- A 2xx response to `CONNECT` sent with `respond_with_string`,
+  `respond_with_bigstring` or `respond_with_streaming` closes the
+  connection after its body. It kept the connection open with no end. A
+  tunnel uses `respond_with_upgrade`.
+- An exception from the request handler of a pipelined request gets that
+  request an error response. It escaped `next_read_operation` or
+  `next_write_operation`.
 - Fixes httpun #95, #143, #150, #151, #154 to #165, and httpaf #18, #38,
   #86, #191, #192.
 - When `Request_descriptor.respond_with_upgrade` cannot write the 101, it

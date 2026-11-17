@@ -19,34 +19,25 @@ let http_handler ~on_eof response response_body =
     Format.fprintf Format.err_formatter "%a\n%!" Response.pp_hum response;
     Stdlib.exit 124
 
-let proxy_handler _env ~sw ~headers flow ~on_eof response _response_body =
+let proxy_handler ~headers proxy ~on_eof response _response_body =
   Format.eprintf "CONNECT response: %a@." Response.pp_hum response;
   match response with
   | { Response.status = `OK; _ } ->
-    (* This means we can now communicate via any protocol on the socket since
-       the server approved the tunnel.
-
-       We'll be boring and use HTTP/1.1 again. *)
-    let connection = Ache_eio.Client.create_connection ~sw flow in
-    let exit_cond = Eio.Condition.create () in
-    Eio.Fiber.fork ~sw (fun () ->
-      let response_handler =
-        http_handler ~on_eof:(fun () ->
-          Stdlib.Format.eprintf "http eof@.";
-          Eio.Condition.broadcast exit_cond;
-          on_eof ())
-      in
-      let request_body =
-        Ache_eio.Client.request
-          ~flush_headers_immediately:true
-          ~error_handler:Ache_examples.Client.error_handler
-          ~response_handler
-          connection
-          (Request.create ~headers `GET "/")
-      in
-      Body.Writer.close request_body);
-    Eio.Condition.await_no_mutex exit_cond;
-    Ache_eio.Client.shutdown connection |> Eio.Promise.await
+    (* The proxy approved the tunnel: the bytes after this response belong to
+       another protocol. We'll be boring and use HTTP/1.1 again. *)
+    let connection = Client_connection.create () in
+    Ache_eio.Client.upgrade
+      proxy
+      (Runtime.make (module Client_connection) connection);
+    let request_body =
+      Client_connection.request
+        ~flush_headers_immediately:true
+        ~error_handler:Ache_examples.Client.error_handler
+        ~response_handler:(http_handler ~on_eof)
+        connection
+        (Request.create ~headers `GET "/")
+    in
+    Body.Writer.close request_body
   | _response -> Stdlib.exit 124
 
 let main port proxy_host =
@@ -70,18 +61,9 @@ let main port proxy_host =
       let exit_cond = Eio.Condition.create () in
       Eio.Fiber.fork ~sw (fun () ->
         let response_handler =
-         fun response response_body ->
-          Eio.Fiber.fork ~sw @@ fun () ->
-          proxy_handler
-            _env
-            ~sw
-            socket
-            ~headers
-            ~on_eof:(fun () ->
-              Stdlib.Format.eprintf "(connect) eof@.";
-              Eio.Condition.broadcast exit_cond)
-            response
-            response_body
+          proxy_handler ~headers connection ~on_eof:(fun () ->
+            Stdlib.Format.eprintf "http eof@.";
+            Eio.Condition.broadcast exit_cond)
         in
         let request_body =
           Ache_eio.Client.request

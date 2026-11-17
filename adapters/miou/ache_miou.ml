@@ -102,8 +102,9 @@ module Make (Io : IO) = struct
       -> interruptible:bool
       -> timeout:
            ([ `Read | `Linger ]
-            -> ([ `Idle | `Head ] * float * (unit -> unit)) option)
+            -> ([ `Idle | `Head | `Response ] * float * (unit -> unit)) option)
       -> linger:bool
+      -> stopped:[ `Done | `Abort ] Miou.Computation.t
       -> t
       -> Io.socket
       -> unit
@@ -114,13 +115,13 @@ module Make (Io : IO) = struct
        ~interruptible
        ~timeout
        ~linger:lingers
+       ~stopped
        t
        socket ->
       let receive_shut = ref false
       and send_shut = ref false
-      and failed = ref false
       and running = ref 2
-      and stopped = Miou.Computation.create () in
+      and unreported = ref None in
       let shutdown_once command =
         let receive =
           (match command with
@@ -141,17 +142,24 @@ module Make (Io : IO) = struct
         | false, true -> shutdown socket SHUTDOWN_SEND
         | false, false -> ()
       in
+      let abort () =
+        ignore (Miou.Computation.try_return stopped `Abort : bool)
+      in
       let report_exn exn =
-        try Runtime.report_exn t exn with
-        | Miou.Cancelled as exn -> raise exn
-        | _ -> ()
+        match Runtime.report_exn t exn with
+        | () -> true
+        | exception (Miou.Cancelled as exn) -> raise exn
+        | exception exn ->
+          if Option.is_none !unreported
+          then unreported := Some (exn, Printexc.get_raw_backtrace ());
+          abort ();
+          false
       in
       let fail = function
         | Miou.Cancelled as exn -> raise exn
         | exn ->
-          report_exn exn;
-          failed := true;
-          ignore (Miou.Computation.try_return stopped () : bool)
+          let (_ : bool) = report_exn exn in
+          abort ()
       in
       let yield register =
         let waker = Miou.Computation.create () in
@@ -163,6 +171,7 @@ module Make (Io : IO) = struct
       let idle_deadline = Deadline.create ()
       and head_deadline = Deadline.create () in
       let pending_read = ref false
+      and writer_waited = ref false
       and read_requested = ref false
       and read_result = ref None
       and request_read = Signal.create ()
@@ -187,6 +196,9 @@ module Make (Io : IO) = struct
                  loop ()))
       in
       let timed_read limit =
+        let until_response =
+          match limit with Some (`Response, _, _) -> true | _ -> false
+        in
         if (not interruptible) && Option.is_none limit && not !pending_read
         then Ok (read socket read_buffer)
         else (
@@ -200,40 +212,50 @@ module Make (Io : IO) = struct
               start_reader ();
               Signal.wake request_read);
             let deadline =
-              Option.map
-                (fun (kind, at, _) ->
-                   let deadline =
-                     match kind with
-                     | `Idle -> idle_deadline
-                     | `Head -> head_deadline
-                   in
-                   Deadline.set deadline at ~expired:read_closed.ready;
-                   deadline)
-                limit
+              Option.bind limit (fun (kind, at, _) ->
+                let deadline =
+                  match kind with
+                  | `Idle -> Some idle_deadline
+                  | `Head -> Some head_deadline
+                  | `Response -> None
+                in
+                Option.iter
+                  (fun deadline ->
+                     Deadline.set deadline at ~expired:read_closed.ready)
+                  deadline;
+                deadline)
             in
             Signal.wait_until read_closed.ready (fun () ->
               Option.is_some !read_result
               || read_closed.closed
-              || Option.fold ~none:false ~some:Deadline.passed deadline));
+              || Option.fold ~none:false ~some:Deadline.passed deadline
+              || (until_response && !writer_waited)));
           match !read_result with
           | Some result ->
             read_result := None;
             pending_read := false;
             (match result with Ok n -> Ok n | Error exn -> raise exn)
           | None when read_closed.closed -> raise End_of_file
+          | None when until_response ->
+            writer_waited := false;
+            Error `Timeout
           | None ->
             Option.iter (fun (_, _, on_timeout) -> on_timeout ()) limit;
             Error `Timeout)
       in
-      let rec linger () =
-        match timed_read (timeout `Linger) with
+      let writer_waits () =
+        writer_waited := true;
+        Signal.wake read_closed.ready
+      in
+      let rec linger limit =
+        match timed_read limit with
         | Ok (_ : int) ->
           let (_ : int) =
             Buffer.get read_buffer ~f:(fun _ ~off:_ ~len -> len)
           in
-          linger ()
-        | Error `Timeout -> if !send_shut then `Stopped else linger ()
-        | exception End_of_file -> `Eof
+          linger limit
+        | Error `Timeout -> if not !send_shut then linger (timeout `Linger)
+        | exception End_of_file -> ()
       in
       let rec read_loop () =
         match Runtime.next_read_operation t with
@@ -261,10 +283,9 @@ module Make (Io : IO) = struct
         | `Close ->
           if not read_closed.closed
           then (
-            let result = if lingers then linger () else `Stopped in
+            if lingers then linger (timeout `Linger);
             shutdown_once SHUTDOWN_RECEIVE;
-            Read_closed.close read_closed;
-            if result = `Eof && not !send_shut then report_exn End_of_file)
+            Read_closed.close read_closed)
       in
       let rec write_loop () =
         match Runtime.next_write_operation t with
@@ -272,23 +293,22 @@ module Make (Io : IO) = struct
           Runtime.report_write_result t (writev socket io_vectors);
           write_loop ()
         | `Yield ->
+          writer_waits ();
           yield Runtime.yield_writer;
           write_loop ()
-        | `Close _ -> shutdown_once SHUTDOWN_SEND
+        | `Close _ ->
+          writer_waits ();
+          shutdown_once SHUTDOWN_SEND
       in
       let read_task () =
         (match read_loop () with
         | () -> ()
         | exception (Miou.Cancelled as exn) -> raise exn
         | exception exn ->
-          (match Runtime.report_exn t exn with
-          | () ->
+          if report_exn exn
+          then (
             shutdown_once SHUTDOWN_RECEIVE;
-            Read_closed.close read_closed
-          | exception (Miou.Cancelled as exn) -> raise exn
-          | exception _ ->
-            failed := true;
-            ignore (Miou.Computation.try_return stopped () : bool)));
+            Read_closed.close read_closed));
         Option.iter Miou.cancel !reader;
         Deadline.stop idle_deadline;
         Deadline.stop head_deadline
@@ -298,7 +318,7 @@ module Make (Io : IO) = struct
       let stop () =
         decr running;
         if !running = 0
-        then ignore (Miou.Computation.try_return stopped () : bool)
+        then ignore (Miou.Computation.try_return stopped `Done : bool)
       in
       let reading =
         Miou.async (fun () ->
@@ -309,17 +329,19 @@ module Make (Io : IO) = struct
           write_task ();
           stop ())
       in
-      await_or_raise stopped;
-      if !failed
-      then (
+      (match await_or_raise stopped with
+      | `Abort ->
         Miou.cancel reading;
         Miou.cancel writing;
-        shutdown_once SHUTDOWN_ALL)
-      else
+        shutdown_once SHUTDOWN_ALL
+      | `Done ->
         let (_ : (unit, exn) result list) =
           Miou.await_all [ reading; writing ]
         in
-        ()
+        ());
+      Option.iter
+        (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
+        !unreported
   end
 
   module Server = struct
@@ -348,14 +370,21 @@ module Make (Io : IO) = struct
         Option.is_none idle_timeout && Option.is_none head_timeout
       in
       fun socket client_addr ->
-        let head_deadline = ref None in
+        let head_deadline = ref None
+        and error_handler_failure = ref None in
+        let error_handler ?request error start_response =
+          try error_handler client_addr ?request error start_response with
+          | Miou.Cancelled as exn -> raise exn
+          | exn ->
+            let bt = Printexc.get_raw_backtrace () in
+            if Option.is_none !error_handler_failure
+            then error_handler_failure := Some (exn, bt);
+            Printexc.raise_with_backtrace exn bt
+        in
         let connection =
-          Ache.Server_connection.create
-            ~config
-            ~error_handler:(error_handler client_addr)
-            (fun reqd ->
-               head_deadline := None;
-               request_handler client_addr reqd)
+          Ache.Server_connection.create ~config ~error_handler (fun reqd ->
+            head_deadline := None;
+            request_handler client_addr reqd)
         in
         let observe () =
           match head_timeout with
@@ -365,7 +394,7 @@ module Make (Io : IO) = struct
             | Some (`Head, _) ->
               if Option.is_none !head_deadline
               then head_deadline := Some (Unix.gettimeofday () +. seconds)
-            | Some (`Idle, _) | None -> head_deadline := None)
+            | Some ((`Idle | `Body), _) | None -> head_deadline := None)
         in
         let module Observed = struct
           include Ache.Server_connection
@@ -390,7 +419,6 @@ module Make (Io : IO) = struct
                      idle_timeout
                      ~default:linger_without_idle_timeout
               , ignore )
-          | `Read when untimed -> None
           | `Read ->
             observe ();
             (match Ache.Server_connection.read_timeout connection with
@@ -403,7 +431,12 @@ module Make (Io : IO) = struct
               Option.map
                 (fun deadline -> `Head, deadline, on_timeout)
                 !head_deadline
-            | None -> None)
+            | Some (`Body, on_timeout) ->
+              Some
+                ( `Idle
+                , Unix.gettimeofday () +. Option.value idle_timeout ~default:0.
+                , on_timeout )
+            | None -> Some (`Response, infinity, ignore))
         in
         IO_loop.start
           (module Observed)
@@ -412,8 +445,12 @@ module Make (Io : IO) = struct
           ~interruptible:false
           ~timeout
           ~linger:(not untimed)
+          ~stopped:(Miou.Computation.create ())
           connection
-          socket
+          socket;
+        Option.iter
+          (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
+          !error_handler_failure
   end
 
   module Client = struct
@@ -423,6 +460,7 @@ module Make (Io : IO) = struct
       { connection : Ache.Client_connection.t
       ; runtime : Upgradable.t
       ; read_closed : Read_closed.t
+      ; stopped : [ `Done | `Abort ] Miou.Computation.t
       ; task : unit Miou.t
       ; mutable awaited : bool
       }
@@ -433,7 +471,8 @@ module Make (Io : IO) = struct
         Upgradable.create
           (Ache.Runtime.make (module Ache.Client_connection) connection)
       in
-      let read_closed = Read_closed.create () in
+      let read_closed = Read_closed.create ()
+      and stopped = Miou.Computation.create () in
       let task =
         Miou.async (fun () ->
           IO_loop.start
@@ -443,16 +482,18 @@ module Make (Io : IO) = struct
             ~interruptible:true
             ~timeout:(fun _ -> None)
             ~linger:true
+            ~stopped
             runtime
             socket)
       in
-      { connection; runtime; read_closed; task; awaited = false }
+      { connection; runtime; read_closed; stopped; task; awaited = false }
 
     let request t = Ache.Client_connection.request t.connection
 
     let shutdown t =
       Read_closed.close t.read_closed;
       Upgradable.shutdown t.runtime;
+      ignore (Miou.Computation.try_return t.stopped `Abort : bool);
       if not t.awaited
       then (
         t.awaited <- true;
@@ -524,6 +565,8 @@ module Server = struct
       let (_ : (unit, exn) result) = Miou.await connection in
       clean_up orphans
 
+  let accept_pause = 0.1
+
   let run
         ?config
         ?idle_timeout
@@ -588,23 +631,38 @@ module Server = struct
       let orphans = Miou.orphans () in
       let rec accept () =
         clean_up orphans;
-        let client, client_addr = Miou_unix.accept listening in
-        ignore
-          (Miou.async ~orphans (fun () ->
-             Fun.protect
-               ~finally:(fun () -> Miou_unix.close client)
-               (fun () ->
-                  match handler client client_addr with
-                  | () -> ()
-                  | exception (Miou.Cancelled as exn) -> raise exn
-                  | exception exn ->
-                    (try on_error exn with
-                    | exn ->
-                      let bt = Printexc.get_raw_backtrace () in
-                      ignore
-                        (Miou.Computation.try_cancel failed (exn, bt) : bool))))
-           : unit Miou.t);
-        accept ()
+        match Miou_unix.accept listening with
+        | exception
+            (Unix.Unix_error ((EMFILE | ENFILE | ENOBUFS | ENOMEM), _, _) as exn)
+          ->
+          on_error exn;
+          Miou_unix.sleep accept_pause;
+          accept ()
+        | exception
+            (Unix.Unix_error
+               ( ( ECONNABORTED | EPERM | ENETDOWN | ENETUNREACH | EHOSTDOWN
+                 | EHOSTUNREACH | ENOPROTOOPT )
+               , _
+               , _ ) as exn) ->
+          on_error exn;
+          accept ()
+        | client, client_addr ->
+          ignore
+            (Miou.async ~orphans (fun () ->
+               Fun.protect
+                 ~finally:(fun () -> Miou_unix.close client)
+                 (fun () ->
+                    match handler client client_addr with
+                    | () -> ()
+                    | exception (Miou.Cancelled as exn) -> raise exn
+                    | exception exn ->
+                      (try on_error exn with
+                      | exn ->
+                        let bt = Printexc.get_raw_backtrace () in
+                        ignore
+                          (Miou.Computation.try_cancel failed (exn, bt) : bool))))
+             : unit Miou.t);
+          accept ()
       in
       accept ()
     in

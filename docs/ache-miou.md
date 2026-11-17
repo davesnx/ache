@@ -141,6 +141,15 @@ With `~tcp_nodelay:true`, `run` sets `TCP_NODELAY` on each accepted
 socket, so that small writes are not held back by Nagle's algorithm. It is
 off by default.
 
+`~on_error` gets the exception when the handler of a connection raises:
+when `error_handler` raises, or when the core cannot handle an exception.
+A peer that resets or closes the connection is not an error. When `accept`
+fails because the process or the system has no free file descriptors or
+memory (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`), `on_error` gets the
+exception, and the loop waits 0.1 s and accepts again. For accept errors
+about one connection, such as `ECONNABORTED`, `EPERM` or a network error,
+`on_error` gets the exception, and the loop accepts again at once.
+
 <!-- example: examples/miou/miou_multicore_server.ml -->
 ```ocaml
 open Ache
@@ -227,21 +236,32 @@ core connection and starts the two loops as two child tasks:
 - **The reader task.** As in `ache-eio`, a read with a timeout goes through
   a separate reader task, and only the wait is stopped when the timeout
   fires. The client always reads through it, so `Client.shutdown` can stop
-  the wait. Every other read is direct. The reader task starts only on the
-  first read that needs it, so a server without timeouts never starts it.
+  the wait. A server read of a request body before its response is
+  complete also goes through it, so that the write task can stop the wait
+  when the response completes (see [Timeouts](ache.md#timeouts)). Every
+  other read is direct. The reader task starts only on the first read that
+  needs it.
 - **Timers.** A timer sleeps at most 0.5 s at a time and then checks its
   deadline again. A cancelled sleep stays in Miou's timer heap until it
   ends, so a short sleep keeps that heap small.
-- **Errors.** If a task fails, the connection cancels the other task and
-  closes the socket. With `Server.run`, the exception goes to `on_error`.
+- **Errors.** The core gets an exception from a read, a write or a
+  handler, and gives it to `error_handler` as `` `Exn ``. If
+  `error_handler` raises, or the core raises when it gets the exception,
+  the connection cancels both tasks and closes the socket, and the server
+  handler raises that exception when it returns. With `Server.run`, the
+  exception goes to `on_error`.
+- **Client shutdown.** `Client.shutdown` cancels both tasks at once, so a
+  write that waits for a peer that does not read does not hold it. Output
+  that is not yet written is dropped.
 
 ### Several domains
 
 `Server.run` starts one accept loop on each domain. Each loop opens its own
 listening socket on the same port with `SO_REUSEPORT`. The first loop
 starts with `Miou.async` on the caller's domain; the others start with
-`Miou.call ~pin`, one for each other domain. A connection stays on the domain that accepted it. If
-`on_error` raises, all the loops stop.
+`Miou.call ~pin`, one for each other domain. A connection stays on the
+domain that accepted it. If `on_error` raises, or an accept error that is
+not temporary occurs, all the loops stop.
 
 ## Runtime notes
 
@@ -252,8 +272,11 @@ socket. For another socket type, implement `Ache_miou.IO` and apply
 its own task for each accepted socket, and close the socket when it
 returns. Timeouts use `Miou_unix.sleep` and need no clock. With
 `?idle_timeout` or `?head_timeout`, when the server stops reading it reads
-and drops input until the peer closes, for at most `idle_timeout` (2 s
-without one). Without a timeout it closes at once. Handlers and body
+and drops input until the peer stops sending. It waits at most
+`idle_timeout` (2 s without one) after it stops reading or after its last
+write, whichever is later; input that arrives does not extend this limit.
+A peer that stops sending still gets the rest of the response. Without a
+timeout it closes at once. Handlers and body
 callbacks run in the connection tasks and must not leave a child task that
 they do not await. `Client.shutdown` must be called by the task that
 created the connection.

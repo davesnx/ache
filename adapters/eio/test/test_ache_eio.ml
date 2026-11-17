@@ -77,6 +77,10 @@ let stream_flush_closed : unit Eio.Promise.u option ref = ref None
 let requests_seen = ref 0
 let on_ws_closed : (int option -> unit) ref = ref ignore
 let pending_upgrade : Request_descriptor.t option ref = ref None
+let pending_response : Request_descriptor.t option ref = ref None
+let pending_body_failed = ref false
+let later_reqd : Request_descriptor.t option ref = ref None
+let big_size = 16 * 1024 * 1024
 
 exception Respond_later
 
@@ -150,6 +154,49 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
     in
     loop ()
   | `GET, "/upgrade-later" -> pending_upgrade := Some reqd
+  | `CONNECT, _ ->
+    Request_descriptor.respond_with_upgrade reqd Headers.empty (echo_server ())
+  | `POST, "/early-close" ->
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers:(Headers.of_list [ "connection", "close" ]) `OK)
+      "no"
+  | `POST, "/early-413" ->
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create `Content_too_large)
+      "no"
+  | `POST, "/respond-later" ->
+    let rec on_read _ ~off:_ ~len:_ =
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () = Alcotest.fail "a cut body completed"
+    and on_error () = pending_body_failed := true in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
+    pending_response := Some reqd
+  | `GET, "/later" ->
+    Body.Reader.close body;
+    later_reqd := Some reqd
+  | `GET, "/big" ->
+    Body.Reader.close body;
+    let response_body =
+      Request_descriptor.respond_with_streaming
+        reqd
+        (Response.create
+           ~headers:
+             (Headers.of_list [ "content-length", string_of_int big_size ])
+           `OK)
+    in
+    let chunk = String.make (1024 * 1024) 'x' in
+    let rec loop n =
+      if n = 0
+      then Body.Writer.close response_body
+      else (
+        Body.Writer.write_string response_body chunk;
+        Body.Writer.flush response_body (function
+          | `Written -> loop (n - 1)
+          | `Closed -> ()))
+    in
+    loop (big_size / String.length chunk)
   | `GET, "/raise" -> failwith "handler failed"
   | `GET, "/raise-later" -> raise Respond_later
   | `POST, "/partial" ->
@@ -354,6 +401,58 @@ let test_many_requests_bounded_stack () =
          Eio.Stream.take connections_done;
          Alcotest.(check int) "responses" requests !received;
          Alcotest.(check int) "server errors" 0 (List.length !server_errors)))
+
+let test_connect_tunnel () =
+  with_server (fun ~sw ~net addr ->
+    let client =
+      Ache_eio.Client.create_connection ~sw (Eio.Net.connect ~sw net addr)
+    in
+    let answered, resolve_answered = Eio.Promise.create () in
+    let request_body =
+      Ache_eio.Client.request
+        client
+        (Request.create
+           ~headers:(Headers.of_list [ "host", "localhost:443" ])
+           `CONNECT
+           "localhost:443")
+        ~error_handler:client_error_handler
+        ~response_handler:(fun response _body ->
+          Eio.Promise.resolve resolve_answered response)
+    in
+    Body.Writer.close request_body;
+    let response = Eio.Promise.await answered in
+    Alcotest.(check int) "status" 200 (Status.to_code response.status);
+    let message = "hello through the tunnel" in
+    let echoed, resolve_echoed = Eio.Promise.create () in
+    let received = Stdlib.Buffer.create 16 in
+    let tunnel_client =
+      Echo.create ~pending:message (fun t s ->
+        Stdlib.Buffer.add_string received s;
+        if Stdlib.Buffer.length received >= String.length message
+        then (
+          Echo.shutdown t;
+          Eio.Promise.resolve resolve_echoed (Stdlib.Buffer.contents received)))
+    in
+    Ache_eio.Client.upgrade client (Runtime.make (module Echo) tunnel_client);
+    Alcotest.(check string) "echoed" message (Eio.Promise.await echoed);
+    Eio.Promise.await (Ache_eio.Client.shutdown client))
+
+let test_connect_tunnel_bytes_after_head () =
+  with_server (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string
+      "CONNECT localhost:443 HTTP/1.1\r\nhost: localhost:443\r\n\r\nping"
+      socket;
+    let expected = "HTTP/1.1 200 OK\r\n\r\nping" in
+    Alcotest.(check string)
+      "200, then the bytes sent with the head come back"
+      expected
+      (Eio.Buf_read.take (String.length expected) reader);
+    Eio.Flow.copy_string "pong" socket;
+    Alcotest.(check string) "later bytes" "pong" (Eio.Buf_read.take 4 reader);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
 
 let test_upgrade () =
   with_server (fun ~sw ~net addr ->
@@ -764,6 +863,92 @@ let test_slow_body_not_cut () =
     Eio.Flow.close socket;
     Eio.Stream.take connections_done);
   Alcotest.(check int) "no error" 0 (List.length !server_errors)
+
+let unread_body_request target =
+  Printf.sprintf
+    "POST %s HTTP/1.1\r\nhost: localhost\r\ncontent-length: 100000\r\n\r\nabc"
+    target
+
+let early_close_response =
+  "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nno"
+
+let early_413_response =
+  "HTTP/1.1 413 Content Too Large\r\ncontent-length: 2\r\n\r\nno"
+
+let test_unread_body_without_idle_timeout () =
+  List.iter
+    (fun (target, response) ->
+       with_server (fun ~sw ~net addr ->
+         let socket = Eio.Net.connect ~sw net addr in
+         Eio.Flow.copy_string (unread_body_request target) socket;
+         Alcotest.(check string)
+           (target ^ ": response, then the connection closes")
+           response
+           (read_all socket);
+         Eio.Stream.take connections_done;
+         Eio.Flow.close socket))
+    [ "/early-close", early_close_response; "/early-413", early_413_response ]
+
+let test_unread_body_idle_timeout () =
+  let clock = Eio_mock.Clock.make () in
+  with_server ~clock ~idle_timeout:0.1 (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string (unread_body_request "/early-413") socket;
+    Alcotest.(check string)
+      "response"
+      early_413_response
+      (Eio.Buf_read.take (String.length early_413_response) reader);
+    advance clock;
+    Alcotest.(check (float 0.))
+      "closed at the idle timeout"
+      0.1
+      (Eio.Time.now clock);
+    Alcotest.(check bool) "closed" true (Eio.Buf_read.at_end_of_input reader);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
+let respond_while_body_read_pending ?clock ?idle_timeout () =
+  pending_response := None;
+  pending_body_failed := false;
+  with_server ?clock ?idle_timeout (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string (unread_body_request "/respond-later") socket;
+    let rec respond () =
+      match !pending_response with
+      | Some reqd ->
+        Request_descriptor.respond_with_string reqd (Response.create `OK) "late"
+      | None ->
+        !real_sleep 0.001;
+        respond ()
+    in
+    respond ();
+    let response = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nlate" in
+    Alcotest.(check string)
+      "response"
+      response
+      (Eio.Buf_read.take (String.length response) reader);
+    Option.iter
+      (fun clock ->
+         advance clock;
+         Alcotest.(check (float 0.))
+           "closed at the idle timeout"
+           0.1
+           (Eio.Time.now clock))
+      clock;
+    Alcotest.(check bool) "closed" true (Eio.Buf_read.at_end_of_input reader);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done);
+  Alcotest.(check bool) "request body failed" true !pending_body_failed
+
+let test_respond_while_body_read_pending () = respond_while_body_read_pending ()
+
+let test_respond_while_body_read_pending_idle_timeout () =
+  respond_while_body_read_pending
+    ~clock:(Eio_mock.Clock.make ())
+    ~idle_timeout:0.1
+    ()
 
 let test_no_timeout_configured () =
   with_server (fun ~sw ~net addr ->
@@ -1475,6 +1660,261 @@ let test_server_run_tcp_nodelay ?tcp_nodelay expected () =
              (nodelay_response expected)
              (get ()))))
 
+let half_closed_request request =
+  let clock = Eio_mock.Clock.make () in
+  later_reqd := None;
+  let output = ref "" in
+  with_server ~clock ~idle_timeout:5. (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    Eio.Flow.copy_string request socket;
+    Eio.Flow.shutdown socket `Send;
+    let rec respond () =
+      match !later_reqd with
+      | None ->
+        !real_sleep 0.01;
+        respond ()
+      | Some reqd ->
+        !real_sleep 0.1;
+        (try
+           Request_descriptor.respond_with_string
+             reqd
+             (Response.create
+                ~headers:(Headers.of_list [ "content-length", "5" ])
+                `OK)
+             "later"
+         with
+        | exn -> output := "respond raised " ^ Printexc.to_string exn)
+    in
+    respond ();
+    if !output = "" then output := read_all socket;
+    Eio.Stream.take connections_done;
+    Eio.Flow.close socket);
+  Alcotest.(check int) "no error" 0 (List.length !server_errors);
+  !output
+
+let test_half_close_close_request () =
+  Alcotest.(check string)
+    "response"
+    "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nlater"
+    (half_closed_request
+       "GET /later HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+
+let test_half_close_http_1_0 () =
+  Alcotest.(check string)
+    "status line"
+    "HTTP/1.1 200 OK"
+    (status_line (half_closed_request "GET /later HTTP/1.0\r\n\r\n"))
+
+let test_half_close_large_response () =
+  let clock = Eio_mock.Clock.make () in
+  with_server ~clock ~idle_timeout:5. (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    Eio.Flow.copy_string
+      "GET /big HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+      socket;
+    Eio.Flow.shutdown socket `Send;
+    !real_sleep 0.2;
+    let buf = Cstruct.create 65536 in
+    let rec drain n =
+      match Eio.Flow.single_read socket buf with
+      | k -> drain (n + k)
+      | exception End_of_file -> n
+    in
+    let head =
+      Printf.sprintf
+        "HTTP/1.1 200 OK\r\ncontent-length: %d\r\nconnection: close\r\n\r\n"
+        big_size
+    in
+    Alcotest.(check int)
+      "bytes received"
+      (String.length head + big_size)
+      (drain 0);
+    Eio.Stream.take connections_done;
+    Eio.Flow.close socket);
+  Alcotest.(check int) "no error" 0 (List.length !server_errors)
+
+let test_linger_deadline_not_renewed () =
+  let clock = Eio_mock.Clock.make () in
+  with_server ~clock ~idle_timeout:0.5 (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    Eio.Flow.copy_string
+      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+      socket;
+    Alcotest.(check string) "response" hello_response_close (read_all socket);
+    let rec trickle i =
+      if
+        i <= 10 && Option.is_none (Eio.Stream.take_nonblocking connections_done)
+      then (
+        Eio.Flow.copy_string "x" socket;
+        !real_sleep 0.05;
+        Eio_mock.Clock.set_time clock (0.2 *. float_of_int i);
+        !real_sleep 0.05;
+        trickle (i + 1))
+      else i
+    in
+    let steps = trickle 1 in
+    Alcotest.(check bool)
+      "linger ended while the peer kept sending"
+      true
+      (steps <= 10);
+    Alcotest.(check bool)
+      "linger lasted until idle_timeout"
+      true
+      (Eio.Time.now clock >= 0.5);
+    Eio.Flow.close socket)
+
+let test_server_run_survives_accept_errors () =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let clock = Eio.Stdenv.clock env in
+    let port =
+      Eio.Switch.run (fun sw ->
+        match
+          Eio.Net.listening_addr
+            (Eio.Net.listen
+               ~sw
+               ~backlog:1
+               net
+               (`Tcp (Eio.Net.Ipaddr.V4.loopback, 0)))
+        with
+        | `Tcp (_, port) -> port
+        | `Unix _ -> assert false)
+    in
+    let addr = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
+    Eio.Time.with_timeout_exn clock 30.0 (fun () ->
+      Eio.Switch.run (fun sw ->
+        let out_r, out_w = Eio_unix.pipe sw in
+        let child =
+          Eio.Process.spawn
+            ~sw
+            (Eio.Stdenv.process_mgr env)
+            ~stdout:out_w
+            [ "/bin/sh"
+            ; "-c"
+            ; Printf.sprintf
+                "ulimit -n 48 && exec ./accept_error_server.exe %d"
+                port
+            ]
+        in
+        Eio.Flow.close out_w;
+        let output = Eio.Buf_read.of_flow out_r ~max_size:1_000_000 in
+        let rec connect () =
+          match Eio.Net.connect ~sw net addr with
+          | socket -> socket
+          | exception Eio.Io (Eio.Net.E (Connection_failure (Refused _)), _) ->
+            Eio.Time.sleep clock 0.01;
+            connect ()
+        in
+        let get = "GET / HTTP/1.1\r\nhost: localhost\r\n\r\n"
+        and ok = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok" in
+        let first = connect () in
+        let first_reader = Eio.Buf_read.of_flow first ~max_size:65536 in
+        Eio.Flow.copy_string get first;
+        Alcotest.(check string)
+          "first response"
+          ok
+          (Eio.Buf_read.take (String.length ok) first_reader);
+        let flood =
+          List.filter_map
+            (fun () ->
+               match Eio.Net.connect ~sw net addr with
+               | socket -> Some socket
+               | exception Eio.Io _ -> None)
+            (List.init 96 (fun _ -> ()))
+        in
+        let line = Eio.Buf_read.line output in
+        if not (String.starts_with ~prefix:"on_error" line)
+        then Alcotest.failf "server output: %s" line;
+        Eio.Flow.copy_string get first;
+        Alcotest.(check string)
+          "live connection still served"
+          ok
+          (match Eio.Buf_read.take (String.length ok) first_reader with
+          | response -> response
+          | exception End_of_file -> "connection cut");
+        List.iter Eio.Flow.close flood;
+        Eio.Flow.close first;
+        let socket = connect () in
+        Eio.Flow.copy_string
+          "GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+          socket;
+        Alcotest.(check string)
+          "new connection served"
+          "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+          (read_all socket);
+        Eio.Process.signal child Sys.sigkill;
+        ignore (Eio.Process.await child : Eio.Process.exit_status))))
+
+exception Error_handler_failed
+
+let test_server_run_error_handler_exception () =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let clock = Eio.Stdenv.clock env in
+    let port =
+      Eio.Switch.run (fun sw ->
+        match
+          Eio.Net.listening_addr
+            (Eio.Net.listen
+               ~sw
+               ~backlog:1
+               net
+               (`Tcp (Eio.Net.Ipaddr.V4.loopback, 0)))
+        with
+        | `Tcp (_, port) -> port
+        | `Unix _ -> assert false)
+    in
+    let addr = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
+    let errors = Eio.Stream.create max_int in
+    let request_handler _ _ = failwith "request handler failed" in
+    let error_handler _ ?request:_ error start_response =
+      match error with
+      | `Exn _ -> raise Error_handler_failed
+      | #Status.standard -> Body.Writer.close (start_response Headers.empty)
+    in
+    Eio.Time.with_timeout_exn clock 10.0 (fun () ->
+      Eio.Fiber.first
+        (fun () ->
+           Ache_eio.Server.run
+             ~domains:1
+             ~on_error:(Eio.Stream.add errors)
+             ~net
+             ~domain_mgr:(Eio.Stdenv.domain_mgr env)
+             ~request_handler
+             ~error_handler
+             addr)
+        (fun () ->
+           let rec connect sw =
+             match Eio.Net.connect ~sw net addr with
+             | socket -> socket
+             | exception Eio.Io (Eio.Net.E (Connection_failure (Refused _)), _)
+               ->
+               Eio.Time.sleep clock 0.01;
+               connect sw
+           in
+           Eio.Switch.run (fun sw ->
+             let socket = connect sw in
+             Eio.Flow.copy_string "GET / HTTP/1.1\r\nhost: x\r\n" socket;
+             Eio.Net.setsockopt socket Eio.Net.Sockopt.SO_LINGER (Some 0);
+             Eio.Flow.close socket);
+           Eio.Time.sleep clock 0.1;
+           Eio.Switch.run (fun sw ->
+             let socket = connect sw in
+             Eio.Flow.copy_string get_close socket;
+             let (_ : string) = read_all socket in
+             ());
+           Alcotest.(check string)
+             "on_error gets the error_handler exception"
+             (Printexc.to_string Error_handler_failed)
+             (Printexc.to_string
+                (Eio.Time.with_timeout_exn clock 5.0 (fun () ->
+                   Eio.Stream.take errors)));
+           Eio.Time.sleep clock 0.1;
+           Alcotest.(check int)
+             "no other error, none for the reset"
+             0
+             (Eio.Stream.length errors))))
+
 let () =
   Alcotest.run
     "ache-eio loopback"
@@ -1486,6 +1926,12 @@ let () =
           , `Quick
           , test_many_requests_bounded_stack )
         ; "101 upgrade to an echo protocol", `Quick, test_upgrade
+        ; ( "CONNECT tunnel through respond_with_upgrade and Client.upgrade"
+          , `Quick
+          , test_connect_tunnel )
+        ; ( "CONNECT tunnel gets the bytes sent with the head"
+          , `Quick
+          , test_connect_tunnel_bytes_after_head )
         ; ( "an incomplete token sent with the upgrade request reaches the new \
              protocol"
           , `Quick
@@ -1505,6 +1951,21 @@ let () =
         ; ( "Server.run with 2 domains serves, from both on Linux"
           , `Quick
           , test_server_run_domains )
+        ; ( "Server.run keeps serving after accept errors"
+          , `Quick
+          , test_server_run_survives_accept_errors )
+        ; ( "Server.run gives an error_handler exception to on_error"
+          , `Quick
+          , test_server_run_error_handler_exception )
+        ; ( "a half-closed Connection: close request answered later"
+          , `Quick
+          , test_half_close_close_request )
+        ; ( "a half-closed HTTP/1.0 request answered later"
+          , `Quick
+          , test_half_close_http_1_0 )
+        ; ( "a half-closed request gets all of a 16 MiB streamed response"
+          , `Quick
+          , test_half_close_large_response )
         ; ( "Server.run: TCP_NODELAY off by default"
           , `Quick
           , test_server_run_tcp_nodelay false )
@@ -1552,10 +2013,25 @@ let () =
           , test_head_deadline )
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
+        ; ( "unread body after the response, no idle_timeout: closes"
+          , `Quick
+          , test_unread_body_without_idle_timeout )
+        ; ( "unread body after the response: idle_timeout"
+          , `Quick
+          , test_unread_body_idle_timeout )
+        ; ( "response while a body read waits, no idle_timeout: closes"
+          , `Quick
+          , test_respond_while_body_read_pending )
+        ; ( "response while a body read waits: idle_timeout"
+          , `Quick
+          , test_respond_while_body_read_pending_idle_timeout )
         ; "a timeout needs a clock", `Quick, test_timeout_needs_clock
         ; ( "when the timeout arguments are checked"
           , `Quick
           , test_timeout_check_timing )
+        ; ( "input during linger does not extend it"
+          , `Quick
+          , test_linger_deadline_not_renewed )
         ; ( "a pipelined head gets its own deadline"
           , `Quick
           , test_pipelined_head_deadline )

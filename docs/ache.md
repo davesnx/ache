@@ -131,8 +131,13 @@ httpun rejected chunk extensions and trailers.
   write past its `Content-Length`.
 - `Request_descriptor.respond_with_informational` sends `100 Continue`,
   `103 Early Hints` or another interim response before the final response.
-- Only a 2xx response to `CONNECT` starts a tunnel. Another response to
-  `CONNECT` lets the connection serve the next request.
+- `Request_descriptor.respond_with_upgrade` on a `CONNECT` request sends a
+  2xx (`200` unless `?status` says otherwise) and gives the connection to
+  the tunnel, with the bytes that came after the `CONNECT` head. A 2xx
+  response to `CONNECT` sent with another `respond_with_*` function is sent
+  as it is, then the connection closes; the bytes after the request are not
+  read. Another response to `CONNECT` lets the connection serve the next
+  request.
 - `Status` has the codes of the IANA registry that httpun did not have (102,
   103, 207, 208, 226, 308, 421, 422, 423, 424, 425, 451, 506, 507, 508).
   `` `Payload_too_large `` is now `` `Content_too_large ``, and 422 is
@@ -148,7 +153,8 @@ httpun rejected chunk extensions and trailers.
   many small chunks is delivered in linear time. ache does not reuse the
   bytes it gives to `on_read`.
 - When the response is complete, the server reads and drops the rest of a
-  request body that the application did not read.
+  request body that the application did not read. It waits for the rest of
+  the body at most `?idle_timeout` (see [Limits](#limits)).
 
 ### Client
 
@@ -376,7 +382,11 @@ same in all three runtimes.
 A client can send several requests in one packet (pipelining). While the core
 parses one read, it holds the writer (`hold` and `release` in
 `lib/serialize.ml`). The responses to all the requests in that read are queued
-and leave in one write when the read is done. Without the hold, a runtime
+and leave in one write when the read is done. While more than
+`Config.max_pending_output` bytes (64 KiB) wait to be written, the core
+answers no more pipelined requests and reads no new request, so a client
+that pipelines and does not read cannot make the server buffer without
+limit. Without the hold, a runtime
 that wakes the writer at once, such as Lwt, would make one write call for each
 response.
 
@@ -388,11 +398,21 @@ The core decides which limit applies to the next read
 - the head timeout, while a request head is only partly received;
 - the idle timeout, on a keep-alive connection that waits for its next
   request;
-- none, while a request is in progress, for example while a body arrives.
+- the idle timeout, once the response is complete and the rest of the
+  request body has not arrived;
+- none, while a request is in progress and its response is not complete,
+  for example while a body arrives for a handler that has not answered.
 
 The runtime owns the clock and starts the timer. When the timer fires first,
-the core sends `408` or closes the connection. Without `?idle_timeout` and
-`?head_timeout` (and, in `ache-eio`, without `?clock`), no timer is used.
+the core sends `408`, or closes the connection (a request body that has not
+ended gets `on_error`). Without `?idle_timeout` and `?head_timeout` (and, in
+`ache-eio`, without `?clock`), no timer is used, and the runtime does not
+wait for the rest of a body after its response: it closes the connection
+at once.
+
+A read can start before the response is complete, and the response can
+complete while the read waits. Each time the write loop waits or ends, it
+tells the read loop, which then asks the core for the limit again.
 
 ### Where the time of a request goes
 
@@ -424,11 +444,20 @@ runtimes.
 - Trailer fields are read and discarded. The API does not give them to the
   application.
 - Server timeouts are off by default. `?idle_timeout` closes a connection
-  that waits for a request. `?head_timeout` answers 408 to a request head
-  that is not complete in time. A request body or a response in progress is
-  never timed out.
+  that waits for a request, or for the rest of a request body after its
+  response. `?head_timeout` answers 408 to a request head that is not
+  complete in time. A request body is not timed out before its response is
+  complete, and a response in progress is never timed out.
+- After the response, the server waits for the rest of the request body at
+  most `?idle_timeout`. Without `?idle_timeout` it does not wait: the body
+  gets `on_error` and the connection closes. This applies to a response that
+  closes the connection and to a keep-alive response, such as a 413, sent
+  before the body was read.
 - Once its write side has closed, the server reads and dispatches no new
-  request; the request in progress still gets its body.
+  request; the request in progress still gets its body, within the limit
+  above.
+- While more than `Config.max_pending_output` bytes of responses wait to be
+  written, the server reads no new request.
 - WebSocket: server only, text messages only. There are no extensions, no
   subprotocols and no binary messages. ache has no timeout on an upgraded
   connection: a client that stops reading, or never answers a close frame,

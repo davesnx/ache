@@ -85,6 +85,7 @@ module IO_loop = struct
          ([ `Read | `Linger ]
           -> ((unit -> int) -> (int, [ `Timeout ]) result) option)
     -> linger:bool
+    -> ?writer_waits:(unit -> unit)
     -> t
     -> _ Eio.Flow.two_way
     -> unit
@@ -94,6 +95,7 @@ module IO_loop = struct
      ?read_closed
      ~timeout
      ~linger:lingers
+     ?(writer_waits = ignore)
      t
      socket ->
     Switch.run @@ fun sw ->
@@ -102,7 +104,8 @@ module IO_loop = struct
       match read_closed with Some p -> p | None -> Promise.create ()
     and receive_shut = ref false
     and send_shut = ref false
-    and failed, resolve_failed = Promise.create () in
+    and failed, resolve_failed = Promise.create ()
+    and unreported = ref None in
     let shutdown_once cmd =
       let receive =
         (match cmd with `Receive | `All -> true | `Send -> false)
@@ -120,14 +123,19 @@ module IO_loop = struct
       | false, false -> ()
     in
     let report_exn exn =
-      try Runtime.report_exn t exn with
-      | Eio.Cancel.Cancelled _ as exn -> raise exn
-      | _ -> ()
+      match Runtime.report_exn t exn with
+      | () -> true
+      | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+      | exception exn ->
+        let bt = Printexc.get_raw_backtrace () in
+        if Option.is_none !unreported then unreported := Some (exn, bt);
+        ignore (Promise.try_resolve resolve_failed () : bool);
+        false
     in
     let fail = function
       | Eio.Cancel.Cancelled _ as exn -> raise exn
       | exn ->
-        report_exn exn;
+        let (_ : bool) = report_exn exn in
         ignore (Promise.try_resolve resolve_failed () : bool)
     in
     let read_buffer = Buffer.create read_buffer_size in
@@ -179,21 +187,22 @@ module IO_loop = struct
           pending_read := false;
           (match result with Ok n -> n | Error exn -> raise exn)
       in
-      let timed_read phase =
-        match timeout phase with
+      let read_within limit =
+        match limit with
         | Some limited -> limited daemon_read
         | None when interruptible || !pending_read -> Ok (daemon_read ())
         | None -> Ok (read socket read_buffer)
       in
-      let rec linger () =
-        match timed_read `Linger with
+      let timed_read phase = read_within (timeout phase) in
+      let rec linger limit =
+        match read_within limit with
         | Ok (_ : int) ->
           let (_ : int) =
             Buffer.get read_buffer ~f:(fun _ ~off:_ ~len -> len)
           in
-          linger ()
-        | Error `Timeout -> if !send_shut then `Stopped else linger ()
-        | exception End_of_file -> `Eof
+          linger limit
+        | Error `Timeout -> if not !send_shut then linger (timeout `Linger)
+        | exception End_of_file -> ()
       in
       fun () ->
         let rec read_loop_step () =
@@ -225,21 +234,18 @@ module IO_loop = struct
           | `Close ->
             if not (Promise.is_resolved read_closed)
             then (
-              let result = if lingers then linger () else `Stopped in
+              if lingers then linger (timeout `Linger);
               shutdown_once `Receive;
-              ignore (Promise.try_resolve resolve_read_closed () : bool);
-              if result = `Eof && not !send_shut then report_exn End_of_file)
+              ignore (Promise.try_resolve resolve_read_closed () : bool))
         in
         match read_loop_step () with
         | () -> ()
         | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
         | exception exn ->
-          (match Runtime.report_exn t exn with
-          | () ->
+          if report_exn exn
+          then (
             shutdown_once `Receive;
-            ignore (Promise.try_resolve resolve_read_closed () : bool)
-          | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
-          | exception _ -> ignore (Promise.try_resolve resolve_failed () : bool))
+            ignore (Promise.try_resolve resolve_read_closed () : bool))
     in
     let write_loop () =
       let rec write_loop_step () =
@@ -249,11 +255,14 @@ module IO_loop = struct
           Runtime.report_write_result t write_result;
           write_loop_step ()
         | `Yield ->
+          writer_waits ();
           let p, u = Promise.create () in
           Runtime.yield_writer t (fun () -> Promise.resolve u ());
           Promise.await p;
           write_loop_step ()
-        | `Close _ -> shutdown_once `Send
+        | `Close _ ->
+          writer_waits ();
+          shutdown_once `Send
       in
       match write_loop_step () with () -> () | exception exn -> fail exn
     in
@@ -261,7 +270,10 @@ module IO_loop = struct
       (fun () -> Fiber.both read_loop write_loop)
       (fun () ->
          Promise.await failed;
-         shutdown_once `All)
+         shutdown_once `All);
+    Option.iter
+      (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
+      !unreported
 
   let no_timeout _ = None
 end
@@ -293,14 +305,21 @@ module Server = struct
         "Ache_eio.Server.create_connection_handler: a timeout needs ~clock"
     | _ -> ());
     fun socket client_addr ->
-      let head_deadline = ref None in
+      let head_deadline = ref None
+      and error_handler_failure = ref None in
+      let error_handler ?request error start_response =
+        try error_handler client_addr ?request error start_response with
+        | Eio.Cancel.Cancelled _ as exn -> raise exn
+        | exn ->
+          let bt = Printexc.get_raw_backtrace () in
+          if Option.is_none !error_handler_failure
+          then error_handler_failure := Some (exn, bt);
+          Printexc.raise_with_backtrace exn bt
+      in
       let connection =
-        Ache.Server_connection.create
-          ~config
-          ~error_handler:(error_handler client_addr)
-          (fun reqd ->
-             head_deadline := None;
-             request_handler client_addr reqd)
+        Ache.Server_connection.create ~config ~error_handler (fun reqd ->
+          head_deadline := None;
+          request_handler client_addr reqd)
       in
       let observe () =
         match clock, head_timeout with
@@ -309,7 +328,7 @@ module Server = struct
           | Some (`Head, _) ->
             if Option.is_none !head_deadline
             then head_deadline := Some (Eio.Time.now clock +. seconds)
-          | Some (`Idle, _) | None -> head_deadline := None)
+          | Some ((`Idle | `Body), _) | None -> head_deadline := None)
         | _ -> ()
       in
       let module Observed = struct
@@ -330,44 +349,89 @@ module Server = struct
         match clock with
         | None -> IO_loop.no_timeout
         | Some clock ->
-          fun phase ->
-            let limit =
-              match phase with
-              | `Linger ->
-                Some
-                  ( Option.value
-                      idle_timeout
-                      ~default:linger_without_idle_timeout
-                  , ignore )
-              | `Read ->
-                observe ();
-                (match Ache.Server_connection.read_timeout connection with
-                | Some (`Idle, on_timeout) ->
-                  Option.map (fun s -> s, on_timeout) idle_timeout
-                | Some (`Head, on_timeout) ->
-                  Option.map
-                    (fun deadline -> deadline -. Eio.Time.now clock, on_timeout)
-                    !head_deadline
-                | None -> None)
-            in
-            Option.map
-              (fun (seconds, on_timeout) read ->
-                 match
-                   Eio.Time.with_timeout clock seconds (fun () -> Ok (read ()))
-                 with
-                 | Ok n -> Ok n
-                 | Error `Timeout ->
-                   on_timeout ();
-                   Error `Timeout)
-              limit
+          let limited seconds on_timeout read =
+            match
+              Eio.Time.with_timeout clock seconds (fun () -> Ok (read ()))
+            with
+            | Ok n -> Ok n
+            | Error `Timeout ->
+              on_timeout ();
+              Error `Timeout
+          in
+          (function
+            | `Linger ->
+              let deadline =
+                Eio.Time.now clock
+                +. Option.value
+                     idle_timeout
+                     ~default:linger_without_idle_timeout
+              in
+              Some
+                (fun read ->
+                  let seconds = deadline -. Eio.Time.now clock in
+                  if seconds > 0.
+                  then limited seconds ignore read
+                  else Error `Timeout)
+            | `Read ->
+              observe ();
+              (match Ache.Server_connection.read_timeout connection with
+              | Some ((`Idle | `Body), on_timeout) ->
+                Option.map (fun s -> limited s on_timeout) idle_timeout
+              | Some (`Head, on_timeout) ->
+                Option.map
+                  (fun deadline ->
+                     limited (deadline -. Eio.Time.now clock) on_timeout)
+                  !head_deadline
+              | None -> None))
+      in
+      let writer_waits = Eio.Condition.create () in
+      let rec until_response_complete () =
+        match Ache.Server_connection.read_timeout connection with
+        | Some (`Body, on_timeout) ->
+          Option.iter
+            (fun clock -> Option.iter (Eio.Time.sleep clock) idle_timeout)
+            clock;
+          on_timeout ();
+          Error `Timeout
+        | Some ((`Idle | `Head), _) | None ->
+          Eio.Condition.await_no_mutex writer_waits;
+          until_response_complete ()
+      in
+      let timeout phase =
+        match phase, Ache.Server_connection.read_timeout connection with
+        | `Read, Some (`Body, on_timeout) when Option.is_none idle_timeout ->
+          Some
+            (fun _ ->
+              on_timeout ();
+              Error `Timeout)
+        | `Read, None ->
+          Some
+            (fun read ->
+              Fiber.first (fun () -> Ok (read ())) until_response_complete)
+        | _ -> timeout phase
       in
       IO_loop.start
         (module Observed)
         ~read_buffer_size:config.read_buffer_size
         ~timeout
         ~linger:(Option.is_some clock)
+        ~writer_waits:(fun () -> Eio.Condition.broadcast writer_waits)
         connection
-        socket
+        socket;
+      Option.iter
+        (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
+        !error_handler_failure
+
+  let accept_retry_delay = 0.05
+
+  let lasting_accept_error = function
+    | Eio.Io
+        ( Eio.Exn.X
+            (Eio_unix.Unix_error ((EBADF | EINVAL | ENOTSOCK | EFAULT), _, _))
+        , _ )
+    | Eio.Io (Eio.Exn.Not_available _, _) ->
+      true
+    | _ -> false
 
   let run
         ?config
@@ -418,7 +482,15 @@ module Server = struct
           net
           (addr :> Eio.Net.Sockaddr.stream)
       in
-      Eio.Net.run_server ~on_error socket handler
+      let rec accept () =
+        (match Eio.Net.accept_fork ~sw socket ~on_error handler with
+        | () -> ()
+        | exception (Eio.Io _ as exn) when not (lasting_accept_error exn) ->
+          on_error exn;
+          Eio_unix.sleep accept_retry_delay);
+        accept ()
+      in
+      accept ()
     in
     Fiber.all
       (serve
@@ -444,14 +516,19 @@ module Client = struct
     let read_closed = Promise.create () in
     Fiber.fork ~sw (fun () ->
       Fun.protect ~finally:(Promise.resolve shutdown_u) (fun () ->
-        IO_loop.start
-          (module Upgradable)
-          ~read_buffer_size:config.read_buffer_size
-          ~read_closed
-          ~timeout:IO_loop.no_timeout
-          ~linger:true
-          runtime
-          socket));
+        match
+          IO_loop.start
+            (module Upgradable)
+            ~read_buffer_size:config.read_buffer_size
+            ~read_closed
+            ~timeout:IO_loop.no_timeout
+            ~linger:true
+            runtime
+            socket
+        with
+        | () -> ()
+        | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+        | exception _ -> ()));
     { connection
     ; runtime
     ; shutdown_reader =

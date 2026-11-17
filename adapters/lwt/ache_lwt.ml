@@ -69,6 +69,7 @@ module IO_loop = struct
     -> read_buffer_size:int
     -> timed_read:((unit -> int Lwt.t) -> (int, [ `Timeout ]) result Lwt.t)
     -> close:(unit -> unit Lwt.t)
+    -> ?writer_waits:(unit -> unit)
     -> fd
     -> unit Lwt.t
     =
@@ -78,6 +79,7 @@ module IO_loop = struct
      ~read_buffer_size
      ~timed_read
      ~close
+     ?(writer_waits = ignore)
      socket ->
     let read_buffer = Buffer.create read_buffer_size in
     let failed, notify_failed = Lwt.wait () in
@@ -108,7 +110,15 @@ module IO_loop = struct
             (fun () ->
                (if Buffer.unread read_buffer
                 then Lwt.return (Ok 0)
-                else timed_read (fun () -> read (module Io) socket read_buffer))
+                else
+                  let reading =
+                    timed_read (fun () -> read (module Io) socket read_buffer)
+                  in
+                  if Lwt.is_sleeping reading
+                  then reading
+                  else
+                    reading >>= fun result ->
+                    Lwt.pause () >|= fun () -> result)
                >|= function
                | Ok (_ : int) ->
                  let (_ : int) = Buffer.get read_buffer ~f:(Runtime.read t) in
@@ -139,9 +149,11 @@ module IO_loop = struct
           Runtime.report_write_result t result;
           write_loop_step ()
         | `Yield ->
+          writer_waits ();
           Runtime.yield_writer t write_loop;
           Lwt.return_unit
         | `Close _ ->
+          writer_waits ();
           Lwt.wakeup_later notify_write_loop_exited ();
           Lwt.return_unit
       in
@@ -372,7 +384,7 @@ module Make (Io : IO) = struct
             then (
               head_armed := true;
               Timeout.set timer)
-          | Some (`Idle, _) | None -> stop_head_timer ())
+          | Some ((`Idle | `Body), _) | None -> stop_head_timer ())
       in
       let module Observed = struct
         include Ache.Server_connection
@@ -388,6 +400,27 @@ module Make (Io : IO) = struct
           n
       end
       in
+      let expire timer on_timeout =
+        Timeout.expired timer >|= fun () ->
+        on_timeout ();
+        Error `Timeout
+      in
+      let body_limit on_timeout =
+        match idle_timer with
+        | Some timer ->
+          Timeout.set timer;
+          expire timer on_timeout
+        | None ->
+          on_timeout ();
+          Lwt.return (Error `Timeout)
+      in
+      let writer_waits = Lwt_condition.create () in
+      let rec until_response_complete () =
+        match Ache.Server_connection.read_timeout connection with
+        | Some (`Body, on_timeout) -> body_limit on_timeout
+        | Some ((`Idle | `Head), _) | None ->
+          Lwt_condition.wait writer_waits >>= until_response_complete
+      in
       let timed_read read =
         observe ();
         let reading = IO_loop.untimed_read read in
@@ -400,25 +433,16 @@ module Make (Io : IO) = struct
             with
             | Some (`Idle, on_timeout), Some timer ->
               Timeout.set timer;
-              Some (timer, on_timeout)
+              Some (expire timer on_timeout)
             | Some (`Head, on_timeout), _ when !head_armed ->
-              Option.map (fun timer -> timer, on_timeout) head_timer
-            | (Some ((`Idle | `Head), _) | None), _ -> None
+              Option.map (fun timer -> expire timer on_timeout) head_timer
+            | Some ((`Idle | `Head), _), _ -> None
+            | Some (`Body, on_timeout), _ -> Some (body_limit on_timeout)
+            | None, _ -> Some (until_response_complete ())
         in
         match limit with
         | None -> reading
-        | Some (timer, on_timeout) ->
-          Lwt.pick
-            [ reading
-            ; ( Timeout.expired timer >|= fun () ->
-                on_timeout ();
-                Error `Timeout )
-            ]
-      in
-      let timed_read =
-        match idle_timeout, head_timeout with
-        | None, None -> IO_loop.untimed_read
-        | _ -> timed_read
+        | Some limit -> Lwt.pick [ reading; limit ]
       in
       Lwt.finalize
         (fun () ->
@@ -429,6 +453,7 @@ module Make (Io : IO) = struct
              ~read_buffer_size:config.read_buffer_size
              ~timed_read
              ~close:(IO_loop.close_once Io.close socket)
+             ~writer_waits:(fun () -> Lwt_condition.broadcast writer_waits ())
              socket)
         (fun () ->
            Option.iter Timeout.stop head_timer;
