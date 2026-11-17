@@ -1228,6 +1228,90 @@ let test_server_run_domains () =
              done;
              Alcotest.(check int) "domains that served" 2 (Hashtbl.length seen)))))
 
+let accepted_socket_nodelay ~server_port ~client_port =
+  (* Unix.file_descr is int on Unix: otherlibs/unix/unix.ml. *)
+  let fd_of_int : int -> Unix.file_descr = Obj.magic in
+  let port = function
+    | Unix.ADDR_INET (_, port) -> Some port
+    | ADDR_UNIX _ -> None
+  in
+  let rec find n =
+    if n = 1024
+    then Alcotest.fail "no accepted socket"
+    else
+      let fd = fd_of_int n in
+      match port (Unix.getsockname fd), port (Unix.getpeername fd) with
+      | Some local, Some peer when local = server_port && peer = client_port ->
+        Unix.getsockopt fd TCP_NODELAY
+      | _ | (exception Unix.Unix_error _) -> find (n + 1)
+  in
+  find 0
+
+let nodelay_response nodelay =
+  let body = string_of_bool nodelay in
+  Printf.sprintf
+    "HTTP/1.1 200 OK\r\ncontent-length: %d\r\nconnection: close\r\n\r\n%s"
+    (String.length body)
+    body
+
+let test_server_run_tcp_nodelay ?tcp_nodelay expected () =
+  server_errors := [];
+  Miou_unix.run ~domains:0 (fun () ->
+    let port =
+      let socket = Miou_unix.tcpv4 () in
+      Fun.protect
+        ~finally:(fun () -> Miou_unix.close socket)
+        (fun () ->
+           Miou_unix.bind_and_listen
+             socket
+             (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+           match Unix.getsockname (Miou_unix.to_file_descr socket) with
+           | ADDR_INET (_, port) -> port
+           | ADDR_UNIX _ -> assert false)
+    in
+    let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, port) in
+    let request_handler client reqd =
+      let client_port =
+        match client with
+        | Unix.ADDR_INET (_, port) -> port
+        | ADDR_UNIX _ -> assert false
+      in
+      let body =
+        string_of_bool (accepted_socket_nodelay ~server_port:port ~client_port)
+      in
+      Reqd.respond_with_string
+        reqd
+        (Response.create
+           ~headers:
+             (Headers.of_list
+                [ "content-length", string_of_int (String.length body) ])
+           `OK)
+        body
+    in
+    let server =
+      Miou.async (fun () ->
+        Ache_miou.Server.run
+          ~domains:1
+          ?tcp_nodelay
+          ~on_error:raise
+          ~request_handler
+          ~error_handler
+          addr)
+    in
+    Fun.protect
+      ~finally:(fun () -> Miou.cancel server)
+      (fun () ->
+         with_timeout 10.0 (fun () ->
+           let socket = connect_retrying addr in
+           Fun.protect
+             ~finally:(fun () -> Miou_unix.close socket)
+             (fun () ->
+                send socket get_close;
+                Alcotest.(check string)
+                  "response"
+                  (nodelay_response expected)
+                  (read_all socket)))))
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
@@ -1274,6 +1358,12 @@ let () =
         ; ( "Server.run with 2 domains serves, from both on Linux"
           , `Quick
           , test_server_run_domains )
+        ; ( "Server.run: TCP_NODELAY off by default"
+          , `Quick
+          , test_server_run_tcp_nodelay false )
+        ; ( "Server.run ~tcp_nodelay:true"
+          , `Quick
+          , test_server_run_tcp_nodelay ~tcp_nodelay:true true )
         ] )
     ; ( "timeouts"
       , [ "idle connection is closed", `Quick, test_idle_timeout

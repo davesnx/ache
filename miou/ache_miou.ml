@@ -530,6 +530,7 @@ module Server = struct
         ?head_timeout
         ?domains
         ?(backlog = 128)
+        ?(tcp_nodelay = false)
         ~on_error
         ~request_handler
         ~error_handler
@@ -565,6 +566,14 @@ module Server = struct
         ?head_timeout
         ~request_handler
         ~error_handler
+    in
+    let handler =
+      if tcp_nodelay
+      then (
+        fun client addr ->
+          Unix.setsockopt (Miou_unix.to_file_descr client) TCP_NODELAY true;
+          handler client addr)
+      else handler
     in
     let failed = Miou.Computation.create () in
     let serve () =

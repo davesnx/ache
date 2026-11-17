@@ -368,6 +368,7 @@ module Server = struct
         ?head_timeout
         ?(domains = Domain.recommended_domain_count ())
         ?(backlog = 128)
+        ?(tcp_nodelay = false)
         ~on_error
         ~net
         ~domain_mgr
@@ -385,6 +386,18 @@ module Server = struct
         ?head_timeout
         ~request_handler
         ~error_handler
+    in
+    let handler =
+      if tcp_nodelay
+      then (
+        fun flow addr ->
+          Option.iter
+            (fun fd ->
+               Eio_unix.Fd.use_exn "setsockopt" fd (fun fd ->
+                 Unix.setsockopt fd TCP_NODELAY true))
+            (Eio_unix.Resource.fd_opt flow);
+          handler flow addr)
+      else handler
     in
     let serve () =
       Switch.run @@ fun sw ->

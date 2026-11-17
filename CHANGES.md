@@ -33,6 +33,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - `Server.run` in `ache-eio` and `ache-miou`: one accept loop for each
   domain, each on its own `SO_REUSEPORT` socket, with no state shared
   between domains.
+  `?tcp_nodelay:true` sets `TCP_NODELAY` on each accepted socket.
 - `Ache_lwt.Timeout`: timeouts that share one Lwt timer for each length, so
   that cancelled timers do not pile up with the `select` and `poll` engines.
 

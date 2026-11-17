@@ -121,6 +121,9 @@ macOS and FreeBSD, `SO_REUSEPORT` does not spread TCP connections: one
 socket gets them, so `run` works but only one domain accepts. The handlers
 run in several domains at the same time. The address must have a fixed
 port.
+With `~tcp_nodelay:true`, `run` sets `TCP_NODELAY` on each accepted
+socket, so that small writes are not held back by Nagle's algorithm. It is
+off by default.
 
 <!-- example: examples/eio/eio_multicore_server.ml -->
 ```ocaml

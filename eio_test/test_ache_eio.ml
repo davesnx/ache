@@ -1291,6 +1291,96 @@ let test_server_run_domains () =
              done;
              Alcotest.(check int) "domains that served" 2 (Hashtbl.length seen)))))
 
+let accepted_socket_nodelay ~server_port ~client_port =
+  (* Unix.file_descr is int on Unix: otherlibs/unix/unix.ml. *)
+  let fd_of_int : int -> Unix.file_descr = Obj.magic in
+  let port = function
+    | Unix.ADDR_INET (_, port) -> Some port
+    | ADDR_UNIX _ -> None
+  in
+  let rec find n =
+    if n = 1024
+    then Alcotest.fail "no accepted socket"
+    else
+      let fd = fd_of_int n in
+      match port (Unix.getsockname fd), port (Unix.getpeername fd) with
+      | Some local, Some peer when local = server_port && peer = client_port ->
+        Unix.getsockopt fd TCP_NODELAY
+      | _ | (exception Unix.Unix_error _) -> find (n + 1)
+  in
+  find 0
+
+let nodelay_response nodelay =
+  let body = string_of_bool nodelay in
+  Printf.sprintf
+    "HTTP/1.1 200 OK\r\ncontent-length: %d\r\nconnection: close\r\n\r\n%s"
+    (String.length body)
+    body
+
+let test_server_run_tcp_nodelay ?tcp_nodelay expected () =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let port =
+      Eio.Switch.run (fun sw ->
+        match
+          Eio.Net.listening_addr
+            (Eio.Net.listen
+               ~sw
+               ~backlog:1
+               net
+               (`Tcp (Eio.Net.Ipaddr.V4.loopback, 0)))
+        with
+        | `Tcp (_, port) -> port
+        | `Unix _ -> assert false)
+    in
+    let addr = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
+    let request_handler client reqd =
+      let client_port =
+        match client with `Tcp (_, port) -> port | `Unix _ -> assert false
+      in
+      let body =
+        string_of_bool (accepted_socket_nodelay ~server_port:port ~client_port)
+      in
+      Reqd.respond_with_string
+        reqd
+        (Response.create
+           ~headers:
+             (Headers.of_list
+                [ "content-length", string_of_int (String.length body) ])
+           `OK)
+        body
+    in
+    Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 10.0 (fun () ->
+      Eio.Fiber.first
+        (fun () ->
+           Ache_eio.Server.run
+             ~domains:1
+             ?tcp_nodelay
+             ~on_error:raise
+             ~net
+             ~domain_mgr:(Eio.Stdenv.domain_mgr env)
+             ~request_handler
+             ~error_handler
+             addr)
+        (fun () ->
+           let rec get () =
+             match
+               Eio.Switch.run (fun sw ->
+                 let socket = Eio.Net.connect ~sw net addr in
+                 Eio.Flow.copy_string get_close socket;
+                 read_all socket)
+             with
+             | response -> response
+             | exception Eio.Io (Eio.Net.E (Connection_failure (Refused _)), _)
+               ->
+               Eio.Time.sleep (Eio.Stdenv.clock env) 0.01;
+               get ()
+           in
+           Alcotest.(check string)
+             "response"
+             (nodelay_response expected)
+             (get ()))))
+
 let () =
   Alcotest.run
     "ache-eio loopback"
@@ -1315,6 +1405,12 @@ let () =
         ; ( "Server.run with 2 domains serves, from both on Linux"
           , `Quick
           , test_server_run_domains )
+        ; ( "Server.run: TCP_NODELAY off by default"
+          , `Quick
+          , test_server_run_tcp_nodelay false )
+        ; ( "Server.run ~tcp_nodelay:true"
+          , `Quick
+          , test_server_run_tcp_nodelay ~tcp_nodelay:true true )
         ; ( "normal close with trailing bytes shuts each direction once"
           , `Quick
           , test_close_with_trailing_bytes )

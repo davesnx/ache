@@ -84,6 +84,7 @@ module Server : sig
     -> ?head_timeout:float
     -> ?domains:int
     -> ?backlog:int
+    -> ?tcp_nodelay:bool
     -> on_error:(exn -> unit)
     -> net:_ Eio.Net.t
     -> domain_mgr:_ Eio.Domain_manager.t
@@ -109,8 +110,12 @@ module Server : sig
       [request_handler] and [error_handler] run in several domains at the
       same time.
 
+      When [tcp_nodelay] is [true], [run] sets [TCP_NODELAY] on each
+      accepted socket before it is served, so that small writes are sent at
+      once and are not held back by Nagle's algorithm.
+
       [domains] defaults to [Domain.recommended_domain_count ()], [backlog]
-      to 128.
+      to 128, [tcp_nodelay] to [false].
 
       [run] does not return. Cancel its fiber to stop all domains. If
       [on_error] raises, or a listen or accept fails in one domain, [run]
