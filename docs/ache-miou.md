@@ -184,6 +184,16 @@ let () =
     Unix.(ADDR_INET (inet_addr_loopback, port))
 ```
 
+## WebSocket
+
+`ache-miou` has no promise API for WebSocket. Use the callbacks of
+`Ache.Websocket` in the request handler, as in [WebSocket in
+ache.md](ache.md#websocket). The callbacks run in the read and write loops of
+the connection. The connection has no lock: call `send_text`, `flush`,
+`close`, `pause_reading` and `resume_reading` from the domain that runs the
+connection. `adapters/miou/test/test_ache_miou.ml` has a server that sends in
+a loop on `flush` and stops at `` `Closed ``.
+
 ## How it works
 
 This continues [How it works](ache.md#how-it-works) in ache.md, which

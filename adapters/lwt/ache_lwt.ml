@@ -243,6 +243,98 @@ module Timeout = struct
   let expired t = Lwt.protected (fst t.expired)
 end
 
+module Websocket = struct
+  type t =
+    { connection : Ache.Websocket.t
+    ; messages : string Queue.t
+    ; receivers : (string option Lwt.t * string option Lwt.u) Queue.t
+    ; ended : bool ref
+    ; closed : unit Lwt.t
+    }
+
+  exception Closed
+
+  let max_queued_messages = 8
+
+  let rec take_receiver receivers =
+    match Queue.take_opt receivers with
+    | Some (p, u) when Lwt.is_sleeping p -> Some u
+    | Some _ -> take_receiver receivers
+    | None -> None
+
+  let upgrade ?max_message_size reqd =
+    let messages = Queue.create ()
+    and receivers = Queue.create ()
+    and ended = ref false in
+    let closed, notify_closed = Lwt.wait () in
+    let connection = ref None in
+    match
+      Ache.Websocket.upgrade ?max_message_size reqd (fun ws ->
+        connection := Some ws;
+        { on_message =
+            (fun message ->
+              match take_receiver receivers with
+              | Some u -> Lwt.wakeup_later u (Some message)
+              | None ->
+                Queue.push message messages;
+                if Queue.length messages >= max_queued_messages
+                then Ache.Websocket.pause_reading ws)
+        ; on_close =
+            (fun (_ : int option) ->
+              ended := true;
+              let rec wake_all () =
+                match take_receiver receivers with
+                | Some u ->
+                  Lwt.wakeup_later u None;
+                  wake_all ()
+                | None -> ()
+              in
+              wake_all ();
+              Lwt.wakeup_later notify_closed ())
+        })
+    with
+    | Error _ as error -> error
+    | Ok () ->
+      Ok
+        { connection = Option.get !connection
+        ; messages
+        ; receivers
+        ; ended
+        ; closed
+        }
+
+  let send t message =
+    Ache.Websocket.send_text t.connection message;
+    let p, u = Lwt.wait () in
+    Ache.Websocket.flush t.connection (function
+      | `Written -> Lwt.wakeup_later u ()
+      | `Closed -> Lwt.wakeup_later_exn u Closed);
+    p
+
+  let receive t =
+    match Queue.take_opt t.messages with
+    | Some message ->
+      if Queue.length t.messages < max_queued_messages
+      then Ache.Websocket.resume_reading t.connection;
+      Lwt.return_some message
+    | None when !(t.ended) -> Lwt.return_none
+    | None ->
+      let pending = Queue.of_seq (Queue.to_seq t.receivers) in
+      Queue.clear t.receivers;
+      Queue.iter
+        (fun ((p, _) as receiver) ->
+           if Lwt.is_sleeping p then Queue.push receiver t.receivers)
+        pending;
+      let p, u = Lwt.task () in
+      Queue.push (p, u) t.receivers;
+      Ache.Websocket.resume_reading t.connection;
+      p
+
+  let close t code =
+    Ache.Websocket.close t.connection ~code;
+    t.closed
+end
+
 module Make (Io : IO) = struct
   module Server = struct
     type socket = Io.socket

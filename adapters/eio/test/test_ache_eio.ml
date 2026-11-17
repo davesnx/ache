@@ -75,6 +75,7 @@ let server_errors : Server_connection.error list ref = ref []
 let partial_body_cut = ref false
 let stream_flush_closed : unit Eio.Promise.u option ref = ref None
 let requests_seen = ref 0
+let on_ws_closed : (int option -> unit) ref = ref ignore
 let pending_upgrade : Request_descriptor.t option ref = ref None
 let pending_response : Request_descriptor.t option ref = ref None
 let pending_body_failed = ref false
@@ -126,6 +127,19 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
       reqd
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (echo_server ())
+  | `GET, "/ws-flood" ->
+    (match
+       Websocket.upgrade reqd (fun ws ->
+         let chunk = String.make 4096 'x' in
+         let rec loop () =
+           Websocket.send_text ws chunk;
+           Websocket.flush ws (function `Written -> loop () | `Closed -> ())
+         in
+         loop ();
+         { on_message = ignore; on_close = (fun code -> !on_ws_closed code) })
+     with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
   | `GET, "/stream" ->
     Body.Reader.close body;
     let response_body =
@@ -635,6 +649,57 @@ let test_eof_mid_body () =
     Alcotest.failf
       "expected one Bad_request, got %d errors"
       (List.length !server_errors)
+
+let ws_flood_request =
+  "GET /ws-flood HTTP/1.1\r\n\
+   host: localhost\r\n\
+   upgrade: websocket\r\n\
+   connection: Upgrade\r\n\
+   sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+   sec-websocket-version: 13\r\n\
+   \r\n"
+
+let ws_101 =
+  "HTTP/1.1 101 Switching Protocols\r\n\
+   upgrade: websocket\r\n\
+   connection: Upgrade\r\n\
+   sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+   \r\n"
+
+let test_websocket_peer_reset () =
+  let closed, resolve_closed = Eio.Promise.create () in
+  on_ws_closed := Eio.Promise.resolve resolve_closed;
+  with_server (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    Eio.Flow.copy_string ws_flood_request socket;
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Alcotest.(check string)
+      "101"
+      ws_101
+      (Eio.Buf_read.take (String.length ws_101) reader);
+    Alcotest.(check string)
+      "server is sending"
+      "\x81\x7e\x10\x00"
+      (Eio.Buf_read.take 4 reader);
+    Eio.Net.setsockopt socket Eio.Net.Sockopt.SO_LINGER (Some 0);
+    let reset_at = Unix.gettimeofday () in
+    Eio.Flow.close socket;
+    Eio.Fiber.first
+      (fun () ->
+         Alcotest.(check (option int))
+           "on_close without a close frame"
+           None
+           (Eio.Promise.await closed);
+         Eio.Stream.take connections_done)
+      (fun () ->
+         !real_sleep 2.0;
+         Alcotest.fail "still running 2 s after the reset");
+    let elapsed = Unix.gettimeofday () -. reset_at in
+    Alcotest.(check bool)
+      (Printf.sprintf "ended within 1 s (%.3f s)" elapsed)
+      true
+      (elapsed < 1.0));
+  on_ws_closed := ignore
 
 let test_flush_after_peer_closed () =
   let flushed, resolve_flushed = Eio.Promise.create () in
@@ -2060,6 +2125,9 @@ let () =
         ; ( "flush calls back with `Closed after the peer closes"
           , `Quick
           , test_flush_after_peer_closed )
+        ; ( "WebSocket server sending to a reset peer ends the connection"
+          , `Quick
+          , test_websocket_peer_reset )
         ; ( "run_server takes the partially applied handler"
           , `Quick
           , test_run_server )

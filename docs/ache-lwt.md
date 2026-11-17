@@ -105,6 +105,66 @@ The output is the same as with [Eio](ache-eio.md#quick-start).
 `examples/` has more: streaming request
 and response bodies, pipelined requests, and a CONNECT proxy.
 
+## WebSocket
+
+`Ache_lwt.Websocket` gives the WebSocket server of
+[ache.md](ache.md#websocket) a promise API. Call `upgrade` in the request
+handler, then receive and send in your own promise:
+
+```ocaml
+open Ache
+
+let rec echo ws =
+  let open Lwt.Syntax in
+  let* message = Ache_lwt.Websocket.receive ws in
+  match message with
+  | None -> Lwt.return_unit
+  | Some "bye" -> Ache_lwt.Websocket.close ws 1000
+  | Some message ->
+    let* () = Ache_lwt.Websocket.send ws message in
+    echo ws
+
+let request_handler _client_address reqd =
+  match Ache_lwt.Websocket.upgrade reqd with
+  | Ok ws ->
+    Lwt.async (fun () ->
+      Lwt.catch
+        (fun () -> echo ws)
+        (function
+          | Ache_lwt.Websocket.Closed -> Lwt.return_unit
+          | exn -> Lwt.reraise exn))
+  | Error _ ->
+    let headers = Headers.of_list [ "content-length", "0" ] in
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers `Bad_request)
+      ""
+```
+
+- `upgrade` checks the handshake and responds with `101`, as
+  `Ache.Websocket.upgrade` does. On `Error _` it responds nothing: send the
+  response yourself, for example `426` with `Sec-WebSocket-Version: 13` for
+  `` Error `Unsupported_version ``.
+- `receive` resolves with the next whole text message. Once the connection
+  has ended and no message waits, it resolves with `None`. The connection
+  ends after the client's close frame, the end of the input, a reset, a
+  protocol error, or your `close`.
+- `send` resolves when the frame is written. It fails with
+  `Ache_lwt.Websocket.Closed` when the connection is gone, also when it was
+  gone before the call, so a send loop ends when the client leaves.
+- `close ws code` sends a close frame and resolves when the frame is written
+  or the connection has ended. It raises `Invalid_argument` at once for a
+  code that an endpoint may not send. The socket closes when the read in
+  progress ends too: when the client answers with its close frame or closes
+  the connection. There is no timeout for a client that does neither.
+- Messages that you have not received wait in a queue. When 8 messages wait,
+  the connection stops reading from the client until `receive` takes one.
+  Frames that one read already holds still join the queue.
+- You can cancel a pending `receive`, for example with `Lwt.pick` or
+  `Lwt_unix.with_timeout`. No message is lost: the next `receive` gets it.
+- The module does not depend on the socket type, so it works the same with
+  `Ache_lwt.Make` and with `ache-lwt-tls`.
+
 ## How it works
 
 This continues [How it works](ache.md#how-it-works) in ache.md, which
