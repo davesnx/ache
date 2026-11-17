@@ -312,6 +312,33 @@ let test_pipelined () =
        /b"
       output)
 
+let test_many_requests_bounded_stack () =
+  let requests = 20_000 in
+  let response = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n/a" in
+  let old = Gc.get () in
+  Fun.protect
+    ~finally:(fun () -> Gc.set old)
+    (fun () ->
+       Gc.set { old with stack_limit = 16_384 };
+       with_server (fun ~sw ~net addr ->
+         let socket = Eio.Net.connect ~sw net addr in
+         let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+         let received = ref 0 in
+         (try
+            for _ = 1 to requests do
+              Eio.Flow.copy_string
+                "GET /a HTTP/1.1\r\nhost: localhost\r\n\r\n"
+                socket;
+              if Eio.Buf_read.take (String.length response) reader = response
+              then incr received
+            done
+          with
+         | End_of_file -> ());
+         Eio.Flow.close socket;
+         Eio.Stream.take connections_done;
+         Alcotest.(check int) "responses" requests !received;
+         Alcotest.(check int) "server errors" 0 (List.length !server_errors)))
+
 let test_upgrade () =
   with_server (fun ~sw ~net addr ->
     let client =
@@ -1388,6 +1415,9 @@ let () =
       , [ "GET", `Quick, test_get
         ; "POST echo larger than the read buffer", `Quick, test_post_echo
         ; "two pipelined requests", `Quick, test_pipelined
+        ; ( "many keep-alive requests on one connection keep the stack bounded"
+          , `Quick
+          , test_many_requests_bounded_stack )
         ; "101 upgrade to an echo protocol", `Quick, test_upgrade
         ; ( "an incomplete token sent with the upgrade request reaches the new \
              protocol"

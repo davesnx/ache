@@ -153,7 +153,7 @@ module IO_loop = struct
       Promise.await read_closed;
       Eio.Condition.broadcast read_ready;
       `Stop_daemon);
-    let rec read_loop =
+    let read_loop =
       let ready () =
         if Option.is_some !read_result || Promise.is_resolved read_closed
         then Some ()
@@ -212,7 +212,7 @@ module IO_loop = struct
             let p, u = Promise.create () in
             Runtime.yield_reader t (fun () -> Promise.resolve u ());
             Promise.await p;
-            read_loop ()
+            read_loop_step ()
           | `Close ->
             if not (Promise.is_resolved read_closed)
             then (
@@ -232,7 +232,7 @@ module IO_loop = struct
           | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
           | exception _ -> ignore (Promise.try_resolve resolve_failed () : bool))
     in
-    let rec write_loop () =
+    let write_loop () =
       let rec write_loop_step () =
         match Runtime.next_write_operation t with
         | `Write io_vectors ->
@@ -243,7 +243,7 @@ module IO_loop = struct
           let p, u = Promise.create () in
           Runtime.yield_writer t (fun () -> Promise.resolve u ());
           Promise.await p;
-          write_loop ()
+          write_loop_step ()
         | `Close _ -> shutdown_once `Send
       in
       match write_loop_step () with () -> () | exception exn -> fail exn
