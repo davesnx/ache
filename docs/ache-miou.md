@@ -169,6 +169,64 @@ let () =
     Unix.(ADDR_INET (inet_addr_loopback, port))
 ```
 
+## How it works
+
+This continues [How it works](ache.md#how-it-works) in ache.md, which
+explains the core and the read and write loops.
+
+### Miou
+
+A Miou program runs in `Miou_unix.run`. Code runs in tasks. `Miou.async`
+starts a task on the current domain, and `Miou.call` on another domain.
+A task must be awaited or cancelled by the task that started it. A task that
+waits, for example in a socket read, is suspended with an effect, and the
+scheduler of that domain runs another task. Each domain has its own
+scheduler, and a task stays on its domain.
+
+### One connection
+
+The server handler runs in a task for each accepted socket. It creates the
+core connection and starts the two loops as two child tasks:
+
+```
+ accept loop ── Miou.async: one task per accepted socket
+        │
+        ▼
+ connection task
+  ├─ read task  ── Miou_unix.read into the read buffer
+  │     └─ timed read ─► reader task (started on first use)
+  ├─ write task ── one sendmsg for all buffers
+  └─ waits until both tasks end, or one fails ─► close the socket
+```
+
+- **Waiting.** On `Yield`, a loop gives the core a callback that wakes it
+  (`yield_reader` or `yield_writer`), and waits on a signal. The core calls
+  the callback when it has work.
+- **Writes.** The write task sends all the buffers of one `Write` with one
+  `sendmsg` (a C stub in `miou/ache_miou_stubs.c`). When the socket buffer is
+  full, it waits until the socket can be written. On a file descriptor that
+  is not a socket, it writes each buffer in turn.
+- **Reads.** The read task reads with `Miou_unix.read` into free space in the
+  read buffer, then gives the new bytes to the core.
+- **The reader task.** As in `ache-eio`, a read with a timeout goes through
+  a separate reader task, and only the wait is stopped when the timeout
+  fires. The client always reads through it, so `Client.shutdown` can stop
+  the wait. Every other read is direct. The reader task starts only on the
+  first read that needs it, so a server without timeouts never starts it.
+- **Timers.** A timer sleeps at most 0.5 s at a time and then checks its
+  deadline again. A cancelled sleep stays in Miou's timer heap until it
+  ends, so a short sleep keeps that heap small.
+- **Errors.** If a task fails, the connection cancels the other task and
+  closes the socket. With `Server.run`, the exception goes to `on_error`.
+
+### Several domains
+
+`Server.run` starts one accept loop on each domain. Each loop opens its own
+listening socket on the same port with `SO_REUSEPORT`. The first loop
+starts with `Miou.async` on the caller's domain; the others start with
+`Miou.call ~pin`, one for each other domain. A connection stays on the domain that accepted it. If
+`on_error` raises, all the loops stop.
+
 ## Runtime notes
 
 The application must ignore `SIGPIPE`. `Ache_miou.Server` and

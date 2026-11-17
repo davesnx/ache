@@ -102,6 +102,60 @@ The output is the same as with [Eio](ache-eio.md#quick-start).
 `examples/` has more: streaming request
 and response bodies, pipelined requests, and a CONNECT proxy.
 
+## How it works
+
+This continues [How it works](ache.md#how-it-works) in ache.md, which
+explains the core and the read and write loops.
+
+### Lwt
+
+An Lwt program runs in `Lwt_main.run`, one event loop on one thread. The
+engine is libev (`epoll` on Linux) when Lwt is built with it, or `select` or
+`poll`. Code runs as callbacks on promises: a callback that must wait
+returns a pending promise, and the loop runs it again when that promise
+resolves.
+
+### One connection
+
+`Server.create_connection_handler` is the function that
+`Lwt_io.establish_server_with_client_socket` calls for each accepted socket.
+It creates the core connection and starts the two loops:
+
+```
+ Lwt_io.establish_server_with_client_socket
+        │  one call per accepted socket
+        ▼
+ IO_loop.start
+  ├─ read loop  (Lwt.async) ── Lwt_bytes.read into the read buffer
+  │                            (Lwt.pick with a timer when a timeout applies)
+  ├─ write loop (Lwt.async) ── Lwt_unix.writev, one call for all buffers
+  └─ Lwt.choose [ both loops ended ; failed ] ─► close the socket once
+```
+
+- **Waiting.** On `Yield`, a loop gives the core a function that starts the
+  loop again (`yield_reader t read_loop`), and returns. The core calls it
+  when it has work. A loop starts again from a callback, so its stack does
+  not grow with each request.
+- **Writes.** The write loop sends all the buffers of one `Write` with one
+  `Lwt_unix.writev`. Lwt wakes a waiting writer at once, so without the
+  hold of the writer while one read is parsed (see
+  [One write for each read](ache.md#one-write-for-each-read)), each
+  pipelined response would be its own `writev`.
+- **Reads.** The read loop reads with `Lwt_bytes.read` into free space in
+  the read buffer, then gives the new bytes to the core.
+- **Timeouts.** A timed read is `Lwt.pick` of the socket read and
+  `Ache_lwt.Timeout.expired`. See [Timeouts](#timeouts) for why the timers
+  are shared.
+- **Errors.** If a write fails, or the core raises in `report_exn`, the
+  connection resolves `failed`, and `Lwt.choose` closes the socket.
+
+### Several cores
+
+Lwt runs on one domain. Lwt 6 adds `Lwt_direct`, for direct-style code on
+top of Lwt promises, but no public API to run Lwt on several domains. To use
+more cores, run more processes; with `SO_REUSEPORT` they can listen on the
+same port.
+
 ## Runtime notes
 
 The application must ignore `SIGPIPE`. `Ache_lwt.Server` and

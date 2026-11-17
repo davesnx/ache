@@ -157,6 +157,93 @@ let () =
     (`Tcp (Eio.Net.Ipaddr.V4.loopback, port))
 ```
 
+## How it works
+
+This continues [How it works](ache.md#how-it-works) in ache.md, which
+explains the core and the read and write loops.
+
+### Eio
+
+An Eio program runs in `Eio_main.run`. On Linux it uses io_uring
+(`eio_linux`), elsewhere `poll` (`eio_posix`). Code runs in fibers. A fiber
+that waits, for example in `Promise.await` or in a socket read, is suspended
+with an effect, and the scheduler runs another fiber. A fiber switch is a
+function call in user space, not a thread switch. A `Switch` owns the fibers
+that are forked in it: when the switch ends, they are cancelled.
+
+### One connection
+
+`Server.create_connection_handler` is the function that
+`Eio.Net.run_server` calls in a new fiber for each accepted socket. It
+creates the core connection and runs the two loops in one switch:
+
+```
+ Eio.Net.run_server ── one fiber per accepted socket
+        │
+        ▼
+ Switch.run
+  ├─ Fiber.first ─┬─ Fiber.both ─┬─ read loop  ── Eio.Flow.single_read
+  │               │              │     │           into the read buffer
+  │               │              │     └─ timed read ─► reader fiber
+  │               │              │                     (daemon)
+  │               │              └─ write loop ── Eio.Flow.write
+  │               │                                (one writev)
+  │               └─ waits for [failed] ─► shut down the socket
+  └─ when the switch ends: the reader fiber is cancelled
+```
+
+- **Waiting.** On `Yield`, a loop creates a promise, gives the core a
+  callback that resolves it (`yield_reader` or `yield_writer`), and awaits
+  it. The core resolves the promise when it has work, and the fiber goes on.
+- **Writes.** The write loop sends all the buffers of one `Write` with one
+  `Eio.Flow.write` on a list of `Cstruct`s. Eio makes one `writev` of it.
+- **Reads.** The read loop reads with `Eio.Flow.single_read` into free space
+  in the read buffer, then gives the new bytes to the core.
+- **The loops call themselves in tail position.** A loop must not call itself
+  inside an exception handler: each request would leave frames on the
+  fiber's stack, and every minor GC scans fiber stacks.
+- **Errors.** If a write fails, or the core raises in `report_exn`, the
+  connection resolves `failed`. `Fiber.first` then cancels both loops, and
+  the socket is shut down in both directions.
+
+### The reader fiber
+
+Each connection also starts a reader fiber, which reads the socket when the
+read loop asks it to, and keeps the result until the read loop takes it.
+
+- A read with a timeout goes through the reader fiber. The read loop waits
+  for the result under `Eio.Time.with_timeout`. When the timeout fires, it
+  cancels the wait, not the read: tls-eio treats a cancelled read as a
+  permanent error, and every later operation on that connection fails.
+- The client always reads through the reader fiber, so `Client.shutdown` can
+  stop the wait without cancelling the read.
+- Every other read is direct: the read loop calls `single_read` itself. A
+  server without `?clock` has no timeouts, so all its reads are direct. With
+  a clock, the reads of a request body and of pipelined requests are direct,
+  and the reads that wait for a new request head use the reader fiber.
+
+A direct read saves two fiber switches and an `Eio.Condition` handoff for
+each read, and the objects of one read die young. In alternating runs of a
+hello-world server against cohttp-eio, direct reads made ache-eio about 19 %
+faster on one core and about 27 % faster on 4 domains.
+
+### Linger
+
+With a clock, when the read loop gets `Close` (after a response that closes
+the connection), it does not close at once. It reads and drops input until
+the peer closes, for at most `idle_timeout` (2 s without one). If the server
+closed with unread input, the kernel would reset the connection, and the
+peer could lose the response.
+
+### Several domains
+
+`Server.run` starts the same handler on several domains. Each domain opens
+its own listening socket on the same port with `SO_REUSEPORT` and runs its
+own `Eio.Net.run_server`. The first domain is the caller's; the others start
+with `Eio.Domain_manager.run`, and `Fiber.all` waits for all of them. The
+domains share no state, so a connection stays on the domain that accepted
+it.
+
 ## Runtime notes
 
 `Ache_eio.Server.create_connection_handler ~request_handler
