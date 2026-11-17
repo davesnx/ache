@@ -235,7 +235,7 @@ module Websocket = struct
   type t =
     { connection : Ache.Websocket.t
     ; messages : string Queue.t
-    ; receivers : string option Lwt.u Queue.t
+    ; receivers : (string option Lwt.t * string option Lwt.u) Queue.t
     ; ended : bool ref
     ; closed : unit Lwt.t
     }
@@ -243,6 +243,12 @@ module Websocket = struct
   exception Closed
 
   let max_queued_messages = 8
+
+  let rec take_receiver receivers =
+    match Queue.take_opt receivers with
+    | Some (p, u) when Lwt.is_sleeping p -> Some u
+    | Some _ -> take_receiver receivers
+    | None -> None
 
   let upgrade ?max_message_size reqd =
     let messages = Queue.create ()
@@ -255,7 +261,7 @@ module Websocket = struct
         connection := Some ws;
         { on_message =
             (fun message ->
-              match Queue.take_opt receivers with
+              match take_receiver receivers with
               | Some u -> Lwt.wakeup_later u (Some message)
               | None ->
                 Queue.push message messages;
@@ -264,8 +270,14 @@ module Websocket = struct
         ; on_close =
             (fun (_ : int option) ->
               ended := true;
-              Queue.iter (fun u -> Lwt.wakeup_later u None) receivers;
-              Queue.clear receivers;
+              let rec wake_all () =
+                match take_receiver receivers with
+                | Some u ->
+                  Lwt.wakeup_later u None;
+                  wake_all ()
+                | None -> ()
+              in
+              wake_all ();
               Lwt.wakeup_later notify_closed ())
         })
     with
@@ -295,8 +307,14 @@ module Websocket = struct
       Lwt.return_some message
     | None when !(t.ended) -> Lwt.return_none
     | None ->
-      let p, u = Lwt.wait () in
-      Queue.push u t.receivers;
+      let pending = Queue.of_seq (Queue.to_seq t.receivers) in
+      Queue.clear t.receivers;
+      Queue.iter
+        (fun ((p, _) as receiver) ->
+           if Lwt.is_sleeping p then Queue.push receiver t.receivers)
+        pending;
+      let p, u = Lwt.task () in
+      Queue.push (p, u) t.receivers;
       Ache.Websocket.resume_reading t.connection;
       p
 

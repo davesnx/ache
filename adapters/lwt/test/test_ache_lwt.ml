@@ -821,6 +821,108 @@ let test_websocket_receive_backpressure () =
           (fun () -> Ache_lwt.Websocket.receive ws)
           (List.init 8 ignore)))
 
+let ws_sans_io () =
+  let ws = ref None in
+  let server =
+    Server_connection.create (fun reqd ->
+      match Ache_lwt.Websocket.upgrade reqd with
+      | Ok t -> ws := Some t
+      | Error _ -> Alcotest.fail "handshake rejected")
+  in
+  let feed s =
+    let len = String.length s in
+    let (_ : int) =
+      Server_connection.read
+        server
+        (Ache.Bigstring.of_string ~off:0 ~len s)
+        ~off:0
+        ~len
+    in
+    ()
+  in
+  let rec drain () =
+    match Server_connection.next_write_operation server with
+    | `Write iovecs ->
+      Server_connection.report_write_result
+        server
+        (`Ok (List.fold_left (fun acc iov -> acc + iov.IOVec.len) 0 iovecs));
+      drain ()
+    | `Yield | `Close _ -> ()
+  in
+  feed (ws_handshake "/ws");
+  drain ();
+  Option.get !ws, feed, drain
+
+let receive_within seconds ws =
+  Lwt.pick
+    [ Ache_lwt.Websocket.receive ws
+    ; (Lwt_unix.sleep seconds >|= fun () -> Some "<timeout>")
+    ]
+
+let test_websocket_cancelled_receive () =
+  let ws, feed, (_ : unit -> unit) = ws_sans_io () in
+  Alcotest.(check (option string))
+    "first receive times out"
+    (Some "<timeout>")
+    (Lwt_main.run (receive_within 0.01 ws));
+  feed (ws_frame 0x1 "hello");
+  Alcotest.(check (option string))
+    "the next receive gets the message"
+    (Some "hello")
+    (Lwt_main.run (receive_within 0.5 ws));
+  let cancelled = Ache_lwt.Websocket.receive ws in
+  Lwt.cancel cancelled;
+  Alcotest.(check bool)
+    "Lwt.cancel cancels receive"
+    true
+    (Lwt.state cancelled = Lwt.Fail Lwt.Canceled);
+  feed (ws_frame 0x1 "again");
+  Alcotest.(check (option string))
+    "the receive after Lwt.cancel gets the message"
+    (Some "again")
+    (Lwt_main.run (receive_within 0.5 ws))
+
+let test_websocket_cancelled_receive_then_close () =
+  let ws, feed, drain = ws_sans_io () in
+  Lwt.cancel (Ache_lwt.Websocket.receive ws);
+  Alcotest.(check (option string))
+    "receive times out"
+    (Some "<timeout>")
+    (Lwt_main.run (receive_within 0.01 ws));
+  feed (ws_frame 0x8 "\x03\xe8");
+  drain ();
+  Alcotest.(check (option string))
+    "a later receive gives None"
+    None
+    (Lwt_main.run (receive_within 0.5 ws))
+
+let test_websocket_cancelled_receives_bounded () =
+  let ws, feed, (_ : unit -> unit) = ws_sans_io () in
+  let cancel_many n =
+    for _ = 1 to n do
+      Lwt.cancel (Ache_lwt.Websocket.receive ws)
+    done
+  in
+  let live_words () =
+    Gc.full_major ();
+    (Gc.stat ()).live_words
+  in
+  cancel_many 1_000;
+  let before = live_words () in
+  cancel_many 100_000;
+  let grown = live_words () - before in
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "100000 cancelled receives keep %d more live words (< 10000)"
+       grown)
+    true
+    (grown < 10_000);
+  feed (ws_frame 0x1 "after");
+  Alcotest.(check (option string))
+    "a receive still gets the next message"
+    (Some "after")
+    (Lwt_main.run (receive_within 0.5 ws))
+
 let test_websocket_peer_reset () =
   let ended = wait_ws_end () in
   ws_flood_sends := 0;
@@ -1395,6 +1497,15 @@ let () =
         ; ( "WebSocket receive queue pauses reading"
           , `Quick
           , test_websocket_receive_backpressure )
+        ; ( "WebSocket cancelled receive loses no message"
+          , `Quick
+          , test_websocket_cancelled_receive )
+        ; ( "WebSocket cancelled receive, then close"
+          , `Quick
+          , test_websocket_cancelled_receive_then_close )
+        ; ( "WebSocket cancelled receives do not pile up"
+          , `Quick
+          , test_websocket_cancelled_receives_bounded )
         ; ( "WebSocket server sending to a reset peer ends the connection"
           , `Quick
           , test_websocket_peer_reset )

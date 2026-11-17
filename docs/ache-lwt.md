@@ -160,9 +160,8 @@ let request_handler _client_address reqd =
 - Messages that you have not received wait in a queue. When 8 messages wait,
   the connection stops reading from the client until `receive` takes one.
   Frames that one read already holds still join the queue.
-- Do not cancel a pending `receive`, for example with `Lwt.pick` or
-  `Lwt_unix.with_timeout`: the cancelled promise stays first in line and
-  takes the next message, which is then lost.
+- You can cancel a pending `receive`, for example with `Lwt.pick` or
+  `Lwt_unix.with_timeout`. No message is lost: the next `receive` gets it.
 - The module does not depend on the socket type, so it works the same with
   `Ache_lwt.Make` and with `ache-lwt-tls`.
 

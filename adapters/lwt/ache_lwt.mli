@@ -128,7 +128,11 @@ module Websocket : sig
   val receive : t -> string option Lwt.t
   (** [receive t] is the next whole text message, or [None] after the
       connection closed, whether the client sent a close frame, the
-      connection ended, or the server closed it. *)
+      connection ended, or the server closed it.
+
+      The promise can be cancelled, for example by [Lwt.pick] or
+      [Lwt_unix.with_timeout]. No message is lost: the next [receive] gets
+      it. *)
 
   val close : t -> int -> unit Lwt.t
   (** [close t code] sends a close frame with [code] (see
