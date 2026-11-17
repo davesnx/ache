@@ -78,6 +78,7 @@ let requests_seen = ref 0
 let pending_upgrade : Request_descriptor.t option ref = ref None
 let pending_response : Request_descriptor.t option ref = ref None
 let pending_body_failed = ref false
+let pending_body_bytes = Stdlib.Buffer.create 16
 let later_reqd : Request_descriptor.t option ref = ref None
 let big_size = 16 * 1024 * 1024
 
@@ -153,9 +154,26 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
       (Response.create `Content_too_large)
       "no"
   | `POST, "/respond-later" ->
+    let rec on_read buffer ~off ~len =
+      Stdlib.Buffer.add_string
+        pending_body_bytes
+        (Ache.Bigstring.substring buffer ~off ~len);
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () = Alcotest.fail "a cut body completed"
+    and on_error () = pending_body_failed := true in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
+    pending_response := Some reqd
+  | `POST, "/respond-later-raise" ->
     let rec on_read _ ~off:_ ~len:_ =
       Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
     and on_eof () = Alcotest.fail "a cut body completed"
+    and on_error () = failwith "body on_error" in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
+    pending_response := Some reqd
+  | `POST, "/respond-later-then-body" ->
+    let rec on_read _ ~off:_ ~len:_ =
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () = ()
     and on_error () = pending_body_failed := true in
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
     pending_response := Some reqd
@@ -879,11 +897,176 @@ let respond_while_body_read_pending ?clock ?idle_timeout () =
 
 let test_respond_while_body_read_pending () = respond_while_body_read_pending ()
 
+let respond_when_pending () =
+  let rec respond () =
+    match !pending_response with
+    | Some reqd ->
+      pending_response := None;
+      !real_sleep 0.001;
+      Request_descriptor.respond_with_string reqd (Response.create `OK) "late"
+    | None ->
+      !real_sleep 0.001;
+      respond ()
+  in
+  respond ()
+
+let late_response = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nlate"
+
+let body_on_error_raises ?clock ?idle_timeout () =
+  pending_response := None;
+  with_server ?clock ?idle_timeout (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string (unread_body_request "/respond-later-raise") socket;
+    respond_when_pending ();
+    Alcotest.(check string)
+      "response"
+      late_response
+      (Eio.Buf_read.take (String.length late_response) reader);
+    Option.iter advance clock;
+    Alcotest.(check bool) "closed" true (Eio.Buf_read.at_end_of_input reader);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
+let test_body_on_error_raises () = body_on_error_raises ()
+
+let test_body_on_error_raises_idle_timeout () =
+  body_on_error_raises ~clock:(Eio_mock.Clock.make ()) ~idle_timeout:0.1 ()
+
+let live_words () =
+  Gc.full_major ();
+  (Gc.stat ()).live_words
+
+let test_body_read_stops_bounded () =
+  let requests = 200 in
+  let growth = ref 0 in
+  pending_response := None;
+  pending_body_failed := false;
+  with_server
+    ~clock:(Eio_mock.Clock.make ())
+    ~idle_timeout:30.
+    (fun ~sw ~net addr ->
+       let socket = Eio.Net.connect ~sw net addr in
+       Eio.Net.setsockopt socket Eio.Net.Sockopt.TCP_NODELAY true;
+       let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+       let exchange () =
+         Eio.Flow.copy_string
+           "POST /respond-later-then-body HTTP/1.1\r\n\
+            host: localhost\r\n\
+            content-length: 6\r\n\
+            \r\n\
+            abc"
+           socket;
+         respond_when_pending ();
+         Alcotest.(check string)
+           "response"
+           late_response
+           (Eio.Buf_read.take (String.length late_response) reader);
+         Eio.Flow.copy_string "def" socket
+       in
+       for _ = 1 to requests / 10 do
+         exchange ()
+       done;
+       let before = live_words () in
+       for _ = 1 to requests do
+         exchange ()
+       done;
+       growth := live_words () - before;
+       Eio.Flow.close socket;
+       Eio.Stream.take connections_done);
+  Alcotest.(check bool) "no body failed" false !pending_body_failed;
+  if !growth > requests
+  then Alcotest.failf "heap grew by %d words over %d requests" !growth requests
+
 let test_respond_while_body_read_pending_idle_timeout () =
   respond_while_body_read_pending
     ~clock:(Eio_mock.Clock.make ())
     ~idle_timeout:0.1
     ()
+
+module Gated_flow = struct
+  type t = { inner : Eio.Flow.two_way_ty Eio.Resource.t }
+
+  let bytes_read = ref 0
+  let gate : (int * unit Eio.Promise.t * string) option ref = ref None
+  let read_methods = []
+
+  let single_read t buf =
+    match !gate with
+    | Some (after, released, data) when !bytes_read >= after ->
+      gate := None;
+      Eio.Promise.await released;
+      Cstruct.blit_from_string data 0 buf 0 (String.length data);
+      String.length data
+    | _ ->
+      let n = Eio.Flow.single_read t.inner buf in
+      bytes_read := !bytes_read + n;
+      n
+
+  let single_write t bufs = Eio.Flow.single_write t.inner bufs
+  let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
+  let shutdown t cmd = Eio.Flow.shutdown t.inner cmd
+
+  let wrap socket =
+    Eio.Resource.T
+      ( { inner = (socket :> Eio.Flow.two_way_ty Eio.Resource.t) }
+      , Eio.Flow.Pi.two_way
+          (module struct
+            type nonrec t = t
+
+            let read_methods = read_methods
+            let single_read = single_read
+            let single_write = single_write
+            let copy = copy
+            let shutdown = shutdown
+          end) )
+end
+
+let test_body_bytes_at_the_deadline () =
+  let clock = Eio_mock.Clock.make () in
+  let request = unread_body_request "/respond-later" in
+  let released, release = Eio.Promise.create () in
+  pending_response := None;
+  pending_body_failed := false;
+  Stdlib.Buffer.clear pending_body_bytes;
+  Gated_flow.bytes_read := 0;
+  Gated_flow.gate := Some (String.length request, released, "def");
+  with_server
+    ~flow:Gated_flow.wrap
+    ~clock
+    ~idle_timeout:0.1
+    (fun ~sw ~net addr ->
+       let socket = Eio.Net.connect ~sw net addr in
+       let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+       Eio.Flow.copy_string request socket;
+       let rec respond () =
+         match !pending_response with
+         | Some reqd ->
+           !real_sleep 0.05;
+           Request_descriptor.respond_with_string
+             reqd
+             (Response.create `OK)
+             "late"
+         | None ->
+           !real_sleep 0.001;
+           respond ()
+       in
+       respond ();
+       let response = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nlate" in
+       Alcotest.(check string)
+         "response"
+         response
+         (Eio.Buf_read.take (String.length response) reader);
+       Eio_mock.Clock.set_time clock 0.1;
+       Eio.Promise.resolve release ();
+       Alcotest.(check bool) "closed" true (Eio.Buf_read.at_end_of_input reader);
+       Eio.Flow.close socket;
+       Eio.Stream.take connections_done);
+  Alcotest.(check string)
+    "body bytes before the deadline"
+    "abc"
+    (Stdlib.Buffer.contents pending_body_bytes);
+  Alcotest.(check bool) "request body failed" true !pending_body_failed
 
 let test_no_timeout_configured () =
   with_server (fun ~sw ~net addr ->
@@ -1957,6 +2140,19 @@ let () =
         ; ( "response while a body read waits: idle_timeout"
           , `Quick
           , test_respond_while_body_read_pending_idle_timeout )
+        ; ( "response while a body read waits, body on_error raises"
+          , `Quick
+          , test_body_on_error_raises )
+        ; ( "response while a body read waits, body on_error raises: \
+             idle_timeout"
+          , `Quick
+          , test_body_on_error_raises_idle_timeout )
+        ; ( "body read stops end with their read"
+          , `Quick
+          , test_body_read_stops_bounded )
+        ; ( "body bytes that arrive at the idle timeout are not delivered"
+          , `Quick
+          , test_body_bytes_at_the_deadline )
         ; "a timeout needs a clock", `Quick, test_timeout_needs_clock
         ; ( "when the timeout arguments are checked"
           , `Quick

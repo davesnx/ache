@@ -109,9 +109,13 @@ let default_error_handler ?request:_ error handle =
   Body.Writer.close body
 
 let shutdown_reader t =
-  if is_active t then Request_descriptor.fail_request_body (current_reqd_exn t);
-  Reader.force_close t.reader;
-  wakeup_reader t
+  Fun.protect
+    ~finally:(fun () ->
+      Reader.force_close t.reader;
+      wakeup_reader t)
+    (fun () ->
+       if is_active t
+       then Request_descriptor.fail_request_body (current_reqd_exn t))
 
 let shutdown_writer t =
   if is_active t
@@ -130,8 +134,9 @@ let error_code t =
   else None
 
 let shutdown t =
-  shutdown_reader t;
-  shutdown_writer t
+  Fun.protect
+    ~finally:(fun () -> shutdown_writer t)
+    (fun () -> shutdown_reader t)
 
 let upgrade t (Runtime.Impl ((module Engine), engine) as impl) =
   let eof = Reader.is_closed t.reader in

@@ -55,6 +55,15 @@ module type Server = sig
       handler raises that exception. A peer that resets or closes the
       connection is not an exception.
 
+      When a response completes while a read of its request body waits, the
+      request body fails ([on_error] runs) at once without [idle_timeout], or
+      after [idle_timeout] with it when no byte arrives first. The connection
+      then closes as described above: with a timeout it waits at most
+      [idle_timeout], or {!linger_without_idle_timeout}, for the peer, and
+      then ends the pending read with a shutdown of reading on [socket];
+      without a timeout it ends the read at once. A body read that starts
+      after the response is complete has the same limits.
+
       A [shutdown] of [socket] that fails is ignored.
 
       @raise Invalid_argument

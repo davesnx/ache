@@ -77,6 +77,14 @@ module IO_loop = struct
     | Eio.Cancel.Cancelled _ as exn -> raise exn
     | _ -> ()
 
+  type body_read =
+    { stop : unit -> (unit -> unit) option
+    ; wait : unit -> unit
+    ; linger : unit -> unit
+    }
+
+  let no_body_read = { stop = (fun () -> None); wait = ignore; linger = ignore }
+
   let start : type t.
     (module Ache.Runtime.ENGINE with type t = t)
     -> read_buffer_size:int
@@ -85,7 +93,7 @@ module IO_loop = struct
          ([ `Read | `Linger ]
           -> ((unit -> int) -> (int, [ `Timeout ]) result) option)
     -> linger:bool
-    -> ?writer_waits:(unit -> unit)
+    -> ?body_read:body_read
     -> t
     -> _ Eio.Flow.two_way
     -> unit
@@ -95,7 +103,7 @@ module IO_loop = struct
      ?read_closed
      ~timeout
      ~linger:lingers
-     ?(writer_waits = ignore)
+     ?(body_read = no_body_read)
      t
      socket ->
     Switch.run @@ fun sw ->
@@ -139,6 +147,48 @@ module IO_loop = struct
         ignore (Promise.try_resolve resolve_failed () : bool)
     in
     let read_buffer = Buffer.create read_buffer_size in
+    let direct_pending = ref false
+    and direct_read_ends = ref None
+    and stop_failure = ref None in
+    let direct_read_ended () =
+      direct_pending := false;
+      (match !direct_read_ends with
+      | None -> ()
+      | Some end_read ->
+        direct_read_ends := None;
+        Promise.resolve end_read ());
+      match !stop_failure with
+      | None -> ()
+      | Some exn ->
+        stop_failure := None;
+        raise exn
+    in
+    let stop_body_read () =
+      if
+        !direct_pending
+        && Option.is_none !direct_read_ends
+        && Option.is_some (body_read.stop ())
+      then (
+        let ended, end_read = Promise.create () in
+        direct_read_ends := Some end_read;
+        Fiber.fork_daemon ~sw (fun () ->
+          Fiber.first
+            (fun () -> Promise.await ended)
+            (fun () ->
+               body_read.wait ();
+               match body_read.stop () with
+               | None -> ()
+               | Some on_timeout ->
+                 (match on_timeout () with
+                 | () ->
+                   if lingers then body_read.linger ();
+                   shutdown_once `Receive
+                 | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+                 | exception exn ->
+                   stop_failure := Some exn;
+                   shutdown_once `Receive));
+          `Stop_daemon))
+    in
     let pending_read = ref false
     and read_requested = ref false
     and read_result = ref None
@@ -191,7 +241,15 @@ module IO_loop = struct
         match limit with
         | Some limited -> limited daemon_read
         | None when interruptible || !pending_read -> Ok (daemon_read ())
-        | None -> Ok (read socket read_buffer)
+        | None ->
+          direct_pending := true;
+          (match read socket read_buffer with
+          | n ->
+            direct_read_ended ();
+            Ok n
+          | exception exn ->
+            direct_read_ended ();
+            raise exn)
       in
       let timed_read phase = read_within (timeout phase) in
       let rec linger limit =
@@ -255,13 +313,13 @@ module IO_loop = struct
           Runtime.report_write_result t write_result;
           write_loop_step ()
         | `Yield ->
-          writer_waits ();
+          stop_body_read ();
           let p, u = Promise.create () in
           Runtime.yield_writer t (fun () -> Promise.resolve u ());
           Promise.await p;
           write_loop_step ()
         | `Close _ ->
-          writer_waits ();
+          stop_body_read ();
           shutdown_once `Send
       in
       match write_loop_step () with () -> () | exception exn -> fail exn
@@ -384,19 +442,6 @@ module Server = struct
                   !head_deadline
               | None -> None))
       in
-      let writer_waits = Eio.Condition.create () in
-      let rec until_response_complete () =
-        match Ache.Server_connection.read_timeout connection with
-        | Some (`Body, on_timeout) ->
-          Option.iter
-            (fun clock -> Option.iter (Eio.Time.sleep clock) idle_timeout)
-            clock;
-          on_timeout ();
-          Error `Timeout
-        | Some ((`Idle | `Head), _) | None ->
-          Eio.Condition.await_no_mutex writer_waits;
-          until_response_complete ()
-      in
       let timeout phase =
         match phase, Ache.Server_connection.read_timeout connection with
         | `Read, Some (`Body, on_timeout) when Option.is_none idle_timeout ->
@@ -404,10 +449,6 @@ module Server = struct
             (fun _ ->
               on_timeout ();
               Error `Timeout)
-        | `Read, None ->
-          Some
-            (fun read ->
-              Fiber.first (fun () -> Ok (read ())) until_response_complete)
         | _ -> timeout phase
       in
       IO_loop.start
@@ -415,7 +456,28 @@ module Server = struct
         ~read_buffer_size:config.read_buffer_size
         ~timeout
         ~linger:(Option.is_some clock)
-        ~writer_waits:(fun () -> Eio.Condition.broadcast writer_waits)
+        ~body_read:
+          { stop =
+              (fun () ->
+                match Ache.Server_connection.read_timeout connection with
+                | Some (`Body, on_timeout) -> Some on_timeout
+                | Some ((`Idle | `Head), _) | None -> None)
+          ; wait =
+              (match clock, idle_timeout with
+              | Some clock, Some seconds ->
+                fun () -> Eio.Time.sleep clock seconds
+              | _ -> ignore)
+          ; linger =
+              (match clock with
+              | Some clock ->
+                fun () ->
+                  Eio.Time.sleep
+                    clock
+                    (Option.value
+                       idle_timeout
+                       ~default:linger_without_idle_timeout)
+              | None -> ignore)
+          }
         connection
         socket;
       Option.iter

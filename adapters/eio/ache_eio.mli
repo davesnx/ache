@@ -75,6 +75,18 @@ module Server : sig
       A [shutdown] of [flow] that raises is ignored, so a flow without
       half-close (for example some TLS flows) ends the connection normally.
 
+      When a response completes while a read of its request body waits, the
+      request body fails ([on_error] runs) at once without [idle_timeout], or
+      after [idle_timeout] with it when no byte arrives first. The connection
+      then closes as described above: with [clock] it waits at most
+      [idle_timeout], or {!linger_without_idle_timeout}, for the peer, and
+      then ends the pending read with [Eio.Flow.shutdown flow `Receive];
+      without [clock] it ends the read at once. A body read that starts
+      after the response is complete has the same limits. A flow whose
+      [`Receive] shutdown does not end a pending read, such as a plain
+      [Tls_eio] flow, keeps that read until input arrives;
+      [Ache_eio_tls.Server] passes this shutdown to the TCP flow.
+
       When [error_handler] raises, the connection closes, and after the
       connection ends the handler raises the first such exception with its
       backtrace, so that the [on_error] of [Eio.Net.run_server],

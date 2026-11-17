@@ -76,6 +76,8 @@ module Echo = struct
 end
 
 let pending_upgrade : Request_descriptor.t option ref = ref None
+let pending_body : Request_descriptor.t option ref = ref None
+let pending_body_failed = ref false
 
 let request_handler (_ : Unix.sockaddr) reqd =
   let request = Request_descriptor.request reqd in
@@ -115,6 +117,13 @@ let request_handler (_ : Unix.sockaddr) reqd =
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (Runtime.make (module Echo) (Echo.create (fun t s -> Echo.send t s)))
   | `GET, "/upgrade-later" -> pending_upgrade := Some reqd
+  | `POST, "/respond-later" ->
+    pending_body := Some reqd;
+    let rec on_read _ ~off:_ ~len:_ =
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () = ()
+    and on_error () = pending_body_failed := true in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | `GET, "/raise" -> failwith "handler failed"
   | _, target ->
     Body.Reader.close body;
@@ -146,8 +155,11 @@ let with_timeout seconds f =
   | Ok value -> value
   | Error exn -> raise exn
 
+let handlers_returned = ref 0
+
 let with_listener handler f =
   handler_errors := [];
+  handlers_returned := 0;
   let fds = open_fds () in
   Miou_unix.run ~domains:0 (fun () ->
     let listening = Miou_unix.tcpv4 () in
@@ -169,7 +181,8 @@ let with_listener handler f =
                | Miou.Cancelled as exn -> raise exn
                | exn -> handler_errors := exn :: !handler_errors);
                Miou_unix.close socket;
-               incr handlers_done)
+               incr handlers_done;
+               incr handlers_returned)
              : unit Miou.t);
           accept ()
         in
@@ -770,6 +783,52 @@ let test_head_timeout_then_data () =
   Alcotest.(check int) "one error" 1 (List.length !server_errors);
   check_no_handler_error ()
 
+let respond_while_body_read_waits ?idle_timeout () =
+  pending_body := None;
+  pending_body_failed := false;
+  with_server ?idle_timeout (fun connect ->
+    with_raw_client connect (fun fd ->
+      let raw = raw_client fd in
+      raw_write
+        raw
+        "POST /respond-later HTTP/1.1\r\n\
+         host: localhost\r\n\
+         content-length: 100000\r\n\
+         \r\n\
+         abc";
+      let rec respond () =
+        match !pending_body with
+        | Some reqd ->
+          Miou_unix.sleep 0.05;
+          Request_descriptor.respond_with_string
+            reqd
+            (Response.create `OK)
+            "late"
+        | None ->
+          Miou_unix.sleep 0.001;
+          respond ()
+      in
+      respond ();
+      let output, ending = raw_read_until_eof raw in
+      Alcotest.(check string)
+        "response"
+        "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nlate"
+        output;
+      Alcotest.(check bool) "close_notify" true (ending = `Close_notify);
+      let rec wait n =
+        if !handlers_returned = 0 && n > 0
+        then (
+          Miou_unix.sleep 0.01;
+          wait (n - 1))
+      in
+      wait 200;
+      Alcotest.(check int)
+        "handler returns before the client closes"
+        1
+        !handlers_returned));
+  Alcotest.(check bool) "request body failed" true !pending_body_failed;
+  check_no_handler_error ()
+
 let test_handler_exception () =
   with_server (fun connect ->
     with_client connect (fun client ->
@@ -1100,6 +1159,14 @@ let () =
             `Quick
             test_peer_insecure
         ; Alcotest.test_case "idle timeout" `Quick test_idle_timeout
+        ; Alcotest.test_case
+            "response while a body read waits, no idle_timeout: closes"
+            `Quick
+            (respond_while_body_read_waits ?idle_timeout:None)
+        ; Alcotest.test_case
+            "response while a body read waits: idle_timeout"
+            `Quick
+            (respond_while_body_read_waits ~idle_timeout:0.2)
         ; Alcotest.test_case "head timeout" `Quick test_head_timeout
         ; Alcotest.test_case
             "input after a head timeout"

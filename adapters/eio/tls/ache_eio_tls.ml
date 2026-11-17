@@ -52,6 +52,24 @@ module Guarded = struct
   let close t = Eio.Resource.close t.tls
 end
 
+module Server_flow = struct
+  type t =
+    { tls : Tls_eio.t
+    ; tcp : flow
+    }
+
+  let read_methods = []
+  let single_read t buf = Eio.Flow.single_read t.tls buf
+  let single_write t bufs = Eio.Flow.single_write t.tls bufs
+  let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
+
+  let shutdown t = function
+    | `Receive -> Eio.Flow.shutdown t.tcp `Receive
+    | (`Send | `All) as command -> Eio.Flow.shutdown t.tls command
+
+  let close t = Eio.Resource.close t.tls
+end
+
 let two_way
       (type t)
       (module Tls_flow : Eio.Flow.Pi.TWO_WAY with type t = t)
@@ -63,6 +81,7 @@ let two_way
 
 let tcp_handler = two_way (module Tcp) Tcp.close
 let guarded_handler = two_way (module Guarded) Guarded.close
+let server_handler = two_way (module Server_flow) Server_flow.close
 
 let close_delimited (request : Ache.Request.t) (response : Ache.Response.t) =
   let request_method =
@@ -143,8 +162,8 @@ module Server = struct
         ~request_handler
         ~error_handler
     in
-    fun flow client_addr ->
-      let handshake () = Tls_eio.server_of_flow tls flow in
+    fun tcp client_addr ->
+      let handshake () = Tls_eio.server_of_flow tls tcp in
       let flow =
         let limit =
           match idle_timeout, head_timeout with
@@ -157,5 +176,8 @@ module Server = struct
           Eio.Time.with_timeout_exn clock seconds handshake
         | _ -> handshake ()
       in
-      handler flow client_addr
+      handler
+        (Eio.Resource.T ({ Server_flow.tls = flow; tcp :> flow }, server_handler)
+         : flow)
+        client_addr
 end

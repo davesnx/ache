@@ -168,6 +168,20 @@ let request_handler (_ : Unix.sockaddr) reqd =
       reqd
       (Response.create `Content_too_large)
       "no"
+  | `POST, "/respond-later-raise" ->
+    let rec on_read _ ~off:_ ~len:_ =
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () = Alcotest.fail "a cut body completed"
+    and on_error () = failwith "body on_error" in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
+    pending_response := Some reqd
+  | `POST, "/respond-later-then-body" ->
+    let rec on_read _ ~off:_ ~len:_ =
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () = ()
+    and on_error () = pending_body_failed := true in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
+    pending_response := Some reqd
   | `POST, "/respond-later" ->
     let rec on_read _ ~off:_ ~len:_ =
       Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
@@ -1114,6 +1128,72 @@ let test_respond_while_body_read_pending () =
 let test_respond_while_body_read_pending_idle_timeout () =
   respond_while_body_read_pending ~idle_timeout:0.3 ~min:0.25 ~max:1.0 ()
 
+let respond_when_pending () =
+  let rec respond () =
+    match !pending_response with
+    | Some reqd ->
+      pending_response := None;
+      Miou_unix.sleep 0.001;
+      Request_descriptor.respond_with_string reqd (Response.create `OK) "late"
+    | None ->
+      Miou_unix.sleep 0.001;
+      respond ()
+  in
+  respond ()
+
+let late_response = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nlate"
+
+let body_on_error_raises ?idle_timeout () =
+  pending_response := None;
+  with_server ?idle_timeout (fun addr ->
+    let socket = connect addr in
+    send socket (unread_body_request "/respond-later-raise");
+    respond_when_pending ();
+    Alcotest.(check string)
+      "response"
+      late_response
+      (take socket (String.length late_response));
+    Alcotest.(check bool) "closed" true (at_end_of_input socket);
+    wait_connection_done ();
+    Miou_unix.close socket)
+
+let test_body_on_error_raises () = body_on_error_raises ()
+
+let test_body_on_error_raises_idle_timeout () =
+  body_on_error_raises ~idle_timeout:0.3 ()
+
+let test_body_read_stop_deadlines_independent () =
+  pending_response := None;
+  pending_body_failed := false;
+  with_server ~idle_timeout:0.3 (fun addr ->
+    let socket = connect addr in
+    send
+      socket
+      "POST /respond-later-then-body HTTP/1.1\r\n\
+       host: localhost\r\n\
+       content-length: 6\r\n\
+       \r\n\
+       abc";
+    respond_when_pending ();
+    Alcotest.(check string)
+      "first response"
+      late_response
+      (take socket (String.length late_response));
+    send socket "def";
+    Miou_unix.sleep 0.01;
+    send socket (unread_body_request "/respond-later");
+    respond_when_pending ();
+    Alcotest.(check string)
+      "second response"
+      late_response
+      (take socket (String.length late_response));
+    let from = Unix.gettimeofday () in
+    Alcotest.(check bool) "closed" true (at_end_of_input socket);
+    check_elapsed "closed" ~from ~min:0.25 ~max:0.45;
+    wait_connection_done ();
+    Miou_unix.close socket);
+  Alcotest.(check bool) "second body failed" true !pending_body_failed
+
 let test_no_timeout_configured () =
   with_server (fun addr ->
     let socket = connect addr in
@@ -1743,6 +1823,16 @@ let () =
         ; ( "response while a body read waits: idle_timeout"
           , `Quick
           , test_respond_while_body_read_pending_idle_timeout )
+        ; ( "response while a body read waits, body on_error raises"
+          , `Quick
+          , test_body_on_error_raises )
+        ; ( "response while a body read waits, body on_error raises: \
+             idle_timeout"
+          , `Quick
+          , test_body_on_error_raises_idle_timeout )
+        ; ( "each body read stop has its own deadline"
+          , `Quick
+          , test_body_read_stop_deadlines_independent )
         ; ( "when the timeout arguments are checked"
           , `Quick
           , test_timeout_check_timing )
