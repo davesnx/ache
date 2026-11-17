@@ -98,6 +98,54 @@ module Timeout : sig
       does not change [t]. *)
 end
 
+(** A promise API for {!Ache.Websocket}, for any socket type: it does not
+    depend on [IO], so the servers of [Make] and [ache-lwt-tls] use it too. *)
+module Websocket : sig
+  type t
+
+  exception Closed
+  (** The connection closed before a message given to {!send} was written. *)
+
+  val upgrade :
+     ?max_message_size:int
+    -> Ache.Reqd.t
+    -> (t, Ache.Websocket.handshake_error) result
+  (** [upgrade ?max_message_size reqd] is {!Ache.Websocket.upgrade}: it
+      responds with [101] when the request is a valid opening handshake. When
+      it returns [Error _], it responded nothing: respond, for example with
+      [400]. Messages that arrive before {!receive} is called are queued.
+      When 8 messages are queued, the connection stops reading from the
+      client ({!Ache.Websocket.pause_reading}) until {!receive} takes one.
+      Frames that a read already holds are still queued, so the queue can
+      pass 8 by what one read buffer holds. *)
+
+  val send : t -> string -> unit Lwt.t
+  (** [send t message] sends [message] as one text frame. The promise
+      resolves when the frame is written. It fails with {!Closed} when the
+      connection closed before, also when it closed before [send] was called:
+      a loop of [send] ends when the client is gone. *)
+
+  val receive : t -> string option Lwt.t
+  (** [receive t] is the next whole text message, or [None] after the
+      connection closed, whether the client sent a close frame, the
+      connection ended, or the server closed it. *)
+
+  val close : t -> int -> unit Lwt.t
+  (** [close t code] sends a close frame with [code] (see
+      {!Ache.Websocket.close}). The promise resolves when the connection is
+      closed: the frame is written, or the connection ended. The socket
+      closes when the read in progress also ends: when the client answers
+      with its close frame or closes the connection.
+
+      There is no timeout: when the client neither answers nor closes, the
+      socket stays open until the caller closes the socket it gave to
+      [create_connection_handler], for example with its own timer.
+
+      @raise Invalid_argument
+        at once, before it returns a promise, if [code] is not one an endpoint
+        may send. *)
+end
+
 module Make (Io : IO) : sig
   module Server : Server with type socket = Io.socket and type addr = Io.addr
   module Client : Client with type socket = Io.socket

@@ -266,6 +266,8 @@ let unsafe_respond_with_upgrade t headers impl =
     Writer.flush t.writer (function
       | `Written when not closed -> t.upgrade impl
       | `Written | `Closed ->
+        let (Runtime.Impl ((module Engine), engine)) = impl in
+        Engine.shutdown engine;
         Reader.force_close t.reader;
         Reader.wakeup t.reader);
     Body.Reader.close t.request_body;

@@ -231,6 +231,80 @@ module Timeout = struct
   let expired t = Lwt.protected (fst t.expired)
 end
 
+module Websocket = struct
+  type t =
+    { connection : Ache.Websocket.t
+    ; messages : string Queue.t
+    ; receivers : string option Lwt.u Queue.t
+    ; ended : bool ref
+    ; closed : unit Lwt.t
+    }
+
+  exception Closed
+
+  let max_queued_messages = 8
+
+  let upgrade ?max_message_size reqd =
+    let messages = Queue.create ()
+    and receivers = Queue.create ()
+    and ended = ref false in
+    let closed, notify_closed = Lwt.wait () in
+    let connection = ref None in
+    match
+      Ache.Websocket.upgrade ?max_message_size reqd (fun ws ->
+        connection := Some ws;
+        { on_message =
+            (fun message ->
+              match Queue.take_opt receivers with
+              | Some u -> Lwt.wakeup_later u (Some message)
+              | None ->
+                Queue.push message messages;
+                if Queue.length messages >= max_queued_messages
+                then Ache.Websocket.pause_reading ws)
+        ; on_close =
+            (fun (_ : int option) ->
+              ended := true;
+              Queue.iter (fun u -> Lwt.wakeup_later u None) receivers;
+              Queue.clear receivers;
+              Lwt.wakeup_later notify_closed ())
+        })
+    with
+    | Error _ as error -> error
+    | Ok () ->
+      Ok
+        { connection = Option.get !connection
+        ; messages
+        ; receivers
+        ; ended
+        ; closed
+        }
+
+  let send t message =
+    Ache.Websocket.send_text t.connection message;
+    let p, u = Lwt.wait () in
+    Ache.Websocket.flush t.connection (function
+      | `Written -> Lwt.wakeup_later u ()
+      | `Closed -> Lwt.wakeup_later_exn u Closed);
+    p
+
+  let receive t =
+    match Queue.take_opt t.messages with
+    | Some message ->
+      if Queue.length t.messages < max_queued_messages
+      then Ache.Websocket.resume_reading t.connection;
+      Lwt.return_some message
+    | None when !(t.ended) -> Lwt.return_none
+    | None ->
+      let p, u = Lwt.wait () in
+      Queue.push u t.receivers;
+      Ache.Websocket.resume_reading t.connection;
+      p
+
+  let close t code =
+    Ache.Websocket.close t.connection ~code;
+    t.closed
+end
+
 module Make (Io : IO) = struct
   module Server = struct
     type socket = Io.socket

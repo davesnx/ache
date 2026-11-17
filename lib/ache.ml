@@ -12,6 +12,7 @@ module Body = Body
 module Config = Config
 module Server_connection = Server_connection
 module Client_connection = Client_connection
+module Websocket = Websocket
 
 module Ache_private = struct
   module Encoder = Encoder

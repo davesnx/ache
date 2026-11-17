@@ -17,6 +17,7 @@ let () =
     ; "client", Test_client.tests
     ; "server connection", Test_server_connection.tests
     ; "request syntax", Test_request_syntax.tests
+    ; "websocket", Test_websocket.tests
     ; ( "bodies"
       , [ "no body expected to complete was cut", `Quick, Helpers.no_body_cut ]
       )

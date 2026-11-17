@@ -88,6 +88,47 @@ let stream response_body =
   loop ()
 
 let requests_seen = ref 0
+let ws_ended : (string, exn) result Lwt.u option ref = ref None
+let ws_flood_sends = ref 0
+
+let end_ws result =
+  Option.iter (fun u -> Lwt.wakeup_later u result) !ws_ended;
+  ws_ended := None
+
+let ws_echo ws =
+  let rec loop () =
+    Lwt.bind (Ache_lwt.Websocket.receive ws) (function
+      | Some "close-me" ->
+        Lwt.bind (Ache_lwt.Websocket.close ws 1001) (fun () ->
+          Lwt.map
+            (fun next ->
+               end_ws
+                 (Ok
+                    (match next with
+                    | None -> "closed, receive None"
+                    | Some m -> "received " ^ m)))
+            (Ache_lwt.Websocket.receive ws))
+      | Some message -> Lwt.bind (Ache_lwt.Websocket.send ws message) loop
+      | None ->
+        end_ws (Ok "receive None");
+        Lwt.return_unit)
+  in
+  loop ()
+
+let ws_flood ws =
+  let chunk = String.make 4096 'x' in
+  let rec loop () =
+    incr ws_flood_sends;
+    Lwt.bind (Ache_lwt.Websocket.send ws chunk) loop
+  in
+  Lwt.catch loop (fun exn ->
+    Lwt.map
+      (fun next ->
+         end_ws
+           (match next with
+           | None -> Error exn
+           | Some _ -> Ok "receive returned a message after the reset"))
+      (Ache_lwt.Websocket.receive ws))
 
 exception Respond_later
 
@@ -131,6 +172,18 @@ let request_handler (_ : Unix.sockaddr) reqd =
       reqd
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (echo_server ())
+  | `GET, ("/ws-echo" | "/ws-flood") ->
+    (match Ache_lwt.Websocket.upgrade reqd with
+    | Ok ws ->
+      Lwt.async (fun () ->
+        if request.target = "/ws-echo" then ws_echo ws else ws_flood ws)
+    | Error _ ->
+      Reqd.respond_with_string
+        reqd
+        (Response.create
+           ~headers:(Headers.of_list [ "content-length", "0" ])
+           `Bad_request)
+        "")
   | `GET, "/stream" ->
     Body.Reader.close body;
     stream (Reqd.respond_with_streaming reqd (Response.create `OK))
@@ -603,6 +656,192 @@ let test_flush_after_peer_closed_epipe () =
     flushed);
   stream_flush_closed := None;
   stream_start := Lwt.return_unit;
+  check_server_sockets_closed ()
+
+let ws_handshake target =
+  Printf.sprintf
+    "GET %s HTTP/1.1\r\n\
+     host: localhost\r\n\
+     upgrade: websocket\r\n\
+     connection: Upgrade\r\n\
+     sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+     sec-websocket-version: 13\r\n\
+     \r\n"
+    target
+
+let ws_101 =
+  "HTTP/1.1 101 Switching Protocols\r\n\
+   upgrade: websocket\r\n\
+   connection: Upgrade\r\n\
+   sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+   \r\n"
+
+let ws_frame ?(fin = true) opcode payload =
+  let mask = "\x01\x02\x03\x04" in
+  let len = String.length payload in
+  assert (len < 126);
+  String.make 1 (Char.chr ((if fin then 0x80 else 0) lor opcode))
+  ^ String.make 1 (Char.chr (0x80 lor len))
+  ^ mask
+  ^ String.mapi
+      (fun i c -> Char.chr (Char.code c lxor Char.code mask.[i land 3]))
+      payload
+
+let read_ws_frame socket =
+  read_exactly socket 2 >>= fun head ->
+  let len = Char.code head.[1] in
+  assert (len < 126);
+  read_exactly socket len >|= fun payload -> Char.code head.[0], payload
+
+let wait_ws_end () =
+  let ended, u = Lwt.wait () in
+  ws_ended := Some u;
+  ended
+
+let test_websocket_echo () =
+  let ended = wait_ws_end () in
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "hello") >>= fun () ->
+    read_ws_frame socket >>= fun first ->
+    write_all
+      socket
+      (ws_frame ~fin:false 0x1 "w\xc3"
+      ^ ws_frame 0x9 "ping"
+      ^ ws_frame 0x0 "\xb6rld")
+    >>= fun () ->
+    read_ws_frame socket >>= fun second ->
+    read_ws_frame socket >>= fun third ->
+    Alcotest.(check (list (pair int string)))
+      "echo, pong, echo of the fragmented message"
+      [ 0x81, "hello"; 0x8a, "ping"; 0x81, "w\xc3\xb6rld" ]
+      [ first; second; third ];
+    write_all socket (ws_frame 0x8 "\x03\xe8") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close echoed" (0x88, "\x03\xe8") close;
+    read_all socket >>= fun rest ->
+    Alcotest.(check string) "then end of input" "" rest;
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "server loop"
+      (Ok "receive None")
+      result;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+let test_websocket_server_close () =
+  let ended = wait_ws_end () in
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "close resolved"
+      (Ok "closed, receive None")
+      result;
+    write_all socket (ws_frame 0x8 "\x03\xe9") >>= fun () ->
+    read_all socket >>= fun rest ->
+    Alcotest.(check string) "then end of input" "" rest;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+let test_websocket_receive_backpressure () =
+  let ws = ref None in
+  let server =
+    Server_connection.create (fun reqd ->
+      match Ache_lwt.Websocket.upgrade reqd with
+      | Ok t -> ws := Some t
+      | Error _ -> Alcotest.fail "handshake rejected")
+  in
+  let feed s =
+    let len = String.length s in
+    let n =
+      Server_connection.read
+        server
+        (Ache.Bigstring.of_string ~off:0 ~len s)
+        ~off:0
+        ~len
+    in
+    Alcotest.(check int) "all consumed" len n
+  in
+  let rec drain () =
+    match Server_connection.next_write_operation server with
+    | `Write iovecs ->
+      Server_connection.report_write_result
+        server
+        (`Ok (List.fold_left (fun acc iov -> acc + iov.IOVec.len) 0 iovecs));
+      drain ()
+    | `Yield | `Close _ -> ()
+  in
+  let read_operation () =
+    match Server_connection.next_read_operation server with
+    | `Read -> "`Read"
+    | `Yield -> "`Yield"
+    | `Close -> "`Close"
+  in
+  feed (ws_handshake "/ws");
+  drain ();
+  let ws = Option.get !ws in
+  let fed = ref 0 in
+  while read_operation () = "`Read" && !fed < 100 do
+    feed (ws_frame 0x1 (string_of_int !fed));
+    incr fed
+  done;
+  Alcotest.(check string)
+    (Printf.sprintf "reader yields (after %d messages)" !fed)
+    "`Yield"
+    (read_operation ());
+  Alcotest.(check int) "after 8 unconsumed messages" 8 !fed;
+  let woken = ref false in
+  Server_connection.yield_reader server (fun () -> woken := true);
+  let first = Lwt_main.run (Ache_lwt.Websocket.receive ws) in
+  Alcotest.(check (option string)) "first message" (Some "0") first;
+  Alcotest.(check bool) "receive wakes the reader" true !woken;
+  Alcotest.(check string) "reads again" "`Read" (read_operation ());
+  feed (ws_frame 0x1 "8");
+  Alcotest.(check (list (option string)))
+    "the rest, in order"
+    (List.init 8 (fun i -> Some (string_of_int (i + 1))))
+    (Lwt_main.run
+       (Lwt_list.map_s
+          (fun () -> Ache_lwt.Websocket.receive ws)
+          (List.init 8 ignore)))
+
+let test_websocket_peer_reset () =
+  let ended = wait_ws_end () in
+  ws_flood_sends := 0;
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-flood") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    read_exactly socket 4 >>= fun first ->
+    Alcotest.(check string) "server is sending" "\x81\x7e\x10\x00" first;
+    Lwt_unix.setsockopt_optint socket Unix.SO_LINGER (Some 0);
+    let reset_at = Unix.gettimeofday () in
+    Lwt_unix.close socket >>= fun () ->
+    Lwt.pick
+      [ ended
+      ; (Lwt_unix.sleep 2.0 >|= fun () -> Ok "still running 2 s after the reset")
+      ]
+    >|= fun result ->
+    let elapsed = Unix.gettimeofday () -. reset_at in
+    Alcotest.(check bool)
+      "send failed with Closed, receive is None"
+      true
+      (result = Error Ache_lwt.Websocket.Closed);
+    Alcotest.(check bool)
+      (Printf.sprintf "ended within 1 s (%.3f s)" elapsed)
+      true
+      (elapsed < 1.0));
   check_server_sockets_closed ()
 
 let get_hello = "GET /hello HTTP/1.1\r\nhost: localhost\r\n\r\n"
@@ -1145,6 +1384,14 @@ let () =
              protocol"
           , `Quick
           , test_upgrade_incomplete_token_reaches_new_protocol )
+        ; "WebSocket echo and close", `Quick, test_websocket_echo
+        ; "WebSocket server close", `Quick, test_websocket_server_close
+        ; ( "WebSocket receive queue pauses reading"
+          , `Quick
+          , test_websocket_receive_backpressure )
+        ; ( "WebSocket server sending to a reset peer ends the connection"
+          , `Quick
+          , test_websocket_peer_reset )
         ; "read failure ends the connection", `Quick, test_read_failure
         ; "write failure ends the connection", `Quick, test_write_failure
         ; "request handler exception", `Quick, test_handler_exception

@@ -36,6 +36,10 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `?tcp_nodelay:true` sets `TCP_NODELAY` on each accepted socket.
 - `Ache_lwt.Timeout`: timeouts that share one Lwt timer for each length, so
   that cancelled timers do not pile up with the `select` and `poll` engines.
+- `Ache.Websocket`: a WebSocket server (RFC 6455) for text messages, which
+  runs after `Reqd.respond_with_upgrade` on every runtime. `Ache_lwt.Websocket`
+  gives it a promise API: `upgrade`, `send`, `receive` and `close`. A write to
+  a client that reset the connection ends the connection (camlworks/dream#467).
 
 ### Changed
 
@@ -54,6 +58,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   connection.
 - Fixes httpun #95, #143, #150, #151, #154 to #165, and httpaf #18, #38,
   #86, #191, #192.
+- When `Reqd.respond_with_upgrade` cannot write the 101, it shuts the new
+  protocol down.
 
 httpun history
 ==============
