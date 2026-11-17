@@ -1,4 +1,11 @@
+(executable
+ (name accept_error_server)
+ (modules accept_error_server)
+ (libraries ache ache-eio eio eio_main))
+
 (test
  (name test_ache_eio)
  (package ache-eio)
+ (modules test_ache_eio)
+ (deps accept_error_server.exe)
  (libraries ache ache-eio alcotest eio eio.mock eio.unix eio_main))
