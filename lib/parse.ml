@@ -590,7 +590,6 @@ module Reader = struct
 
   type stage =
     | Leading
-    | First
     | Fields
     | Trailer
     | Chunk_size
@@ -757,12 +756,12 @@ module Reader = struct
     o.run <- 0;
     o.resume <- p;
     match t.stage with
+    (* RFC 9112 §2.2: empty lines before the start line are skipped, any number
+       of them, counted against the head limit (decision 0017). *)
     | Leading when get bs stop p = '\r' ->
       let where = if t.request then "request-line" else "status-line" in
-      let q = end_line ~eof:false o bs stop p where in
-      if q >= 0 && t.request then t.stage <- First;
-      q
-    | Leading | First ->
+      end_line ~eof:false o bs stop p where
+    | Leading ->
       let q =
         if t.request
         then request_line ~eof:false o bs p stop
@@ -853,9 +852,12 @@ module Reader = struct
 
   let too_large t =
     match t.stage with
-    | (Leading | First) when t.request ->
+    | Leading when t.request ->
       let meth_end = skip tchar t.buffer t.buffered 0 in
-      if get t.buffer t.buffered meth_end = ' '
+      if meth_end = 0 && t.fed > 0
+      then (* Empty lines filled the head (decision 0017). *)
+        `Header_too_large
+      else if get t.buffer t.buffered meth_end = ' '
       then `Target_too_long
       else `Method_too_long
     | _ -> `Header_too_large

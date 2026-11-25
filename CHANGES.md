@@ -203,6 +203,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   response let the connection read them as the next request.
 - A `CONNECT` request has no body: the server ignores its `Content-Length`
   and `Transfer-Encoding` (RFC 9110 §9.3.6). It read a body framed by them.
+- The server skips any number of empty lines before a request line,
+  counted against `Config.max_header_size`. It answered 400 to a second one.
 - The client accepts a status-line with CRLF right after the status code
   (`HTTP/1.1 301\r\n`) and gives `` `Malformed_response `` for a response
   whose `Transfer-Encoding` lists no coding.

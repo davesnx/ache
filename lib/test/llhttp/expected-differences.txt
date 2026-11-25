@@ -41,6 +41,3 @@ request/content-length.md:78 | harness | input ends inside the head; llhttp fail
 request/content-length.md:103 | harness | input ends inside the head; llhttp fails at the field, ache at the end of the head
 request/content-length.md:447 | harness | skipBody: llhttp skips the body of a request, ache cannot
 request/invalid.md:493 | harness | input ends inside the request line; llhttp fails at the version, ache at the line end
-
-# gaps
-request/connection.md:159 | ticket: task 27 | two CRLFs between pipelined requests: ache allows one

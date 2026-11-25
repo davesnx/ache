@@ -172,8 +172,14 @@ let cr_after_status_code input =
   in
   from 0
 
+(* Decision 0017: a request after two empty lines, which v1 rejected. *)
+let empty_lines_before_request c =
+  c.kind = Request && String.starts_with ~prefix:"\r\n\r" c.input
+
 let changed_on_purpose c =
-  rejected_target c.input || cr_after_status_code c.input
+  rejected_target c.input
+  || cr_after_status_code c.input
+  || empty_lines_before_request c
 
 let test_changed_on_purpose () =
   let changed = List.filter changed_on_purpose (Lazy.force cases) in
@@ -191,9 +197,22 @@ let test_changed_on_purpose () =
          Alcotest.(check bool)
            (Printf.sprintf "%S: response accepted" c.input)
            true
-           (Result.is_ok g.response))
+           (Result.is_ok g.response);
+       if empty_lines_before_request c
+       then
+         (* The same messages as the input with one empty line less. *)
+         let now = Parse_oracle.case c.kind ~limit:c.limit c.input in
+         let one_less =
+           Parse_oracle.case c.kind ~limit:c.limit (drop_empty_line c.input)
+         in
+         let one_read o = o.outcomes.(0) in
+         Alcotest.(check bool)
+           (Printf.sprintf "%S: one empty line less" c.input)
+           true
+           ((one_read now).messages = (one_read one_less).messages
+           && same_next (one_read now).post.next (one_read one_less).post.next))
     changed;
-  Alcotest.(check int) "cases changed on purpose" 1367 (List.length changed)
+  Alcotest.(check int) "cases changed on purpose" 1379 (List.length changed)
 
 let test_size () =
   let cases = Lazy.force cases in
@@ -249,7 +268,7 @@ let tests =
   ; "grammar matches v1", `Quick, test_grammar
   ; "reader matches v1 at every split", `Quick, test_reader
   ; "every split ends as one read", `Quick, test_splits_end_as_one_read
-  ; ( "inputs changed by decision 0007 and the status-line fix"
+  ; ( "inputs changed by decisions 0007, 0017 and the status-line fix"
     , `Quick
     , test_changed_on_purpose )
   ]

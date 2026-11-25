@@ -1079,6 +1079,43 @@ let test_reader_many_empty_lines () =
   Alcotest.(check (list string)) "errors" [] c.cerrors;
   Alcotest.(check int) "consumed" (String.length input) c.cfeeder.consumed
 
+(* Decision 0017: any number of empty lines before a request line, counted
+   against max_header_size. *)
+let test_empty_lines_before_request () =
+  let get = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
+  let summary = {|"GET" "/" HTTP/1.1 ["Host":"a"]|} in
+  check_server ~expect:[ summary, "" ] ("\r\n\r\n\r\n" ^ get);
+  check_server
+    ~expect:
+      [ {|"POST" "/" HTTP/1.1 ["Host":"a";"Content-Length":"2"]|}, "ok"
+      ; summary, ""
+      ]
+    ("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nok\r\n\r\n" ^ get);
+  let config = { Config.default with max_header_size = 100 } in
+  let at = head_of_size 90 in
+  let s =
+    run_server ~config [ String.concat "" (List.init 5 (fun _ -> "\r\n")) ^ at ]
+  in
+  Alcotest.(check int)
+    "10 bytes of empty lines and a 90-byte head"
+    1
+    (List.length s.requests);
+  Alcotest.(check (list string)) "no error" [] s.errors;
+  List.iter
+    (fun input ->
+       List.iter
+         (fun chunks ->
+            let s = run_server ~config chunks in
+            Alcotest.(check (list request_body)) "no request" [] s.requests;
+            Alcotest.(check (list string))
+              (Printf.sprintf "%S: 431" input)
+              [ "Request_header_fields_too_large" ]
+              s.errors)
+         (all_splits input))
+    [ String.concat "" (List.init 6 (fun _ -> "\r\n")) ^ at
+    ; String.concat "" (List.init 50 (fun _ -> "\r\n"))
+    ]
+
 let test_reader_empty_trailer_split () =
   let s = server () in
   Feeder.feed s.feeder (chunked_head ^ "5\r\nhello\r\n0\r\n");
@@ -1501,6 +1538,9 @@ let tests =
   ; ( "reader: 8,000 empty lines then a response, one byte per read"
     , `Quick
     , test_reader_many_empty_lines )
+  ; ( "empty lines before a request: skipped, counted in the head limit"
+    , `Quick
+    , test_empty_lines_before_request )
   ; ( "reader: empty trailer split as CR, LF"
     , `Quick
     , test_reader_empty_trailer_split )

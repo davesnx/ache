@@ -114,8 +114,9 @@ error handler does not send it.
 | A head that is not complete when `?head_timeout` expires (30 s by default) | 408 |
 | A major version other than 1 | 505 |
 
-ache accepts HTTP/1.x with x > 1 as HTTP/1.1, one empty line before the
-request line, chunk extensions (ignored) and trailer fields (see
+ache accepts HTTP/1.x with x > 1 as HTTP/1.1, any number of empty lines
+before the request line (they count against `max_header_size`, as part of
+the head), chunk extensions (ignored) and trailer fields (see
 [Trailers](#trailers)). httpun rejected chunk extensions and trailers.
 
 A `CONNECT` request has no body (RFC 9110 §9.3.6): the server ignores its
