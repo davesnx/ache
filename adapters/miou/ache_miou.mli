@@ -278,6 +278,9 @@ module Websocket : sig
       A session whose client sends nothing for [idle_timeout] is closed with
       code 1001: {!receive} returns [None].
 
+      Cancelling the task that waits in [close] stops only the wait: the
+      connection still closes, at the client's answer or the close timeout.
+
       @raise Invalid_argument
         at once if [code] is not one an endpoint may send, or [reason] is not
         valid UTF-8 or longer than 123 bytes. *)

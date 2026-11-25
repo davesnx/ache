@@ -1065,6 +1065,43 @@ let test_websocket_close_timeout_silent_client ?idle_timeout () =
     Lwt_unix.close socket);
   check_server_sockets_closed ()
 
+(* After the server's close frame, a ping from the client still gets a pong; the
+   client then sends nothing and keeps its socket open, and the close timeout
+   ends the connection. *)
+let test_websocket_close_timeout_pong_then_silent () =
+  let ended = wait_ws_end () in
+  with_server ~idle_timeout:30. ~close_timeout:0.2 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    let started = Unix.gettimeofday () in
+    write_all socket (ws_frame 0x9 "p") >>= fun () ->
+    read_ws_frame socket >>= fun pong ->
+    Alcotest.(check (pair int string)) "pong after close" (0x8a, "p") pong;
+    Lwt.pick
+      [ (read_all socket >|= fun rest -> Some rest)
+      ; (Lwt_unix.sleep 2.5 >|= fun () -> None)
+      ]
+    >>= fun rest ->
+    Alcotest.(check (option string))
+      (Printf.sprintf
+         "end of input within 2.5 s (after %.2f s)"
+         (Unix.gettimeofday () -. started))
+      (Some "")
+      rest;
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "close resolved without the client's close frame"
+      (Ok "closed, no client close")
+      result;
+    check_server_sockets_closed ();
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
 (* A client that never answers, keeps sending and never closes its socket: after
    the close timeout the server closes its socket and the connection promise
    resolves. *)
@@ -2894,6 +2931,10 @@ let () =
         ; ( "WebSocket close timeout for a silent client and an idle timeout"
           , `Quick
           , test_websocket_close_timeout_silent_client ~idle_timeout:30. )
+        ; ( "WebSocket close timeout after a pong to a client that then stays \
+             silent"
+          , `Quick
+          , test_websocket_close_timeout_pong_then_silent )
         ; ( "WebSocket close timeout closes the server socket of a client that \
              keeps sending"
           , `Quick

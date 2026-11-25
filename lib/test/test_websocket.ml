@@ -946,6 +946,22 @@ let test_close_timeout () =
   check_closed c [ None ];
   Alcotest.(check string) "no timeout once closed" "none" (timeout_kind c)
 
+let test_close_timeout_paused () =
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1000;
+  Websocket.pause_reading (ws c);
+  check_output c (close_frame_out 1000) `Yield;
+  Alcotest.(check string)
+    "a pause after close does not stop the read"
+    "`Read"
+    (read_operation c);
+  Alcotest.(check string) "the close timeout applies" "close" (timeout_kind c);
+  feed c (client_frame 0x9 "p");
+  check_output ~msg:"a ping gets a pong" c "\x8a\x01p" `Yield;
+  feed c (client_frame 0x8 (close_payload 1000));
+  check_output c "" `Close;
+  check_closed c [ Some 1000 ]
+
 let test_close_answered_no_timeout () =
   let c = upgraded () in
   Websocket.close (ws c) ~code:1000;
@@ -984,6 +1000,9 @@ let tests =
   [ "accept key", `Quick, test_accept_key
   ; "idle timeout closes with 1001", `Quick, test_idle_timeout
   ; "close timeout aborts the closing handshake", `Quick, test_close_timeout
+  ; ( "a pause after close still reads the close frame"
+    , `Quick
+    , test_close_timeout_paused )
   ; ( "no close timeout after the client's answer"
     , `Quick
     , test_close_answered_no_timeout )

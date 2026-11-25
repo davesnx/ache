@@ -2546,6 +2546,33 @@ let close_timeout_silent ?idle_timeout () =
     Eio.Flow.close socket;
     Eio.Stream.take connections_done)
 
+(* After the server's close frame, a ping from the client still gets a pong; the
+   client then sends nothing and keeps its socket open, and the close timeout
+   ends the connection. *)
+let test_websocket_close_timeout_pong_then_silent () =
+  with_server ~idle_timeout:30. ~close_timeout:0.2 (fun ~sw ~net addr ->
+    let socket, reader = ws_connect ~sw ~net addr "/ws-echo" in
+    Eio.Flow.copy_string (ws_frame 0x1 "close-me") socket;
+    Alcotest.check frame "close 1001" (0x88, "\x03\xe9") (read_ws_frame reader);
+    let closed_at = Unix.gettimeofday () in
+    Eio.Flow.copy_string (ws_frame 0x9 "p") socket;
+    Alcotest.check frame "pong after close" (0x8a, "p") (read_ws_frame reader);
+    Alcotest.(check string)
+      "then end of input"
+      ""
+      (Eio.Buf_read.take_all reader);
+    let elapsed = Unix.gettimeofday () -. closed_at in
+    Alcotest.(check bool)
+      (Printf.sprintf "closed within 2.5 s (%.3f s)" elapsed)
+      true
+      (elapsed < 2.5);
+    Alcotest.(check string)
+      "close returned without the client's close frame"
+      "closed, no client close"
+      (Eio.Stream.take ws_reports);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
 (* The core's [close], called from another fiber while the read waits (a close
    from [on_message] runs inside a read). The read gets the close timeout,
    without an idle timeout. *)
@@ -3954,6 +3981,9 @@ let () =
         ; ( "close timeout, silent client, idle timeout"
           , `Quick
           , test_websocket_close_timeout_silent_idle )
+        ; ( "close timeout, pong after close then silent client"
+          , `Quick
+          , test_websocket_close_timeout_pong_then_silent )
         ; ( "close timeout, no linger"
           , `Quick
           , test_websocket_close_timeout_no_linger )

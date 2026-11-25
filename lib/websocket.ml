@@ -478,7 +478,12 @@ let read_eof t bs ~off ~len =
   n
 
 let max_unwritten_output = 65536
-let read_blocked t = t.paused || t.queued - t.written > max_unwritten_output
+
+(* A pause only holds back messages: once our close frame is out, they are
+   dropped, and the peer's close frame must still be read. *)
+let read_blocked t =
+  (t.paused && t.writing = Open) || t.queued - t.written > max_unwritten_output
+
 let wake_reader_unless_blocked t = if not (read_blocked t) then wake_reader t
 
 let next_read_operation t =

@@ -1083,6 +1083,33 @@ let test_websocket_close_timeout_silent ?idle_timeout () =
     Miou_unix.close socket;
     wait_connection_done ())
 
+(* After the server's close frame, a ping from the client still gets a pong; the
+   client then sends nothing and keeps its socket open, and the close timeout
+   ends the connection. *)
+let test_websocket_close_timeout_pong_then_silent () =
+  let ended = wait_ws_end () in
+  with_server ~idle_timeout:30. ~close_timeout:0.2 (fun addr ->
+    let socket = ws_connect addr "/ws-echo" in
+    send socket (ws_frame 0x1 "close-me");
+    Alcotest.(check (pair int string))
+      "close 1001"
+      (0x88, "\x03\xe9")
+      (read_ws_frame socket);
+    let from = Unix.gettimeofday () in
+    send socket (ws_frame 0x9 "p");
+    Alcotest.(check (pair int string))
+      "pong after close"
+      (0x8a, "p")
+      (read_ws_frame socket);
+    Alcotest.(check string) "then end of input" "" (read_all socket);
+    check_elapsed "closed" ~from ~min:0. ~max:2.5;
+    wait_connection_done ();
+    Alcotest.(check (result string reject))
+      "close returned without the client's close frame"
+      (Ok "closed, no client close")
+      (await ended);
+    Miou_unix.close socket)
+
 let test_websocket_ping () =
   let ended = wait_ws_end () in
   with_server (fun addr ->
@@ -3456,6 +3483,9 @@ let () =
         ; ( "WebSocket close timeout: silent client, idle timeout 30 s"
           , `Quick
           , test_websocket_close_timeout_silent ~idle_timeout:30. )
+        ; ( "WebSocket close timeout: pong after close, then a silent client"
+          , `Quick
+          , test_websocket_close_timeout_pong_then_silent )
         ; ( "WebSocket close timeout: no linger after it"
           , `Quick
           , test_websocket_close_timeout_no_linger )

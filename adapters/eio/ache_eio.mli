@@ -399,6 +399,9 @@ module Websocket : sig
       connection closes without its answer: [close] returns and
       {!client_close} is [None]. Messages do not extend this time.
 
+      Cancelling [close] stops only the wait: the connection still closes, at
+      the client's answer or the close timeout.
+
       @raise Invalid_argument
         at once if [code] is not one an endpoint may send, or [reason] is not
         valid UTF-8 or longer than 123 bytes. *)

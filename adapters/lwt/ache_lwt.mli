@@ -207,6 +207,9 @@ module Websocket : sig
       that arrive meanwhile do not extend the wait. With
       [~close_timeout:None] it waits until the client answers or closes.
 
+      Cancelling the promise of [close] stops only the wait: the connection
+      still closes, at the client's answer or the close timeout.
+
       @raise Invalid_argument
         at once, before it returns a promise, if [code] is not one an endpoint
         may send, or [reason] is not valid UTF-8 or longer than 123 bytes. *)
