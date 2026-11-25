@@ -152,7 +152,7 @@ module Client : Client with type socket = Miou_unix.file_descr
       let request_handler _client_address reqd =
         match Ache_miou.Websocket.upgrade reqd echo with
         | Ok () -> ()
-        | Error _ -> (* respond, for example with 400 *) ...
+        | Error _ -> (* respond: 426 for `Unsupported_version, else 400 *) ...
     ]}
 
     The module does not depend on the socket type: it works with the servers
@@ -174,7 +174,9 @@ module Websocket : sig
       {!Ache.Websocket.upgrade}: it responds with [101], with [headers]
       added, when the request is a valid opening handshake,
       and then runs [session] in its own task. When it returns [Error _], it
-      responded nothing: respond, for example with [400].
+      responded nothing: respond, for example with [426] and
+      [Sec-WebSocket-Version: 13] for [`Unsupported_version], [400]
+      otherwise.
 
       The session task is a child of the connection task, in the same domain,
       started with [Miou.async]. The server handler of the connection returns
@@ -184,9 +186,10 @@ module Websocket : sig
       session that uses them ends. The session is cancelled only when the
       connection task is cancelled.
 
-      {!Closed} raised by [session] is ignored. Another exception sends a
-      close frame with code [1011] and closes the connection, and the server
-      handler raises it when it returns: with {!Server.run}, it goes to
+      When [session] returns or raises {!Closed}, the connection closes with
+      code [1000], unless it has already ended. Another exception sends a
+      close frame with code [1011], and the server handler raises it when the
+      connection has ended (see {!close}) and it returns: with {!Server.run}, it goes to
       [on_error].
 
       [upgrade] finds its connection through an effect handler around the
@@ -228,15 +231,20 @@ module Websocket : sig
       which.
 
       The task that waits in [receive] can be cancelled, for example with
-      [Miou.cancel] or by losing a [Miou.await_first]. No message is lost:
-      the next [receive] gets it. *)
+      [Miou.cancel] or by losing a [Miou.await_first]. A cancelled [receive]
+      loses no message: the next [receive] gets it. A [receive] that returned
+      has taken its message: when [Miou.await_first] drops the result of a
+      task that finished at the same time as the winner, that message is
+      lost. *)
 
   val ping : t -> string -> unit
   (** [ping t payload] sends a ping and waits for the next pong from the
       client (any pong: RFC 6455 §5.5.3 lets a client answer only the latest
       ping, or send pongs unasked). To find a client that is gone, race
       [ping] with a task that sleeps, with [Miou.await_first], and {!close}
-      when the sleep wins. The task that waits in [ping] can be cancelled.
+      when the sleep wins, raced with a sleep too: a client that is gone does
+      not answer the close frame. The task that waits in [ping] can be
+      cancelled.
 
       The pong comes after the messages the client sent before it. While 8
       messages wait for {!receive}, reading is paused, so the pong is not
@@ -249,18 +257,22 @@ module Websocket : sig
 
   val client_close : t -> Ache.Websocket.close option
   (** [client_close t] is the client's close frame (code and reason), once
-      {!receive} returned [None]: see the [on_close] of
-      {!Ache.Websocket.handler}. [None] before that, or when the client sent
-      no valid close frame. *)
+      the connection has ended: see the [on_close] of
+      {!Ache.Websocket.handler}. It is set when the connection ends, also
+      while {!receive} still returns queued messages. [None] before that, or
+      when the connection ended without a valid close frame from the client:
+      an end of input, a reset, a protocol error, or the server's own close
+      that the client did not answer. *)
 
   val close : ?reason:string -> t -> int -> unit
   (** [close ?reason t code] sends a close frame with [code] and [reason] (see
-      {!Ache.Websocket.close}). It returns when the connection is closed: the
-      frame is written, or the connection ended. The connection stops
-      reading, and closes as any closing connection of
-      {!Server.create_connection_handler} does: it reads and drops input
-      until the client closes, at most [idle_timeout] (the default), and at
-      once without timeouts.
+      {!Ache.Websocket.close}). It returns when the connection has ended: the
+      client answered with its close frame (then in {!client_close}), closed
+      the connection, or the connection failed. Messages that arrive
+      meanwhile are dropped.
+
+      There is no timeout: when the client neither answers nor closes, the
+      connection stays open until its task is cancelled.
 
       A session whose client sends nothing for [idle_timeout] is closed with
       code 1001: {!receive} returns [None].

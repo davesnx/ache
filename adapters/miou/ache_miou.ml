@@ -1272,7 +1272,10 @@ module Websocket = struct
       let t = Option.get !t in
       Sessions.add sessions (fun () ->
         match session t with
-        | () | (exception Closed) -> ()
+        | () | (exception Closed) ->
+          (* Nothing reads the messages any more: close, unless the connection
+             already ended. *)
+          Ache.Websocket.close t.connection ~code:1000
         | exception (Miou.Cancelled as exn) -> raise exn
         | exception exn ->
           let bt = Printexc.get_raw_backtrace () in

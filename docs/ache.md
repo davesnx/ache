@@ -386,7 +386,11 @@ let request_handler _client_address reqd =
   | Error `Unsupported_version ->
     respond_empty
       reqd
-      ~headers:[ "sec-websocket-version", "13" ]
+      ~headers:
+        [ "sec-websocket-version", "13"
+        ; "upgrade", "websocket"
+        ; "connection", "upgrade"
+        ]
       `Upgrade_required
   | Error (`Not_get | `Not_websocket | `Invalid_key) ->
     respond_empty reqd `Bad_request
@@ -439,13 +443,18 @@ when the connection closed first.
   code, then closes the connection. `on_close` gets the client's code and
   reason, or `Some { code = 1005; reason = "" }` for a close frame without a
   code.
-- `Websocket.close ?reason ws ~code` sends a close frame, stops reading, and
-  closes the connection when the frame is written. It does not wait for the
-  client's close frame. The reason must be valid UTF-8 and at most 123
+- `Websocket.close ?reason ws ~code` sends a close frame and waits for the
+  client's: it keeps reading, drops the messages that arrive meanwhile, and
+  closes the connection at the client's close frame or the end of input.
+  `on_close` gets the client's code and reason. Paused reading starts again,
+  so the client's close frame is seen. There is no timeout for a client that
+  neither answers nor closes. The reason must be valid UTF-8 and at most 123
   bytes.
 - `Websocket.ping ws payload` sends a ping; the client's pong reaches
   `on_pong`. To find a client that is gone, ping it on a timer and close the
-  connection when no pong comes in time.
+  connection when no pong comes in time. A client that is gone does not
+  answer the close frame either: the socket stays open until you close it
+  ([Limits](#limits)).
 - It closes the connection with a code when the client breaks the protocol.
   `on_close` then gets `None`:
 
@@ -709,7 +718,8 @@ runtimes.
   a subprotocol and answers it with `?headers` of `upgrade`. A WebSocket
   connection that receives nothing for the idle timeout is closed with
   code 1001, and one whose writes make no progress for the write timeout
-  is closed.
+  is closed. After the server sends its close frame, no timeout applies: a
+  client that neither answers nor closes keeps the connection open.
 - The API is not stable before 1.0.
 
 ## Test a handler

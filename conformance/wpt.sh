@@ -41,13 +41,17 @@ fi
 
 work=$(mktemp -d)
 pid=
+created=
 cleanup() {
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     kill -TERM "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   fi
-  rm -f "$test_dir/ache.any.js"
-  rmdir "$test_dir" 2>/dev/null || true
+  # Only the run that made the test directory removes it.
+  if [ -n "$created" ]; then
+    rm -f "$test_dir/ache.any.js"
+    rmdir "$test_dir" 2>/dev/null || true
+  fi
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -56,6 +60,7 @@ trap 'exit 130' INT TERM
 (cd "$root" && dune build --root . "./conformance/ws_echo_$runtime.exe")
 
 mkdir "$test_dir"
+created=1
 sed "s/127\.0\.0\.1:8090/127.0.0.1:$port/" "$here/wpt/ache.any.js" >"$test_dir/ache.any.js"
 if ! grep -qF "const acheHost = \"127.0.0.1:$port\";" "$test_dir/ache.any.js"; then
   echo "wpt/ache.any.js: acheHost is not 127.0.0.1:8090, so the port was not replaced" >&2

@@ -239,7 +239,21 @@ let rec echo ws =
 let request_handler _client_address reqd =
   match Ache_miou.Websocket.upgrade reqd echo with
   | Ok () -> ()
-  | Error _ ->
+  | Error `Unsupported_version ->
+    (* RFC 6455 §4.4: name the version this server speaks. *)
+    let headers =
+      Headers.of_list
+        [ "sec-websocket-version", "13"
+        ; "upgrade", "websocket"
+        ; "connection", "upgrade"
+        ; "content-length", "0"
+        ]
+    in
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers `Upgrade_required)
+      ""
+  | Error (`Not_get | `Not_websocket | `Invalid_key) ->
     let headers = Headers.of_list [ "content-length", "0" ] in
     Request_descriptor.respond_with_string
       reqd
@@ -261,29 +275,35 @@ let request_handler _client_address reqd =
   session when the socket closes: the session sees the end, because
   `receive` returns `None` and the other functions raise `Closed` or
   return. The session is cancelled only when the connection task is.
-- `Closed` raised by the session is ignored. Another exception sends a
-  close frame with code 1011 and closes the connection, and the server
-  handler raises it: with `Server.run`, it goes to `on_error`.
+- When the session returns, or raises `Closed`, the connection closes with
+  code 1000, unless it has already ended. Another exception sends a
+  close frame with code 1011, and the server handler raises it once the
+  connection has ended (see `close`): with `Server.run`, it goes to
+  `on_error`.
 - `receive` returns the next whole message, `Text s` or `Binary s`. Once
   the connection has ended and no message waits, it returns `None`. The
   connection ends after the client's close frame, the end of the input, a
-  reset, a protocol error, or your `close`. `client_close ws` then gives
-  the client's close code and reason, if it sent a valid close frame.
+  reset, a protocol error, or your `close`. `client_close ws` gives the
+  client's close code and reason once the connection has ended, if it sent
+  a valid close frame; `None` does not tell an end of input, a reset or a
+  protocol error apart.
 - `send_text` and `send_binary` return when the frame is written. They
   raise `Ache_miou.Websocket.Closed` when the connection is gone, also when
   it was gone before the call, so a send loop ends when the client leaves.
 - `ping ws payload` sends a ping and returns when the next pong arrives, or
   raises `Closed` when the connection ends first. To find a client that is
   gone, race it with a task that sleeps, with `Miou.await_first`, and
-  `close` when the sleep wins. The pong comes after the messages the
+  `close` when the sleep wins, raced with a sleep too, since a client that
+  is gone does not answer. The pong comes after the messages the
   client sent before it, so keep calling `receive` meanwhile: while 8
   messages wait, reading is paused and the pong is not seen.
-- `close ?reason ws code` sends a close frame and returns when the frame is
-  written or the connection has ended. It raises `Invalid_argument` at
-  once for a code that an endpoint may not send, or a reason that is not
-  UTF-8 or longer than 123 bytes. The connection then stops reading and
-  closes as any closing connection does: it waits for the client to close
-  at most `idle_timeout` (60 s by default), and at once without timeouts.
+- `close ?reason ws code` sends a close frame and returns when the
+  connection has ended: the client answered with its close frame (then in
+  `client_close`), closed the connection, or the connection failed.
+  Messages that arrive meanwhile are dropped. There is no timeout for a
+  client that neither answers nor closes: race `close` with a task that
+  sleeps. It raises `Invalid_argument` at once for a code that an endpoint
+  may not send, or a reason that is not UTF-8 or longer than 123 bytes.
 - A session whose client sends nothing for `idle_timeout` (60 s by
   default) gets a close frame with code 1001, and `receive` returns
   `None`.
@@ -291,8 +311,10 @@ let request_handler _client_address reqd =
   wait, the connection stops reading from the client until `receive` takes
   one. Frames that one read already holds still join the queue.
 - You can cancel a task that waits in `receive` or `ping`, for example with
-  `Miou.cancel` or `Miou.await_first`. No message is lost: the next
-  `receive` gets it.
+  `Miou.cancel` or `Miou.await_first`. A cancelled `receive` loses no
+  message: the next `receive` gets it. A `receive` that has returned has
+  taken its message: when `Miou.await_first` drops the result of a task
+  that finished at the same time as the winner, that message is lost.
 - Call these functions from the session task, or from tasks that it starts
   with `Miou.async`. The connection has no lock, so they must run in its
   domain; do not call them from a task of `Miou.call`.

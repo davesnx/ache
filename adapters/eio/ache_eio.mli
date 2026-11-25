@@ -299,7 +299,8 @@ module Websocket : sig
       {!Ache.Websocket.upgrade}: it responds with [101], with [headers]
       added, when the request is a valid opening handshake
       and returns [Ok ()]. When it returns [Error _], it responded nothing:
-      respond, for example with [400].
+      respond, for example with [426] and [Sec-WebSocket-Version: 13] for
+      [`Unsupported_version], [400] otherwise.
 
       After [Ok ()], [session t] runs in a new fiber of the connection, on the
       domain that runs it, once [upgrade] has returned. The handler of
@@ -310,7 +311,8 @@ module Websocket : sig
       uses them ends. [session] is cancelled only when the connection's fiber
       is, for example when the server stops.
 
-      When [session] raises {!Closed}, it is ignored. When it raises another
+      When [session] returns or raises {!Closed}, the connection closes with
+      code [1000], unless it has already ended. When it raises another
       exception, the connection sends a close frame with code [1011] and the
       handler raises the exception after the connection ends, as for
       [error_handler].
@@ -355,7 +357,8 @@ module Websocket : sig
       client arrives (any pong: RFC 6455 §5.5.3 lets a client answer only the
       latest ping, or send pongs unasked). To find a client that is gone:
       [Eio.Time.with_timeout_exn clock 30. (fun () -> ping t "")], then
-      {!close} on [Eio.Time.Timeout]. [ping] can be cancelled.
+      {!close} on [Eio.Time.Timeout], with a timeout too: a client that is
+      gone does not answer the close frame. [ping] can be cancelled.
 
       The pong comes after the messages the client sent before it. While 8
       messages wait for {!receive}, reading is paused, so the pong is not
@@ -368,18 +371,20 @@ module Websocket : sig
 
   val client_close : t -> Ache.Websocket.close option
   (** [client_close t] is the client's close frame (code and reason), once
-      {!receive} returned [None]: see the [on_close] of
-      {!Ache.Websocket.handler}. [None] before that, or when the client sent
-      no valid close frame. *)
+      the connection has ended: see the [on_close] of
+      {!Ache.Websocket.handler}. It is set when the connection ends, also
+      while {!receive} still returns queued messages. [None] before that, or
+      when the connection ended without a valid close frame from the client:
+      an end of input, a reset, a protocol error, or the server's own close
+      that the client did not answer. *)
 
   val close : ?reason:string -> t -> int -> unit
   (** [close ?reason t code] sends a close frame with [code] and [reason] (see
-      {!Ache.Websocket.close}) and returns when the connection is closed: the
-      frame is written, or the connection ended. The socket closes when the
-      read in progress also ends: when the client answers with its close
-      frame or closes the connection, or at most [idle_timeout] later, as
-      after any closing response (see
-      {!Server.create_connection_handler}).
+      {!Ache.Websocket.close}) and returns when the connection has ended: the
+      client answered with its close frame (then in {!client_close}), closed
+      the connection, or the connection failed. Messages that arrive
+      meanwhile are dropped. There is no timeout for a client that neither
+      answers nor closes: wrap [close] in [Eio.Time.with_timeout].
 
       @raise Invalid_argument
         at once if [code] is not one an endpoint may send, or [reason] is not
