@@ -328,7 +328,9 @@ let end_frame t =
   match t.opcode with
   | 0x8 -> on_close_frame t (Stdlib.Buffer.contents t.control)
   | 0x9 ->
-    if t.writing = Open
+    (* RFC 6455 §5.5.2: a ping gets a pong until the peer's close frame, even
+       after ours. *)
+    if t.writing <> Closed
     then frame t ~opcode:0xA (Stdlib.Buffer.contents t.control);
     t.reading <- Header
   | 0xA ->
