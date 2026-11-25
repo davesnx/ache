@@ -23,5 +23,6 @@
   test_server_connection
   test_version
   test_websocket
-  test_testing)
+  test_testing
+  test_trailers)
  (name test_ache))

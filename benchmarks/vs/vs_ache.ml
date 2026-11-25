@@ -28,7 +28,7 @@ module Http = struct
 
   let write_bigstring = Body.Writer.write_bigstring
   let flush = Body.Writer.flush
-  let close_writer = Body.Writer.close
+  let close_writer writer = Body.Writer.close writer
   let writer_is_closed = Body.Writer.is_closed
 end
 

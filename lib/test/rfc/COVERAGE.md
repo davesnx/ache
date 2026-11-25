@@ -12,8 +12,8 @@ Test names are in `lib/test/rfc/test_s*.ml`; a name followed by "(RFC 9112 suite
 
 | Status | Rows |
 |---|---|
-| Tested | 93 |
-| Out of scope | 352 |
+| Tested | 95 |
+| Out of scope | 350 |
 | Total | 445 (412 keyword sentences, 33 DEF rows) |
 
 ## Requirements
@@ -94,18 +94,18 @@ Test names are in `lib/test/rfc/test_s*.ml`; a name followed by "(RFC 9112 suite
 | §6.2#6 | both | SHOULD | A recipient that receives a message with a major version number that it implements and a minor version number higher than what it implements SHOULD ... | `§6.2 both SHOULD: HTTP/1.2 request is processed as HTTP/1.1`<br>`§6.2 client SHOULD: HTTP/1.2 response is processed as HTTP/1.1` |
 | §6.4.1#D1 | both | DEF | All 1xx (Informational), 204 (No Content), and 304 (Not Modified) responses do not include content. | `§6.4.1 server DEF: no body bytes in a 204 from respond_with_string`<br>`§6.4.1 server DEF: no body bytes in a 304 from respond_with_string`<br>`§6.4.1 server DEF: no body bytes in a streamed 204`<br>`§6.4.1 server DEF: no body bytes in a streamed 304`<br>`§6.4.1 server DEF: no body bytes after a 100 head`<br>`§6.4.1 client DEF: 204 response ends after the head`<br>`§6.4.1 client DEF: 304 response with Content-Length ends after the head`<br>`§6.4.1 client DEF: 100 response ends after the head` |
 | §6.4.1#D2 | server | DEF | All other responses do include content, although that content might be of zero length. | `§6.4.1 server DEF: a 200 response includes its content` |
-| §6.5.1#1 | n/a | MUST NOT | A sender MUST NOT generate a trailer field unless the sender knows the corresponding header field name's definition permits the field to be sent in ... | out of scope: the library has no API to send trailer fields |
+| §6.5.1#1 | both | MUST NOT | A sender MUST NOT generate a trailer field unless the sender knows the corresponding header field name's definition permits the field to be sent in ... | `§6.5.1 server MUST NOT: framing and routing fields are refused as trailers`<br>`§6.5.1 client MUST NOT: framing and routing fields are refused as trailers`<br>`Body.Writer.close ~trailers` refuses the fields of Go's badTrailer list; other fields are the application's choice |
 | §6.5.1#2 | both | MUST NOT | A recipient MUST NOT merge a trailer field into a header section unless the recipient understands the corresponding header field definition and that definition explicitly ... | `§6.5.1 server MUST NOT: trailer not merged into request headers`<br>`§6.5.1 client MUST NOT: trailer not merged into response headers` |
-| §6.5.1#3 | n/a | SHOULD NOT | Because of the potential for trailer fields to be discarded in transit, a server SHOULD NOT generate trailer fields that it believes are necessary for ... | out of scope: the library has no API to send trailer fields |
+| §6.5.1#3 | n/a | SHOULD NOT | Because of the potential for trailer fields to be discarded in transit, a server SHOULD NOT generate trailer fields that it believes are necessary for ... | out of scope: application: it chooses which trailer fields to send |
 | §6.5.2#1 | n/a | MUST | Trailer fields that might be generated more than once during a message MUST be defined as a list-based field even if each member value is ... | out of scope: field definitions: requirement on specification authors |
-| §6.5.2#2 | n/a | MAY | At the end of a message, a recipient MAY treat the set of received trailer fields as a data structure of name/value pairs, similar to ... | out of scope: MAY: the library exposes no trailer data structure |
+| §6.5.2#2 | both | MAY | At the end of a message, a recipient MAY treat the set of received trailer fields as a data structure of name/value pairs, similar to ... | `§6.5.1 server MUST NOT: trailer not merged into request headers`<br>`§6.5.1 client MUST NOT: trailer not merged into response headers`<br>`Body.Reader.trailers` gives the received trailer fields as a `Headers.t` |
 | §6.6.1#1 | n/a | SHOULD | A sender that generates a Date header field SHOULD generate its field value as the best available approximation of the date and time of message ... | out of scope: application: the library has no clock and leaves Date to the application |
 | §6.6.1#2 | n/a | MUST | An origin server with a clock (as defined in Section 5.6.7) MUST generate a Date header field in all 2xx (Successful), 3xx (Redirection), and 4xx ... | out of scope: application: the library has no clock and leaves Date to the application |
 | §6.6.1#3 | server | MUST NOT | An origin server without a clock MUST NOT generate a Date header field. | `§6.6.1 server MUST NOT: library adds no Date field` |
 | §6.6.1#4 | n/a | MUST | A recipient with a clock that receives a response message without a Date header field MUST record the time it was received and append a ... | out of scope: caches and forwarding recipients only |
 | §6.6.1#5 | n/a | MAY | A recipient with a clock that receives a response with an invalid Date header field value MAY replace that value with the time that response ... | out of scope: the library has no clock and does not interpret Date |
 | §6.6.1#6 | n/a | MAY | A user agent MAY send a Date header field in a request, though generally will not do so unless it is believed to convey useful ... | out of scope: application: request fields are chosen by the application |
-| §6.6.2#1 | n/a | SHOULD | A sender that intends to generate one or more trailer fields in a message SHOULD generate a Trailer header field in the header section of ... | out of scope: the library has no API to send trailer fields |
+| §6.6.2#1 | n/a | SHOULD | A sender that intends to generate one or more trailer fields in a message SHOULD generate a Trailer header field in the header section of ... | out of scope: application: it adds the Trailer field to the header section |
 | §7.1#1 | both | MUST NOT | These forms MUST NOT be used with other methods. | `§3.2 server SHOULD: 400 for asterisk-form or authority-form outside OPTIONS and CONNECT` (RFC 9112 suite) |
 | §7.2#1 | client | MUST | A user agent MUST generate a Host header field in a request unless it sends that information as an ":authority" pseudo-header field. | out of scope: the application builds the request header section; Client_connection writes it unchanged (see the §7.2 SHOULD test) |
 | §7.2#2 | client | SHOULD | A user agent that sends Host SHOULD send it as the first field in the header section of a request. | `§7.2 client SHOULD: Host stays the first field when given first` |
@@ -188,7 +188,7 @@ Test names are in `lib/test/rfc/test_s*.ml`; a name followed by "(RFC 9112 suite
 | §8.8.2.1#4 | n/a | MUST | If the last modification time is derived from implementation-specific metadata that evaluates to some time in the future, according to the origin server's clock, then ... | out of scope: application: the library has no clock and generates no Last-Modified |
 | §8.8.2.1#5 | n/a | MUST NOT | An origin server without a clock MUST NOT generate a Last-Modified date for a response unless that date value was assigned to the resource by ... | out of scope: application: the library has no clock and generates no Last-Modified |
 | §8.8.3#1 | n/a | MUST | If an origin server provides an entity tag for a representation and the generation of that entity tag does not satisfy all of the characteristics ... | out of scope: application: validators are chosen by the application |
-| §8.8.3#2 | n/a | MAY | A sender MAY send the ETag field in a trailer section (see Section 6.5). | out of scope: the library has no API to send trailer fields |
+| §8.8.3#2 | n/a | MAY | A sender MAY send the ETag field in a trailer section (see Section 6.5). | out of scope: application: it chooses the trailer fields given to `Body.Writer.close` |
 | §8.8.3.1#1 | n/a | SHOULD | An origin server SHOULD send an ETag for any selected representation for which detection of changes can be reasonably and consistently determined, since the entity ... | out of scope: application: validators are chosen by the application |
 | §9.1#1 | server | MUST | All general-purpose servers MUST support the methods GET and HEAD. | `§9.1 server MUST: GET and HEAD are supported` |
 | §9.1#2 | n/a | OPTIONAL | All other methods are OPTIONAL. | out of scope: application: it chooses which methods to implement; the library passes every method to the handler |

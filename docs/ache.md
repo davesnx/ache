@@ -112,8 +112,8 @@ error handler does not send it.
 | A major version other than 1 | 505 |
 
 ache accepts HTTP/1.x with x > 1 as HTTP/1.1, one empty line before the
-request line, chunk extensions (ignored) and trailer fields (discarded).
-httpun rejected chunk extensions and trailers.
+request line, chunk extensions (ignored) and trailer fields (see
+[Trailers](#trailers)). httpun rejected chunk extensions and trailers.
 
 ### Responses
 
@@ -164,6 +164,95 @@ httpun rejected chunk extensions and trailers.
 - When the response is complete, the server reads and drops the rest of a
   request body that the application did not read. It waits for the rest of
   the body at most `?idle_timeout` (see [Limits](#limits)).
+
+### Trailers
+
+A chunked body can end with trailer fields, such as the `grpc-status` of
+gRPC. On both sides:
+
+- `Body.Reader.trailers body` returns the received trailer fields. It is
+  `Headers.empty` until `on_eof` is called, so read it in `on_eof`.
+- `Body.Writer.close ~trailers body` sends trailer fields after the last
+  chunk. A server sends them only when the request has `TE: trailers`, and
+  drops them otherwise; a client always sends them. On a close-delimited
+  body, or a response with no body (`HEAD`, 204, 304), they are dropped.
+- Fields that frame, route or authenticate a message (`content-length`,
+  `transfer-encoding`, `host`, `trailer`, `te`, `connection`,
+  `authorization`, `content-type`, and the rest of Go's `badTrailer` list)
+  are dropped when received. `Body.Writer.close ~trailers` raises
+  `Invalid_argument` for them, for an invalid field, and on a body framed
+  by `Content-Length`. A `Trailer` field in the head is ignored.
+- The trailer section counts against `Config.max_header_size` on its own;
+  a larger one ends the body with `on_error`, and the server answers 431.
+
+<!-- example: examples/readme/trailers_example.ml -->
+```ocaml
+open Ache
+
+(* The server streams a gRPC response and sends its status in trailers. *)
+let request_handler reqd =
+  let body =
+    Request_descriptor.respond_with_streaming
+      reqd
+      (Response.create
+         ~headers:(Headers.of_list [ "content-type", "application/grpc" ])
+         `OK)
+  in
+  Body.Writer.write_string body "\000\000\000\000\002hi";
+  Body.Writer.close
+    ~trailers:(Headers.of_list [ "grpc-status", "0"; "grpc-message", "OK" ])
+    body
+
+(* The client reads grpc-status when the response body ends. *)
+let response_handler status _response body =
+  let rec read () =
+    Body.Reader.schedule_read
+      body
+      ~on_read:(fun _ ~off:_ ~len:_ -> read ())
+      ~on_error:ignore
+      ~on_eof:(fun () ->
+        status := Headers.get (Body.Reader.trailers body) "grpc-status")
+  in
+  read ()
+
+let () =
+  let request =
+    Request.create
+      ~headers:
+        (Headers.of_list
+           [ "host", "a"; "te", "trailers"; "content-length", "0" ])
+      `POST
+      "/helloworld.Greeter/SayHello"
+  in
+  let client = Client_connection.create () in
+  let status = ref None in
+  let _ : Body.Writer.t =
+    Client_connection.request
+      client
+      request
+      ~error_handler:ignore
+      ~response_handler:(response_handler status)
+  in
+  let output =
+    Testing.serve
+      request_handler
+      "POST /helloworld.Greeter/SayHello HTTP/1.1\r\n\
+       Host: a\r\n\
+       TE: trailers\r\n\
+       Content-Length: 0\r\n\
+       \r\n"
+  in
+  let len = String.length output in
+  let read =
+    Client_connection.read
+      client
+      (Bigstring.of_string output ~off:0 ~len)
+      ~off:0
+      ~len
+  in
+  assert (read = len);
+  assert (!status = Some "0")
+```
 
 ### Client
 
@@ -494,8 +583,9 @@ runtimes.
 
 - HTTP/1.0 and HTTP/1.1 only. There is no HTTP/2 or HTTP/3.
 - TLS is ocaml-tls only (see [TLS](#tls)): there is no OpenSSL runtime.
-- Trailer fields are read and discarded. The API does not give them to the
-  application.
+- Trailer fields named in Go's `badTrailer` list are dropped on receipt
+  and refused on send. The server sends trailer fields only to a request
+  with `TE: trailers` (see [Trailers](#trailers)).
 - Server timeouts are off by default. `?idle_timeout` closes a connection
   that waits for a request, or for the rest of a request body after its
   response. `?head_timeout` answers 408 to a request head that is not
@@ -595,8 +685,8 @@ it is out of scope:
 
 | RFC | Requirements | Tested | Out of scope |
 |---|---|---|---|
-| 9110 | 445 | 93 | 352 |
-| 9112 | 173 | 115 | 58 |
+| 9110 | 445 | 95 | 350 |
+| 9112 | 174 | 117 | 57 |
 
 No test is marked as a known failure (`lib/test/rfc/KNOWN_FAILURES*.md`). The
 README check makes sure that the code in the three runtime pages is the same

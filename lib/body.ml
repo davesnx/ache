@@ -44,6 +44,7 @@ module Reader = struct
     ; mutable on_read : Bigstring.t -> off:int -> len:int -> unit
     ; when_ready_to_read : Optional_thunk.t
     ; mutable on_first_read : Optional_thunk.t
+    ; mutable trailers : Headers.t
     }
 
   let default_on_eof = Sys.opaque_identity (fun () -> ())
@@ -64,6 +65,7 @@ module Reader = struct
     ; on_read = default_on_read
     ; when_ready_to_read
     ; on_first_read = Optional_thunk.none
+    ; trailers = Headers.empty
     }
 
   let create_empty () =
@@ -72,6 +74,8 @@ module Reader = struct
     t
 
   let is_closed t = t.closed
+  let trailers t = if t.eof_has_been_called then t.trailers else Headers.empty
+  let set_trailers t trailers = t.trailers <- trailers
   let set_on_first_read t f = t.on_first_read <- f
   let ready_to_read t = Optional_thunk.call_if_some t.when_ready_to_read
 
@@ -158,7 +162,11 @@ module Writer = struct
   type encoding =
     | Identity
     | Fixed of { mutable remaining : Int64.t }
-    | Chunked of { mutable written_final_chunk : bool }
+    | Chunked of
+        { mutable written_final_chunk : bool
+        ; send_trailers : bool
+        ; mutable trailers : Headers.t
+        }
     | Discard
 
   type t =
@@ -168,21 +176,28 @@ module Writer = struct
     ; mutable buffered_bytes : int
     }
 
-  let of_encoder encoder ~encoding ~writer =
+  let of_encoder ~send_trailers encoder ~encoding ~writer =
     let encoding =
       match encoding with
       | `Fixed remaining -> Fixed { remaining }
       | `Close_delimited -> Identity
-      | `Chunked -> Chunked { written_final_chunk = false }
+      | `Chunked ->
+        Chunked
+          { written_final_chunk = false
+          ; send_trailers
+          ; trailers = Headers.empty
+          }
       | `No_body -> Discard
     in
     { encoder; encoding; writer; buffered_bytes = 0 }
 
-  let create buffer ~encoding =
-    of_encoder (Encoder.of_bigstring buffer) ~encoding
+  let create ~send_trailers buffer ~encoding ~writer =
+    of_encoder ~send_trailers (Encoder.of_bigstring buffer) ~encoding ~writer
 
   let create_empty ~writer =
-    let t = create Bigstring.empty ~encoding:(`Fixed 0L) ~writer in
+    let t =
+      create ~send_trailers:false Bigstring.empty ~encoding:(`Fixed 0L) ~writer
+    in
     Encoder.close t.encoder;
     t
 
@@ -253,16 +268,46 @@ module Writer = struct
     (* Resolve all pending flushes *)
     ignore (Encoder.drain t.encoder : int)
 
-  let close t =
+  let close_encoder t =
     Serialize.Writer.unyield t.writer;
     Encoder.close t.encoder;
     ready_to_write t
+
+  let check_trailers t trailers =
+    Serialize.check_headers trailers;
+    List.iter
+      (fun (name, _) ->
+         if Message.is_forbidden_trailer name
+         then
+           invalid_arg
+             (Printf.sprintf
+                "ache.Body.Writer.close: %S is not allowed in trailers"
+                name))
+      (Headers.to_rev_list trailers);
+    match t.encoding with
+    | Fixed _ ->
+      invalid_arg
+        "ache.Body.Writer.close: trailers on a body framed by content-length"
+    | Identity | Chunked _ | Discard -> ()
+
+  let close ?(trailers = Headers.empty) t =
+    (match Headers.to_rev_list trailers with
+    | [] -> ()
+    | _ :: _ ->
+      if not (is_closed t)
+      then (
+        check_trailers t trailers;
+        match t.encoding with
+        | Chunked chunked when chunked.send_trailers ->
+          chunked.trailers <- trailers
+        | Identity | Fixed _ | Chunked _ | Discard -> ()));
+    close_encoder t
 
   let force_close t =
     (match t.encoding with
     | Chunked t -> t.written_final_chunk <- true
     | Identity | Fixed _ | Discard -> ());
-    close t
+    close_encoder t
 
   let has_pending_output t =
     (* Force another write poll to make sure that the final chunk is emitted for
@@ -271,7 +316,7 @@ module Writer = struct
     let additional_encoding_output =
       match t.encoding with
       | Identity | Fixed _ | Discard -> false
-      | Chunked { written_final_chunk } ->
+      | Chunked { written_final_chunk; _ } ->
         Encoder.is_closed t.encoder && not written_final_chunk
     in
     encoder_has_output || additional_encoding_output
@@ -288,11 +333,13 @@ module Writer = struct
       | `Close ->
         (match t.encoding with
         | Identity | Fixed _ | Discard -> ()
-        | Chunked ({ written_final_chunk } as chunked) ->
+        | Chunked ({ written_final_chunk; trailers; _ } as chunked) ->
           if not written_final_chunk
           then (
             chunked.written_final_chunk <- true;
-            Serialize.Writer.schedule_chunk t.writer []))
+            match Headers.to_rev_list trailers with
+            | [] -> Serialize.Writer.schedule_chunk t.writer []
+            | _ :: _ -> Serialize.Writer.write_last_chunk t.writer trailers))
       | `Writev iovecs when t.encoding = Discard ->
         Encoder.shift encoder (IOVec.lengthv iovecs)
       | `Writev iovecs ->

@@ -246,6 +246,11 @@ let set_error_and_handle ?request t error =
                 * (is_active t == false), and are therefore not making use of
                 that * buffer. *)
              Body.Writer.create
+               ~send_trailers:
+                 (match encoding, request with
+                 | `Chunked, Some (request : Request.t) ->
+                   Message.accepts_trailers request.headers
+                 | _ -> false)
                t.response_body_buffer
                ~encoding
                ~writer:t.writer

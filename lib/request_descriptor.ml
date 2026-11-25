@@ -282,8 +282,17 @@ let unsafe_respond_with_streaming ~flush_headers_immediately t response =
         t
         response
     in
+    let send_trailers =
+      match encoding with
+      | `Chunked -> Message.accepts_trailers t.request.headers
+      | `Fixed _ | `Close_delimited | `No_body -> false
+    in
     let response_body =
-      Body.Writer.create t.response_body_buffer ~encoding ~writer:t.writer
+      Body.Writer.create
+        ~send_trailers
+        t.response_body_buffer
+        ~encoding
+        ~writer:t.writer
     in
     write_response t response;
     if Writer.is_closed t.writer then Body.Writer.close_and_drain response_body;

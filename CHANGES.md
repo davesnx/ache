@@ -31,6 +31,9 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `` `Bad_request ``: the reason the request was rejected, for logs. The
   default error handler does not send it. An error handler that matches
   `#Status.standard` must match `` `Bad_request _ `` first.
+- `Body.Writer.close` has the type `?trailers:Headers.t -> t -> unit`. A call
+  compiles as before; a module that gives it where a `t -> unit` value is
+  expected must apply it (`fun w -> Body.Writer.close w`).
 
 ### New
 
@@ -65,6 +68,12 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - `Websocket.upgrade ?headers` (core, Eio, Lwt and Miou) adds fields to the
   `101`, for example `Sec-WebSocket-Protocol`; `Websocket.requested_protocols`
   reads the subprotocols that the client offers.
+- HTTP/1.1 trailers. `Body.Reader.trailers` gives the trailer fields of a
+  chunked body in `on_eof`, and `Body.Writer.close ~trailers` sends them
+  after the last chunk; a server sends them only when the request has
+  `TE: trailers`. Framing, routing and authentication fields (Go's
+  `badTrailer` list) are dropped when received and raise `Invalid_argument`
+  when sent. Trailers were read and discarded.
 
 ### Changed
 

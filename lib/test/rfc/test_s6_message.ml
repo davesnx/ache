@@ -244,6 +244,15 @@ let content_tests =
       check_client_ex "final response" ~status:200 ~body:"ok" ex)
   ]
 
+let forbidden_trailers =
+  [ "Content-Length"
+  ; "transfer-encoding"
+  ; "Host"
+  ; "TE"
+  ; "Trailer"
+  ; "Connection"
+  ]
+
 let trailer_tests =
   [ test
       "§6.5.1 server MUST NOT: trailer not merged into request headers"
@@ -265,7 +274,11 @@ let trailer_tests =
            Alcotest.(check (option string))
              "trailer not in headers"
              None
-             (Headers.get ex.request.headers "x-trailer")
+             (Headers.get ex.request.headers "x-trailer");
+           Alcotest.(check (option string))
+             "trailer given apart"
+             (Some "1")
+             (Headers.get ex.trailers "x-trailer")
          | _ -> Alcotest.fail "expected one request")
   ; test
       "§6.5.1 client MUST NOT: trailer not merged into response headers"
@@ -283,6 +296,10 @@ let trailer_tests =
             X-Trailer: 1\r\n\
             \r\n";
          check_client_ex "response" ~status:200 ~body:"abc" ex;
+         Alcotest.(check (option string))
+           "trailer given apart"
+           (Some "1")
+           (Headers.get ex.trailers "x-trailer");
          match ex.responses with
          | [ r ] ->
            Alcotest.(check (option string))
@@ -290,6 +307,71 @@ let trailer_tests =
              None
              (Headers.get r.headers "x-trailer")
          | _ -> Alcotest.fail "expected one response")
+  ; test
+      "§6.5.1 server MUST NOT: framing and routing fields are refused as \
+       trailers"
+      (fun () ->
+         let raised = ref [] in
+         let s =
+           Server.run
+             ~handler:(fun ex ->
+               let w =
+                 Request_descriptor.respond_with_streaming
+                   ex.Server.reqd
+                   (Response.create `OK)
+               in
+               List.iter
+                 (fun name ->
+                    match
+                      Body.Writer.close
+                        ~trailers:(Headers.of_list [ name, "1" ])
+                        w
+                    with
+                    | () -> ()
+                    | exception Invalid_argument _ -> raised := name :: !raised)
+                 forbidden_trailers;
+               Body.Writer.close w)
+             (req
+                ~headers:[ "Host", "example.com"; "TE", "trailers" ]
+                "GET"
+                "/")
+         in
+         Alcotest.(check (list string))
+           "refused"
+           forbidden_trailers
+           (List.rev !raised);
+         if not (contains (Server.output s) "\r\n\r\n0\r\n\r\n")
+         then Alcotest.failf "no empty last chunk in %S" (Server.output s))
+  ; test
+      "§6.5.1 client MUST NOT: framing and routing fields are refused as \
+       trailers"
+      (fun () ->
+         let c = Client.create () in
+         let ex =
+           Client.request
+             ~close_body:false
+             c
+             (Request.create
+                ~headers:
+                  (Headers.of_list
+                     [ "host", "example.com"; "transfer-encoding", "chunked" ])
+                `POST
+                "/")
+         in
+         List.iter
+           (fun name ->
+              match
+                Body.Writer.close
+                  ~trailers:(Headers.of_list [ name, "1" ])
+                  ex.writer
+              with
+              | () -> Alcotest.failf "%s accepted" name
+              | exception Invalid_argument _ -> ())
+           forbidden_trailers;
+         Body.Writer.close ex.writer;
+         Client.pump c;
+         if not (contains (Client.written c) "\r\n\r\n0\r\n\r\n")
+         then Alcotest.failf "no empty last chunk in %S" (Client.written c))
   ]
 
 let date_tests =

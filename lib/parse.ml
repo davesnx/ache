@@ -751,7 +751,16 @@ module Reader = struct
         t.state <- Body (body, Trailers))
       else t.state <- Body (body, Chunk_data (Int64.of_int t.out.size))
     | Body (body, Trailers) ->
-      t.out.fields <- [];
+      (match t.out.fields with
+      | [] -> ()
+      | fields ->
+        t.out.fields <- [];
+        Body.Reader.set_trailers
+          body
+          (Headers.of_rev_list
+             (List.filter
+                (fun (name, _) -> not (Message.is_forbidden_trailer name))
+                fields)));
       finish t body
     | Done | Head_done | Body _ | Fail _ | Cancelled_parse -> ()
 

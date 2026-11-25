@@ -325,6 +325,7 @@ module Server = struct
     ; mutable body : string
     ; mutable body_complete : bool
     ; mutable body_cut : bool
+    ; mutable trailers : Headers.t
     }
 
   type t =
@@ -340,6 +341,7 @@ module Server = struct
         body
         ~on_eof:(fun () ->
           ex.body_complete <- true;
+          ex.trailers <- Body.Reader.trailers body;
           on_complete ex.body)
         ~on_error:(fun () -> ex.body_cut <- true)
         ~on_read:(fun bs ~off ~len ->
@@ -396,6 +398,7 @@ module Server = struct
         ; body = ""
         ; body_complete = false
         ; body_cut = false
+        ; trailers = Headers.empty
         }
       in
       s.exchanges <- s.exchanges @ [ ex ];
@@ -444,6 +447,7 @@ module Client = struct
     ; mutable body : string
     ; mutable body_eof : bool
     ; mutable body_cut : bool
+    ; mutable trailers : Headers.t
     ; mutable errors : string list
     }
 
@@ -467,7 +471,9 @@ module Client = struct
            let rec loop () =
              Body.Reader.schedule_read
                reader
-               ~on_eof:(fun () -> ex.body_eof <- true)
+               ~on_eof:(fun () ->
+                 ex.body_eof <- true;
+                 ex.trailers <- Body.Reader.trailers reader)
                ~on_error:(fun () -> ex.body_cut <- true)
                ~on_read:(fun bs ~off ~len ->
                  ex.body <- ex.body ^ Ache.Bigstring.substring bs ~off ~len;
@@ -493,6 +499,7 @@ module Client = struct
          ; body = ""
          ; body_eof = false
          ; body_cut = false
+         ; trailers = Headers.empty
          ; errors = []
          })
     in

@@ -13,9 +13,9 @@ Test names are in `lib/test/rfc/test_9112_*.ml`; a name followed by "(RFC 9110 s
 
 | Status | Rows |
 |---|---|
-| Tested | 115 |
-| Out of scope | 58 |
-| Total | 173 |
+| Tested | 117 |
+| Out of scope | 57 |
+| Total | 174 |
 
 ## Requirements
 
@@ -130,15 +130,16 @@ Test names are in `lib/test/rfc/test_9112_*.ml`; a name followed by "(RFC 9110 s
 | §7.1#4 | server | SHOULD | The chunked coding does not define any parameters. Their presence SHOULD be treated as an error. | `§7.1 server SHOULD: chunked with parameters is an error` |
 | §7.1.1#D1 | both | DEF | chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] ); chunk-ext-name = token; chunk-ext-val = token / quoted-string | `§7.1.1 server DEF: 400 then close for an invalid chunk-ext`<br>`§7.1.1 client DEF: error and close for an invalid chunk-ext` |
 | §7.1.1#1 | both | MUST | A recipient MUST ignore unrecognized chunk extensions. | `§7.1.1 server MUST: unrecognized chunk extensions are ignored`<br>`§7.1.1 client MUST: unrecognized chunk extensions are ignored` |
-| §7.1.2#D1 | both | DEF | trailer-section = *( field-line CRLF ) | `§7.1.2 server DEF: 400 then close for an invalid trailer field`<br>`§7.1.2 client DEF: error and close for an invalid trailer field` |
-| §7.1.2#1 | both | MAY | A recipient that removes the chunked coding from a message MAY selectively retain or discard the received trailer fields. | `§7.1.2 server MAY: trailer fields are read and discarded`<br>`§7.1.2 client MAY: trailer fields are read and discarded` |
-| §7.1.2#2 | both | MUST | A recipient that retains a received trailer field MUST either store/ forward the trailer field separately from the received header fields or merge the received ... | out of scope: ache discards every trailer field (§7.1.2#1) and retains none |
-| §7.1.2#3 | both | MUST NOT | A recipient MUST NOT merge a received trailer field into the header section unless its corresponding header field definition explicitly permits and instructs how the ... | `§7.1.2 server MAY: trailer fields are read and discarded`<br>`§7.1.2 client MAY: trailer fields are read and discarded`<br>`§6.5.1 server MUST NOT: trailer not merged into request headers` (RFC 9110 suite)<br>`§6.5.1 client MUST NOT: trailer not merged into response headers` (RFC 9110 suite) |
+| §7.1.2#D1 | both | DEF | trailer-section = *( field-line CRLF ) | `§7.1.2 server DEF: 400 then close for an invalid trailer field`<br>`§7.1.2 client DEF: error and close for an invalid trailer field`<br>`§7.1.2 server DEF: trailer fields follow the last chunk as field lines`<br>`§7.1.2 client DEF: trailer fields follow the last chunk as field lines` |
+| §7.1.2#1 | both | MAY | A recipient that removes the chunked coding from a message MAY selectively retain or discard the received trailer fields. | `§7.1.2 server MAY: trailer fields are kept apart, framing fields discarded`<br>`§7.1.2 client MAY: trailer fields are kept apart, framing fields discarded`<br>Received fields in Go's badTrailer list (framing, routing, authentication, content processing) are discarded; the rest are given by `Body.Reader.trailers` |
+| §7.1.2#2 | both | MUST | A recipient that retains a received trailer field MUST either store/ forward the trailer field separately from the received header fields or merge the received ... | `§7.1.2 server MAY: trailer fields are kept apart, framing fields discarded`<br>`§7.1.2 client MAY: trailer fields are kept apart, framing fields discarded`<br>`§6.5.1 server MUST NOT: trailer not merged into request headers` (RFC 9110 suite)<br>`§6.5.1 client MUST NOT: trailer not merged into response headers` (RFC 9110 suite)<br>Retained fields are stored apart, in `Body.Reader.trailers` |
+| §7.1.2#3 | both | MUST NOT | A recipient MUST NOT merge a received trailer field into the header section unless its corresponding header field definition explicitly permits and instructs how the ... | `§7.1.2 server MAY: trailer fields are kept apart, framing fields discarded`<br>`§7.1.2 client MAY: trailer fields are kept apart, framing fields discarded`<br>`§6.5.1 server MUST NOT: trailer not merged into request headers` (RFC 9110 suite)<br>`§6.5.1 client MUST NOT: trailer not merged into response headers` (RFC 9110 suite) |
 | §7.2#1 | n/a | SHOULD | The presence of parameters with any of these compression codings SHOULD be treated as an error. | out of scope: the library implements no compression transfer coding; any non-chunked coding is rejected (see §6.1#9) |
 | §7.3#1 | n/a | MUST | Registrations MUST include the following fields: | out of scope: IANA registry procedure |
 | §7.3#2 | n/a | MUST NOT | Names of transfer codings MUST NOT overlap with names of content codings (Section 8.4.1 of [HTTP]) unless the encoding transformation is identical, as is the ... | out of scope: IANA registry procedure |
 | §7.3#3 | n/a | SHOULD NOT | Future registrations of transfer codings SHOULD NOT define parameters called "q" (case-insensitively) in order to avoid ambiguities. | out of scope: IANA registry procedure |
 | §7.3#4 | n/a | MUST | Values to be added to this namespace require IETF Review (see Section 4.8 of [RFC8126]) and MUST conform to the purpose of transfer coding defined ... | out of scope: IANA registry procedure |
+| §7.4#D1 | server | DEF | The keyword "trailers" indicates that the sender will not discard trailer fields, as described in Section 6.5 of [HTTP]. | `§7.4 server DEF: trailer fields are sent only when TE has trailers` |
 | §7.4#1 | n/a | MUST NOT | A client MUST NOT send the chunked transfer coding name in TE; chunked is always acceptable for HTTP/1.1 recipients. | out of scope: application: it builds the TE field |
 | §7.4#2 | n/a | MAY | When multiple transfer codings are acceptable, the client MAY rank the codings by preference using a case-insensitive "q" parameter (similar to the qvalues used in ... | out of scope: application: it builds the TE field |
 | §7.4#3 | n/a | MUST | Since the TE header field only applies to the immediate connection, a sender of TE MUST also send a "TE" connection option within the Connection ... | out of scope: application: it builds the TE and Connection fields |

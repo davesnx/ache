@@ -225,6 +225,10 @@ module Writer = struct
     schedule_fixed t iovecs;
     write_crlf t.encoder
 
+  let write_last_chunk t trailers =
+    write_chunk_length t.encoder 0;
+    write_headers t.encoder trailers
+
   let on_wakeup t k =
     if Encoder.is_closed t.encoder
     then failwith "on_wakeup on closed writer"

@@ -119,6 +119,19 @@ module Body : sig
     val is_closed : t -> bool
     (** [is_closed t] is [true] if {!close} has been called on [t] and [false]
         otherwise. A closed [t] may still have bytes available for reading. *)
+
+    val trailers : t -> Headers.t
+    (** [trailers t] is the trailer section of a chunked body (RFC 9112
+        §7.1.2), to read in [on_eof]: it is {!Headers.empty} until [on_eof] is
+        called, and always on a body that is not chunked or ends with
+        [on_error]. A [Trailer] header field is ignored. Fields that must
+        not be trailers are dropped: [authorization], [cache-control], [connection], [content-encoding],
+        [content-length], [content-range], [content-type], [expect], [host],
+        [keep-alive], [max-forwards], [pragma], [proxy-authenticate],
+        [proxy-authorization], [proxy-connection], [range], [realm], [te],
+        [trailer], [transfer-encoding] and [www-authenticate]. The trailer
+        section counts against {!Config.max_header_size}; a larger one ends
+        the body with [on_error]. *)
   end
 
   module Writer : sig
@@ -156,10 +169,21 @@ module Body : sig
         about whether those packets have been queued for delivery or have
         actually been received by the intended recipient. *)
 
-    val close : t -> unit
-    (** [close t] closes [t]. Later writes to [t] are ignored. If [t] is
-        writable, this will cause any pending output to become available to the
-        output channel. *)
+    val close : ?trailers:Headers.t -> t -> unit
+    (** [close ?trailers t] closes [t]. Later writes to [t] are ignored, and a
+        later [close] does nothing. If [t] is writable, this will cause any
+        pending output to become available to the output channel.
+
+        [trailers] (default {!Headers.empty}) are sent in the trailer section
+        after the last chunk of a chunked body (RFC 9112 §7.1.2). A server
+        sends them only when the request had [TE: trailers], and drops them
+        otherwise; a client always sends them. They are dropped on a body that
+        is close-delimited or has no content (a response to [HEAD], [204],
+        [304]).
+
+        Raises [Invalid_argument], and leaves [t] open, when [trailers] holds an
+        invalid field, a field that {!Reader.trailers} drops, or when [t] is
+        framed by [Content-Length]. *)
 
     val is_closed : t -> bool
     (** [is_closed t] is [true] if {!close} has been called on [t], or if the
@@ -440,9 +464,10 @@ module Config : sig
     ; response_body_buffer_size : int  (** Default is [4096] *)
     ; max_header_size : int
       (** Largest request or response head, chunk-size line or trailer
-              section, in bytes. Default is [16384]. A larger request head gets
-              a [501], [414] or [431] response, see
-              {!Server_connection.create}. *)
+              section, in bytes, each counted on its own. Default is
+              [16384]. A larger request head gets a [501], [414] or [431]
+              response, see {!Server_connection.create}. A larger trailer
+              section ends the body with [on_error]. *)
     ; proxy : bool
     ; max_pending_output : int
       (** Server: while more response bytes than this wait to be written, the
