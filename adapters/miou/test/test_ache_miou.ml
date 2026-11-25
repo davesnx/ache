@@ -166,12 +166,59 @@ let ws_session = function
   | _ -> None
 
 let ws_gates : unit Miou.Computation.t list ref = ref []
+let body_failed = ref false
+let stream_closed : unit Miou.Computation.t option ref = ref None
 
 let request_handler (_ : Unix.sockaddr) reqd =
   incr requests_seen;
   let request = Request_descriptor.request reqd in
   let body = Request_descriptor.request_body reqd in
   match request.meth, request.target with
+  | `POST, "/count-body" ->
+    let count = ref 0 in
+    let rec on_read _ ~off:_ ~len =
+      count := !count + len;
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () =
+      let text = string_of_int !count in
+      Request_descriptor.respond_with_string
+        reqd
+        (Response.create
+           ~headers:
+             (Headers.of_list
+                [ "content-length", string_of_int (String.length text) ])
+           `OK)
+        text
+    and on_error () = body_failed := true in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+  | `GET, "/stream-forever" ->
+    Body.Reader.close body;
+    let response_body =
+      Request_descriptor.respond_with_streaming
+        reqd
+        (Response.create
+           ~headers:(Headers.of_list [ "transfer-encoding", "chunked" ])
+           `OK)
+    in
+    let chunk = String.make 0x10000 'x' in
+    let rec write n =
+      if n = 0
+      then Body.Writer.close response_body
+      else (
+        Body.Writer.write_string response_body chunk;
+        Body.Writer.flush response_body (function
+          | `Written -> write (n - 1)
+          | `Closed ->
+            Option.iter (fun closed -> resolve closed ()) !stream_closed))
+    in
+    write 1024
+  | `GET, "/sleep-1s" ->
+    Body.Reader.close body;
+    Miou_unix.sleep 1.0;
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers:(Headers.of_list [ "content-length", "4" ]) `OK)
+      "done"
   | `GET, "/slow" ->
     Body.Reader.close body;
     Miou_unix.sleep 0.4;
@@ -356,7 +403,17 @@ let with_timeout seconds f =
   | Ok value -> value
   | Error exn -> raise exn
 
-let with_server ?idle_timeout ?head_timeout ?(date = false) ?stop ?grace f =
+(* Timeouts that a test does not give are off, not at their defaults. *)
+let with_server
+      ?idle_timeout
+      ?head_timeout
+      ?body_timeout
+      ?write_timeout
+      ?(date = false)
+      ?stop
+      ?grace
+      f
+  =
   server_errors := [];
   requests_seen := 0;
   connections_done := 0;
@@ -380,8 +437,10 @@ let with_server ?idle_timeout ?head_timeout ?(date = false) ?stop ?grace f =
                  (fun () ->
                     Ache_miou.Server.create_connection_handler
                       ~date
-                      ?idle_timeout
-                      ?head_timeout
+                      ~idle_timeout
+                      ~head_timeout
+                      ~body_timeout
+                      ~write_timeout
                       ?stop
                       ?grace
                       ~request_handler
@@ -1150,6 +1209,10 @@ let on_socketpair ?(cancel = false) client_side =
       Miou.async (fun () ->
         Ache_miou.Server.create_connection_handler
           ~date:false
+          ~idle_timeout:None
+          ~head_timeout:None
+          ~body_timeout:None
+          ~write_timeout:None
           ~request_handler
           ~error_handler
           server
@@ -1196,6 +1259,10 @@ let test_websocket_waiting_handlers () =
             (fun () ->
                Ache_miou.Server.create_connection_handler
                  ~date:false
+                 ~idle_timeout:None
+                 ~head_timeout:None
+                 ~body_timeout:None
+                 ~write_timeout:None
                  ~request_handler
                  ~error_handler
                  server
@@ -1379,6 +1446,10 @@ let test_cancel_is_not_an_error () =
       Miou.async (fun () ->
         Ache_miou.Server.create_connection_handler
           ~date:false
+          ~idle_timeout:None
+          ~head_timeout:None
+          ~body_timeout:None
+          ~write_timeout:None
           ~request_handler
           ~error_handler
           server
@@ -1585,8 +1656,10 @@ let check_connection_timers_bounded ~connections exchange =
                  (fun () ->
                     Ache_miou.Server.create_connection_handler
                       ~date:false
-                      ~idle_timeout:30.
-                      ~head_timeout:30.
+                      ~idle_timeout:(Some 30.)
+                      ~head_timeout:(Some 30.)
+                      ~body_timeout:None
+                      ~write_timeout:None
                       ~request_handler
                       ~error_handler
                       socket
@@ -1800,22 +1873,19 @@ let early_close_response =
 let early_413_response =
   "HTTP/1.1 413 Content Too Large\r\ncontent-length: 2\r\n\r\nno"
 
-let test_unread_body_without_idle_timeout () =
-  List.iter
-    (fun (target, response) ->
-       with_server (fun addr ->
-         let socket = connect addr in
-         send socket (unread_body_request target);
-         Alcotest.(check string)
-           (target ^ ": response, then the connection closes")
-           response
-           (read_all socket);
-         wait_connection_done ();
-         Miou_unix.close socket))
-    [ "/early-close", early_close_response; "/early-413", early_413_response ]
+let test_unread_body_closing_response () =
+  with_server (fun addr ->
+    let socket = connect addr in
+    send socket (unread_body_request "/early-close");
+    Alcotest.(check string)
+      "response, then the connection closes"
+      early_close_response
+      (read_all socket);
+    Miou_unix.close socket;
+    wait_connection_done ())
 
-let test_unread_body_idle_timeout () =
-  with_server ~idle_timeout:0.3 (fun addr ->
+let test_unread_body_body_timeout () =
+  with_server ~body_timeout:0.3 (fun addr ->
     let socket = connect addr in
     send socket (unread_body_request "/early-413");
     Alcotest.(check string)
@@ -1824,14 +1894,14 @@ let test_unread_body_idle_timeout () =
       (take socket (String.length early_413_response));
     let from = Unix.gettimeofday () in
     Alcotest.(check bool) "closed" true (at_end_of_input socket);
-    check_elapsed "closed at the idle timeout" ~from ~min:0.25 ~max:1.0;
+    check_elapsed "closed at the body timeout" ~from ~min:0.2 ~max:1.0;
     wait_connection_done ();
     Miou_unix.close socket)
 
 let respond_while_body_read_pending ?idle_timeout ~min ~max () =
   pending_response := None;
   pending_body_failed := false;
-  with_server ?idle_timeout (fun addr ->
+  with_server ?idle_timeout ~body_timeout:0.3 (fun addr ->
     let socket = connect addr in
     send socket (unread_body_request "/respond-later");
     let rec respond () =
@@ -1856,10 +1926,10 @@ let respond_while_body_read_pending ?idle_timeout ~min ~max () =
   Alcotest.(check bool) "request body failed" true !pending_body_failed
 
 let test_respond_while_body_read_pending () =
-  respond_while_body_read_pending ~min:0. ~max:0.2 ()
+  respond_while_body_read_pending ~min:0.15 ~max:1.0 ()
 
 let test_respond_while_body_read_pending_idle_timeout () =
-  respond_while_body_read_pending ~idle_timeout:0.3 ~min:0.25 ~max:1.0 ()
+  respond_while_body_read_pending ~idle_timeout:0.3 ~min:0.15 ~max:1.0 ()
 
 let respond_when_pending () =
   let rec respond () =
@@ -1878,7 +1948,7 @@ let late_response = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nlate"
 
 let body_on_error_raises ?idle_timeout () =
   pending_response := None;
-  with_server ?idle_timeout (fun addr ->
+  with_server ?idle_timeout ~body_timeout:0.3 (fun addr ->
     let socket = connect addr in
     send socket (unread_body_request "/respond-later-raise");
     respond_when_pending ();
@@ -1898,7 +1968,7 @@ let test_body_on_error_raises_idle_timeout () =
 let test_body_read_stop_deadlines_independent () =
   pending_response := None;
   pending_body_failed := false;
-  with_server ~idle_timeout:0.3 (fun addr ->
+  with_server ~body_timeout:0.3 (fun addr ->
     let socket = connect addr in
     send
       socket
@@ -1912,17 +1982,18 @@ let test_body_read_stop_deadlines_independent () =
       "first response"
       late_response
       (take socket (String.length late_response));
+    Miou_unix.sleep 0.2;
     send socket "def";
     Miou_unix.sleep 0.01;
+    let from = Unix.gettimeofday () in
     send socket (unread_body_request "/respond-later");
     respond_when_pending ();
     Alcotest.(check string)
       "second response"
       late_response
       (take socket (String.length late_response));
-    let from = Unix.gettimeofday () in
     Alcotest.(check bool) "closed" true (at_end_of_input socket);
-    check_elapsed "closed" ~from ~min:0.25 ~max:0.45;
+    check_elapsed "closed" ~from ~min:0.25 ~max:0.6;
     wait_connection_done ();
     Miou_unix.close socket);
   Alcotest.(check bool) "second body failed" true !pending_body_failed
@@ -1954,7 +2025,7 @@ let test_timeout_check_timing () =
     let bound =
       Ache_miou.Server.create_connection_handler
         ~date:false
-        ~idle_timeout:(-1.)
+        ~idle_timeout:(Some (-1.))
         ~request_handler
         ~error_handler
     in
@@ -1968,7 +2039,7 @@ let test_timeout_check_timing () =
       (raises (fun () ->
          Ache_miou.Server.create_connection_handler
            ~date:false
-           ~head_timeout:0.
+           ~head_timeout:(Some 0.)
            ~request_handler
            ~error_handler
            socket
@@ -1984,7 +2055,7 @@ let test_timeout_check_timing () =
              (take
                 (Ache_miou.Server.create_connection_handler
                    ~date:false
-                   ~idle_timeout:(-1.)
+                   ~idle_timeout:(Some (-1.))
                    ~request_handler
                    ~error_handler))));
     Alcotest.(check bool)
@@ -1999,13 +2070,36 @@ let test_timeout_check_timing () =
            (Ache_miou.Server.create_connection_handler
               ~date:false
               ~config:Ache.Config.default
-              ~idle_timeout:(-1.)
-              ~head_timeout:1.
+              ~idle_timeout:(Some (-1.))
+              ~head_timeout:(Some 1.)
+              ~body_timeout:(Some 1.)
+              ~write_timeout:(Some 1.)
               ~stop:(Miou.Computation.create ())
               ~grace:1.
               ~request_handler
               ~error_handler
             : _ -> _ -> unit)));
+    List.iter
+      (fun (name, f) -> Alcotest.(check bool) name true (raises f))
+      [ ( "zero body_timeout raises"
+        , fun () ->
+            Ache_miou.Server.create_connection_handler
+              ~date:false
+              ~body_timeout:(Some 0.)
+              ~request_handler
+              ~error_handler
+              socket
+              addr )
+      ; ( "negative write_timeout raises"
+        , fun () ->
+            Ache_miou.Server.create_connection_handler
+              ~date:false
+              ~write_timeout:(Some (-1.))
+              ~request_handler
+              ~error_handler
+              socket
+              addr )
+      ];
     Alcotest.(check bool)
       "zero grace raises"
       true
@@ -2631,13 +2725,15 @@ let test_server_run_stop () =
              "busy: response with connection: close"
              slow_response_close
              (read_all busy);
+           (* With the default timeouts, a closing connection reads until the
+              peer closes. *)
+           Miou_unix.close idle;
+           Miou_unix.close busy;
            Alcotest.(check (result unit reject))
              "run returns"
              (Ok ())
              (await returned);
            check_elapsed "run returned" ~from ~min:0.2 ~max:1.0;
-           Miou_unix.close idle;
-           Miou_unix.close busy;
            let socket = Miou_unix.tcpv4 () in
            Fun.protect
              ~finally:(fun () -> Miou_unix.close socket)
@@ -2645,6 +2741,136 @@ let test_server_run_stop () =
                 match Miou_unix.connect socket addr with
                 | () -> Alcotest.fail "a connection was accepted after stop"
                 | exception Unix.Unix_error (ECONNREFUSED, _, _) -> ()))))
+
+let count_body_head length =
+  Printf.sprintf
+    "POST /count-body HTTP/1.1\r\nhost: localhost\r\ncontent-length: %d\r\n\r\n"
+    length
+
+let test_body_trickle_times_out () =
+  body_failed := false;
+  with_server ~body_timeout:0.3 (fun addr ->
+    let socket = connect addr in
+    send socket (count_body_head 100);
+    let from = Unix.gettimeofday () in
+    let sender =
+      Miou.async (fun () ->
+        try
+          for _ = 1 to 20 do
+            send socket "x";
+            Miou_unix.sleep 0.2
+          done
+        with
+        | Unix.Unix_error ((EPIPE | ECONNRESET), _, _) -> ())
+    in
+    let output = read_all socket in
+    Miou.cancel sender;
+    Alcotest.(check string)
+      "408"
+      "HTTP/1.1 408 Request Timeout"
+      (status_line output);
+    check_elapsed "timed out" ~from ~min:0.3 ~max:1.5;
+    wait_connection_done ();
+    Miou_unix.close socket);
+  Alcotest.(check bool) "on_error" true !body_failed
+
+let test_body_progress_not_timed_out () =
+  body_failed := false;
+  let rounds = 6
+  and size = 2100 in
+  with_server ~body_timeout:0.3 (fun addr ->
+    let socket = connect addr in
+    send socket (count_body_head (rounds * size));
+    for _ = 1 to rounds do
+      Miou_unix.sleep 0.2;
+      send socket (String.make size 'x')
+    done;
+    let text = string_of_int (rounds * size) in
+    let response =
+      Printf.sprintf
+        "HTTP/1.1 200 OK\r\ncontent-length: %d\r\n\r\n%s"
+        (String.length text)
+        text
+    in
+    Alcotest.(check string)
+      "whole body"
+      response
+      (take socket (String.length response));
+    Miou_unix.close socket;
+    wait_connection_done ());
+  Alcotest.(check bool) "no on_error" false !body_failed
+
+let test_write_timeout () =
+  let closed = Miou.Computation.create () in
+  stream_closed := Some closed;
+  Fun.protect
+    ~finally:(fun () -> stream_closed := None)
+    (fun () ->
+       with_server ~write_timeout:0.3 (fun addr ->
+         let socket = connect addr in
+         send socket (get_target "/stream-forever");
+         let from = Unix.gettimeofday () in
+         with_timeout 1.5 (fun () -> await closed);
+         check_elapsed "flush got `Closed" ~from ~min:0.3 ~max:1.5;
+         wait_connection_done ();
+         Miou_unix.close socket))
+
+let test_slow_handler_not_timed_out () =
+  with_server
+    ~idle_timeout:0.3
+    ~head_timeout:0.3
+    ~body_timeout:0.3
+    ~write_timeout:0.3
+    (fun addr ->
+       let socket = connect addr in
+       send socket (get_target "/sleep-1s");
+       let response = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\ndone" in
+       Alcotest.(check string)
+         "response"
+         response
+         (take socket (String.length response));
+       Miou_unix.close socket;
+       wait_connection_done ());
+  Alcotest.(check int) "no error" 0 (List.length !server_errors)
+
+let test_websocket_idle_timeout () =
+  let ended = wait_ws_end () in
+  with_server ~idle_timeout:0.3 (fun addr ->
+    let socket = ws_connect addr "/ws-echo" in
+    let from = Unix.gettimeofday () in
+    Alcotest.(check string)
+      "close frame 1001"
+      "\x88\x02\x03\xe9"
+      (take socket 4);
+    check_elapsed "idle" ~from ~min:0.25 ~max:1.0;
+    Alcotest.(check string) "then end of input" "" (read_all socket);
+    Alcotest.(check (result string reject))
+      "session"
+      (Ok "receive None")
+      (await ended);
+    wait_connection_done ();
+    Miou_unix.close socket)
+
+let test_idle_timeout_none () =
+  with_server
+    ~head_timeout:0.1
+    ~body_timeout:0.1
+    ~write_timeout:0.1
+    (fun addr ->
+       let socket = connect addr in
+       send socket get_hello;
+       Alcotest.(check string)
+         "first response"
+         hello_response
+         (take socket (String.length hello_response));
+       Miou_unix.sleep 0.4;
+       send socket get_hello;
+       Alcotest.(check string)
+         "second response"
+         hello_response
+         (take socket (String.length hello_response));
+       Miou_unix.close socket;
+       wait_connection_done ())
 
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
@@ -2790,16 +3016,16 @@ let () =
           , test_head_deadline )
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
-        ; ( "unread body after the response, no idle_timeout: closes"
+        ; ( "unread body after a closing response: response, then the end"
           , `Quick
-          , test_unread_body_without_idle_timeout )
-        ; ( "unread body after the response: idle_timeout"
+          , test_unread_body_closing_response )
+        ; ( "unread body after the response: body_timeout"
           , `Quick
-          , test_unread_body_idle_timeout )
-        ; ( "response while a body read waits, no idle_timeout: closes"
+          , test_unread_body_body_timeout )
+        ; ( "response while a body read waits: body_timeout"
           , `Quick
           , test_respond_while_body_read_pending )
-        ; ( "response while a body read waits: idle_timeout"
+        ; ( "response while a body read waits: body_timeout, idle_timeout"
           , `Quick
           , test_respond_while_body_read_pending_idle_timeout )
         ; ( "response while a body read waits, body on_error raises"
@@ -2809,9 +3035,27 @@ let () =
              idle_timeout"
           , `Quick
           , test_body_on_error_raises_idle_timeout )
-        ; ( "each body read stop has its own deadline"
+        ; ( "the body clock restarts for each request"
           , `Quick
           , test_body_read_stop_deadlines_independent )
+        ; ( "a body that trickles 1 byte at a time gets 408"
+          , `Quick
+          , test_body_trickle_times_out )
+        ; ( "a body sent at 2048 bytes per wait is not timed out"
+          , `Quick
+          , test_body_progress_not_timed_out )
+        ; ( "a client that stops reading is closed after write_timeout"
+          , `Quick
+          , test_write_timeout )
+        ; ( "a slow handler that reads no body is not timed out"
+          , `Quick
+          , test_slow_handler_not_timed_out )
+        ; ( "an idle WebSocket gets close 1001 after idle_timeout"
+          , `Quick
+          , test_websocket_idle_timeout )
+        ; ( "~idle_timeout:None turns the idle timeout off"
+          , `Quick
+          , test_idle_timeout_none )
         ; ( "when the timeout arguments are checked"
           , `Quick
           , test_timeout_check_timing )

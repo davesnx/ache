@@ -147,8 +147,10 @@ module Server = struct
   let create_connection_handler
         ?config
         ?clock
-        ?idle_timeout
-        ?head_timeout
+        ?(idle_timeout = Some 60.)
+        ?(head_timeout = Some 30.)
+        ?body_timeout
+        ?write_timeout
         ?date
         ?stop
         ?grace
@@ -160,27 +162,35 @@ module Server = struct
       Ache_eio.Server.create_connection_handler
         ?config
         ?clock
-        ?idle_timeout
-        ?head_timeout
+        ~idle_timeout
+        ~head_timeout
+        ?body_timeout
+        ?write_timeout
         ?date
         ?stop
         ?grace
         ~request_handler
         ~error_handler
     in
+    let limit =
+      match idle_timeout, head_timeout with
+      | None, None -> None
+      | Some seconds, None | None, Some seconds -> Some seconds
+      | Some idle, Some head -> Some (Float.min idle head)
+    in
     fun tcp client_addr ->
       let handshake () = Tls_eio.server_of_flow tls tcp in
       let handshake () =
-        let limit =
-          match idle_timeout, head_timeout with
-          | None, None -> None
-          | Some seconds, None | None, Some seconds -> Some seconds
-          | Some idle, Some head -> Some (Float.min idle head)
-        in
         match clock, limit with
         | Some clock, Some seconds ->
           Eio.Time.with_timeout_exn clock seconds handshake
-        | _ -> handshake ()
+        | None, Some seconds ->
+          Eio.Fiber.first
+            (fun () ->
+               Eio_unix.sleep seconds;
+               raise Eio.Time.Timeout)
+            handshake
+        | _, None -> handshake ()
       in
       let flow =
         match stop with

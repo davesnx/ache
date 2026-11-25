@@ -27,6 +27,35 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   codes have constructors.
 - The `respond_with_*` functions and `Client_connection.request` raise
   `Invalid_argument` for a head they cannot send correctly.
+- `ache-miou`, `ache-miou-tls`: the server timeouts are on by default and
+  take a `float option`: `?idle_timeout` (60 s), `?head_timeout` (30 s),
+  and the new `?body_timeout` (60 s, request body progress) and
+  `?write_timeout` (60 s, write progress); `None` turns one off. An idle
+  WebSocket is closed with code 1001 after `idle_timeout`. A request body
+  left unread after its response is no longer dropped at once without
+  `idle_timeout`: `body_timeout` bounds it.
+- `ache-lwt`, `ache-lwt-tls`: the server timeouts are on by default and
+  take a `float option`: `?idle_timeout` (60 s), `?head_timeout` (30 s),
+  and the new `?body_timeout` (60 s, request body progress, counted in
+  shared ticks of a tenth) and `?write_timeout` (60 s, write progress);
+  `None` turns one off. An idle WebSocket is closed with code 1001 after
+  `idle_timeout`. A request body left unread after its response is bounded
+  by `body_timeout`, no longer by `idle_timeout` (or dropped at once).
+- `ache-eio`, `ache-eio-tls`: the server timeouts are on by default and
+  take a `float option`: `?idle_timeout` (60 s), `?head_timeout` (30 s),
+  and the new `?body_timeout` (60 s, request body progress) and
+  `?write_timeout` (60 s, write progress); `None` turns one off. They no
+  longer need `?clock`: without it the server uses the system clock, and
+  it always lingers after a closing response. An idle WebSocket is closed
+  with code 1001 after `idle_timeout`. A request body left unread after its
+  response is bounded by `body_timeout`, no longer by `idle_timeout` (or
+  dropped at once).
+- `Server_connection.read_timeout` answers `` `Body `` whenever a read
+  waits for request body bytes, also before the response is complete, and
+  its action sends 408 when no response has started (otherwise it closes).
+  On a connection upgraded with `Websocket.upgrade` it answers `` `Idle ``,
+  whose action closes with code 1001 (new `Websocket.read_timeout`). It
+  answers `None` only while no read waits for the peer.
 
 ### New
 

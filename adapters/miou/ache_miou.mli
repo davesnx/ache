@@ -43,8 +43,10 @@ module Server : sig
 
   val run :
      ?config:Ache.Config.t
-    -> ?idle_timeout:float
-    -> ?head_timeout:float
+    -> ?idle_timeout:float option
+    -> ?head_timeout:float option
+    -> ?body_timeout:float option
+    -> ?write_timeout:float option
     -> ?date:bool
     -> ?domains:int
     -> ?backlog:int
@@ -69,8 +71,8 @@ module Server : sig
 
       Call it inside [Miou_unix.run]. Each accepted socket is served in its
       own task, in the domain that accepted it, by the handler from
-      {!create_connection_handler}, which takes [config], [idle_timeout],
-      [head_timeout], [date], [stop], [grace], [request_handler] and
+      {!create_connection_handler}, which takes [config], the four timeouts
+      (on by default), [date], [stop], [grace], [request_handler] and
       [error_handler].
       [request_handler] and [error_handler] run in several domains at the
       same time. When the handler of a connection raises (see
@@ -234,12 +236,14 @@ module Websocket : sig
   val close : ?reason:string -> t -> int -> unit
   (** [close ?reason t code] sends a close frame with [code] and [reason] (see
       {!Ache.Websocket.close}). It returns when the connection is closed: the
-      frame is written, or the connection ended. The socket closes when the
-      read in progress also ends: when the client answers with its close
-      frame or closes the connection.
+      frame is written, or the connection ended. The connection stops
+      reading, and closes as any closing connection of
+      {!Server.create_connection_handler} does: it reads and drops input
+      until the client closes, at most [idle_timeout] (the default), and at
+      once without timeouts.
 
-      There is no timeout: when the client neither answers nor closes, the
-      connection stays open until its task is cancelled.
+      A session whose client sends nothing for [idle_timeout] is closed with
+      code 1001: {!receive} returns [None].
 
       @raise Invalid_argument
         at once if [code] is not one an endpoint may send, or [reason] is not

@@ -70,6 +70,8 @@ module IO_loop = struct
     -> timed_read:((unit -> int Lwt.t) -> (int, [ `Timeout ]) result Lwt.t)
     -> close:(unit -> unit Lwt.t)
     -> ?writer_waits:(unit -> unit)
+    -> ?writev:
+         (Ache.Bigstring.t Ache.IOVec.t list -> [ `Closed | `Ok of int ] Lwt.t)
     -> fd
     -> unit Lwt.t
     =
@@ -80,6 +82,7 @@ module IO_loop = struct
      ~timed_read
      ~close
      ?(writer_waits = ignore)
+     ?writev
      socket ->
     let read_buffer = Buffer.create read_buffer_size in
     let failed, notify_failed = Lwt.wait () in
@@ -139,7 +142,7 @@ module IO_loop = struct
       in
       Lwt.async (fun () -> Lwt.catch read_loop_step read_failed)
     in
-    let writev = Io.writev socket in
+    let writev = Option.value writev ~default:(Io.writev socket) in
     let write_loop_exited, notify_write_loop_exited = Lwt.wait () in
     let rec write_loop () =
       let rec write_loop_step () =
@@ -414,10 +417,20 @@ module Make (Io : IO) = struct
              name)
       | _ -> ()
 
+    (* The body and write clocks restart after this many bytes, so that a peer
+       that sends or reads a byte at a time cannot keep them alive. *)
+    let progress_bytes = 2048
+
+    (* The body clock counts in ticks of a tenth of [body_timeout], so that all
+       connections share one [Timeout] queue for each [body_timeout]. *)
+    let body_ticks = 10
+
     let create_connection_handler
           ?(config = Ache.Config.default)
-          ?idle_timeout
-          ?head_timeout
+          ?(idle_timeout = Some 60.)
+          ?(head_timeout = Some 30.)
+          ?(body_timeout = Some 60.)
+          ?(write_timeout = Some 60.)
           ?(date = true)
           ?stop
           ?grace
@@ -428,6 +441,8 @@ module Make (Io : IO) = struct
       =
       check_timeout "idle_timeout" idle_timeout;
       check_timeout "head_timeout" head_timeout;
+      check_timeout "body_timeout" body_timeout;
+      check_timeout "write_timeout" write_timeout;
       check_timeout "grace" grace;
       let close = IO_loop.close_once Io.close socket in
       match stop with
@@ -435,7 +450,22 @@ module Make (Io : IO) = struct
       | _ ->
         let head_timer = Option.map Timeout.create head_timeout
         and head_armed = ref false
-        and idle_timer = Option.map Timeout.create idle_timeout in
+        and idle_timer = Option.map Timeout.create idle_timeout
+        and tick_timer =
+          Option.map
+            (fun seconds -> Timeout.create (seconds /. float body_ticks))
+            body_timeout
+        and write_timer = Option.map Timeout.create write_timeout in
+        (* Body clock: ticks counted while a read waits in the [`Body] phase,
+           and bytes read in that phase since the last restart. *)
+        let ticks = ref 0
+        and body_progress = ref 0
+        and ticking = ref false
+        and body_wait = ref None in
+        let restart_body_clock () =
+          ticks := 0;
+          body_progress := 0
+        in
         let stop_head_timer () =
           head_armed := false;
           Option.iter Timeout.stop head_timer
@@ -447,6 +477,7 @@ module Make (Io : IO) = struct
             ?date:(if date then Some current_date else None)
             (fun reqd ->
                stop_head_timer ();
+               restart_body_clock ();
                request_handler client_addr reqd)
         in
         let observe () =
@@ -480,21 +511,38 @@ module Make (Io : IO) = struct
           on_timeout ();
           Error `Timeout
         in
-        let body_limit on_timeout =
-          match idle_timer with
-          | Some timer ->
-            Timeout.set timer;
-            expire timer on_timeout
-          | None ->
-            on_timeout ();
-            Lwt.return (Error `Timeout)
+        (* One tick of the body clock. A tick that ends while no read waits in
+           the [`Body] phase is not counted, and the clock stops until the next
+           such read. *)
+        let rec tick timer () =
+          match !body_wait with
+          | Some u ->
+            incr ticks;
+            if !ticks >= body_ticks
+            then (
+              ticking := false;
+              body_wait := None;
+              Lwt.wakeup_later u ())
+            else (
+              Timeout.set timer;
+              Lwt.on_success (Timeout.expired timer) (tick timer))
+          | None -> ticking := false
         in
-        let writer_waits = Lwt_condition.create () in
-        let rec until_response_complete () =
-          match Ache.Server_connection.read_timeout connection with
-          | Some (`Body, on_timeout) -> body_limit on_timeout
-          | Some ((`Idle | `Head), _) | None ->
-            Lwt_condition.wait writer_waits >>= until_response_complete
+        let body_limit timer =
+          let p, u = Lwt.wait () in
+          body_wait := Some u;
+          if not !ticking
+          then (
+            ticking := true;
+            Timeout.set timer;
+            Lwt.on_success (Timeout.expired timer) (tick timer));
+          p >|= fun () ->
+          restart_body_clock ();
+          (* The action depends on the state when the clock runs out. *)
+          (match Ache.Server_connection.read_timeout connection with
+          | Some (`Body, expire) -> expire ()
+          | Some ((`Idle | `Head), _) | None -> ());
+          Error `Timeout
         in
         (* The idle read in progress, which [drain] ends: a drained idle
            connection reads nothing more. *)
@@ -507,32 +555,108 @@ module Make (Io : IO) = struct
         let timed_read read =
           observe ();
           let reading = IO_loop.untimed_read read in
+          let phase = Ache.Server_connection.read_timeout connection in
+          let counted =
+            match phase, tick_timer with
+            | Some (`Body, _), Some _ ->
+              reading >|= fun result ->
+              (match result with
+              | Ok n ->
+                body_progress := !body_progress + n;
+                if !body_progress >= progress_bytes then restart_body_clock ()
+              | Error `Timeout -> ());
+              result
+            | _ -> reading
+          in
           let limits =
             if not (Lwt.is_sleeping reading)
             then []
             else
-              match
-                Ache.Server_connection.read_timeout connection, idle_timer
-              with
-              | Some (`Idle, on_timeout), Some timer ->
-                Timeout.set timer;
-                [ expire timer on_timeout ]
-              | Some (`Head, on_timeout), _ when !head_armed ->
+              match phase with
+              | Some (`Idle, on_timeout) ->
+                (match idle_timer with
+                | Some timer ->
+                  Timeout.set timer;
+                  [ expire timer on_timeout ]
+                | None -> [])
+              | Some (`Head, on_timeout) when !head_armed ->
                 Option.to_list
                   (Option.map (fun timer -> expire timer on_timeout) head_timer)
-              | Some ((`Idle | `Head), _), _ -> []
-              | Some (`Body, on_timeout), _ -> [ body_limit on_timeout ]
-              | None, _ -> [ until_response_complete () ]
+              | Some (`Head, _) -> []
+              | Some (`Body, _) ->
+                Option.to_list (Option.map body_limit tick_timer)
+              | None -> []
           in
           let limits =
-            match stop, Ache.Server_connection.read_timeout connection with
+            match stop, phase with
             | Some _, Some (`Idle, _) when Lwt.is_sleeping reading ->
               drainable () :: limits
             | _ -> limits
           in
           match limits with
-          | [] -> reading
-          | limits -> Lwt.pick (reading :: limits)
+          | [] -> counted
+          | limits ->
+            let waiting = !body_wait in
+            let result = Lwt.pick (counted :: limits) in
+            (* The next read can start before this callback runs. *)
+            Lwt.on_termination result (fun () ->
+              match !body_wait, waiting with
+              | Some u, Some mine when u == mine -> body_wait := None
+              | _ -> ());
+            result
+        in
+        let cancelled, notify_cancelled = Lwt.wait () in
+        let cancel () =
+          (try Ache.Server_connection.shutdown connection with _ -> ());
+          Lwt.on_termination (close ()) (fun () ->
+            if Lwt.is_sleeping cancelled
+            then Lwt.wakeup_later notify_cancelled ())
+        in
+        (* Write clock: runs while output is pending; restarts when all of it is
+           written or after [progress_bytes]. *)
+        let written = ref 0
+        and write_clock = ref false in
+        let stop_write_clock () =
+          if !write_clock
+          then (
+            write_clock := false;
+            Option.iter Timeout.stop write_timer)
+        in
+        let writev =
+          match write_timer with
+          | None -> None
+          | Some timer ->
+            Some
+              (fun iovecs ->
+                if not !write_clock
+                then (
+                  write_clock := true;
+                  written := 0;
+                  Timeout.set timer);
+                let account = function
+                  | `Ok n ->
+                    written := !written + n;
+                    if !written >= progress_bytes
+                    then (
+                      written := 0;
+                      Timeout.set timer)
+                  | `Closed -> ()
+                in
+                let writing = Io.writev socket iovecs in
+                if not (Lwt.is_sleeping writing)
+                then (
+                  Lwt.on_success writing account;
+                  writing)
+                else
+                  Lwt.pick
+                    [ ( writing >|= fun result ->
+                        account result;
+                        result )
+                    ; ( Timeout.expired timer >|= fun () ->
+                        write_clock := false;
+                        cancel ();
+                        `Closed )
+                    ])
         in
         let serving =
           IO_loop.start
@@ -542,23 +666,19 @@ module Make (Io : IO) = struct
             ~read_buffer_size:config.read_buffer_size
             ~timed_read
             ~close
-            ~writer_waits:(fun () -> Lwt_condition.broadcast writer_waits ())
+            ~writer_waits:stop_write_clock
+            ?writev
             socket
         in
-        let cancelled, notify_cancelled = Lwt.wait () in
         let ended =
           Lwt.finalize
             (fun () -> Lwt.choose [ serving; cancelled ])
             (fun () ->
                Option.iter Timeout.stop head_timer;
                Option.iter Timeout.stop idle_timer;
+               Option.iter Timeout.stop tick_timer;
+               Option.iter Timeout.stop write_timer;
                Lwt.return_unit)
-        in
-        let cancel () =
-          (try Ache.Server_connection.shutdown connection with _ -> ());
-          Lwt.on_termination (close ()) (fun () ->
-            if Lwt.is_sleeping cancelled
-            then Lwt.wakeup_later notify_cancelled ())
         in
         let drain () =
           Ache.Server_connection.drain connection;

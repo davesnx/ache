@@ -77,9 +77,9 @@ client on such a flow reports a cut response as complete. A request body
 always has an explicit length, so a server reports a cut body without this
 check.
 
-Timeouts: when `?idle_timeout` or `?head_timeout` is set (with `?clock` for
-Eio), the TLS handshake must be complete within the smaller of them. Without
-either, the handshake has no time limit. A client that sends plain HTTP to a
+Timeouts: the TLS handshake must be complete within the smaller of
+`?idle_timeout` and `?head_timeout` (30 s by default). With both off, the
+handshake has no time limit. A client that sends plain HTTP to a
 TLS port gets no answer, because ocaml-tls waits for the rest of what it
 reads as a TLS record, so without a timeout the connection stays open until
 the client closes it.
@@ -105,7 +105,7 @@ on the same connection get their responses first.
 | A method longer than `Config.max_header_size` | 501 |
 | A target that makes the request line longer than `max_header_size` | 414 |
 | A head longer than `max_header_size` (default 16 KiB) | 431 |
-| A head that is not complete when `?head_timeout` expires (off by default) | 408 |
+| A head that is not complete when `?head_timeout` expires (30 s by default) | 408 |
 | A major version other than 1 | 505 |
 
 ache accepts HTTP/1.x with x > 1 as HTTP/1.1, one empty line before the
@@ -160,8 +160,8 @@ httpun rejected chunk extensions and trailers.
   many small chunks is delivered in linear time. ache does not reuse the
   bytes it gives to `on_read`.
 - When the response is complete, the server reads and drops the rest of a
-  request body that the application did not read. It waits for the rest of
-  the body at most `?idle_timeout` (see [Limits](#limits)).
+  request body that the application did not read, within the body timeout
+  (see [Timeouts](#timeouts)).
 
 ### Client
 
@@ -417,22 +417,30 @@ The core decides which limit applies to the next read
 
 - the head timeout, while a request head is only partly received;
 - the idle timeout, on a keep-alive connection that waits for its next
-  request;
-- the idle timeout, once the response is complete and the rest of the
-  request body has not arrived;
-- none, while a request is in progress and its response is not complete,
-  for example while a body arrives for a handler that has not answered.
+  request, and on a WebSocket connection that reads frames;
+- the body timeout, while the connection waits for request body bytes: the
+  application has scheduled a read on the body, or the response is complete
+  and the rest of the body has not arrived;
+- none, while no read waits for the peer, for example while the handler
+  runs and has not asked for the body, or after an upgrade to a protocol
+  other than WebSocket.
 
-The runtime owns the clock and starts the timer. When the timer fires first,
-the core sends `408`, or closes the connection (a request body that has not
-ended gets `on_error`). Without `?idle_timeout` and `?head_timeout` (and, in
-`ache-eio`, without `?clock`), no timer is used, and the runtime does not
-wait for the rest of a body after its response: it closes the connection
-at once.
+The runtime owns the clock and starts the timer, and asks again before each
+read. When the timer fires first, it calls the action that the core gave
+for the state at that time: `408` for a head; for a body, `on_error` and
+then `408` if no response has started, or a close; a close for an idle
+connection, with close code 1001 on a WebSocket.
 
-A read can start before the response is complete, and the response can
-complete while the read waits. Each time the write loop waits or ends, it
-tells the read loop, which then asks the core for the limit again.
+The runtimes count the body and write limits as progress, after warp and
+Cowboy: the body clock runs only while the connection waits for body bytes,
+the write clock only while a write waits, and each starts again from zero
+after 2048 bytes. A peer that trickles one byte at a time cannot keep a
+connection open, and a handler that is slow to answer is never timed out.
+A write that makes no progress closes the connection; the core sees it as
+a failed write (`` `Closed ``).
+
+All four timeouts are on by default in every runtime: head 30 s, idle,
+body and write 60 s. Passing `None` turns one off.
 
 ### Graceful stop
 
@@ -482,25 +490,25 @@ runtimes.
 - TLS is ocaml-tls only (see [TLS](#tls)): there is no OpenSSL runtime.
 - Trailer fields are read and discarded. The API does not give them to the
   application.
-- Server timeouts are off by default. `?idle_timeout` closes a connection
-  that waits for a request, or for the rest of a request body after its
-  response. `?head_timeout` answers 408 to a request head that is not
-  complete in time. A request body is not timed out before its response is
-  complete, and a response in progress is never timed out.
-- After the response, the server waits for the rest of the request body at
-  most `?idle_timeout`. Without `?idle_timeout` it does not wait: the body
-  gets `on_error` and the connection closes. This applies to a response that
-  closes the connection and to a keep-alive response, such as a 413, sent
-  before the body was read.
+- Server timeouts are on by default (see [Timeouts](#timeouts)): 30 s for a
+  request head, 60 s for an idle connection, and 60 s without progress for
+  a request body or a write. `None` turns one off. With
+  `~body_timeout:None` the server waits for the rest of an unread request
+  body without limit; with `~write_timeout:None` a client that stops
+  reading keeps the connection open.
+- After the response, the server reads the rest of the request body
+  within the body timeout, to find the next request. This applies to a
+  response that closes the connection and to a keep-alive response, such
+  as a 413, sent before the body was read.
 - Once its write side has closed, the server reads and dispatches no new
   request; the request in progress still gets its body, within the limit
   above.
 - While more than `Config.max_pending_output` bytes of responses wait to be
   written, the server reads no new request.
-- WebSocket: server only. There are no extensions and no subprotocols. ache
-  has no timeout on an upgraded
-  connection: a client that stops reading, or never answers a close frame,
-  keeps the connection open until you close the socket.
+- WebSocket: server only. There are no extensions and no subprotocols. A
+  WebSocket connection that receives nothing for the idle timeout is closed
+  with code 1001, and one whose writes make no progress for the write
+  timeout is closed.
 - The API is not stable before 1.0.
 
 ## Testing

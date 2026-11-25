@@ -195,17 +195,35 @@ end
 (** The function that results from [create_connection_handler] can be passed to
     [Lwt_io.establish_server_with_client_socket].
 
-    Timeouts of [create_connection_handler] are in seconds and are off by
-    default:
-    - [idle_timeout]: when no request is in progress and no byte arrives for
-      [idle_timeout], the connection closes without a response.
-    - [head_timeout]: when a request head is not complete [head_timeout] after
-      its first bytes were read, [error_handler] is called with
-      [`Request_timeout] (408) and the connection closes after the error
-      response.
+    Timeouts of [create_connection_handler] are in seconds. Each is on by
+    default; [~idle_timeout:None] (and so on) turns one off.
+    - [idle_timeout] (default [Some 60.]): when no request is in progress and
+      no byte arrives for [idle_timeout], the connection closes without a
+      response. On a connection upgraded with {!Websocket.upgrade}: when no
+      frame arrives for [idle_timeout], the connection sends a close frame
+      with code [1001] and closes.
+    - [head_timeout] (default [Some 30.]): when a request head is not
+      complete [head_timeout] after its first bytes were read,
+      [error_handler] is called with [`Request_timeout] (408) and the
+      connection closes after the error response. Each request head,
+      pipelined or not, has its own limit.
+    - [body_timeout] (default [Some 60.]): the connection waits for request
+      body bytes (a read is scheduled on the body, or the response is
+      complete and the rest of the body has not arrived) and the client
+      sends less than 2048 bytes in [body_timeout] of waiting. The body gets
+      [on_error]; then the client gets 408 if no response started, and
+      otherwise the connection closes after its pending output. The clock
+      counts only while the connection waits for body bytes, restarts at
+      each request and after each 2048 bytes, and counts in tenths of
+      [body_timeout], so it can run out up to a tenth late.
+    - [write_timeout] (default [Some 60.]): output waits to be written and
+      less than 2048 bytes of it are written in [write_timeout], for example
+      because the client stopped reading. The connection closes its socket
+      and ends; pending [Body.Writer.flush] callbacks get [`Closed]. The
+      clock restarts when all output is written and after each 2048 bytes.
 
-    A request body or a response in progress is never timed out. Each request
-    head, pipelined or not, has its own limit.
+    While the request handler runs and the connection waits for nothing
+    from the client, no timeout applies.
 
     [date] defaults to [true]: each response that is not 1xx and has no [Date]
     field gets [Date] with the current time (RFC 9110 §6.6.1), as
@@ -221,8 +239,8 @@ end
       connection sends a close frame with code [1001].
     + [grace] seconds later, a connection that is still open is cancelled:
       it stops, and its socket is closed without waiting for the handler or
-      for pending output, and the promise of the connection resolves. Without [grace] the
-      connection has no time limit.
+      for pending output, and the promise of the connection resolves.
+      Without [grace] the connection has no time limit.
 
     A handler applied to a socket after [stop] resolved closes the socket
     and does not read a request. [create_connection_handler] does not stop

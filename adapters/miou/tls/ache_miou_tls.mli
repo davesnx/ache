@@ -89,8 +89,10 @@ module Server : sig
 
   val create_connection_handler_with_fd :
      ?config:Ache.Config.t
-    -> ?idle_timeout:float
-    -> ?head_timeout:float
+    -> ?idle_timeout:float option
+    -> ?head_timeout:float option
+    -> ?body_timeout:float option
+    -> ?write_timeout:float option
     -> ?date:bool
     -> ?stop:unit Miou.Computation.t
     -> ?grace:float
@@ -106,9 +108,10 @@ module Server : sig
       [date], [stop] and [grace]. A handshake in progress when [stop] is
       resolved is treated as an idle connection: it stops, and the handler
       returns.
-      When [idle_timeout] or [head_timeout] is set, the handshake must be
-      complete within the smaller of them; without either, it has no time
-      limit.
+      The handshake must be complete within the smaller of [idle_timeout]
+      and [head_timeout] (30 s with the defaults); when both are [None], it
+      has no time limit. [write_timeout] applies to the TLS records: a peer
+      that stops reading is closed after it, without [close_notify].
 
       When the handshake fails or takes too long, the handler returns; the
       error is not reported. To see it, call {!server_of_fd} and then

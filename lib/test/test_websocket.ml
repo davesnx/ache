@@ -785,8 +785,34 @@ let test_pause_reading () =
   feed c hello_masked;
   check_messages c [ "Hello" ]
 
+let test_idle_timeout () =
+  let c = upgraded () in
+  (match
+     Websocket.read_timeout (ws c), Server_connection.read_timeout c.server
+   with
+  | Some (`Idle, _), Some (`Idle, close) -> close ()
+  | _ -> Alcotest.fail "expected an idle timeout on an open connection");
+  check_output c (close_frame_out 1001) `Close;
+  check_reader_closed c;
+  Alcotest.(check bool)
+    "no timeout once closed"
+    true
+    (Option.is_none (Websocket.read_timeout (ws c)));
+  let c = upgraded () in
+  Websocket.pause_reading (ws c);
+  Alcotest.(check bool)
+    "no timeout while reading is paused"
+    true
+    (Option.is_none (Server_connection.read_timeout c.server));
+  Websocket.resume_reading (ws c);
+  Alcotest.(check bool)
+    "timeout again after resume"
+    true
+    (Option.is_some (Server_connection.read_timeout c.server))
+
 let tests =
   [ "accept key", `Quick, test_accept_key
+  ; "idle timeout closes with 1001", `Quick, test_idle_timeout
   ; "handshake accepted", `Quick, test_handshake_accept
   ; "handshake rejected", `Quick, test_handshake_reject
   ; "canonical keys only", `Quick, test_canonical_keys

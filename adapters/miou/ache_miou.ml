@@ -191,13 +191,9 @@ module Make (Io : IO) = struct
 
     let shutdown = Io.shutdown
 
-    type body_read =
-      { stop : unit -> (unit -> unit) option
-      ; wait : float
-      ; linger : float
-      }
-
-    let no_body_read = { stop = (fun () -> None); wait = 0.; linger = 0. }
+    (* The body and write clocks restart after this many bytes, so that a
+       trickle of bytes cannot keep a connection alive. *)
+    let progress_bytes = 2048
 
     type graceful =
       { stop : unit Miou.Computation.t
@@ -212,9 +208,12 @@ module Make (Io : IO) = struct
       -> interruptible:bool
       -> timeout:
            ([ `Read | `Linger ]
-            -> ([ `Idle | `Head ] * float * (unit -> unit)) option)
+            -> ([ `Idle | `Head | `Body of float -> int -> unit ]
+               * float
+               * (unit -> unit))
+                 option)
       -> linger:bool
-      -> ?body_read:body_read
+      -> ?write_timeout:float
       -> ?sessions:Sessions.t
       -> ?graceful:graceful
       -> stopped:[ `Done | `Abort ] Miou.Computation.t
@@ -228,7 +227,7 @@ module Make (Io : IO) = struct
        ~interruptible
        ~timeout
        ~linger:lingers
-       ?(body_read = no_body_read)
+       ?write_timeout
        ?sessions
        ?graceful
        ~stopped
@@ -290,75 +289,6 @@ module Make (Io : IO) = struct
       let read_buffer = Buffer.create read_buffer_size in
       let idle_deadline = Deadline.create ()
       and head_deadline = Deadline.create () in
-      let direct_reads = ref 0
-      and direct_pending = ref false
-      and stop_armed = ref 0
-      and stop_at = ref None
-      and stop_failure = ref None
-      and body_stop = Signal.create () in
-      let live read = !direct_pending && !direct_reads = read in
-      let stop read = function
-        | `Linger ->
-          shutdown_once SHUTDOWN_RECEIVE;
-          None
-        | `Body ->
-          (match body_read.stop () with
-          | None -> None
-          | Some on_timeout ->
-            (match on_timeout () with
-            | () when lingers ->
-              Some (read, Unix.gettimeofday () +. body_read.linger, `Linger)
-            | () ->
-              shutdown_once SHUTDOWN_RECEIVE;
-              None
-            | exception (Miou.Cancelled as exn) -> raise exn
-            | exception exn ->
-              stop_failure := Some exn;
-              shutdown_once SHUTDOWN_RECEIVE;
-              None))
-      in
-      let stopper =
-        if lingers
-        then
-          Some
-            (Miou.async (fun () ->
-               let rec loop () =
-                 Signal.wait_until body_stop (fun () -> Option.is_some !stop_at);
-                 (match !stop_at with
-                 | Some (read, _, _) when not (live read) -> stop_at := None
-                 | Some (read, at, stage) ->
-                   let left = at -. Unix.gettimeofday () in
-                   if left > 0.
-                   then Miou_unix.sleep (Float.min Deadline.longest_sleep left)
-                   else stop_at := stop read stage
-                 | None -> ());
-                 loop ()
-               in
-               loop ()))
-        else None
-      in
-      let stop_body_read () =
-        if
-          !direct_pending
-          && !stop_armed <> !direct_reads
-          && Option.is_some (body_read.stop ())
-        then (
-          let read = !direct_reads in
-          stop_armed := read;
-          match stopper with
-          | Some _ ->
-            stop_at := Some (read, Unix.gettimeofday () +. body_read.wait, `Body);
-            Signal.wake body_stop
-          | None -> ignore (stop read `Body : _ option))
-      in
-      let direct_read_ended () =
-        direct_pending := false;
-        match !stop_failure with
-        | None -> ()
-        | Some exn ->
-          stop_failure := None;
-          raise exn
-      in
       let pending_read = ref false
       and read_requested = ref false
       and read_result = ref None
@@ -385,17 +315,15 @@ module Make (Io : IO) = struct
       in
       let timed_read limit =
         if (not interruptible) && Option.is_none limit && not !pending_read
-        then (
-          incr direct_reads;
-          direct_pending := true;
-          match read socket read_buffer with
-          | n ->
-            direct_read_ended ();
-            Ok n
-          | exception exn ->
-            direct_read_ended ();
-            raise exn)
-        else (
+        then Ok (read socket read_buffer)
+        else
+          let started = Unix.gettimeofday () in
+          let waited n =
+            match limit with
+            | Some (`Body progress, _, _) ->
+              progress (Unix.gettimeofday () -. started) n
+            | Some ((`Idle | `Head), _, _) | None -> ()
+          in
           if Option.is_none !read_result
           then (
             if read_closed.closed then raise End_of_file;
@@ -409,7 +337,7 @@ module Make (Io : IO) = struct
               Option.bind limit (fun (kind, at, _) ->
                 let deadline =
                   match kind with
-                  | `Idle -> Some idle_deadline
+                  | `Idle | `Body _ -> Some idle_deadline
                   | `Head -> Some head_deadline
                 in
                 Option.iter
@@ -426,11 +354,16 @@ module Make (Io : IO) = struct
           | Some result ->
             read_result := None;
             pending_read := false;
-            (match result with Ok n -> Ok n | Error exn -> raise exn)
+            (match result with
+            | Ok n ->
+              waited n;
+              Ok n
+            | Error exn -> raise exn)
           | None when read_closed.closed -> raise End_of_file
           | None ->
+            waited 0;
             Option.iter (fun (_, _, on_timeout) -> on_timeout ()) limit;
-            Error `Timeout)
+            Error `Timeout
       in
       let rec linger limit =
         match timed_read limit with
@@ -472,18 +405,62 @@ module Make (Io : IO) = struct
             shutdown_once SHUTDOWN_RECEIVE;
             Read_closed.close read_closed)
       in
+      (* The write clock runs while output waits to be written. It restarts when
+         all of it is written, and after each [progress_bytes] bytes written. *)
+      let write_clock = ref false
+      and write_deadline = ref 0.
+      and written = ref 0
+      and in_writev = ref false
+      and write_armed = Signal.create () in
+      let restart_write_clock limit =
+        write_deadline := Unix.gettimeofday () +. limit;
+        written := 0
+      in
       let rec write_loop () =
         match Runtime.next_write_operation t with
         | `Write io_vectors ->
-          Runtime.report_write_result t (writev socket io_vectors);
+          (match write_timeout with
+          | Some limit when not !write_clock ->
+            write_clock := true;
+            restart_write_clock limit;
+            Signal.wake write_armed
+          | Some _ | None -> ());
+          in_writev := true;
+          let result = writev socket io_vectors in
+          in_writev := false;
+          (match write_timeout, result with
+          | Some limit, `Ok n ->
+            written := !written + n;
+            if !written >= progress_bytes then restart_write_clock limit
+          | _ -> ());
+          Runtime.report_write_result t result;
           write_loop ()
         | `Yield ->
-          stop_body_read ();
+          write_clock := false;
           yield Runtime.yield_writer;
           write_loop ()
         | `Close _ ->
-          stop_body_read ();
+          write_clock := false;
           shutdown_once SHUTDOWN_SEND
+      in
+      let write_watchdog =
+        Option.map
+          (fun (_ : float) ->
+             Miou.async (fun () ->
+               let rec loop () =
+                 Signal.wait_until write_armed (fun () -> !write_clock);
+                 let rec sleep () =
+                   let left = !write_deadline -. Unix.gettimeofday () in
+                   if left > 0.
+                   then (
+                     Miou_unix.sleep (Float.min Deadline.longest_sleep left);
+                     sleep ())
+                 in
+                 sleep ();
+                 if !write_clock then abort () else loop ()
+               in
+               loop ()))
+          write_timeout
       in
       let read_task () =
         (match read_loop () with
@@ -547,6 +524,17 @@ module Make (Io : IO) = struct
       | `Abort ->
         Miou.cancel reading;
         Miou.cancel writing;
+        (* A write that was cancelled before it returned is lost: tell the core,
+           so that the flushes that wait for it get [`Closed]. *)
+        if !in_writev
+        then (
+          in_writev := false;
+          match Runtime.report_write_result t `Closed with
+          | () -> ()
+          | exception (Miou.Cancelled as exn) -> raise exn
+          | exception exn ->
+            let (_ : bool) = report_exn exn in
+            ());
         shutdown_once SHUTDOWN_ALL
       | `Done ->
         let (_ : (unit, exn) result list) =
@@ -560,7 +548,7 @@ module Make (Io : IO) = struct
              | Miou.Cancelled as exn -> raise exn
              | _ -> ()))
         sessions;
-      Option.iter Miou.cancel stopper;
+      Option.iter Miou.cancel write_watchdog;
       Option.iter Miou.cancel watcher;
       Option.iter
         (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
@@ -571,6 +559,10 @@ module Make (Io : IO) = struct
     type socket = Io.socket
 
     let linger_without_idle_timeout = 2.0
+    let default_idle_timeout = Some 60.
+    let default_head_timeout = Some 30.
+    let default_body_timeout = Some 60.
+    let default_write_timeout = Some 60.
     let current_date = Ache.Ache_private.Http_date.now
 
     let check_timeout name = function
@@ -583,8 +575,10 @@ module Make (Io : IO) = struct
 
     let create_connection_handler
           ?(config = Ache.Config.default)
-          ?idle_timeout
-          ?head_timeout
+          ?(idle_timeout = default_idle_timeout)
+          ?(head_timeout = default_head_timeout)
+          ?(body_timeout = default_body_timeout)
+          ?(write_timeout = default_write_timeout)
           ?(date = true)
           ?stop
           ?grace
@@ -593,12 +587,16 @@ module Make (Io : IO) = struct
       =
       check_timeout "idle_timeout" idle_timeout;
       check_timeout "head_timeout" head_timeout;
+      check_timeout "body_timeout" body_timeout;
+      check_timeout "write_timeout" write_timeout;
       check_timeout "grace" grace;
       let untimed =
         Option.is_none idle_timeout && Option.is_none head_timeout
       in
       let serve socket client_addr =
         let head_deadline = ref None
+        and body_spent = ref 0.
+        and body_received = ref 0
         and error_handler_failure = ref None
         and sessions = Sessions.create () in
         let with_sessions = Sessions.with_current sessions in
@@ -618,6 +616,8 @@ module Make (Io : IO) = struct
             ?date:(if date then Some current_date else None)
             (fun reqd ->
                head_deadline := None;
+               body_spent := 0.;
+               body_received := 0;
                with_sessions (fun () -> request_handler client_addr reqd))
         in
         let observe () =
@@ -665,11 +665,29 @@ module Make (Io : IO) = struct
               Option.map
                 (fun deadline -> `Head, deadline, on_timeout)
                 !head_deadline
-            | Some (`Body, on_timeout) ->
-              Some
-                ( `Idle
-                , Unix.gettimeofday () +. Option.value idle_timeout ~default:0.
-                , on_timeout )
+            | Some (`Body, _) ->
+              (* The body clock counts only the time spent waiting for body
+                 bytes, and restarts after [progress_bytes] bytes. *)
+              Option.map
+                (fun limit ->
+                   let progress elapsed n =
+                     body_spent := !body_spent +. elapsed;
+                     body_received := !body_received + n;
+                     if !body_received >= IO_loop.progress_bytes
+                     then (
+                       body_spent := 0.;
+                       body_received := 0)
+                   and expire () =
+                     body_spent := 0.;
+                     body_received := 0;
+                     match Ache.Server_connection.read_timeout connection with
+                     | Some (`Body, expire) -> expire ()
+                     | Some ((`Idle | `Head), _) | None -> ()
+                   in
+                   ( `Body progress
+                   , Unix.gettimeofday () +. limit -. !body_spent
+                   , expire ))
+                body_timeout
             | None -> None)
         in
         IO_loop.start
@@ -679,16 +697,7 @@ module Make (Io : IO) = struct
           ~interruptible:false
           ~timeout
           ~linger:(not untimed)
-          ~body_read:
-            { stop =
-                (fun () ->
-                  match Ache.Server_connection.read_timeout connection with
-                  | Some (`Body, on_timeout) -> Some on_timeout
-                  | Some ((`Idle | `Head), _) | None -> None)
-            ; wait = Option.value idle_timeout ~default:0.
-            ; linger =
-                Option.value idle_timeout ~default:linger_without_idle_timeout
-            }
+          ?write_timeout
           ~sessions
           ?graceful:
             (Option.map
@@ -863,6 +872,8 @@ module Server = struct
         ?config
         ?idle_timeout
         ?head_timeout
+        ?body_timeout
+        ?write_timeout
         ?date
         ?domains
         ?(backlog = 128)
@@ -902,6 +913,8 @@ module Server = struct
         ?config
         ?idle_timeout
         ?head_timeout
+        ?body_timeout
+        ?write_timeout
         ?date
         ?stop
         ?grace

@@ -49,13 +49,18 @@ module type ENGINE = sig
   val shutdown : t -> unit
 end
 
-type 't hooks = { drain : 't -> unit }
+type 't hooks =
+  { drain : 't -> unit
+  ; read_timeout : 't -> ([ `Idle ] * (unit -> unit)) option
+  }
+
 type impl = Impl : (module ENGINE with type t = 't) * 't * 't hooks -> impl
 
-let no_hooks = { drain = (fun _ -> ()) }
+let no_hooks = { drain = (fun _ -> ()); read_timeout = (fun _ -> None) }
 let make runtime t = Impl (runtime, t, no_hooks)
 let make_with_hooks runtime t hooks = Impl (runtime, t, hooks)
 let drain (Impl (_, t, hooks)) = hooks.drain t
+let read_timeout (Impl (_, t, hooks)) = hooks.read_timeout t
 
 module Upgradable = struct
   type t = { mutable impl : impl }

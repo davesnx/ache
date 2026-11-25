@@ -89,8 +89,10 @@ module Server : sig
 
   val create_connection_handler_with_fd :
      ?config:Ache.Config.t
-    -> ?idle_timeout:float
-    -> ?head_timeout:float
+    -> ?idle_timeout:float option
+    -> ?head_timeout:float option
+    -> ?body_timeout:float option
+    -> ?write_timeout:float option
     -> ?date:bool
     -> ?stop:unit Lwt.t
     -> ?grace:float
@@ -104,10 +106,11 @@ module Server : sig
       can be passed to [Lwt_io.establish_server_with_client_socket]. It does the
       TLS handshake on the accepted file descriptor and then serves HTTP/1.1 as
       {!Ache_lwt.Server.create_connection_handler} does, with the same
-      timeouts, [date], [stop] and [grace]. A handshake in progress when
-      [stop] resolves is closed, as an idle connection. When [idle_timeout] or [head_timeout] is set, the handshake
-      must be complete within the smaller of them; without either, it has no
-      time limit.
+      timeouts and defaults, [date], [stop] and [grace]. The write timeout
+      applies to TLS records. A handshake in progress when [stop] resolves
+      is closed, as an idle connection. The handshake must be complete
+      within the smaller of [idle_timeout] and [head_timeout] (30 s by
+      default); when both are [None], it has no time limit.
 
       When the handshake fails, the promise resolves after the file descriptor
       is closed; the error is not reported. To see it, call {!server_of_fd} and

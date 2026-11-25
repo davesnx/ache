@@ -146,8 +146,10 @@ module Server = struct
 
   let create_connection_handler_with_fd
         ?config
-        ?idle_timeout
-        ?head_timeout
+        ?(idle_timeout = Some 60.)
+        ?(head_timeout = Some 30.)
+        ?body_timeout
+        ?write_timeout
         ?date
         ?stop
         ?grace
@@ -165,6 +167,15 @@ module Server = struct
              "Ache_lwt_tls.Server.create_connection_handler_with_fd: a timeout \
               must be positive"))
       [ idle_timeout; head_timeout; grace ];
+    List.iter
+      (Option.iter
+         (Option.iter (fun seconds ->
+            if not (seconds > 0.)
+            then
+              invalid_arg
+                "Ache_lwt_tls.Server.create_connection_handler_with_fd: a \
+                 timeout must be positive")))
+      [ body_timeout; write_timeout ];
     match stop with
     | Some stop when not (Lwt.is_sleeping stop) -> close_fd fd
     | _ ->
@@ -200,8 +211,10 @@ module Server = struct
         (fun socket ->
            create_connection_handler
              ?config
-             ?idle_timeout
-             ?head_timeout
+             ~idle_timeout
+             ~head_timeout
+             ?body_timeout
+             ?write_timeout
              ?date
              ?stop
              ?grace

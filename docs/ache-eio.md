@@ -163,11 +163,48 @@ let () =
     (`Tcp (Eio.Net.Ipaddr.V4.loopback, port))
 ```
 
+## Timeouts
+
+The server entry points (`Server.create_connection_handler`, `Server.run`
+and the TLS handler) take four timeouts, in seconds, of type
+`float option`. Each is on by default; `None` turns it off:
+
+| Argument | Default | What it limits |
+| --- | --- | --- |
+| `?idle_timeout` | `Some 60.` | A connection that waits for its next request, or a WebSocket that receives nothing. |
+| `?head_timeout` | `Some 30.` | A request head, from its first byte. The client gets 408. |
+| `?body_timeout` | `Some 60.` | A request body that makes no progress while the connection waits for it. |
+| `?write_timeout` | `Some 60.` | A write that makes no progress, for example to a client that stopped reading. |
+
+The body and write limits count progress, not single reads or writes. The
+body clock runs only while the connection waits for body bytes; it starts
+again from zero with each request and after each 2048 bytes. A body that
+trickles in a byte at a time times out even when each byte comes before
+the limit. When the clock reaches the limit, the body's `on_error` runs,
+and the client gets 408 when no response has started; otherwise the
+connection closes. The write clock runs while a write waits; it starts
+again when the write is done and after each 2048 bytes written. When it
+reaches the limit, the write is cancelled, a `flush` in progress gets
+`` `Closed ``, and the connection closes.
+
+While the request handler runs and the connection waits for nothing from
+the client, no limit applies: a slow handler is not timed out.
+
+Timeouts use the system clock. `?clock` replaces it, for example with a mock
+clock in tests. With TLS, the handshake must end within the smaller of
+`idle_timeout` and `head_timeout`.
+
+```ocaml
+Ache_eio.Server.run
+  ~idle_timeout:(Some 5.)
+  ~body_timeout:None
+  ~on_error ~net ~domain_mgr ~request_handler ~error_handler addr
+```
+
 ## Graceful stop
 
 `Server.run`, `Server.create_connection_handler` and the TLS handler take
-`?stop:unit Eio.Promise.t` and `?grace:float`. `grace` needs `?clock`. When
-`stop` is resolved:
+`?stop:unit Eio.Promise.t` and `?grace:float`. When `stop` is resolved:
 
 1. `run` stops accepting in every domain and closes its listening sockets.
    Connections that the kernel queued and `run` did not accept are reset.
@@ -207,7 +244,6 @@ let () =
       Eio.Promise.resolve resolve_stop ())
     (fun () ->
       Ache_eio.Server.run
-        ~clock:(Eio.Stdenv.clock env)
         ~stop
         ~grace:10.
         ~on_error:(Eio.traceln "connection error: %a" Fmt.exn)
@@ -291,7 +327,9 @@ let request_handler _client_address reqd =
   for a code that an endpoint may not send, or a reason that is not UTF-8 or
   longer than 123 bytes. The socket closes when the read in progress ends
   too: when the client answers with its close frame or closes the
-  connection. There is no timeout for a client that does neither.
+  connection, or at most `idle_timeout` later.
+- A WebSocket that receives nothing for `idle_timeout` gets a close frame
+  with code 1001 and closes; `receive` returns `None`.
 - Messages that you have not received wait in a queue. When 8 messages wait,
   the connection stops reading from the client until `receive` takes one.
   Frames that one read already holds still join the queue.
@@ -370,33 +408,46 @@ creates the core connection and runs the two loops in one switch:
 Each connection also starts a reader fiber, which reads the socket when the
 read loop asks it to, and keeps the result until the read loop takes it.
 
-- A read with a timeout goes through the reader fiber. The read loop waits
-  for the result under `Eio.Time.with_timeout`. When the timeout fires, it
-  cancels the wait, not the read: tls-eio treats a cancelled read as a
-  permanent error, and every later operation on that connection fails.
+- A read with a timeout goes through the reader fiber. When the timeout
+  fires, the read loop stops waiting, but the read goes on: tls-eio treats
+  a cancelled read as a permanent error, and every later operation on that
+  connection fails.
 - The client always reads through the reader fiber, so `Client.shutdown` can
   stop the wait without cancelling the read.
-- A server read of a request body before its response is complete goes
-  through the reader fiber, with or without `?clock`, so that the write
-  loop can stop the wait when the response completes (see
-  [Timeouts](ache.md#timeouts)).
 - With `?stop`, a read that waits for a new request goes through the
-  reader fiber, with or without `?clock`, so that the drain at `stop` can
-  end the wait.
-- Every other read is direct: the read loop calls `single_read` itself. A
-  server without `?clock` and `?stop` has no timeouts, so its other reads
-  are direct. With a clock, the reads of pipelined requests are direct, and
-  the reads that wait for a new request head use the reader fiber.
+  reader fiber, also without `idle_timeout`, so that the drain at `stop`
+  can end the wait.
+- Every other read is direct: the read loop calls `single_read` itself, for
+  example with all four timeouts off, in a tunnel after `CONNECT`, or after
+  an error response.
 
 A direct read saves two fiber switches and an `Eio.Condition` handoff for
 each read, and the objects of one read die young. In alternating runs of a
 hello-world server against cohttp-eio, direct reads made ache-eio about 19 %
 faster on one core and about 27 % faster on 4 domains.
 
+### The watchdog
+
+A timer for each read or write would cost a fiber and a timer each time.
+Instead, each connection has one watchdog fiber that sleeps until the
+nearest deadline of its read or its write. A read or write that ends in
+time only clears its deadline; a deadline that moves later does not wake
+the watchdog, which sleeps again when it wakes and finds no deadline
+passed. On a keep-alive connection it wakes about once per `idle_timeout`.
+When a read deadline passes, the watchdog wakes the read loop, which calls
+the core's timeout action. When a write deadline passes, it cancels the
+write (`Eio.Cancel`), and the connection closes. On one core, a hello-world
+server with the default timeouts serves about 25 % fewer requests per
+second than with all four off, mostly for the reader fiber.
+
+A write that tls-eio was in the middle of leaves the TLS session in an
+error state. The connection then sends no `close_notify`, and later reads
+end as the end of input.
+
 ### Linger
 
-With a clock, when the read loop gets `Close` (after a response that closes
-the connection), it does not close at once. It reads and drops input until
+When the read loop gets `Close` (after a response that closes the
+connection), it does not close at once. It reads and drops input until
 the peer closes, for at most `idle_timeout` (2 s without one). If the server
 closed with unread input, the kernel would reset the connection, and the
 peer could lose the response.
@@ -429,12 +480,12 @@ that show the listening socket itself is not usable (`EBADF`, `EINVAL`,
 
 `Ache_eio.Server.create_connection_handler ~request_handler
 ~error_handler` can be given to `Eio.Net.run_server`. The server and the
-client accept any `_ Eio.Flow.two_way`; `ache-eio-tls` gives TLS. Timeouts
-need `?clock`. With a clock, when the server stops reading (after a
-response that closes the connection) it reads and drops input until the
-peer closes, for at most `idle_timeout` (2 s without
-one), so that the peer can read the response before the connection is
-reset. Without a clock it closes at once.
+client accept any `_ Eio.Flow.two_way`; `ache-eio-tls` gives TLS. The
+server's timeouts are on by default (see [Timeouts](#timeouts)). When the
+server stops reading (after a response that closes the connection) it reads
+and drops input until the peer closes, for at most `idle_timeout` (2 s
+without one), so that the peer can read the response before the connection
+is reset.
 
 The server adds a `Date` field with the current time to each response that
 is not 1xx and has none (RFC 9110 §6.6.1). The text is formatted once per
@@ -448,7 +499,7 @@ To make the test certificates, and for the TLS notes, see
 
 An Eio server. The handler does the handshake in the connection fiber; when
 it fails, it raises and `run_server` gives the exception to `on_error`. The
-time limit of the handshake is under "Timeouts" below.
+time limit of the handshake is under [Timeouts](#timeouts).
 
 <!-- example: examples/eio/eio_tls_hello_server.ml -->
 ```ocaml

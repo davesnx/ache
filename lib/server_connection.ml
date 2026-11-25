@@ -238,7 +238,8 @@ let set_error_and_handle ?request t error =
   then (
     assert (request = None);
     let reqd = current_reqd_exn t in
-    Request_descriptor.report_error reqd error)
+    Request_descriptor.report_error reqd error;
+    wakeup_writer t)
   else
     let status =
       match (error :> [ error | Status.standard ]) with
@@ -574,6 +575,16 @@ let shutdown t =
   | None -> shutdown t
   | Some (Runtime.Impl ((module Engine), engine, _)) -> Engine.shutdown engine
 
+let body_timed_out t =
+  if is_active t
+  then
+    let reqd = current_reqd_exn t in
+    match
+      Request_descriptor.response reqd, Request_descriptor.error_code reqd
+    with
+    | None, None -> Request_descriptor.report_error reqd `Request_timeout
+    | _ -> shutdown t
+
 let read_timeout t =
   match t.upgraded, t.error_code with
   | None, No_error when not (is_active t) ->
@@ -586,10 +597,14 @@ let read_timeout t =
     (match
        Request_descriptor.output_state reqd, Request_descriptor.input_state reqd
      with
-    | Complete, (Wait | Ready) when not (Reader.is_closed t.reader) ->
-      Some (`Body, fun () -> shutdown t)
+    | ((Wait | Ready | Complete), Ready | Complete, Wait)
+      when not (Reader.is_closed t.reader) ->
+      Some (`Body, fun () -> body_timed_out t)
     | _ -> None)
-  | _ -> None
+  | Some impl, _ ->
+    (Runtime.read_timeout impl
+      :> ([ `Idle | `Head | `Body ] * (unit -> unit)) option)
+  | None, Error _ -> None
 
 let drain t =
   if not t.draining

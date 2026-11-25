@@ -4281,16 +4281,97 @@ let test_unread_body_after_response_is_timed () =
          ])
     splits
 
-let test_body_timeout_only_after_response () =
+let test_body_timeout_before_response () =
+  let events = ref [] in
   let t =
     Raw.create (fun reqd ->
-      record_body (ref []) (Request_descriptor.request_body reqd))
+      record_body events (Request_descriptor.request_body reqd))
   in
   Raw.feed ~chunk:max_int t (post_head 10 ^ "01234");
+  (match Server_connection.read_timeout t.conn with
+  | Some (`Body, expire) -> expire ()
+  | _ ->
+    Alcotest.failf
+      "expected a body timeout while a body read waits, got %s"
+      (read_timeout_kind t.conn));
+  check_one_ending "body read" "error" events;
+  let output = ref "" in
+  let rec write () =
+    match Server_connection.next_write_operation t.conn with
+    | `Write iovecs ->
+      let s = Write_operation.iovecs_to_string iovecs in
+      output := !output ^ s;
+      Server_connection.report_write_result t.conn (`Ok (String.length s));
+      write ()
+    | `Yield | `Close _ -> ()
+  in
+  write ();
   Alcotest.(check string)
-    "no timeout while the response is pending"
+    "408 response"
+    "HTTP/1.1 408"
+    (String.sub !output 0 (min 12 (String.length !output)));
+  Alcotest.check read_operation "reader closed" `Close (Raw.read_op t);
+  Alcotest.(check bool)
+    "connection closed"
+    true
+    (Server_connection.is_closed t.conn)
+
+let test_eof_in_unread_body_after_response_closes () =
+  let t =
+    Raw.create (fun reqd ->
+      Request_descriptor.respond_with_string
+        reqd
+        (Response.create `Content_too_large)
+        "no")
+  in
+  Raw.feed ~chunk:max_int t (post_head 100000 ^ "abc");
+  Alcotest.(check bool) "writer waits" true (Raw.write_all t = `Yield);
+  let woken = ref false in
+  Server_connection.yield_writer t.conn (fun () -> woken := true);
+  Alcotest.check read_operation "reads the rest" `Read (Raw.read_op t);
+  Raw.feed ~eof:true ~chunk:max_int t "";
+  Alcotest.check read_operation "reader closed" `Close (Raw.read_op t);
+  Alcotest.(check bool) "writer woken" true !woken;
+  Alcotest.(check bool) "writer closed" true (Raw.write_all t = `Close);
+  Alcotest.(check bool)
+    "connection closed"
+    true
+    (Server_connection.is_closed t.conn)
+
+let test_no_body_timeout_while_the_handler_runs () =
+  let t = Raw.create (fun (_ : Request_descriptor.t) -> ()) in
+  Raw.feed ~chunk:max_int t (post_head 10 ^ "01234");
+  Alcotest.(check string)
+    "no timeout while no body read waits"
+    "none"
+    (read_timeout_kind t.conn);
+  let t = Raw.create (fun (_ : Request_descriptor.t) -> ()) in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  Alcotest.(check string)
+    "no timeout while a GET is handled"
     "none"
     (read_timeout_kind t.conn)
+
+let test_body_timeout_after_response_started () =
+  let events = ref [] in
+  let t =
+    Raw.create (fun reqd ->
+      record_body events (Request_descriptor.request_body reqd);
+      let body =
+        Request_descriptor.respond_with_streaming
+          ~flush_headers_immediately:true
+          reqd
+          (Response.create `OK)
+      in
+      Body.Writer.write_string body "x")
+  in
+  Raw.feed ~chunk:max_int t (post_head 10 ^ "01234");
+  (match Server_connection.read_timeout t.conn with
+  | Some (`Body, expire) -> expire ()
+  | _ ->
+    Alcotest.failf "expected a body timeout, got %s" (read_timeout_kind t.conn));
+  check_one_ending "body read" "error" events;
+  Alcotest.check read_operation "reader closed" `Close (Raw.read_op t)
 
 let test_connect_upgrade_status () =
   let impl () =
@@ -4760,9 +4841,18 @@ let tests =
   ; ( "unread body after the response has a timeout"
     , `Quick
     , test_unread_body_after_response_is_timed )
-  ; ( "no body timeout before the response"
+  ; ( "body timeout before the response: on_error, then 408"
     , `Quick
-    , test_body_timeout_only_after_response )
+    , test_body_timeout_before_response )
+  ; ( "end of input in an unread body after the response closes"
+    , `Quick
+    , test_eof_in_unread_body_after_response_closes )
+  ; ( "no body timeout while the handler runs"
+    , `Quick
+    , test_no_body_timeout_while_the_handler_runs )
+  ; ( "body timeout after the response started closes"
+    , `Quick
+    , test_body_timeout_after_response_started )
   ]
 
 (* https://httpwg.org/specs/rfc9110.html For example, a CONNECT request (Section

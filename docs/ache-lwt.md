@@ -225,11 +225,9 @@ It creates the core connection and starts the two loops:
   for each record. With the default 4 KiB buffer, each record takes 4
   writes.
 - **Timeouts.** A timed read is `Lwt.pick` of the socket read and
-  `Ache_lwt.Timeout.expired`. See [Timeouts](#timeouts) for why the timers
-  are shared. A read of a request body before its response is complete is
-  `Lwt.pick` of the socket read and a wait for the write loop, which
-  then gives the limit for the rest of the body (see
-  [Timeouts](ache.md#timeouts)).
+  `Ache_lwt.Timeout.expired`; a timed write is `Lwt.pick` of the `writev`
+  and the write timer. See [Timeouts](#timeouts) for which timer applies
+  and why the timers are shared.
 - **Errors.** If a write fails, or the core raises in `report_exn`, the
   connection resolves `failed`, and `Lwt.choose` closes the socket.
 
@@ -251,6 +249,30 @@ TLS handler turns it off.
 
 ### Timeouts
 
+The server timeouts are on by default; `~idle_timeout:None` (and so on)
+turns one off. The TLS handler takes the same arguments.
+
+| Argument | Default | Applies while |
+|---|---|---|
+| `?idle_timeout` | `Some 60.` | no request is in progress, or a WebSocket waits for a frame (it closes with 1001) |
+| `?head_timeout` | `Some 30.` | a request head is partly read (408) |
+| `?body_timeout` | `Some 60.` | the connection waits for request body bytes (408 if no response started, else close) |
+| `?write_timeout` | `Some 60.` | output waits to be written, for example to a client that stopped reading (close) |
+
+Before each read, the server asks the core which timeout applies
+(`Server_connection.read_timeout`). While the request handler runs and the
+connection waits for nothing from the client, no timeout applies.
+
+The body and write timeouts measure progress, not single reads or writes:
+their clock restarts only after 2048 bytes, so a client that sends or reads
+one byte at a time cannot keep a connection. The body clock counts only
+while a read waits for body bytes. It counts ticks of a tenth of
+`body_timeout`, so all connections with the same `body_timeout` share one
+timer queue, and the timeout can end up to a tenth late. The write clock
+runs while output is pending and restarts when all of it is written. When
+it runs out, the server closes the socket and ends the connection, and
+pending `Body.Writer.flush` callbacks get `` `Closed ``.
+
 With Lwt's `select` and `poll` engines, a cancelled `Lwt_unix.sleep` stays in
 memory until no other sleep ends before it. A server that starts one sleep
 for each connection and cancels it when the connection ends then keeps
@@ -260,8 +282,8 @@ frees a cancelled sleep at once.
 `Ache_lwt.Timeout` avoids this. All timeouts of one length share one queue,
 in deadline order, and one sleep for the front of the queue that is never
 cancelled. `set` and `stop` only move an entry in the queue. The servers of
-`ache-lwt` and `ache-lwt-tls` use it for `?idle_timeout`, `?head_timeout` and
-the TLS handshake. An application can use it for its own timeouts:
+`ache-lwt` and `ache-lwt-tls` use it for each server timeout and the TLS
+handshake. An application can use it for its own timeouts:
 
 ```ocaml
 let read_with_timeout timeout read =

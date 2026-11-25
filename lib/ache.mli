@@ -651,17 +651,22 @@ module Server_connection : sig
       - [Some (`Head, reject)]: a request head is partly read. [reject] calls
         [error_handler] with [`Request_timeout] (408) and closes the connection
         after the error response. The request handler is not called.
-      - [Some (`Body, close)]: the response is complete, and the rest of the
-        request body has not arrived. The application reads it, or the
-        connection drops it to find the next request. A runtime waits for it
-        at most its idle timeout; a runtime without an idle timeout calls
-        [close] instead of waiting. [close] calls the body's [on_error] and
-        closes the connection after its pending output.
-      - [None]: a request is in progress and its response is not complete,
-        or the connection is closing or upgraded. No timeout applies. The
-        answer can change to [Some (`Body, _)] while the runtime waits for
-        input, when the response completes. A runtime asks again each time
-        its write loop waits or ends. *)
+      - [Some (`Body, expire)]: the connection waits for request body bytes:
+        the application has scheduled a read on the request body, or the
+        response is complete and the rest of the body has not arrived (the
+        connection drops it to find the next request). The peer must make
+        progress; the runtimes give it their body timeout and restart it
+        only after enough bytes. [expire] calls the body's [on_error]; then,
+        when no response has started, it calls [error_handler] with
+        [`Request_timeout] (408) and closes the connection after the error
+        response, and otherwise it closes the connection after its pending
+        output.
+      - [Some (`Idle, close)] on a connection upgraded with
+        {!Websocket.upgrade}: see {!Websocket.read_timeout}.
+      - [None]: no read is waiting for the peer (the application runs, a
+        response is being written, the connection is closing), or the
+        connection was upgraded to another protocol. No timeout applies.
+        A runtime asks again before each read. *)
 end
 
 (** {2 WebSocket Server} *)
@@ -698,9 +703,11 @@ end
     closes the TCP connection once the frame is written. It does not wait for
     the client's close frame.
 
-    ache has no timeout on an upgraded connection. A client that stops
-    reading, or never answers a close frame, keeps the connection open until
-    the caller closes the socket, for example with its own timer.
+    The runtimes close a connection that receives nothing for their idle
+    timeout, with close code [1001] (see {!read_timeout}), and one whose
+    writes make no progress for their write timeout. A client that never
+    answers a close frame does not keep the connection: it closes when the
+    close frame is written.
 
     Reading stops while more than 64 KiB of frames (messages, pongs and close
     frames) are queued and not yet written, and starts again when the writes
@@ -831,6 +838,16 @@ module Websocket : sig
   val is_closed : t -> bool
   (** [is_closed t] is [true] once the connection is closed: [on_close] was
       called and nothing more is written. *)
+
+  val read_timeout : t -> ([ `Idle ] * (unit -> unit)) option
+  (** [read_timeout t] tells a runtime which read timeout applies while it
+      waits for input on [t], as {!Server_connection.read_timeout} does (and
+      that function answers with it once the connection is upgraded).
+      - [Some (`Idle, close)]: the connection reads frames. When nothing
+        arrives for the runtime's idle timeout, [close] sends a close frame
+        with code [1001] (going away) and closes as {!close} does.
+      - [None]: reading is paused, waits for the writes, or the connection
+        is closing. No timeout applies. *)
 end
 
 (** {2 Client Connection} *)

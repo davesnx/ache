@@ -43,8 +43,10 @@ module type Server = sig
 
   val create_connection_handler :
      ?config:Ache.Config.t
-    -> ?idle_timeout:float
-    -> ?head_timeout:float
+    -> ?idle_timeout:float option
+    -> ?head_timeout:float option
+    -> ?body_timeout:float option
+    -> ?write_timeout:float option
     -> ?date:bool
     -> ?stop:unit Lwt.t
     -> ?grace:float

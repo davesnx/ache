@@ -8,6 +8,7 @@ let localhost = Domain_name.(host_exn (of_string_exn "localhost"))
 let server_errors : Server_connection.error list ref = ref []
 let partial_body_cut = ref false
 let slow_reqd : Request_descriptor.t option ref = ref None
+let stream_closed : unit Lwt.u option ref = ref None
 
 let request_handler (_ : Unix.sockaddr) reqd =
   let request = Request_descriptor.request reqd in
@@ -16,6 +17,19 @@ let request_handler (_ : Unix.sockaddr) reqd =
   | `GET, "/slow" ->
     Body.Reader.close body;
     slow_reqd := Some reqd
+  | `GET, "/stream" ->
+    Body.Reader.close body;
+    let response_body =
+      Request_descriptor.respond_with_streaming reqd (Response.create `OK)
+    in
+    let chunk = String.make 65536 'x' in
+    let rec loop () =
+      Body.Writer.write_string response_body chunk;
+      Body.Writer.flush response_body (function
+        | `Written -> loop ()
+        | `Closed -> Option.iter (fun u -> Lwt.wakeup_later u ()) !stream_closed)
+    in
+    loop ()
   | `POST, "/echo" ->
     let headers =
       Headers.of_list
@@ -82,15 +96,25 @@ let with_listener handler f =
          (Lwt_unix.state fd = Lwt_unix.Closed))
     !accepted
 
-let with_server ?idle_timeout ?head_timeout ?stop ?grace f =
+let with_server
+      ?idle_timeout
+      ?head_timeout
+      ?body_timeout
+      ?write_timeout
+      ?stop
+      ?grace
+      f
+  =
   server_errors := [];
   partial_body_cut := false;
   run (fun () ->
     with_listener
       (Ache_lwt_tls.Server.create_connection_handler_with_fd
          ~date:false
-         ?idle_timeout
-         ?head_timeout
+         ~idle_timeout
+         ~head_timeout
+         ~body_timeout
+         ~write_timeout
          ?stop
          ?grace
          ~tls:server_config
@@ -399,8 +423,8 @@ let test_timeout_check_timing () =
     Ache_lwt_tls.Server.create_connection_handler_with_fd
       ~date:false
       ~config:Ache.Config.default
-      ~idle_timeout:0.
-      ~head_timeout:1.
+      ~idle_timeout:(Some 0.)
+      ~head_timeout:(Some 1.)
       ~tls:server_config
       ~request_handler
       ~error_handler
@@ -596,8 +620,8 @@ let check_handshake_timers_bounded ~connections exchange =
          Lwt.async (fun () ->
            Ache_lwt_tls.Server.create_connection_handler_with_fd
              ~date:false
-             ~idle_timeout:30.
-             ~head_timeout:30.
+             ~idle_timeout:(Some 30.)
+             ~head_timeout:(Some 30.)
              ~tls:server_config
              ~request_handler
              ~error_handler
@@ -691,6 +715,22 @@ let test_stop_drains () =
     Alcotest.(check bool) "close_notify" true (ending = `Close_notify);
     Lwt_unix.close stalled >>= fun () -> raw_close raw)
 
+let test_write_timeout () =
+  let closed, notify_closed = Lwt.wait () in
+  stream_closed := Some notify_closed;
+  with_server ~write_timeout:0.3 (fun connect ->
+    connect () >>= fun fd ->
+    Lwt_unix.setsockopt_int fd Unix.SO_RCVBUF 4096;
+    raw_client fd >>= fun raw ->
+    raw_write raw "GET /stream HTTP/1.1\r\nhost: localhost\r\n\r\n"
+    >>= fun () ->
+    let since = Unix.gettimeofday () in
+    closed >>= fun () ->
+    let elapsed = Unix.gettimeofday () -. since in
+    if elapsed < 0.3 || elapsed > 1.5
+    then Alcotest.failf "flush got `Closed after %.3f s" elapsed;
+    Lwt_unix.close fd)
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
@@ -773,6 +813,10 @@ let () =
             "stop closes a handshake and drains a request"
             `Quick
             test_stop_drains
+        ; Alcotest.test_case
+            "a client that stops reading is closed at write_timeout"
+            `Quick
+            test_write_timeout
         ; Alcotest.test_case "idle timeout" `Quick test_idle_timeout
         ; Alcotest.test_case "head timeout" `Quick test_head_timeout
         ; Alcotest.test_case

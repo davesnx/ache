@@ -78,6 +78,7 @@ end
 let pending_upgrade : Request_descriptor.t option ref = ref None
 let pending_body : Request_descriptor.t option ref = ref None
 let pending_body_failed = ref false
+let stream_closed = ref false
 
 let request_handler (_ : Unix.sockaddr) reqd =
   let request = Request_descriptor.request reqd in
@@ -136,6 +137,26 @@ let request_handler (_ : Unix.sockaddr) reqd =
     and on_error () = pending_body_failed := true in
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | `GET, "/raise" -> failwith "handler failed"
+  | `GET, "/stream-forever" ->
+    Body.Reader.close body;
+    let response_body =
+      Request_descriptor.respond_with_streaming
+        reqd
+        (Response.create
+           ~headers:(Headers.of_list [ "transfer-encoding", "chunked" ])
+           `OK)
+    in
+    let chunk = String.make 0x10000 'x' in
+    let rec write n =
+      if n = 0
+      then Body.Writer.close response_body
+      else (
+        Body.Writer.write_string response_body chunk;
+        Body.Writer.flush response_body (function
+          | `Written -> write (n - 1)
+          | `Closed -> stream_closed := true))
+    in
+    write 1024
   | _, target ->
     Body.Reader.close body;
     Request_descriptor.respond_with_string reqd (Response.create `OK) target
@@ -225,14 +246,25 @@ let with_listener handler f =
              !handlers_done)));
   Alcotest.(check int) "no file descriptor leaked" fds (open_fds ())
 
-let with_server ?idle_timeout ?head_timeout ?stop ?grace f =
+(* Timeouts that a test does not give are off, not at their defaults. *)
+let with_server
+      ?idle_timeout
+      ?head_timeout
+      ?body_timeout
+      ?write_timeout
+      ?stop
+      ?grace
+      f
+  =
   server_errors := [];
   partial_body_cut := false;
   with_listener
     (Ache_miou_tls.Server.create_connection_handler_with_fd
        ~date:false
-       ?idle_timeout
-       ?head_timeout
+       ~idle_timeout
+       ~head_timeout
+       ~body_timeout
+       ~write_timeout
        ?stop
        ?grace
        ~tls:server_config
@@ -600,7 +632,7 @@ let test_timeout_check_timing () =
     let bound =
       Ache_miou_tls.Server.create_connection_handler_with_fd
         ~date:false
-        ~head_timeout:(-1.)
+        ~head_timeout:(Some (-1.))
         ~tls:server_config
         ~request_handler
         ~error_handler
@@ -617,8 +649,10 @@ let test_timeout_check_timing () =
            (Ache_miou_tls.Server.create_connection_handler_with_fd
               ~date:false
               ~config:Ache.Config.default
-              ~idle_timeout:1.
-              ~head_timeout:(-1.)
+              ~idle_timeout:(Some 1.)
+              ~head_timeout:(Some (-1.))
+              ~body_timeout:(Some 1.)
+              ~write_timeout:(Some 1.)
               ~stop:(Miou.Computation.create ())
               ~grace:1.
               ~tls:server_config
@@ -804,7 +838,7 @@ let test_head_timeout_then_data () =
 let respond_while_body_read_waits ?idle_timeout () =
   pending_body := None;
   pending_body_failed := false;
-  with_server ?idle_timeout (fun connect ->
+  with_server ?idle_timeout ~body_timeout:0.2 (fun connect ->
     with_raw_client connect (fun fd ->
       let raw = raw_client fd in
       raw_write
@@ -1012,8 +1046,10 @@ let check_handshake_timers_bounded ~connections exchange =
     let handler =
       Ache_miou_tls.Server.create_connection_handler_with_fd
         ~date:false
-        ~idle_timeout:30.
-        ~head_timeout:30.
+        ~idle_timeout:(Some 30.)
+        ~head_timeout:(Some 30.)
+        ~body_timeout:None
+        ~write_timeout:None
         ~tls:server_config
         ~request_handler
         ~error_handler
@@ -1151,12 +1187,40 @@ let test_stop_during_handshake () =
       check_bounded "handshake" ~max:0.5 since));
   check_no_handler_error ()
 
+let test_write_timeout () =
+  stream_closed := false;
+  with_server ~write_timeout:0.3 (fun connect ->
+    with_raw_client connect (fun fd ->
+      let raw = raw_client fd in
+      raw_write raw "GET /stream-forever HTTP/1.1\r\nhost: localhost\r\n\r\n";
+      let from = Unix.gettimeofday () in
+      while (not !stream_closed) && Unix.gettimeofday () -. from < 3. do
+        Miou_unix.sleep 0.01
+      done;
+      check_bounded "write timeout" ~max:1.5 from;
+      Alcotest.(check bool)
+        "the handler's flush got `Closed"
+        true
+        !stream_closed;
+      let rec at_end () =
+        match Miou_unix.read fd (Bytes.create 0x10000) with
+        | 0 -> ()
+        | _ -> at_end ()
+        | exception Unix.Unix_error (ECONNRESET, _, _) -> ()
+      in
+      at_end ()));
+  check_no_handler_error ()
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
     "ache-miou-tls"
     [ ( "tls"
       , [ Alcotest.test_case "GET" `Quick test_get
+        ; Alcotest.test_case
+            "write timeout: a client that stops reading"
+            `Quick
+            test_write_timeout
         ; Alcotest.test_case
             "stop closes an idle connection"
             `Quick
@@ -1244,11 +1308,11 @@ let () =
             test_peer_insecure
         ; Alcotest.test_case "idle timeout" `Quick test_idle_timeout
         ; Alcotest.test_case
-            "response while a body read waits, no idle_timeout: closes"
+            "response while a body read waits: body_timeout"
             `Quick
             (respond_while_body_read_waits ?idle_timeout:None)
         ; Alcotest.test_case
-            "response while a body read waits: idle_timeout"
+            "response while a body read waits: body_timeout, idle_timeout"
             `Quick
             (respond_while_body_read_waits ~idle_timeout:0.2)
         ; Alcotest.test_case "head timeout" `Quick test_head_timeout
