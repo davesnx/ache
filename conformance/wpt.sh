@@ -57,6 +57,10 @@ trap 'exit 130' INT TERM
 
 mkdir "$test_dir"
 sed "s/127\.0\.0\.1:8090/127.0.0.1:$port/" "$here/wpt/ache.any.js" >"$test_dir/ache.any.js"
+if ! grep -qF "const acheHost = \"127.0.0.1:$port\";" "$test_dir/ache.any.js"; then
+  echo "wpt/ache.any.js: acheHost is not 127.0.0.1:8090, so the port was not replaced" >&2
+  exit 2
+fi
 
 "$server" -p "$port" >"$work/server.out" 2>"$work/server.err" &
 pid=$!
