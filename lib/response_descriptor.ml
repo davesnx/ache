@@ -38,18 +38,33 @@ let create ~error_handler ~writer ~response_handler request request_body =
   ; persistent = Request.persistent_connection request
   }
 
+(* A 204 or 304 has no body (RFC 9110 §15.3.5, §15.4.5), so a length or a coding
+   in it leaves the end of the response unclear. *)
+let no_content_with_framing (request : Request.t) (response : Response.t) =
+  match response.status with
+  | (`No_content | `Not_modified) when request.meth <> `HEAD ->
+    Headers.mem response.headers "transfer-encoding"
+    ||
+      (match Headers.get_multi response.headers "content-length" with
+      | [] -> false
+      | value :: values -> Message.content_length value values <> 0L)
+  | _ -> false
+
 let handle_response t response body =
   let request = t.request in
   if t.persistent
   then
     t.persistent <-
       Response.persistent_connection response
-      && not
-           (Headers.mem response.headers "transfer-encoding"
-           && (Headers.mem response.headers "content-length"
-              || not (Message.at_least_v1_1 response.version))
-           && Response.body_length ~request_method:request.Request.meth response
-              <> `No_body);
+      && (not
+            (Headers.mem response.headers "transfer-encoding"
+            && (Headers.mem response.headers "content-length"
+               || not (Message.at_least_v1_1 response.version))
+            && Response.body_length
+                 ~request_method:request.Request.meth
+                 response
+               <> `No_body))
+      && not (no_content_with_framing request response);
   let next_request_state =
     match request.Request.meth, response.status with
     (* From RFC9110§6.4.1: * 2xx (Successful) responses to a CONNECT request

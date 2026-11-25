@@ -129,11 +129,12 @@ let host_end s =
     let j = skip_class s 0 length reg_name_class in
     if j = length || String.unsafe_get s j = ':' then j else -1
 
-(* RFC 3986 §3.2: uri-host [ ":" port ]. *)
+(* RFC 3986 §3.2: uri-host [ ":" port ]. An empty value is valid (RFC 9112
+   §3.2), an empty host with a port is not (RFC 9110 §4.2.1). *)
 let is_host_field s =
   let length = String.length s in
   let j = host_end s in
-  j >= 0
+  (j > 0 || length = 0)
   && (j = length
      || (String.unsafe_get s j = ':'
         && skip_class s (j + 1) length digit_class = length))
@@ -175,12 +176,36 @@ let is_absolute_form target =
     | _ -> false)
   | _ -> false
 
+(* RFC 9110 §4.2.1 and §4.2.4: the authority of an absolute-form target has a
+   host and no userinfo (decision 0007). *)
+let has_valid_authority target =
+  let scheme_end = String.index target ':' in
+  let length = String.length target in
+  if
+    length < scheme_end + 3
+    || target.[scheme_end + 1] <> '/'
+    || target.[scheme_end + 2] <> '/'
+  then true
+  else
+    let start = scheme_end + 3 in
+    let rec stop i =
+      if i < length && target.[i] <> '/' && target.[i] <> '?'
+      then stop (i + 1)
+      else i
+    in
+    let stop = stop start in
+    stop > start
+    && target.[start] <> ':'
+    && not (String.contains (String.sub target start (stop - start)) '@')
+
 (* RFC 9112 §3.2. *)
 let target_fits_method meth target =
   match meth with
   | `CONNECT -> is_connect_target target
   | `OPTIONS when target = "*" -> true
-  | _ -> String.starts_with ~prefix:"/" target || is_absolute_form target
+  | _ ->
+    String.starts_with ~prefix:"/" target
+    || (is_absolute_form target && has_valid_authority target)
 
 let transfer_coding_error { version; headers; _ } =
   if not (Headers.mem headers "transfer-encoding")

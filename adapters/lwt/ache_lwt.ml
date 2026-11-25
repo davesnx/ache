@@ -335,7 +335,37 @@ module Websocket = struct
     t.closed
 end
 
-module Make (Io : IO) = struct
+(* A client checks an idle connection for response bytes before it writes a
+   request (undici GHSA-35p6-xmwp-9g52). *)
+module Idle_input = struct
+  let rec has_response_byte buf i stop =
+    i < stop
+    &&
+    match Ache.Bigstring.unsafe_get buf i with
+    | '\r' | '\n' -> has_response_byte buf (i + 1) stop
+    | _ -> true
+
+  (* Bytes other than empty lines, or the end of input, that wait on the
+     non-blocking [fd]. [fd] must not be read by another thread. *)
+  let waiting fd =
+    let buf = Bytes.create 64 in
+    match Unix.recv fd buf 0 (Bytes.length buf) [ Unix.MSG_PEEK ] with
+    | n ->
+      n = 0
+      || Bytes.exists
+           (function '\r' | '\n' -> false | _ -> true)
+           (Bytes.sub buf 0 n)
+    | exception Unix.Unix_error ((ECONNRESET | ECONNABORTED | EPIPE), _, _) ->
+      true
+    | exception Unix.Unix_error _ -> false
+end
+
+module Make_with_idle_check
+    (Io : IO)
+    (Idle : sig
+       val input_waiting : Io.socket -> bool
+     end) =
+struct
   module Server = struct
     type socket = Io.socket
     type addr = Io.addr
@@ -468,6 +498,8 @@ module Make (Io : IO) = struct
       { connection : Ache.Client_connection.t
       ; runtime : Upgradable.t
       ; close : unit -> unit Lwt.t
+      ; socket : socket
+      ; unread : bool ref
       }
 
     let create_connection ?(config = Ache.Config.default) socket =
@@ -477,18 +509,60 @@ module Make (Io : IO) = struct
           (Ache.Runtime.make (module Ache.Client_connection) connection)
       in
       let close = IO_loop.close_once Io.close socket in
+      (* [unread]: a read returned response bytes that the connection has not
+         been given yet: the read loop can pause between the two. *)
+      let unread = ref false in
+      let module Io = struct
+        include Io
+
+        let read socket buf ~off ~len =
+          Io.read socket buf ~off ~len >|= fun n ->
+          if Idle_input.has_response_byte buf off (off + n) then unread := true;
+          n
+      end
+      in
+      let module Engine = struct
+        include Upgradable
+
+        let read t buf ~off ~len =
+          unread := false;
+          Upgradable.read t buf ~off ~len
+
+        let read_eof t buf ~off ~len =
+          unread := false;
+          Upgradable.read_eof t buf ~off ~len
+      end
+      in
       Lwt.async (fun () ->
         IO_loop.start
           (module Io)
-          (module Upgradable)
+          (module Engine)
           runtime
           ~read_buffer_size:config.read_buffer_size
           ~timed_read:IO_loop.untimed_read
           ~close
           socket);
-      Lwt.return { connection; runtime; close }
+      Lwt.return { connection; runtime; close; socket; unread }
 
-    let request t = Ache.Client_connection.request t.connection
+    let request
+          t
+          ?flush_headers_immediately
+          request
+          ~error_handler
+          ~response_handler
+      =
+      (* Response bytes that wait on an idle connection would be taken as the
+         response to this request: close the connection instead. *)
+      if
+        Ache.Ache_private.Client_connection.is_waiting t.connection
+        && (!(t.unread) || Idle.input_waiting t.socket)
+      then Upgradable.shutdown t.runtime;
+      Ache.Client_connection.request
+        t.connection
+        ?flush_headers_immediately
+        request
+        ~error_handler
+        ~response_handler
 
     let shutdown t =
       Upgradable.shutdown t.runtime;
@@ -542,4 +616,22 @@ module Io = struct
       | Unix.Unix_error (Unix.ENOTCONN, _, _) -> ()
 end
 
-include Make (Io)
+module Make (Io : IO) =
+  Make_with_idle_check
+    (Io)
+    (struct
+      let input_waiting _ = false
+    end)
+
+include
+  Make_with_idle_check
+    (Io)
+    (struct
+      (* A blocking descriptor may be read by a Lwt thread at the same time. *)
+      let input_waiting socket =
+        Lwt_unix.state socket = Lwt_unix.Opened
+        && (match Lwt.state (Lwt_unix.blocking socket) with
+          | Lwt.Return false -> true
+          | Lwt.Return true | Lwt.Fail _ | Lwt.Sleep -> false)
+        && Idle_input.waiting (Lwt_unix.unix_file_descr socket)
+    end)

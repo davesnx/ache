@@ -79,7 +79,13 @@ module type IO = Ache_miou_intf.IO
 module type Server = Ache_miou_intf.Server
 module type Client = Ache_miou_intf.Client
 
-module Make (Io : IO) = struct
+module Make_with_idle_check
+    (Io : IO)
+    (Idle : sig
+       (* Response bytes or the end of input wait on the socket. *)
+       val input_waiting : Io.socket -> bool
+     end) =
+struct
   module IO_loop = struct
     let writev = Io.writev
 
@@ -549,6 +555,7 @@ module Make (Io : IO) = struct
       ; stopped : [ `Done | `Abort ] Miou.Computation.t
       ; task : unit Miou.t
       ; mutable awaited : bool
+      ; socket : socket
       }
 
     let create_connection ?(config = Ache.Config.default) socket =
@@ -572,9 +579,38 @@ module Make (Io : IO) = struct
             runtime
             socket)
       in
-      { connection; runtime; read_closed; stopped; task; awaited = false }
+      { connection
+      ; runtime
+      ; read_closed
+      ; stopped
+      ; task
+      ; awaited = false
+      ; socket
+      }
 
-    let request t = Ache.Client_connection.request t.connection
+    let request
+          t
+          ?flush_headers_immediately
+          request
+          ~error_handler
+          ~response_handler
+      =
+      (* Response bytes that wait on an idle connection would be taken as the
+         response to this request (undici GHSA-35p6-xmwp-9g52): close the
+         connection instead. The read loop gives the bytes of a read to the
+         connection before it yields, so the socket holds all of them. *)
+      if
+        Ache.Ache_private.Client_connection.is_waiting t.connection
+        && Idle.input_waiting t.socket
+      then (
+        Read_closed.close t.read_closed;
+        Upgradable.shutdown t.runtime);
+      Ache.Client_connection.request
+        t.connection
+        ?flush_headers_immediately
+        request
+        ~error_handler
+        ~response_handler
 
     let shutdown t =
       Read_closed.close t.read_closed;
@@ -639,7 +675,37 @@ module Io = struct
     | Unix.Unix_error _ -> ()
 end
 
-include Make (Io)
+(* Bytes other than empty lines, or the end of input, that wait on [fd], without
+   blocking. *)
+let input_waiting fd =
+  match Unix.select [ fd ] [] [] 0. with
+  | [], _, _ -> false
+  | _ :: _, _, _ ->
+    let buf = Bytes.create 64 in
+    (match Unix.recv fd buf 0 (Bytes.length buf) [ Unix.MSG_PEEK ] with
+    | n ->
+      n = 0
+      || Bytes.exists
+           (function '\r' | '\n' -> false | _ -> true)
+           (Bytes.sub buf 0 n)
+    | exception Unix.Unix_error ((ECONNRESET | ECONNABORTED | EPIPE), _, _) ->
+      true
+    | exception Unix.Unix_error _ -> false)
+  | exception Unix.Unix_error _ -> false
+
+module Make (Io : IO) =
+  Make_with_idle_check
+    (Io)
+    (struct
+      let input_waiting _ = false
+    end)
+
+include
+  Make_with_idle_check
+    (Io)
+    (struct
+      let input_waiting socket = input_waiting (Miou_unix.to_file_descr socket)
+    end)
 
 module Server = struct
   include Server

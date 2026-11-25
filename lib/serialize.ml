@@ -109,15 +109,35 @@ let write_headers t headers =
   write_fields t (Headers.to_list headers);
   write_crlf t
 
-let check_request { Request.meth; target; headers; _ } =
+let check_request_head { Request.meth; target; headers; _ } =
   let meth = Method.to_string meth in
   if not (is_token meth) then invalid_argf "ache: invalid method %S" meth;
   if has_cr_lf_nul_space target 0
   then invalid_argf "ache: invalid request target %S" target;
   check_headers headers
 
+(* RFC 9110 §7.2: one Host field. RFC 9112 §6.1-6.3: a body length the recipient
+   can read. *)
+let check_request ({ Request.headers; _ } as request) =
+  check_request_head request;
+  (match Headers.get_multi headers "host" with
+  | _ :: _ :: _ -> invalid_arg "ache: more than one host field"
+  | [] | [ _ ] -> ());
+  match Request.body_length request with
+  | `Fixed _ | `Chunked -> ()
+  | `Error `Bad_request ->
+    if Headers.mem headers "content-length"
+    then
+      if Headers.mem headers "transfer-encoding"
+      then invalid_arg "ache: content-length and transfer-encoding are both set"
+      else
+        invalid_argf
+          "ache: invalid content-length %S"
+          (String.concat ", " (Headers.get_multi headers "content-length"))
+    else invalid_arg "ache: transfer-encoding does not end with chunked"
+
 let write_request t ({ Request.meth; target; version; headers } as request) =
-  check_request request;
+  check_request_head request;
   write_string t (Method.to_string meth);
   write_space t;
   write_string t target;

@@ -78,6 +78,8 @@ type t =
   ; response_body_buffer : Bigstring.t
   ; error_handler : error_handler
   ; upgrade : Runtime.impl -> unit
+  ; max_discard_body : int
+  ; mutable discarded : int
   ; mutable persistent : bool
   ; mutable response_state : Response_state.t
   ; mutable error_code : [ `Ok | error ]
@@ -91,6 +93,7 @@ let create
       ~writer
       ~response_body_buffer
       ~proxy
+      ~max_discard_body
       request
       request_body
   =
@@ -101,6 +104,8 @@ let create
   ; response_body_buffer
   ; error_handler
   ; upgrade
+  ; max_discard_body
+  ; discarded = 0
   ; persistent = Request.persistent_connection request
   ; response_state = Waiting
   ; error_code = `Ok
@@ -121,6 +126,19 @@ let response_exn { response_state; _ } =
     failwith "ache.Request_descriptor.response_exn: response has not started"
   | Streaming (response, _) | Fixed response | Upgrade response -> response
 
+(* Decision 0010: the connection drains at most [max_discard_body] bytes of an
+   unread body after the response, so a longer known remainder closes it. A body
+   the application closed is dropped the same way. *)
+let unread_body_too_large t =
+  match Reader.body_remaining t.reader t.request_body with
+  | Some n -> Int64.compare n (Int64.of_int t.max_discard_body) > 0
+  | None -> false
+
+(* After a CONNECT the next bytes may be tunnel data, so a response that does
+   not start the tunnel closes the connection. *)
+let keeps_connection t =
+  t.persistent && t.request.meth <> `CONNECT && not (unread_body_too_large t)
+
 let frame ~fn ~length t (response : Response.t) =
   if Status.is_informational response.status
   then
@@ -133,7 +151,7 @@ let frame ~fn ~length t (response : Response.t) =
     ~proxy:t.proxy
     ~request_method:t.request.meth
     ~request_version:t.request.version
-    ~persistent:t.persistent
+    ~persistent:(keeps_connection t)
     ~length
     response
 
@@ -146,8 +164,7 @@ let commit_persistence t (response : Response.t) =
   if t.persistent
   then
     t.persistent <-
-      Response.persistent_connection response
-      && not (t.request.meth = `CONNECT && Status.is_successful response.status);
+      keeps_connection t && Response.persistent_connection response;
   if not t.persistent then Reader.pause t.reader
 
 let has_body t encoding =
@@ -403,6 +420,15 @@ let persistent_connection t =
     not (Body.Writer.is_incomplete response_body)
   | Waiting | Fixed _ | Upgrade _ -> true
 
+(* The application closed the body while the parser is still inside it: on a
+   persistent connection its rest is dropped, within the discard budget, before
+   the next request. *)
+let drops_closed_body t =
+  t.persistent
+  && Body.Reader.is_closed t.request_body
+  && (not (Reader.is_closed t.reader))
+  && Reader.in_body t.reader t.request_body
+
 let input_state t : Io_state.t =
   match t.response_state, t.request.meth with
   | Upgrade _, _ when Reader.is_closed t.reader -> Complete
@@ -414,13 +440,30 @@ let input_state t : Io_state.t =
     Wait
   | _ ->
     if Body.Reader.is_closed t.request_body
-    then Complete
+    then if drops_closed_body t then Wait else Complete
     else if Body.Reader.is_read_scheduled t.request_body
     then Ready
     else Wait
 
 let output_state { response_state; writer; _ } =
   Response_state.output_state response_state ~writer
+
+(* The parser is still inside the request body, and its bytes are dropped: the
+   connection discards it, or the application closed it. *)
+let drops_body t =
+  Reader.in_body t.reader t.request_body
+  && (Body.Reader.is_discarding t.request_body
+     || Body.Reader.is_closed t.request_body)
+
+(* The bytes the connection may still read to drop the unread body, while it
+   drops it. *)
+let discard_budget t =
+  if drops_body t
+  then Some (Int.max 0 (t.max_discard_body - t.discarded))
+  else None
+
+let add_discarded t n = t.discarded <- t.discarded + n
+let discard_budget_spent t = discard_budget t = Some 0
 
 let flush_request_body t =
   if Body.Reader.has_pending_output t.request_body

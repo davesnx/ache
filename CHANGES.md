@@ -27,6 +27,10 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   codes have constructors.
 - The `respond_with_*` functions and `Client_connection.request` raise
   `Invalid_argument` for a head they cannot send correctly.
+- The client pipelines only up to `Config.max_pipelined_requests`, default
+  1: a request is written after the previous response is complete. A
+  non-idempotent request, or one that may switch protocols, is never
+  written while another response is pending. Set the limit to pipeline.
 
 ### New
 
@@ -77,10 +81,43 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - An exception from the request handler of a pipelined request gets that
   request an error response. It escaped `next_read_operation` or
   `next_write_operation`.
+- A bad byte in a head line split over reads gets the 400 in the read that
+  brings it. It came when the line ended, at the head limit or at end of
+  input.
+- Client: bytes that do not start a valid response, read with the end of a
+  response, give the error to the next request, or close the connection when
+  no request waits or the response closes it. They gave the error to the
+  request whose response was complete.
 - Fixes httpun #95, #143, #150, #151, #154 to #165, and httpaf #18, #38,
   #86, #191, #192.
 - When `Request_descriptor.respond_with_upgrade` cannot write the 101, it
   shuts the new protocol down.
+- `Config.max_discard_body` (256 KiB): after the response, the server reads
+  at most this much of a request body the application did not read. A
+  `Content-Length` remainder above it gets `connection: close`; a chunked
+  body that passes it closes the connection.
+- The server answers 400 to a target byte outside RFC 3986 (`#`, a byte
+  above 0x7F, `"`, `<`, `>`, `{`, `}`, `|`, `^`, `` ` ``, `\`), to userinfo
+  or an empty host in an absolute-form target, and to a `Host` with an
+  empty host (`:80`). Bytes above 0x7F were accepted.
+- Every response to `CONNECT` other than `respond_with_upgrade` closes the
+  connection, and the bytes after the request are not read. A non-2xx
+  response let the connection read them as the next request.
+- The client accepts a status-line with CRLF right after the status code
+  (`HTTP/1.1 301\r\n`) and gives `` `Malformed_response `` for a response
+  whose `Transfer-Encoding` lists no coding.
+- A chunked body fails when its chunk lines and extensions exceed its data
+  by more than 16 KiB (Go's budget, CVE-2023-39326): the server answers 400,
+  the client gets `` `Malformed_response ``.
+- Client: a 204 or 304 (not to `HEAD`) with `Transfer-Encoding` or a
+  nonzero `Content-Length` closes the connection after it.
+- Client: `Client_connection.request` raises `Invalid_argument` for two
+  `Host` fields and for conflicting or invalid `Content-Length` and
+  `Transfer-Encoding`. It raised `Failure` for the latter.
+- Client: response bytes on an idle connection close it also before their
+  head is complete, and `Client.request` of the plain runtimes checks an
+  idle socket for such bytes before it writes (undici
+  GHSA-35p6-xmwp-9g52).
 
 httpun history
 ==============

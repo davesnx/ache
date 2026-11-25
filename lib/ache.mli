@@ -317,10 +317,10 @@ module Request_descriptor : sig
       No body is sent in a response to [HEAD] or with status 1xx, 204 or 304
       (RFC 9112 §6.3). A [HEAD] or 304 response can carry the [Content-Length]
       of the matching [GET] response. To start a tunnel for a [CONNECT]
-      request, use {!respond_with_upgrade}. The body of a 2xx response to
-      [CONNECT] given to another [respond_with_*] function is sent as it is,
-      then the connection closes, and the bytes after the [CONNECT] request
-      are not read.
+      request, use {!respond_with_upgrade}. Any other response to [CONNECT]
+      closes the connection, and the bytes after the [CONNECT] request are
+      not read: a 2xx is sent as it is, another status gets
+      [connection: close].
 
       ache adds:
       - [Content-Length] to a string or bigstring response that has neither
@@ -445,6 +445,20 @@ module Config : sig
           connection reads and dispatches no new request. A client that
           pipelines requests and does not read the responses then stops
           being read. Default is [65536]. *)
+    ; max_discard_body : int
+      (** Server: the most bytes of a request body that is unread or closed
+          by {!Body.Reader.close} the connection reads and discards after the
+          response, to serve the next request.
+          A response sent while more than this remains of a body framed by
+          Content-Length has [connection: close]. The connection closes once
+          it has read this many bytes of a body it discards and the body is
+          not complete. Default is [262144]. *)
+    ; max_pipelined_requests : int
+      (** Client: the most requests that wait for a response on one
+          connection. A request with a non-idempotent method, or one that may
+          switch protocols, is never written while another response is
+          pending. Default is [1]: a request is written after the previous
+          response is complete. *)
     }
 
   val default : t
@@ -476,7 +490,12 @@ module Server_connection : sig
         RFC 9112 §3 and §5 (lines end with CRLF; a bare LF is an error;
         obs-fold is an error); an HTTP/1.1 request has no Host field; a request
         has more than one Host field or a Host value that is not
-        [uri-host [":" port]] (RFC 3986 §3.2); a CONNECT target is not
+        [uri-host [":" port]] (RFC 3986 §3.2) or has an empty host, as in
+        [:80] (RFC 9110 §4.2.1); a target byte is not allowed by RFC 3986
+        ([#], a byte above 0x7F, a CTL, a double quote, an angle bracket, a
+        brace, a bar, a caret, a backquote or a backslash); an
+        absolute-form target has userinfo or an empty host (RFC 9110 §4.2.1,
+        §4.2.4); a CONNECT target is not
         [host:port] with a port of 0 to 65535; the target is [*] and the
         method is not OPTIONS; the method is not CONNECT and the target is
         not [*] for OPTIONS, nor origin-form ([/...]), nor absolute-form
@@ -497,8 +516,7 @@ module Server_connection : sig
         runtime's head timeout expires (see {!read_timeout}).
 
       A request with version HTTP/1.x, x > 1, is processed as HTTP/1.1. Its
-      [version] field keeps the received minor version. Request-target bytes
-      0x80 to 0xFF are accepted, because clients send them unencoded.
+      [version] field keeps the received minor version.
 
       A request that is rejected after earlier pipelined requests gets its
       error response after the responses to those requests. A request that
@@ -516,9 +534,9 @@ module Server_connection : sig
       nothing past the end of that request until its response is decided
       (RFC 9110 §7.8, §9.3.6). After {!Request_descriptor.respond_with_upgrade}
       (a 101, or a 2xx to [CONNECT]), those bytes go to the new protocol.
-      After a 2xx response to [CONNECT] sent another way, they are not read,
-      and the connection closes when the response is written. After any
-      other response, they are read as the next request. When the input ends
+      After any other response to [CONNECT], they are not read, and the
+      connection closes when the response is written. After any other
+      response to an [Upgrade] request, they are read as the next request. When the input ends
       before the upgrade response is written, the new protocol gets end of
       input after the switch.
 
@@ -788,8 +806,9 @@ module Client_connection : sig
       - [`Connection_closed]: the connection stopped reading responses before
         any byte of the response to this request arrived: end of input, a
         previous response that closes the connection, {!shutdown}, or an error
-        on an earlier response. RFC 9112 §9.3.1 lets the application send the
-        request again on a new connection.
+        on an earlier response. The request may still have reached the
+        server: RFC 9112 §9.3.1 lets the application send it again on a new
+        connection only when its method is idempotent.
       - [`Exn]: an exception from the application or reported with
         {!report_exn}. *)
 
@@ -819,15 +838,18 @@ module Client_connection : sig
       An obs-fold in a response field value is replaced with one space
       (RFC 9112 §5.2).
 
-      A request is written right away, or after the requests before it: it is
-      pipelined behind a request with an idempotent method (RFC 9110 §9.2.2)
-      whose request has been sent, and it waits behind any other request, and
-      behind a request that may switch protocols ([CONNECT], or [Upgrade] with
-      the [upgrade] connection option), until
-      that request's response is complete (RFC 9112 §9.3.2). When a response
-      ends the connection ([Connection: close], an HTTP/1.0 response without
-      keep-alive or with [Transfer-Encoding], or both [Content-Length] and
-      [Transfer-Encoding]), the connection stops writing, also in the middle of
+      A request is written right away when no response is pending, or after
+      the requests before it. With {!Config.max_pipelined_requests} above 1, it
+      is pipelined while fewer responses than that limit are pending, when it
+      and the requests before it have an idempotent method (RFC 9110 §9.2.2)
+      and none may switch protocols ([CONNECT], or [Upgrade] with the
+      [upgrade] connection option). Otherwise it waits until the response
+      before it is complete (RFC 9112 §9.3.2). When a response ends the
+      connection ([Connection: close], an HTTP/1.0 response without
+      keep-alive or with [Transfer-Encoding], both [Content-Length] and
+      [Transfer-Encoding], or a 204 or 304 to a method other than [HEAD] with
+      [Transfer-Encoding] or a [Content-Length] other than 0), the connection
+      stops writing, also in the middle of
       a request body, and the later requests get [`Connection_closed]. A
       request made after the connection stopped writing gets
       [`Connection_closed] once: from inside [request], before it returns,
@@ -835,12 +857,16 @@ module Client_connection : sig
       responses are complete.
 
       Response bytes that arrive when no request waits for a response close the
-      connection. Empty lines before a response are discarded.
+      connection, also before their head is complete. Empty lines before a
+      response are discarded.
 
       Raises [Invalid_argument], naming the offending field, when the head of
       [req] is invalid, before the request is queued: a method or field name that is not a token (RFC 9110
-      §9.1, §5.1), a field value with CR, LF or NUL (§5.5), or a request target
-      with CR, LF, NUL or space. *)
+      §9.1, §5.1), a field value with CR, LF or NUL (§5.5), a request target
+      with CR, LF, NUL or space, more than one [Host] field (§7.2), both
+      [Content-Length] and [Transfer-Encoding], a [Content-Length] that is
+      not one repeated [1*DIGIT] value, or a [Transfer-Encoding] whose last
+      coding is not [chunked] (RFC 9112 §6). *)
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
   (** [next_read_operation t] returns a value describing the next operation that
@@ -940,6 +966,12 @@ module Ache_private : sig
     type t
 
     val awaiting : Request.t -> (Response.t -> Body.Reader.t -> unit) -> t
+  end
+
+  module Client_connection : sig
+    val is_waiting : Client_connection.t -> bool
+    (** [is_waiting t] is [true] when [t] is open and no request waits for a
+        response. *)
   end
 
   module Parse : sig

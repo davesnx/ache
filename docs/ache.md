@@ -70,7 +70,7 @@ every other case the end of TCP without `close_notify` counts as the end of
 the input, as without TLS: a complete response with `Content-Length` or
 chunked framing is not an error, and a request that got no byte of its
 response gets `` `Connection_closed ``, so that the application can retry
-it. `Ache_eio` also accepts a `Tls_eio` flow directly,
+it when its method is idempotent. `Ache_eio` also accepts a `Tls_eio` flow directly,
 but `tls-eio` 2.1.5 does not tell `close_notify` from the end of TCP, so a
 client on such a flow reports a cut response as complete. A request body
 always has an explicit length, so a server reports a cut body without this
@@ -95,11 +95,14 @@ on the same connection get their responses first.
 |---|---|
 | A bare LF or a bare CR as a line end, obs-fold, a field name that is not a token, a CTL (for example NUL) in a field value | 400 |
 | A request line without a version | 400 |
-| An HTTP/1.1 request without `Host`, two `Host` fields, a `Host` value that is not `uri-host [":" port]` | 400 |
+| A target byte outside RFC 3986: `#`, a byte above 0x7F, a CTL, or one of `"` `<` `>` `{` `}` `\|` `^` `` ` `` `\` | 400 |
+| An absolute-form target with userinfo (`http://u:p@host/`) or an empty host (`http:///x`, `http://:80/`) | 400 |
+| An HTTP/1.1 request without `Host`, two `Host` fields, a `Host` value that is not `uri-host [":" port]`, a `Host` with an empty host (`:80`) | 400 |
 | A target form that does not fit the method: `*` with a method other than OPTIONS; without CONNECT, a target that is neither `/...` nor `scheme:...` (an authority such as `example.com:80` reads as a URI with scheme `example.com` and is accepted; `127.0.0.1:80` or `[::1]:80` is not) | 400 |
 | A CONNECT target that is not `host:port` with a port of 0 to 65535 | 400 |
 | A `Content-Length` that is not one repeated `1*DIGIT` value, such as `+3` or `3, 4` | 400 |
 | Both `Content-Length` and `Transfer-Encoding`; `Transfer-Encoding` in an HTTP/1.0 request; `chunked` that is not the final coding or is there twice | 400 |
+| A chunked body whose chunk lines and extensions exceed its data by more than 16 KiB: each chunk line counts its bytes, less 16 and twice the chunk size (Go's budget) | 400 |
 | A transfer coding other than `chunked`, as in `gzip, chunked` | 501 |
 | A method longer than `Config.max_header_size` | 501 |
 | A target that makes the request line longer than `max_header_size` | 414 |
@@ -133,11 +136,10 @@ httpun rejected chunk extensions and trailers.
   `103 Early Hints` or another interim response before the final response.
 - `Request_descriptor.respond_with_upgrade` on a `CONNECT` request sends a
   2xx (`200` unless `?status` says otherwise) and gives the connection to
-  the tunnel, with the bytes that came after the `CONNECT` head. A 2xx
-  response to `CONNECT` sent with another `respond_with_*` function is sent
-  as it is, then the connection closes; the bytes after the request are not
-  read. Another response to `CONNECT` lets the connection serve the next
-  request.
+  the tunnel, with the bytes that came after the `CONNECT` head. Any other
+  response to `CONNECT` closes the connection, and the bytes after the
+  request are not read: they may be tunnel data. A 2xx is sent as it is,
+  another status gets `connection: close`.
 - `Status` has the codes of the IANA registry that httpun did not have (102,
   103, 207, 208, 226, 308, 421, 422, 423, 424, 425, 451, 506, 507, 508).
   `` `Payload_too_large `` is now `` `Content_too_large ``, and 422 is
@@ -153,8 +155,13 @@ httpun rejected chunk extensions and trailers.
   many small chunks is delivered in linear time. ache does not reuse the
   bytes it gives to `on_read`.
 - When the response is complete, the server reads and drops the rest of a
-  request body that the application did not read. It waits for the rest of
-  the body at most `?idle_timeout` (see [Limits](#limits)).
+  request body that the application did not read or closed. It waits for the rest of
+  the body at most `?idle_timeout` (see [Limits](#limits)), and reads at
+  most `Config.max_discard_body` (256 KiB) of it. A response sent while more
+  than that remains of a `Content-Length` body has `connection: close`; a
+  chunked body that passes the limit closes the connection after the
+  response. httpun read the whole body, so a 413 to a 10 GB upload read
+  10 GB.
 
 ### Client
 
@@ -162,17 +169,43 @@ httpun rejected chunk extensions and trailers.
   byte of its response before the connection stopped reading. httpun called
   no handler for these requests, or gave them
   `` `Malformed_response "unexpected eof" ``.
-- A request is pipelined only behind requests with an idempotent method. It
-  waits behind other requests, and behind `CONNECT` and `Upgrade` requests,
-  until their responses are complete.
+- `Config.max_pipelined_requests` (default 1) limits the requests that wait
+  for a response on one connection: by default a request is written after
+  the previous response is complete. httpun pipelined without a limit. A
+  request with a non-idempotent method, or a `CONNECT` or `Upgrade` request,
+  is never written while another response is pending, and the requests
+  behind it wait too. A request that gets `` `Connection_closed `` may have
+  reached the server: retry it only when its method is idempotent.
+- A 204 or 304 response (not to `HEAD`) with `Transfer-Encoding` or a
+  `Content-Length` other than 0 has no body and closes the connection after
+  it.
+- Response bytes that arrive when no request waits for a response close the
+  connection, also before their head is complete. On an idle connection,
+  `Client.request` first looks, without blocking, for such bytes that a read
+  returned and the connection has not handled yet, or that wait on the
+  socket, and for the end of input; if there are some, the connection closes
+  and the request gets `` `Connection_closed `` instead of them as its
+  response (undici GHSA-35p6-xmwp-9g52). `Ache_eio.Client.request` yields
+  twice first, so that a read that io_uring completed returns. The socket is
+  looked at by `ache-lwt` and `ache-miou`, and by `ache-eio` on a
+  non-blocking descriptor (`eio_posix`), not over TLS; `ache-miou-tls`
+  makes neither check.
 - Interim 1xx responses other than 101 are dropped. After a 101, or a 2xx
   response to `CONNECT`, the client stops reading HTTP and `upgrade` gives
   the bytes after the head to the new protocol.
 - An obs-fold in a response field value becomes one space. Empty lines
-  before a response are ignored.
+  before a response are ignored. A status-line with CRLF right after the
+  status code (`HTTP/1.1 301\r\n`) has an empty reason phrase.
+- A response whose `Transfer-Encoding` lists no coding gives
+  `` `Malformed_response ``.
+- A chunked response body over the chunk overhead budget of the server
+  table above gives `` `Malformed_response ``.
 - `Client_connection.request` raises `Invalid_argument` for a method or field
-  name that is not a token, a CR, LF or NUL in a field value, and a CR, LF,
-  NUL or space in the target. Later requests are still sent.
+  name that is not a token, a CR, LF or NUL in a field value, a CR, LF,
+  NUL or space in the target, two `Host` fields, both `Content-Length` and
+  `Transfer-Encoding`, an invalid `Content-Length`, and a
+  `Transfer-Encoding` whose last coding is not `chunked`. Later requests are
+  still sent.
 
 ## WebSocket
 
@@ -453,8 +486,11 @@ runtimes.
   gets `on_error` and the connection closes. This applies to a response that
   closes the connection and to a keep-alive response, such as a 413, sent
   before the body was read.
+- After the response, the server reads at most `Config.max_discard_body`
+  (256 KiB) of a request body the application did not read or closed, then
+  closes the connection.
 - Once its write side has closed, the server reads and dispatches no new
-  request; the request in progress still gets its body, within the limit
+  request; the request in progress still gets its body, within the limits
   above.
 - While more than `Config.max_pending_output` bytes of responses wait to be
   written, the server reads no new request.

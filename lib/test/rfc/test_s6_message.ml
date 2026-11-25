@@ -67,7 +67,9 @@ let no_body_server_test ~status ~streaming =
   check_no_body_then_next ~status s
 
 let pipelined_client requests =
-  let c = Client.create () in
+  let c =
+    Client.create ~config:{ Config.default with max_pipelined_requests = 16 } ()
+  in
   let exs = List.map (fun r -> Client.request c r) requests in
   c, exs
 
@@ -230,13 +232,22 @@ let content_tests =
         ~first_response:"HTTP/1.1 204 No Content\r\n\r\n"
         ~status:204)
   ; test
-      "§6.4.1 client DEF: 304 response with Content-Length ends after the head"
+      "§6.4.1 client DEF: 304 response with Content-Length ends after the \
+       head, and the connection closes"
       (fun () ->
-         client_no_body_test
-           ~first_request:(client_get "/a")
-           ~first_response:
-             "HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\n"
-           ~status:304)
+         let c, exs = pipelined_client [ client_get "/a"; client_get "/b" ] in
+         Client.feed
+           c
+           ("HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\n" ^ next_ok);
+         match exs with
+         | [ a; b ] ->
+           check_client_ex "first response" ~status:304 ~body:"" a;
+           Alcotest.(check (list string))
+             "second response: Connection_closed"
+             [ "Connection_closed" ]
+             b.errors;
+           Alcotest.(check bool) "closed" true (Client.is_closed c)
+         | _ -> assert false)
   ; test "§6.4.1 client DEF: 100 response ends after the head" (fun () ->
       let c = Client.create () in
       let ex = Client.request c (client_get "/") in

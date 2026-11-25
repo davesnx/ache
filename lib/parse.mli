@@ -55,6 +55,11 @@ module Reader : sig
     -> Response_descriptor.t Queue.t
     -> response
 
+  val body_remaining : (_, _) t -> Body.Reader.t -> int64 option
+  (** The bytes of [body] the reader has yet to read: [Some n] for a body
+      framed by Content-Length, [None] while a chunked body is unfinished,
+      [Some 0L] once the reader is past [body]. *)
+
   val read_with_more :
      (_, _) t
     -> Bigstring.t
@@ -65,9 +70,12 @@ module Reader : sig
   (** Returns the number of bytes consumed. A head, chunk-size line or trailer
       section that is still incomplete consumes all the bytes it was given.
       Nothing is consumed after a message that may switch protocols until the
-      response decides. A bad byte in the first part of a line split across
-      reads is rejected at once; a bad byte in a later part is reported when
-      the line ends, at the head limit, or at end of input. *)
+      response decides. A bad byte is rejected in the read that brings it, also
+      in a line split across reads. *)
+
+  val in_body : (_, _) t -> Body.Reader.t -> bool
+  (** [in_body t body] is [true] while [t] reads [body], and after [t] failed
+      inside [body]. *)
 
   val force_close : (_, _) t -> unit
   (** Closes the reader. After a partial head, chunk-size line or trailer

@@ -24,8 +24,10 @@ let error_to_string : Client_connection.error -> string = function
   | `Connection_closed -> "Connection_closed"
   | `Exn exn -> "Exn " ^ Printexc.to_string exn
 
-let create () =
-  { c = Client_connection.create ()
+let pipelining = { Config.default with max_pipelined_requests = 16 }
+
+let create ?config () =
+  { c = Client_connection.create ?config ()
   ; written = Buffer.create 256
   ; pending = ""
   ; consumed = 0
@@ -172,7 +174,7 @@ let second_response ~bytewise =
   check_closed "closed" t
 
 let crlf_between ~bytewise =
-  let t = create () in
+  let t = create ~config:pipelining () in
   let ex1 = send t "/1" in
   let ex2 = send t "/2" in
   feed ~bytewise t ("\r\n" ^ ok "r1" ^ "\r\n\r\n" ^ ok "r2" ^ "\r\n");
@@ -181,7 +183,7 @@ let crlf_between ~bytewise =
   Alcotest.(check bool) "open" false (closed t)
 
 let no_pipelining_after_post ~bytewise =
-  let t = create () in
+  let t = create ~config:pipelining () in
   let ex1 =
     send
       ~meth:`POST

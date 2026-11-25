@@ -6,6 +6,8 @@ type t =
   ; max_header_size : int
   ; proxy : bool
   ; max_pending_output : int
+  ; max_discard_body : int
+  ; max_pipelined_requests : int
   }
 
 let default =
@@ -16,4 +18,6 @@ let default =
   ; max_header_size = 0x4000
   ; proxy = false
   ; max_pending_output = 0x10000
+  ; max_discard_body = 0x40000
+  ; max_pipelined_requests = 1
   }

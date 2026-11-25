@@ -14,13 +14,17 @@ let test_parse_valid () =
   check
     "OK response without headers"
     ~expect:(Ok (Response.create `OK))
-    "HTTP/1.1 200 OK\r\n\r\n"
+    "HTTP/1.1 200 OK\r\n\r\n";
+  check
+    "CRLF right after the status code"
+    ~expect:(Ok (Response.create ~reason:"" `Moved_permanently))
+    "HTTP/1.1 301\r\n\r\n"
 
 let test_parse_invalid_error () =
   check
-    "OK response without a status message"
+    "CR without LF after the status code"
     ~expect:(Error "unexpected '\\r' in status-line")
-    "HTTP/1.1 200\r\n\r\n";
+    "HTTP/1.1 200\rOK\r\n\r\n";
   check
     "OK response without a status message"
     ~expect:(Error "status-code empty")

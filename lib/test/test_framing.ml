@@ -268,13 +268,21 @@ let cases =
   ; ( "CONNECT 404, string"
     , req "CONNECT"
     , with_string `Not_found "no"
-    , "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\n\r\nno"
-    , "open" )
+    , "HTTP/1.1 404 Not Found\r\n\
+       content-length: 2\r\n\
+       connection: close\r\n\
+       \r\n\
+       no"
+    , "closed" )
   ; ( "CONNECT 403, streaming"
     , req "CONNECT"
     , streaming ~headers:[ "content-length", "2" ] `Forbidden "no"
-    , "HTTP/1.1 403 Forbidden\r\ncontent-length: 2\r\n\r\nno"
-    , "open" )
+    , "HTTP/1.1 403 Forbidden\r\n\
+       content-length: 2\r\n\
+       connection: close\r\n\
+       \r\n\
+       no"
+    , "closed" )
   ; ( "HTTP/1.0 GET 200, streaming, app chunked"
     , req ~version:"HTTP/1.0" "GET"
     , streaming ~headers:[ "transfer-encoding", "chunked" ] `OK "hello"
@@ -694,26 +702,36 @@ let test_pipelined_after_no_body () =
     ; "304", "GET", `Not_modified, "HTTP/1.1 304 Not Modified\r\n\r\n"
     ]
 
+(* The bytes after a CONNECT may be tunnel data: a refused CONNECT closes the
+   connection and the bytes are not read as a request (Go c8ef343b2b). *)
 let test_connect_refused_then_next () =
-  let s =
-    server
-      (fun reqd ->
-         match (Request_descriptor.request reqd).meth with
-         | `CONNECT -> with_string `Forbidden "no" reqd
-         | _ -> with_string `OK "ok" reqd)
-      (req "CONNECT" ^ req "GET")
-  in
-  Alcotest.(check string)
-    "403 then the GET response"
-    "HTTP/1.1 403 Forbidden\r\n\
-     content-length: 2\r\n\
-     \r\n\
-     noHTTP/1.1 200 OK\r\n\
-     content-length: 2\r\n\
-     \r\n\
-     ok"
-    (Buffer.contents s.out);
-  Alcotest.(check string) "connection" "open" (state s)
+  List.iter
+    (fun (status, head) ->
+       let handled = ref [] in
+       let s =
+         server
+           (fun reqd ->
+              let meth = (Request_descriptor.request reqd).meth in
+              handled := Method.to_string meth :: !handled;
+              match meth with
+              | `CONNECT -> with_string status "no" reqd
+              | _ -> with_string `OK "ok" reqd)
+           (req "CONNECT" ^ req "GET")
+       in
+       Alcotest.(check string)
+         (head ^ ", then the connection closes")
+         (head ^ "\r\ncontent-length: 2\r\nconnection: close\r\n\r\nno")
+         (Buffer.contents s.out);
+       Alcotest.(check (list string))
+         (head ^ ": GET not handled")
+         [ "CONNECT" ]
+         !handled;
+       Alcotest.(check string) (head ^ ": connection") "closed" (state s))
+    [ `Forbidden, "HTTP/1.1 403 Forbidden"
+    ; ( `Proxy_authentication_required
+      , "HTTP/1.1 407 Proxy Authentication Required" )
+    ; `Moved_permanently, "HTTP/1.1 301 Moved Permanently"
+    ]
 
 let test_client_cl_and_te () =
   let chunked = "\r\n2\r\nok\r\n0\r\n\r\n" in
@@ -751,7 +769,11 @@ let tests =
 
 let test_client_cl_and_te_pipelined () =
   let run first_headers =
-    let conn = Client_connection.create () in
+    let conn =
+      Client_connection.create
+        ~config:{ Config.default with max_pipelined_requests = 16 }
+        ()
+    in
     let written = Buffer.create 128 in
     let statuses = ref [] in
     let send target =

@@ -1141,6 +1141,35 @@ let test_unread_body_without_idle_timeout () =
          Miou_unix.close socket))
     [ "/early-close", early_close_response; "/early-413", early_413_response ]
 
+(* Decision 0010: the server drains at most 256 KiB of an unread body. *)
+let large_413_head =
+  "POST /early-413 HTTP/1.1\r\n\
+   host: localhost\r\n\
+   content-length: 10000000\r\n\
+   \r\n"
+
+let large_413_response =
+  "HTTP/1.1 413 Content Too Large\r\n\
+   content-length: 2\r\n\
+   connection: close\r\n\
+   \r\n\
+   no"
+
+let test_unread_body_drain_limit () =
+  with_server ~idle_timeout:5.0 (fun addr ->
+    let socket = connect addr in
+    send socket large_413_head;
+    Alcotest.(check string)
+      "413 closes"
+      large_413_response
+      (take socket (String.length large_413_response));
+    let from = Unix.gettimeofday () in
+    (try send socket (String.make 0x50000 'x') with Unix.Unix_error _ -> ());
+    Alcotest.(check string) "then closed" "" (read_all socket);
+    check_elapsed "closed after 256 KiB" ~from ~min:0. ~max:2.0;
+    wait_connection_done ();
+    Miou_unix.close socket)
+
 let test_unread_body_idle_timeout () =
   with_server ~idle_timeout:0.3 (fun addr ->
     let socket = connect addr in
@@ -1784,6 +1813,135 @@ let test_server_run_on_error () =
       "on_error got [%s], expected [Error_handler_failed]"
       (String.concat "; " (List.map Printexc.to_string errors))
 
+(* Client: response bytes on an idle connection (undici GHSA-35p6-xmwp-9g52).
+   The server runs in another domain with blocking sockets, so that the client
+   domain can block while the stray bytes arrive. For each of [strays], it
+   accepts a connection, answers the first request, sends the stray bytes 50 ms
+   later, and answers a second request if one comes within 1 s. The domain
+   returns the second requests. *)
+let stray_server strays =
+  let listening = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Unix.setsockopt listening Unix.SO_REUSEADDR true;
+  Unix.bind listening (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.listen listening 1;
+  let port =
+    match Unix.getsockname listening with
+    | Unix.ADDR_INET (_, port) -> port
+    | Unix.ADDR_UNIX _ -> assert false
+  in
+  let serve stray =
+    let socket, _ = Unix.accept listening in
+    let write s =
+      try ignore (Unix.write_substring socket s 0 (String.length s) : int) with
+      | Unix.Unix_error _ -> ()
+    in
+    let buf = Bytes.create 4096 in
+    let rec read_head acc =
+      let rec has_end i =
+        i + 4 <= String.length acc
+        && (String.sub acc i 4 = "\r\n\r\n" || has_end (i + 1))
+      in
+      if has_end 0
+      then acc
+      else
+        match Unix.read socket buf 0 (Bytes.length buf) with
+        | 0 -> acc
+        | n -> read_head (acc ^ Bytes.sub_string buf 0 n)
+        | exception Unix.Unix_error _ -> acc
+    in
+    ignore (read_head "" : string);
+    write "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    Unix.sleepf 0.05;
+    write stray;
+    Unix.setsockopt_float socket Unix.SO_RCVTIMEO 1.0;
+    let second = read_head "" in
+    if second <> ""
+    then write "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal";
+    Unix.close socket;
+    second
+  in
+  ( port
+  , Domain.spawn (fun () ->
+      Fun.protect
+        ~finally:(fun () -> Unix.close listening)
+        (fun () -> List.map serve strays)) )
+
+let stray_cases =
+  [ "a response", "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nevil"
+  ; "part of a head", "HTTP/1.1 200 OK\r\n"
+  ]
+
+let stray_outcome client =
+  let result = Miou.Computation.create () in
+  let finish r = ignore (Miou.Computation.try_return result r : bool) in
+  let writer =
+    Ache_miou.Client.request
+      client
+      (Ache.Request.create
+         ~headers:(Ache.Headers.of_list [ "host", "localhost" ])
+         `GET
+         "/")
+      ~error_handler:(function
+        | `Connection_closed -> finish "Connection_closed"
+        | `Malformed_response _ -> finish "Malformed_response"
+        | `Invalid_response_body_length _ ->
+          finish "Invalid_response_body_length"
+        | `Exn exn -> finish (Printexc.to_string exn))
+      ~response_handler:(fun response reader ->
+        let body = Stdlib.Buffer.create 16 in
+        let rec loop () =
+          Ache.Body.Reader.schedule_read
+            reader
+            ~on_error:(fun () -> finish "body error")
+            ~on_eof:(fun () ->
+              finish
+                (Printf.sprintf
+                   "%d %s"
+                   (Ache.Status.to_code response.status)
+                   (Stdlib.Buffer.contents body)))
+            ~on_read:(fun bs ~off ~len ->
+              Stdlib.Buffer.add_string
+                body
+                (Ache.Bigstring.substring bs ~off ~len);
+              loop ())
+        in
+        loop ())
+  in
+  Ache.Body.Writer.close writer;
+  match Miou.Computation.await result with
+  | Ok outcome -> outcome
+  | Error (exn, bt) -> Printexc.raise_with_backtrace exn bt
+
+let test_stray_bytes_on_idle_connection () =
+  let port, server = stray_server (List.map snd stray_cases) in
+  List.iter
+    (fun (name, _) ->
+       Miou_unix.run ~domains:0 (fun () ->
+         let socket = Miou_unix.tcpv4 () in
+         Miou_unix.connect
+           socket
+           (Unix.ADDR_INET (Unix.inet_addr_loopback, port));
+         let client = Ache_miou.Client.create_connection socket in
+         Alcotest.(check string)
+           (name ^ ": first")
+           "200 ok"
+           (stray_outcome client);
+         (* The stray bytes arrive while this domain does not run the read
+            loop. *)
+         Unix.sleepf 0.2;
+         Alcotest.(check string)
+           (name ^ ": second")
+           "Connection_closed"
+           (stray_outcome client);
+         Ache_miou.Client.shutdown client;
+         Miou_unix.close socket);
+       ())
+    stray_cases;
+  Alcotest.(check (list string))
+    "second requests not sent"
+    (List.map (fun _ -> "") stray_cases)
+    (Domain.join server)
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Option.iter
@@ -1795,6 +1953,9 @@ let () =
     "ache-miou loopback"
     [ ( "loopback"
       , [ "GET", `Quick, test_get
+        ; ( "client: response bytes on an idle connection are not a response"
+          , `Quick
+          , test_stray_bytes_on_idle_connection )
         ; "POST echo larger than the read buffer", `Quick, test_post_echo
         ; "two pipelined requests", `Quick, test_pipelined
         ; "101 upgrade to an echo protocol", `Quick, test_upgrade
@@ -1880,6 +2041,9 @@ let () =
         ; ( "unread body after the response: idle_timeout"
           , `Quick
           , test_unread_body_idle_timeout )
+        ; ( "unread body past 256 KiB closes the connection"
+          , `Quick
+          , test_unread_body_drain_limit )
         ; ( "response while a body read waits, no idle_timeout: closes"
           , `Quick
           , test_respond_while_body_read_pending )
