@@ -202,8 +202,9 @@ let request_handler _client_address reqd =
       ""
 ```
 
-- `upgrade` checks the handshake and responds with `101`, as
-  `Ache.Websocket.upgrade` does. On `Error _` it responds nothing: send the
+- `upgrade ?max_message_size ?headers` checks the handshake and responds with
+  `101`, as `Ache.Websocket.upgrade` does; `headers` answers a subprotocol
+  (see [Choose a subprotocol](ache.md#choose-a-subprotocol)). On `Error _` it responds nothing: send the
   response yourself, for example `426` with `Sec-WebSocket-Version: 13` for
   `` Error `Unsupported_version ``. Call it in the request handler of
   `Server.create_connection_handler`, `Server.run` or

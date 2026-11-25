@@ -897,7 +897,7 @@ module Websocket = struct
     | Error (exn, bt) -> fail exn bt
     | exception exn -> fail exn (Printexc.get_raw_backtrace ())
 
-  let upgrade ?max_message_size reqd session =
+  let upgrade ?max_message_size ?headers reqd session =
     let sessions =
       match Sessions.current () with
       | Some sessions -> sessions
@@ -912,7 +912,7 @@ module Websocket = struct
     and closed = Miou.Computation.create () in
     let t = ref None in
     match
-      Ache.Websocket.upgrade ?max_message_size reqd (fun connection ->
+      Ache.Websocket.upgrade ?max_message_size ?headers reqd (fun connection ->
         let ws =
           { connection
           ; messages

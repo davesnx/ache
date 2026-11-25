@@ -275,7 +275,7 @@ module Websocket = struct
          if Lwt.is_sleeping p then Queue.push waiter waiters)
       pending
 
-  let create ?max_message_size reqd =
+  let create ?max_message_size ?headers reqd =
     let messages = Queue.create ()
     and receivers = Queue.create ()
     and pingers = Queue.create ()
@@ -284,7 +284,7 @@ module Websocket = struct
     let closed, notify_closed = Lwt.wait () in
     let connection = ref None in
     match
-      Ache.Websocket.upgrade ?max_message_size reqd (fun ws ->
+      Ache.Websocket.upgrade ?max_message_size ?headers reqd (fun ws ->
         connection := Some ws;
         { on_message =
             (fun message ->
@@ -339,8 +339,8 @@ module Websocket = struct
         ; closed
         }
 
-  let upgrade ?max_message_size reqd session =
-    match create ?max_message_size reqd with
+  let upgrade ?max_message_size ?headers reqd session =
+    match create ?max_message_size ?headers reqd with
     | Error _ as error -> error
     | Ok t ->
       Lwt.async (fun () ->

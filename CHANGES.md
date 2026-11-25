@@ -59,6 +59,9 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   style, with the session in a fiber (Eio) or task (Miou) of the connection.
   A write to a client that reset the connection ends the connection
   (camlworks/dream#467).
+- `Websocket.upgrade ?headers` (core, Eio, Lwt and Miou) adds fields to the
+  `101`, for example `Sec-WebSocket-Protocol`; `Websocket.requested_protocols`
+  reads the subprotocols that the client offers.
 
 ### Changed
 

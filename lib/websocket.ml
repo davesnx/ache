@@ -554,9 +554,33 @@ let close ?(reason = "") t ~code =
 
 let default_max_message_size = 1 lsl 20
 
-let upgrade ?(max_message_size = default_max_message_size) reqd make_handler =
+let requested_protocols (request : Request.t) =
+  List.filter
+    (fun member -> member <> "")
+    (Message.list_members
+       (Headers.get_multi request.headers "sec-websocket-protocol"))
+
+let handshake_fields = [ "upgrade"; "connection"; "sec-websocket-accept" ]
+
+let check_extra_headers headers =
+  Headers.iter headers ~f:(fun name _ ->
+    if List.exists (Headers.ci_equal name) handshake_fields
+    then
+      invalid_arg
+        (Printf.sprintf
+           "Ache.Websocket.upgrade: the handshake owns the field %S"
+           name));
+  Serialize.check_headers headers
+
+let upgrade
+      ?(max_message_size = default_max_message_size)
+      ?(headers = Headers.empty)
+      reqd
+      make_handler
+  =
   if max_message_size < 1
   then invalid_arg "Ache.Websocket.upgrade: max_message_size must be positive";
+  check_extra_headers headers;
   match check_handshake (Request_descriptor.request reqd) with
   | Error _ as error -> error
   | Ok accept ->
@@ -609,9 +633,10 @@ let upgrade ?(max_message_size = default_max_message_size) reqd make_handler =
     Request_descriptor.respond_with_upgrade
       reqd
       (Headers.of_list
-         [ "upgrade", "websocket"
-         ; "connection", "Upgrade"
-         ; "sec-websocket-accept", accept
-         ])
+         ([ "upgrade", "websocket"
+          ; "connection", "Upgrade"
+          ; "sec-websocket-accept", accept
+          ]
+         @ Headers.to_list headers))
       (Runtime.make (module Engine) t);
     Ok ()

@@ -365,6 +365,99 @@ let test_upgrade_rejected_responds_nothing () =
     "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n"
     output
 
+let bare_conn server =
+  { server
+  ; leftover = ""
+  ; messages = ref []
+  ; pongs = ref []
+  ; closed = ref []
+  ; ws = ref None
+  }
+
+let no_handler _ =
+  { Websocket.on_message = ignore; on_pong = ignore; on_close = ignore }
+
+let test_upgrade_adds_headers () =
+  let offered = ref [] in
+  let server =
+    Server_connection.create (fun reqd ->
+      offered := Websocket.requested_protocols (Request_descriptor.request reqd);
+      match
+        Websocket.upgrade
+          ~headers:(Headers.of_list [ "Sec-WebSocket-Protocol", "chat" ])
+          reqd
+          no_handler
+      with
+      | Ok () -> ()
+      | Error _ -> Alcotest.fail "handshake rejected")
+  in
+  let c = bare_conn server in
+  feed
+    c
+    (request_string
+       (handshake_headers @ [ "sec-websocket-protocol", "chat, superchat" ]));
+  Alcotest.(check (list string)) "offered" [ "chat"; "superchat" ] !offered;
+  let output, state = drain c in
+  Alcotest.(check string)
+    "101 with the added field last"
+    "HTTP/1.1 101 Switching Protocols\r\n\
+     upgrade: websocket\r\n\
+     connection: Upgrade\r\n\
+     sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+     Sec-WebSocket-Protocol: chat\r\n\
+     \r\n"
+    output;
+  Alcotest.check write_state "101 written" `Yield state
+
+let test_upgrade_rejects_headers () =
+  let check name headers request =
+    let raised = ref None in
+    let server =
+      Server_connection.create (fun reqd ->
+        match
+          Websocket.upgrade ~headers:(Headers.of_list headers) reqd (fun _ ->
+            Alcotest.fail (name ^ ": handler called"))
+        with
+        | Ok () | Error _ -> raised := Some false
+        | exception Invalid_argument _ -> raised := Some true)
+    in
+    let c = bare_conn server in
+    feed c (request_string request);
+    Alcotest.(check (option bool)) (name ^ ": raises") (Some true) !raised;
+    let output, (_ : [ `Yield | `Close ]) = drain c in
+    Alcotest.(check string) (name ^ ": writes nothing") "" output
+  in
+  List.iter
+    (fun (name, headers) ->
+       check name headers handshake_headers;
+       check (name ^ ", invalid handshake") headers (remove "upgrade"))
+    [ "Upgrade", [ "Upgrade", "websocket" ]
+    ; "connection", [ "x-a", "b"; "connection", "close" ]
+    ; "SEC-WEBSOCKET-ACCEPT", [ "SEC-WEBSOCKET-ACCEPT", "x" ]
+    ; "name not a token", [ "bad name", "x" ]
+    ; "CR LF in a value", [ "x-a", "b\r\nx-b: c" ]
+    ; "NUL in a value", [ "x-a", "b\000" ]
+    ]
+
+let test_requested_protocols () =
+  let protocols fields =
+    Websocket.requested_protocols
+      (Request.create ~headers:(Headers.of_list fields) `GET "/")
+  in
+  Alcotest.(check (list string)) "none" [] (protocols handshake_headers);
+  Alcotest.(check (list string))
+    "members of all fields, in order, trimmed, empty dropped"
+    [ "chat"; "superchat"; "v2.json" ]
+    (protocols
+       [ "Sec-WebSocket-Protocol", " chat ,\tsuperchat"
+       ; "host", "a"
+       ; "sec-websocket-protocol", ", ,v2.json,"
+       ]);
+  Alcotest.(check (list string))
+    "empty field"
+    []
+    (protocols [ "sec-websocket-protocol", "" ])
+
 let hello_masked = "\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58"
 
 let test_masked_text () =
@@ -793,6 +886,11 @@ let tests =
   ; ( "rejected upgrade responds nothing"
     , `Quick
     , test_upgrade_rejected_responds_nothing )
+  ; "upgrade adds response fields", `Quick, test_upgrade_adds_headers
+  ; ( "upgrade rejects reserved and invalid fields"
+    , `Quick
+    , test_upgrade_rejects_headers )
+  ; "requested_protocols", `Quick, test_requested_protocols
   ; "masked text frame", `Quick, test_masked_text
   ; "send_text with 7, 16 and 64-bit lengths", `Quick, test_send_text
   ; "send before the 101 is written", `Quick, test_send_before_101

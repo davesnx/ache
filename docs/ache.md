@@ -248,6 +248,37 @@ let request_handler _client_address reqd =
     respond_empty reqd `Bad_request
 ```
 
+### Choose a subprotocol
+
+A client can offer subprotocols in `Sec-WebSocket-Protocol`, for example
+`new WebSocket(url, ["chat"])` in a browser. ache has none of its own: read
+the offered ones with `Websocket.requested_protocols request` (the members of
+all `Sec-WebSocket-Protocol` fields, in order), choose one, and answer it with
+`?headers` of `upgrade`. `upgrade` adds `headers` to the `101` after its own
+fields. A browser that offers protocols fails the connection when the `101`
+names none of them, so answer only when you support one, and reject the
+request otherwise if your service needs a subprotocol.
+
+```ocaml
+open Ache
+
+let upgrade_chat reqd make_handler =
+  let request = Request_descriptor.request reqd in
+  let headers =
+    if List.mem "chat" (Websocket.requested_protocols request)
+    then Headers.of_list [ "sec-websocket-protocol", "chat" ]
+    else Headers.empty
+  in
+  Websocket.upgrade ~headers reqd make_handler
+```
+
+`headers` cannot set `Upgrade`, `Connection` or `Sec-WebSocket-Accept`, in
+any case: `upgrade` owns them and raises `Invalid_argument`, as it does for
+an invalid field. It raises before it checks the handshake and writes
+nothing.
+
+### Send messages
+
 `send_text` queues one text frame, and `send_binary` one binary frame. The
 connection writes them after the `101`, also when you call them from your
 function before the `101` is written. `send_text` does not check that the
@@ -475,8 +506,9 @@ runtimes.
   above.
 - While more than `Config.max_pending_output` bytes of responses wait to be
   written, the server reads no new request.
-- WebSocket: server only. There are no extensions and no subprotocols. ache
-  has no timeout on an upgraded
+- WebSocket: server only. There are no extensions. The application chooses
+  a subprotocol and answers it with `?headers` of `upgrade`. ache has no
+  timeout on an upgraded
   connection: a client that stops reading, or never answers a close frame,
   keeps the connection open until you close the socket.
 - The API is not stable before 1.0.

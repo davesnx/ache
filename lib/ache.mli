@@ -637,9 +637,11 @@ end
     after a [101] response sent with {!Request_descriptor.respond_with_upgrade}. It needs no
     runtime code: every runtime drives it like {!Server_connection}.
 
-    It has no extensions and no subprotocols. It does not check [Origin] or
-    authentication: the request handler does that before
-    {!Websocket.upgrade}.
+    It has no extensions. The application chooses a subprotocol: it reads the
+    offered ones with {!Websocket.requested_protocols} and answers
+    [Sec-WebSocket-Protocol] with the [headers] of {!Websocket.upgrade}. It
+    does not check [Origin] or authentication: the request handler does that
+    before {!Websocket.upgrade}.
 
     What the connection does on its own:
     - it answers a ping with a pong that has the same payload;
@@ -729,18 +731,25 @@ module Websocket : sig
   val default_max_message_size : int
   (** [1048576] bytes (1 MiB). *)
 
+  val requested_protocols : Request.t -> string list
+  (** [requested_protocols request] is the subprotocols that the client
+      offers: the members of all [Sec-WebSocket-Protocol] fields of
+      [request], in order, without surrounding whitespace and without empty
+      members. *)
+
   val upgrade :
      ?max_message_size:int
+    -> ?headers:Headers.t
     -> Request_descriptor.t
     -> (t -> handler)
     -> (unit, handshake_error) result
-  (** [upgrade ?max_message_size reqd make_handler] checks the request of
-      [reqd] with {!check_handshake}. When it is valid, [upgrade] calls
-      [make_handler] with the new connection, then responds with [101] and
-      the headers [Upgrade: websocket], [Connection: Upgrade] and
-      [Sec-WebSocket-Accept], and returns [Ok ()]. The connection starts to
-      read and write when the [101] is written. Messages sent before that are
-      written after the [101].
+  (** [upgrade ?max_message_size ?headers reqd make_handler] checks the
+      request of [reqd] with {!check_handshake}. When it is valid, [upgrade]
+      calls [make_handler] with the new connection, then responds with [101]
+      and the headers [Upgrade: websocket], [Connection: Upgrade],
+      [Sec-WebSocket-Accept] and then [headers], and returns [Ok ()]. The
+      connection starts to read and write when the [101] is written.
+      Messages sent before that are written after the [101].
 
       When the request is not valid, [upgrade] responds with nothing and
       returns the error: the caller responds, for example with [400].
@@ -748,7 +757,16 @@ module Websocket : sig
       [max_message_size] limits the length of a message, all fragments
       together. Default {!default_max_message_size}.
 
-      @raise Invalid_argument if [max_message_size] is not positive. *)
+      [headers] adds fields to the [101], for example
+      [Sec-WebSocket-Protocol] with a subprotocol chosen from
+      {!requested_protocols}. Default empty.
+
+      @raise Invalid_argument
+        if [max_message_size] is not positive, or if [headers] has a field
+        named [Upgrade], [Connection] or [Sec-WebSocket-Accept] (in any case)
+        or an invalid field (a name that is not a token, a value with CR, LF
+        or NUL). It raises before it checks the handshake, and writes
+        nothing. *)
 
   val send_text : t -> string -> unit
   (** [send_text t message] queues [message] as one text frame without a

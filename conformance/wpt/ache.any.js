@@ -82,9 +82,9 @@ promise_test(async () => {
   }
 }, "Concurrent fetches get their own responses");
 
-function open(path) {
+function open(path, protocols = []) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://${acheHost}${path}`);
+    const ws = new WebSocket(`ws://${acheHost}${path}`, protocols);
     ws.binaryType = "arraybuffer";
     ws.onopen = () => resolve(ws);
     ws.onerror = () => reject(new Error("WebSocket error"));
@@ -129,3 +129,12 @@ promise_test(async () => {
   assert_equals(event.code, 4001);
   assert_equals(event.reason, "goodbye from the browser");
 }, "The browser sees the code and reason of a close the server starts");
+
+promise_test(async (t) => {
+  const ws = await open("/ws", ["chat"]);
+  t.add_cleanup(() => ws.close());
+  assert_equals(ws.protocol, "chat");
+  const message = next(ws, "message");
+  ws.send("hello chat");
+  assert_equals((await message).data, "hello chat");
+}, "A WebSocket that offers the chat subprotocol gets it");

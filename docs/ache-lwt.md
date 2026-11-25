@@ -142,8 +142,10 @@ let request_handler _client_address reqd =
       ""
 ```
 
-- `upgrade reqd session` checks the handshake and responds with `101`, as
-  `Ache.Websocket.upgrade` does, then runs `session ws` like `Lwt.async`.
+- `upgrade ?max_message_size ?headers reqd session` checks the handshake and
+  responds with `101`, as `Ache.Websocket.upgrade` does (`headers` answers a
+  subprotocol, see [Choose a subprotocol](ache.md#choose-a-subprotocol)),
+  then runs `session ws` like `Lwt.async`.
   `Ache_lwt.Websocket.Closed` raised by the session is ignored, so a session
   ends quietly when a send finds the client gone. Another exception sends a
   close frame with code 1011, then goes to `Lwt.async_exception_hook`, whose

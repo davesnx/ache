@@ -207,11 +207,13 @@ module Websocket : sig
 
   val upgrade :
      ?max_message_size:int
+    -> ?headers:Ache.Headers.t
     -> Ache.Request_descriptor.t
     -> (t -> unit)
     -> (unit, Ache.Websocket.handshake_error) result
-  (** [upgrade ?max_message_size reqd session] is {!Ache.Websocket.upgrade}:
-      it responds with [101] when the request is a valid opening handshake
+  (** [upgrade ?max_message_size ?headers reqd session] is
+      {!Ache.Websocket.upgrade}: it responds with [101], with [headers]
+      added, when the request is a valid opening handshake
       and returns [Ok ()]. When it returns [Error _], it responded nothing:
       respond, for example with [400].
 
@@ -236,7 +238,8 @@ module Websocket : sig
       what one read buffer holds.
 
       @raise Invalid_argument
-        if it is not called in a request handler of
+        for the reasons that {!Ache.Websocket.upgrade} gives, or if it is not
+        called in a request handler of
         {!Server.create_connection_handler}, {!Server.run} or
         [Ache_eio_tls.Server], or in a fiber forked from it. *)
 
