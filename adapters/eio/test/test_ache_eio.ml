@@ -86,6 +86,57 @@ let big_size = 16 * 1024 * 1024
 exception Respond_later
 
 let late_error_response : (unit -> unit) option ref = ref None
+let ws_reports : string Eio.Stream.t = Eio.Stream.create max_int
+let text_of = function Ache.Websocket.Text s -> s | Binary s -> "binary:" ^ s
+
+let ws_echo ws =
+  let module W = Ache_eio.Websocket in
+  let rec loop () =
+    match W.receive ws with
+    | Some (Text "close-me") ->
+      W.close ws 1001;
+      Eio.Stream.add
+        ws_reports
+        (match W.receive ws with
+        | None -> "closed, receive None"
+        | Some m -> "received " ^ text_of m)
+    | Some (Text "ping-me") ->
+      W.ping ws "are you there";
+      W.send_text ws "pong seen";
+      loop ()
+    | Some (Text "bye-reason") ->
+      W.close ~reason:"done here" ws 4000;
+      Eio.Stream.add ws_reports "closed with a reason"
+    | Some (Text message) ->
+      W.send_text ws message;
+      loop ()
+    | Some (Binary message) ->
+      W.send_binary ws message;
+      loop ()
+    | None ->
+      Eio.Stream.add
+        ws_reports
+        (match W.client_close ws with
+        | None -> "receive None"
+        | Some { code; reason } ->
+          Printf.sprintf "receive None, client close %d %S" code reason)
+  in
+  loop ()
+
+let ws_send_loop ws =
+  let module W = Ache_eio.Websocket in
+  let chunk = String.make 4096 'x' in
+  let rec loop () =
+    W.send_text ws chunk;
+    loop ()
+  in
+  try loop () with
+  | W.Closed ->
+    Eio.Stream.add
+      ws_reports
+      (match W.receive ws with
+      | None -> "send raised Closed, receive None"
+      | Some _ -> "a message after the reset")
 
 let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
   incr requests_seen;
@@ -144,6 +195,11 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
                  (Option.map (fun { Websocket.code; _ } -> code) close))
          })
      with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
+  | `GET, (("/ws-echo" | "/ws-send-loop") as target) ->
+    let session = if target = "/ws-echo" then ws_echo else ws_send_loop in
+    (match Ache_eio.Websocket.upgrade reqd session with
     | Ok () -> ()
     | Error _ -> Alcotest.fail "handshake rejected")
   | `GET, "/stream" ->
@@ -2104,6 +2160,512 @@ let test_server_run_error_handler_exception () =
              0
              (Eio.Stream.length errors))))
 
+let ws_handshake target =
+  Printf.sprintf
+    "GET %s HTTP/1.1\r\n\
+     host: localhost\r\n\
+     upgrade: websocket\r\n\
+     connection: Upgrade\r\n\
+     sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+     sec-websocket-version: 13\r\n\
+     \r\n"
+    target
+
+let ws_frame ?(fin = true) opcode payload =
+  let mask = "\x01\x02\x03\x04" in
+  let len = String.length payload in
+  assert (len < 126);
+  String.make 1 (Char.chr ((if fin then 0x80 else 0) lor opcode))
+  ^ String.make 1 (Char.chr (0x80 lor len))
+  ^ mask
+  ^ String.mapi
+      (fun i c -> Char.chr (Char.code c lxor Char.code mask.[i land 3]))
+      payload
+
+let read_ws_frame reader =
+  let head = Eio.Buf_read.take 2 reader in
+  let len = Char.code head.[1] in
+  assert (len < 126);
+  Char.code head.[0], Eio.Buf_read.take len reader
+
+let frame = Alcotest.(pair int string)
+
+let drain_ws_reports () =
+  while Option.is_some (Eio.Stream.take_nonblocking ws_reports) do
+    ()
+  done
+
+let ws_connect ~sw ~net addr target =
+  drain_ws_reports ();
+  let socket = Eio.Net.connect ~sw net addr in
+  Eio.Flow.copy_string (ws_handshake target) socket;
+  let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+  Alcotest.(check string)
+    "101"
+    ws_101
+    (Eio.Buf_read.take (String.length ws_101) reader);
+  socket, reader
+
+let test_websocket_echo () =
+  with_server (fun ~sw ~net addr ->
+    let socket, reader = ws_connect ~sw ~net addr "/ws-echo" in
+    Eio.Flow.copy_string (ws_frame 0x1 "hello") socket;
+    let first = read_ws_frame reader in
+    Eio.Flow.copy_string
+      (ws_frame ~fin:false 0x1 "w\xc3"
+      ^ ws_frame 0x9 "ping"
+      ^ ws_frame 0x0 "\xb6rld")
+      socket;
+    let second = read_ws_frame reader in
+    let third = read_ws_frame reader in
+    Eio.Flow.copy_string (ws_frame 0x2 "\x00\xff") socket;
+    let fourth = read_ws_frame reader in
+    Alcotest.(check (list frame))
+      "echo, pong, echo of the fragmented message, binary echo"
+      [ 0x81, "hello"; 0x8a, "ping"; 0x81, "w\xc3\xb6rld"; 0x82, "\x00\xff" ]
+      [ first; second; third; fourth ];
+    Eio.Flow.copy_string (ws_frame 0x8 "\x03\xe8bye") socket;
+    Alcotest.check
+      frame
+      "close echoed"
+      (0x88, "\x03\xe8")
+      (read_ws_frame reader);
+    Alcotest.(check string)
+      "then end of input"
+      ""
+      (Eio.Buf_read.take_all reader);
+    Alcotest.(check string)
+      "session"
+      "receive None, client close 1000 \"bye\""
+      (Eio.Stream.take ws_reports);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
+let test_websocket_server_close () =
+  with_server (fun ~sw ~net addr ->
+    let socket, reader = ws_connect ~sw ~net addr "/ws-echo" in
+    Eio.Flow.copy_string (ws_frame 0x1 "close-me") socket;
+    Alcotest.check frame "close 1001" (0x88, "\x03\xe9") (read_ws_frame reader);
+    Alcotest.(check string)
+      "close returned"
+      "closed, receive None"
+      (Eio.Stream.take ws_reports);
+    Eio.Flow.copy_string (ws_frame 0x8 "\x03\xe9") socket;
+    Alcotest.(check string)
+      "then end of input"
+      ""
+      (Eio.Buf_read.take_all reader);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
+let test_websocket_ping () =
+  with_server (fun ~sw ~net addr ->
+    let socket, reader = ws_connect ~sw ~net addr "/ws-echo" in
+    Eio.Flow.copy_string (ws_frame 0x1 "ping-me") socket;
+    Alcotest.check
+      frame
+      "server ping"
+      (0x89, "are you there")
+      (read_ws_frame reader);
+    Eio.Flow.copy_string (ws_frame 0xA "are you there") socket;
+    Alcotest.check
+      frame
+      "ping returned on the pong"
+      (0x81, "pong seen")
+      (read_ws_frame reader);
+    Eio.Flow.copy_string (ws_frame 0x1 "bye-reason") socket;
+    Alcotest.check
+      frame
+      "close with a reason"
+      (0x88, "\x0f\xa0done here")
+      (read_ws_frame reader);
+    Eio.Flow.copy_string (ws_frame 0x8 "\x0f\xa0") socket;
+    Alcotest.(check string)
+      "close returned"
+      "closed with a reason"
+      (Eio.Stream.take ws_reports);
+    Alcotest.(check string)
+      "then end of input"
+      ""
+      (Eio.Buf_read.take_all reader);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
+let test_websocket_send_loop_peer_reset () =
+  with_server (fun ~sw ~net addr ->
+    let socket, reader = ws_connect ~sw ~net addr "/ws-send-loop" in
+    Alcotest.(check string)
+      "server is sending"
+      "\x81\x7e\x10\x00"
+      (Eio.Buf_read.take 4 reader);
+    Eio.Net.setsockopt socket Eio.Net.Sockopt.SO_LINGER (Some 0);
+    let reset_at = Unix.gettimeofday () in
+    Eio.Flow.close socket;
+    Eio.Fiber.first
+      (fun () ->
+         Alcotest.(check string)
+           "session"
+           "send raised Closed, receive None"
+           (Eio.Stream.take ws_reports);
+         Eio.Stream.take connections_done)
+      (fun () ->
+         !real_sleep 2.0;
+         Alcotest.fail "still running 2 s after the reset");
+    let elapsed = Unix.gettimeofday () -. reset_at in
+    Alcotest.(check bool)
+      (Printf.sprintf "ended within 1 s (%.3f s)" elapsed)
+      true
+      (elapsed < 1.0))
+
+(* Serves one WebSocket connection on a socket pair: [session] runs in it,
+   [client] drives the other end. The result is how the connection handler
+   ended. *)
+let with_ws_session ?(on_upgrade = ignore) session client =
+  Eio_main.run (fun env ->
+    let clock = Eio.Stdenv.clock env in
+    Eio.Time.with_timeout_exn clock 10.0 (fun () ->
+      Eio.Switch.run (fun sw ->
+        let server, socket = Eio_unix.Net.socketpair_stream ~sw () in
+        let handled, resolve_handled = Eio.Promise.create () in
+        Eio.Fiber.fork ~sw (fun () ->
+          Eio.Promise.resolve
+            resolve_handled
+            (match
+               Ache_eio.Server.create_connection_handler
+                 ~request_handler:(fun _ reqd ->
+                   match Ache_eio.Websocket.upgrade reqd (session clock) with
+                   | Ok () -> on_upgrade ()
+                   | Error _ -> Alcotest.fail "handshake rejected")
+                 ~error_handler
+                 server
+                 (`Unix "ws")
+             with
+            | () -> Ok ()
+            | exception exn -> Error (Printexc.to_string exn)));
+        Eio.Flow.copy_string (ws_handshake "/ws") socket;
+        let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+        Alcotest.(check string)
+          "101"
+          ws_101
+          (Eio.Buf_read.take (String.length ws_101) reader);
+        client clock socket reader;
+        Eio.Promise.await handled)))
+
+let check_handled = Alcotest.(check (result unit string)) "handler" (Ok ())
+
+let client_closes socket reader =
+  Eio.Flow.copy_string (ws_frame 0x8 "\x03\xe8") socket;
+  Alcotest.check frame "close echoed" (0x88, "\x03\xe8") (read_ws_frame reader);
+  Alcotest.(check string) "then end of input" "" (Eio.Buf_read.take_all reader)
+
+let receive_text ws = Option.map text_of (Ache_eio.Websocket.receive ws)
+
+let test_websocket_ping_timeout () =
+  let log = ref [] in
+  let say s = log := s :: !log in
+  let module W = Ache_eio.Websocket in
+  let session clock ws =
+    (match W.ping ws (String.make 126 'x') with
+    | () -> say "126-byte ping sent"
+    | exception Invalid_argument _ -> say "126-byte ping: Invalid_argument");
+    (match W.close ws 1005 with
+    | () -> say "close 1005 sent"
+    | exception Invalid_argument _ -> say "close 1005: Invalid_argument");
+    (match Eio.Time.with_timeout clock 0.05 (fun () -> Ok (W.ping ws "")) with
+    | Ok () -> say "pong"
+    | Error `Timeout -> say "no pong: timeout");
+    W.ping ws "x";
+    say "pong returns";
+    (match W.ping ws "y" with
+    | () -> say "pong"
+    | exception W.Closed -> say "close: Closed");
+    (match W.client_close ws with
+    | Some { code; reason } ->
+      say (Printf.sprintf "client close %d %S" code reason)
+    | None -> say "no client close");
+    (match W.ping ws "" with
+    | () -> say "pong"
+    | exception W.Closed -> say "ping after close: Closed");
+    (match W.send_text ws "late" with
+    | () -> say "sent"
+    | exception W.Closed -> say "send after close: Closed");
+    W.close ws 1000;
+    say "close after close returns";
+    say
+      (match W.receive ws with None -> "receive None" | Some _ -> "a message")
+  in
+  check_handled
+    (with_ws_session session (fun _ socket reader ->
+       Alcotest.check frame "ping" (0x89, "") (read_ws_frame reader);
+       Alcotest.check frame "ping x" (0x89, "x") (read_ws_frame reader);
+       Eio.Flow.copy_string (ws_frame 0xA "x") socket;
+       Alcotest.check frame "ping y" (0x89, "y") (read_ws_frame reader);
+       client_closes socket reader));
+  Alcotest.(check (list string))
+    "session"
+    [ "126-byte ping: Invalid_argument"
+    ; "close 1005: Invalid_argument"
+    ; "no pong: timeout"
+    ; "pong returns"
+    ; "close: Closed"
+    ; "client close 1000 \"\""
+    ; "ping after close: Closed"
+    ; "send after close: Closed"
+    ; "close after close returns"
+    ; "receive None"
+    ]
+    (List.rev !log)
+
+let readable socket =
+  match Eio_unix.Resource.fd_opt socket with
+  | None -> Alcotest.fail "no fd"
+  | Some fd ->
+    Eio_unix.Fd.use_exn "select" fd (fun fd ->
+      match Unix.select [ fd ] [] [] 0. with [], _, _ -> false | _ -> true)
+
+let test_websocket_receive_backpressure () =
+  let go, resolve_go = Eio.Promise.create () in
+  let received = ref [] in
+  let session _ ws =
+    Eio.Promise.await go;
+    received := List.init 10 (fun _ -> receive_text ws);
+    received := !received @ [ receive_text ws ]
+  in
+  check_handled
+    (with_ws_session session (fun clock socket reader ->
+       for i = 0 to 9 do
+         Eio.Flow.copy_string (ws_frame 0x1 (string_of_int i)) socket
+       done;
+       Eio.Time.sleep clock 0.05;
+       Eio.Flow.copy_string (ws_frame 0x9 "p") socket;
+       Eio.Time.sleep clock 0.1;
+       Alcotest.(check bool)
+         "10 unread messages: reading paused, no pong"
+         false
+         (readable socket);
+       Eio.Promise.resolve resolve_go ();
+       Alcotest.check
+         frame
+         "receive resumes reading: pong"
+         (0x8a, "p")
+         (read_ws_frame reader);
+       client_closes socket reader));
+  Alcotest.(check (list (option string)))
+    "the messages, in order, then None"
+    (List.init 10 (fun i -> Some (string_of_int i)) @ [ None ])
+    !received
+
+let test_websocket_cancelled_receive () =
+  let timed_out, resolve_timed_out = Eio.Promise.create () in
+  let raced, resolve_raced = Eio.Promise.create () in
+  let log = ref [] in
+  let say s = log := s :: !log in
+  let session clock ws =
+    (match
+       Eio.Time.with_timeout clock 0.01 (fun () -> Ok (receive_text ws))
+     with
+    | Ok _ -> say "a message"
+    | Error `Timeout -> say "timeout");
+    Eio.Promise.resolve resolve_timed_out ();
+    say (Option.value (receive_text ws) ~default:"None");
+    (* Two receives woken by one read: Fiber.first keeps the first result and
+       cancels the other, which must leave its message queued. *)
+    let first =
+      Eio.Fiber.first (fun () -> receive_text ws) (fun () -> receive_text ws)
+    in
+    Eio.Promise.resolve resolve_raced ();
+    say (Option.value first ~default:"None");
+    say (Option.value (receive_text ws) ~default:"None");
+    say (Option.value (receive_text ws) ~default:"None")
+  in
+  check_handled
+    (with_ws_session session (fun _ socket reader ->
+       Eio.Promise.await timed_out;
+       Eio.Flow.copy_string (ws_frame 0x1 "hello") socket;
+       Eio.Flow.copy_string (ws_frame 0x1 "a" ^ ws_frame 0x1 "b") socket;
+       Eio.Promise.await raced;
+       client_closes socket reader));
+  Alcotest.(check (list string))
+    "session"
+    [ "timeout"; "hello"; "a"; "b"; "None" ]
+    (List.rev !log)
+
+let test_websocket_cancelled_receive_then_close () =
+  let timed_out, resolve_timed_out = Eio.Promise.create () in
+  let result = ref [] in
+  let session clock ws =
+    let r1 =
+      match
+        Eio.Time.with_timeout clock 0.01 (fun () -> Ok (receive_text ws))
+      with
+      | Ok _ -> "a message"
+      | Error `Timeout -> "timeout"
+    in
+    Eio.Promise.resolve resolve_timed_out ();
+    result := [ r1; Option.value (receive_text ws) ~default:"None" ]
+  in
+  check_handled
+    (with_ws_session session (fun _ socket reader ->
+       Eio.Promise.await timed_out;
+       client_closes socket reader));
+  Alcotest.(check (list string))
+    "receive times out, then None"
+    [ "timeout"; "None" ]
+    !result
+
+let test_websocket_cancelled_receives_bounded () =
+  let cancelled, resolve_cancelled = Eio.Promise.create () in
+  let grown = ref 0
+  and after = ref None in
+  let session _ ws =
+    let cancel_many n =
+      for _ = 1 to n do
+        Eio.Fiber.first
+          (fun () -> ignore (Ache_eio.Websocket.receive ws))
+          Eio.Fiber.yield
+      done
+    in
+    let live_words () =
+      Gc.full_major ();
+      (Gc.stat ()).live_words
+    in
+    cancel_many 1_000;
+    let before = live_words () in
+    cancel_many 100_000;
+    grown := live_words () - before;
+    Eio.Promise.resolve resolve_cancelled ();
+    after := receive_text ws;
+    ignore (Ache_eio.Websocket.receive ws)
+  in
+  check_handled
+    (with_ws_session session (fun _ socket reader ->
+       Eio.Promise.await cancelled;
+       Eio.Flow.copy_string (ws_frame 0x1 "after") socket;
+       client_closes socket reader));
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "100000 cancelled receives keep %d more live words (< 10000)"
+       !grown)
+    true
+    (!grown < 10_000);
+  Alcotest.(check (option string))
+    "a receive still gets the next message"
+    (Some "after")
+    !after
+
+let test_websocket_session_after_upgrade () =
+  let upgraded = ref false
+  and seen = ref None
+  and finished = ref false in
+  let session clock ws =
+    seen := Some !upgraded;
+    ignore (Ache_eio.Websocket.receive ws);
+    Eio.Time.sleep clock 0.05;
+    finished := true
+  in
+  check_handled
+    (with_ws_session
+       ~on_upgrade:(fun () -> upgraded := true)
+       session
+       (fun _ socket reader -> client_closes socket reader));
+  Alcotest.(check (option bool))
+    "the session starts after upgrade returned"
+    (Some true)
+    !seen;
+  Alcotest.(check bool) "the handler waits for the session" true !finished
+
+let test_websocket_session_exception () =
+  let session _ ws =
+    ignore (Ache_eio.Websocket.receive ws);
+    failwith "session failed"
+  in
+  Alcotest.(check (result unit string))
+    "the handler raises the exception"
+    (Error (Printexc.to_string (Failure "session failed")))
+    (with_ws_session session (fun _ socket reader ->
+       Eio.Flow.copy_string (ws_frame 0x1 "boom") socket;
+       Alcotest.check
+         frame
+         "close 1011"
+         (0x88, "\x03\xf3")
+         (read_ws_frame reader);
+       Eio.Flow.copy_string (ws_frame 0x8 "\x03\xf3") socket;
+       Alcotest.(check string)
+         "then end of input"
+         ""
+         (Eio.Buf_read.take_all reader)))
+
+let test_websocket_session_closed_ignored () =
+  let session _ ws =
+    ignore (Ache_eio.Websocket.receive ws);
+    Ache_eio.Websocket.send_text ws "late"
+  in
+  check_handled
+    (with_ws_session session (fun _ socket reader ->
+       client_closes socket reader))
+
+let test_websocket_session_cancelled () =
+  let waiting, resolve_waiting = Eio.Promise.create () in
+  let outcome = ref "running" in
+  Eio_main.run (fun _ ->
+    Eio.Switch.run (fun sw ->
+      let server, socket = Eio_unix.Net.socketpair_stream ~sw () in
+      Eio.Flow.copy_string (ws_handshake "/ws") socket;
+      Eio.Fiber.first
+        (fun () ->
+           Ache_eio.Server.create_connection_handler
+             ~request_handler:(fun _ reqd ->
+               match
+                 Ache_eio.Websocket.upgrade reqd (fun ws ->
+                   Eio.Promise.resolve resolve_waiting ();
+                   match Ache_eio.Websocket.receive ws with
+                   | _ -> outcome := "receive returned"
+                   | exception (Eio.Cancel.Cancelled _ as exn) ->
+                     outcome := "cancelled";
+                     raise exn)
+               with
+               | Ok () -> ()
+               | Error _ -> Alcotest.fail "handshake rejected")
+             ~error_handler
+             server
+             (`Unix "ws"))
+        (fun () -> Eio.Promise.await waiting)));
+  Alcotest.(check string)
+    "cancelling the connection fiber cancels the session"
+    "cancelled"
+    !outcome
+
+let test_websocket_upgrade_outside_connection () =
+  Eio_main.run @@ fun _ ->
+  let raised = ref None in
+  let server =
+    Server_connection.create (fun reqd ->
+      match Ache_eio.Websocket.upgrade reqd ignore with
+      | _ -> raised := Some "returned"
+      | exception Invalid_argument message -> raised := Some message)
+  in
+  let s = ws_handshake "/ws" in
+  let len = String.length s in
+  let (_ : int) =
+    Server_connection.read
+      server
+      (Ache.Bigstring.of_string s ~off:0 ~len)
+      ~off:0
+      ~len
+  in
+  Alcotest.(check (option string))
+    "Invalid_argument"
+    (Some
+       "Ache_eio.Websocket.upgrade: not called in a request handler of \
+        Ache_eio.Server")
+    !raised;
+  Alcotest.(check bool)
+    "nothing responded"
+    true
+    (match Server_connection.next_write_operation server with
+    | `Yield -> true
+    | `Write _ | `Close _ -> false)
+
 let () =
   Alcotest.run
     "ache-eio loopback"
@@ -2187,6 +2749,46 @@ let () =
         ; ( "an exception from report_exn ends the connection"
           , `Quick
           , test_report_exn_raises )
+        ] )
+    ; ( "websocket"
+      , [ "echo through Ache_eio.Websocket", `Quick, test_websocket_echo
+        ; "server close", `Quick, test_websocket_server_close
+        ; ( "ping returns on the pong, close with a reason"
+          , `Quick
+          , test_websocket_ping )
+        ; ( "ping timeout, Closed after close"
+          , `Quick
+          , test_websocket_ping_timeout )
+        ; ( "a send loop to a reset peer ends"
+          , `Quick
+          , test_websocket_send_loop_peer_reset )
+        ; ( "8 unread messages pause reading, receive resumes it"
+          , `Quick
+          , test_websocket_receive_backpressure )
+        ; ( "cancelled receive loses no message"
+          , `Quick
+          , test_websocket_cancelled_receive )
+        ; ( "cancelled receive, then close"
+          , `Quick
+          , test_websocket_cancelled_receive_then_close )
+        ; ( "cancelled receives keep memory bounded"
+          , `Quick
+          , test_websocket_cancelled_receives_bounded )
+        ; ( "the session starts after upgrade, the handler waits for it"
+          , `Quick
+          , test_websocket_session_after_upgrade )
+        ; ( "a session exception closes with 1011 and goes to the handler"
+          , `Quick
+          , test_websocket_session_exception )
+        ; ( "Closed from a session is ignored"
+          , `Quick
+          , test_websocket_session_closed_ignored )
+        ; ( "cancelling the connection cancels the session"
+          , `Quick
+          , test_websocket_session_cancelled )
+        ; ( "upgrade outside a connection raises Invalid_argument"
+          , `Quick
+          , test_websocket_upgrade_outside_connection )
         ] )
     ; ( "timeouts"
       , [ "idle connection is closed", `Quick, test_idle_timeout

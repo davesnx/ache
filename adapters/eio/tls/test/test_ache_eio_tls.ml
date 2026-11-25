@@ -117,6 +117,20 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (Runtime.make (module Echo) (Echo.create (fun t s -> Echo.send t s)))
   | `GET, "/upgrade-later" -> pending_upgrade := Some reqd
+  | `GET, "/ws-echo" ->
+    let rec echo ws =
+      match Ache_eio.Websocket.receive ws with
+      | Some (Text message) ->
+        Ache_eio.Websocket.send_text ws message;
+        echo ws
+      | Some (Binary message) ->
+        Ache_eio.Websocket.send_binary ws message;
+        echo ws
+      | None -> ()
+    in
+    (match Ache_eio.Websocket.upgrade reqd echo with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
   | `POST, "/respond-later" ->
     pending_body := Some reqd;
     let rec on_read _ ~off:_ ~len:_ =
@@ -1081,6 +1095,52 @@ let test_handshake_no_timeout () =
       Alcotest.(check bool) "still open after 0.5 s" true (state = `Open);
       Eio.Flow.shutdown socket `Send))
 
+let ws_frame opcode payload =
+  let mask = "\x01\x02\x03\x04" in
+  let len = String.length payload in
+  assert (len < 126);
+  String.make 1 (Char.chr (0x80 lor opcode))
+  ^ String.make 1 (Char.chr (0x80 lor len))
+  ^ mask
+  ^ String.mapi
+      (fun i c -> Char.chr (Char.code c lxor Char.code mask.[i land 3]))
+      payload
+
+let test_websocket_echo () =
+  with_server (fun _ connect ->
+    Eio.Switch.run (fun sw ->
+      let raw = raw_client (connect sw) in
+      Eio.Flow.copy_string
+        "GET /ws-echo HTTP/1.1\r\n\
+         host: localhost\r\n\
+         upgrade: websocket\r\n\
+         connection: Upgrade\r\n\
+         sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         sec-websocket-version: 13\r\n\
+         \r\n"
+        raw.tls;
+      let reader = Eio.Buf_read.of_flow raw.tls ~max_size:65536 in
+      let rec skip_head () =
+        if Eio.Buf_read.line reader <> "" then skip_head ()
+      in
+      Alcotest.(check string)
+        "101"
+        "HTTP/1.1 101 Switching Protocols"
+        (Eio.Buf_read.line reader);
+      skip_head ();
+      Eio.Flow.copy_string (ws_frame 0x1 "hello") raw.tls;
+      Alcotest.(check string)
+        "echo"
+        "\x81\x05hello"
+        (Eio.Buf_read.take 7 reader);
+      Eio.Flow.copy_string (ws_frame 0x8 "\x03\xe8") raw.tls;
+      Alcotest.(check string)
+        "close echoed"
+        "\x88\x02\x03\xe8"
+        (Eio.Buf_read.take 4 reader);
+      Eio.Flow.close raw.tls));
+  check_no_handler_error ()
+
 let () =
   Alcotest.run
     "ache-eio-tls"
@@ -1175,6 +1235,10 @@ let () =
             `Quick
             test_cancel_connection_fiber
         ; Alcotest.test_case "client upgrade" `Quick test_upgrade
+        ; Alcotest.test_case
+            "Ache_eio.Websocket echo over TLS"
+            `Quick
+            test_websocket_echo
         ; Alcotest.test_case
             "server upgrade with bytes after the head"
             `Quick
