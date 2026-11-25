@@ -60,12 +60,24 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   On a connection upgraded with `Websocket.upgrade` it answers `` `Idle ``,
   whose action closes with code 1001 (new `Websocket.read_timeout`). It
   answers `None` only while no read waits for the peer.
+- `Server_connection.error` has `` `Bad_request of string `` instead of
+  `` `Bad_request ``: the reason the request was rejected, for logs. The
+  default error handler does not send it. An error handler that matches
+  `#Status.standard` must match `` `Bad_request _ `` first.
+- `Body.Writer.close` has the type `?trailers:Headers.t -> t -> unit`. A call
+  compiles as before; a module that gives it where a `t -> unit` value is
+  expected must apply it (`fun w -> Body.Writer.close w`).
 
 ### New
 
 - Packages `ache-miou`, `ache-eio-tls`, `ache-lwt-tls` and `ache-miou-tls`.
+- `Ache.Testing` runs a request handler on bytes or on a `Request.t` and a
+  body, with no sockets and no runtime.
 - `Request_descriptor.respond_with_informational`, for `100 Continue` and
   `103 Early Hints`.
+- `Config.auto_continue` (default `false`): the first read of the body of a
+  request with `Expect: 100-continue` sends `100 Continue`, unless a
+  response has started.
 - Server timeouts `?idle_timeout` and `?head_timeout`, and
   `Config.max_header_size`.
 - `Server_connection.create ?date` adds a `Date` field to each final
@@ -129,6 +141,15 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   idle connection `n - 2` seconds after a response with that hint, and a
   request on it after then gets `` `Connection_closed `` before anything is
   written.
+- `Websocket.upgrade ?headers` (core, Eio, Lwt and Miou) adds fields to the
+  `101`, for example `Sec-WebSocket-Protocol`; `Websocket.requested_protocols`
+  reads the subprotocols that the client offers.
+- HTTP/1.1 trailers. `Body.Reader.trailers` gives the trailer fields of a
+  chunked body in `on_eof`, and `Body.Writer.close ~trailers` sends them
+  after the last chunk; a server sends them only when the request has
+  `TE: trailers`. Framing, routing and authentication fields (Go's
+  `badTrailer` list) are dropped when received and raise `Invalid_argument`
+  when sent. Trailers were read and discarded.
 
 ### Changed
 

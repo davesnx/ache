@@ -30,7 +30,7 @@
   ----------------------------------------------------------------------------*)
 
 type error =
-  [ `Bad_request
+  [ `Bad_request of string
   | `Not_implemented
   | `Http_version_not_supported
   | `Uri_too_long
@@ -88,6 +88,21 @@ type t =
   ; keep_alive : string
   }
 
+let continue_response = Response.create `Continue
+
+let expects_continue (request : Request.t) =
+  Message.at_least_v1_1 request.version
+  && Message.has_member
+       (Headers.get_multi request.headers "expect")
+       "100-continue"
+
+let send_continue t =
+  match t.response_state, t.error_code with
+  | Waiting, `Ok when not (Writer.is_closed t.writer) ->
+    Writer.write_response t.writer continue_response;
+    Writer.wakeup t.writer
+  | _ -> ()
+
 let create
       ~error_handler
       ~upgrade
@@ -98,25 +113,37 @@ let create
       ~max_discard_body
       ~date
       ~keep_alive
+      ~auto_continue
       request
       request_body
   =
-  { request
-  ; request_body
-  ; reader
-  ; writer
-  ; response_body_buffer
-  ; error_handler
-  ; upgrade
-  ; max_discard_body
-  ; discarded = 0
-  ; persistent = Request.persistent_connection request
-  ; response_state = Waiting
-  ; error_code = `Ok
-  ; proxy
-  ; date
-  ; keep_alive
-  }
+  let t =
+    { request
+    ; request_body
+    ; reader
+    ; writer
+    ; response_body_buffer
+    ; error_handler
+    ; upgrade
+    ; max_discard_body
+    ; discarded = 0
+    ; persistent = Request.persistent_connection request
+    ; response_state = Waiting
+    ; error_code = `Ok
+    ; proxy
+    ; date
+    ; keep_alive
+    }
+  in
+  if
+    auto_continue
+    && (not (Body.Reader.is_closed request_body))
+    && expects_continue request
+  then
+    Body.Reader.set_on_first_read
+      request_body
+      (Optional_thunk.some (fun () -> send_continue t));
+  t
 
 let request { request; _ } = request
 let request_body { request_body; _ } = request_body
@@ -284,6 +311,8 @@ let respond_with_informational t (response : Response.t) =
        transfer-encoding in a 1xx";
   match t.response_state with
   | Waiting ->
+    if Status.to_code response.status = 100
+    then Body.Reader.set_on_first_read t.request_body Optional_thunk.none;
     if Message.at_least_v1_1 t.request.version
     then (
       write_response t response;
@@ -307,8 +336,17 @@ let unsafe_respond_with_streaming ~flush_headers_immediately t response =
         t
         response
     in
+    let send_trailers =
+      match encoding with
+      | `Chunked -> Message.accepts_trailers t.request.headers
+      | `Fixed _ | `Close_delimited | `No_body -> false
+    in
     let response_body =
-      Body.Writer.create t.response_body_buffer ~encoding ~writer:t.writer
+      Body.Writer.create
+        ~send_trailers
+        t.response_body_buffer
+        ~encoding
+        ~writer:t.writer
     in
     write_response t response;
     if Writer.is_closed t.writer then Body.Writer.close_and_drain response_body;
@@ -383,9 +421,13 @@ let report_error t error =
   | Waiting, `Ok ->
     t.error_code <- (error :> [ `Ok | error ]);
     let status =
-      match (error :> [ error | Status.standard ]) with
+      match error with
       | `Exn _ -> `Internal_server_error
-      | #Status.standard as status -> status
+      | `Bad_request _ -> `Bad_request
+      | ( `Not_implemented | `Http_version_not_supported | `Uri_too_long
+        | `Bad_gateway | `Internal_server_error
+        | `Request_header_fields_too_large | `Request_timeout ) as status ->
+        status
     in
     (match
        t.error_handler ~request:t.request error (fun headers ->

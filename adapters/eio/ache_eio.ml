@@ -494,7 +494,7 @@ module Websocket = struct
 
   let max_queued_messages = 8
 
-  let upgrade ?max_message_size reqd session =
+  let upgrade ?max_message_size ?headers reqd session =
     let context =
       match Fiber.get connection_context with
       | Some context -> context
@@ -505,7 +505,7 @@ module Websocket = struct
     in
     let state = ref None in
     match
-      Ache.Websocket.upgrade ?max_message_size reqd (fun connection ->
+      Ache.Websocket.upgrade ?max_message_size ?headers reqd (fun connection ->
         let t =
           { connection
           ; messages = Queue.create ()

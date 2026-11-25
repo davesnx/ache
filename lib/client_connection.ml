@@ -89,6 +89,7 @@ let create_request_body ~request t =
   | `Fixed 0L -> Body.Writer.create_empty ~writer:t.writer
   | (`Fixed _ | `Chunked) as encoding ->
     Body.Writer.create
+      ~send_trailers:true
       (Bigstring.create t.config.request_body_buffer_size)
       ~encoding
       ~writer:t.writer

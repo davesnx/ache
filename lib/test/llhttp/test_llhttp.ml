@@ -101,7 +101,7 @@ let tally_outcome t =
   | _ -> Reject
 
 let error_name : Server_connection.error -> string = function
-  | `Bad_request -> "400"
+  | `Bad_request _ -> "400"
   | `Not_implemented -> "501"
   | `Http_version_not_supported -> "505"
   | `Uri_too_long -> "414"

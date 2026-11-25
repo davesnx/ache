@@ -789,7 +789,7 @@ let test_eof_mid_body () =
     Eio.Flow.close socket);
   Alcotest.(check bool) "request body cut" true !partial_body_cut;
   match !server_errors with
-  | [ `Bad_request ] -> ()
+  | [ `Bad_request _ ] -> ()
   | _ ->
     Alcotest.failf
       "expected one Bad_request, got %d errors"
@@ -2301,7 +2301,7 @@ let test_server_run_error_handler_exception () =
     let error_handler _ ?request:_ error start_response =
       match error with
       | `Exn _ -> raise Error_handler_failed
-      | #Status.standard -> Body.Writer.close (start_response Headers.empty)
+      | _ -> Body.Writer.close (start_response Headers.empty)
     in
     Eio.Time.with_timeout_exn clock 10.0 (fun () ->
       Eio.Fiber.first
@@ -3559,6 +3559,71 @@ let test_client_no_hint () =
     Alcotest.check outcome "reused" (Ok 200) (Eio.Promise.await second);
     Eio.Promise.await (Ache_eio.Client.shutdown client))
 
+let continue_size = 2 * 1024 * 1024
+
+let continue_request =
+  Printf.sprintf
+    "POST /upload HTTP/1.1\r\n\
+     host: localhost\r\n\
+     expect: 100-continue\r\n\
+     content-length: %d\r\n\
+     \r\n"
+    continue_size
+
+let continue_100 = "HTTP/1.1 100 Continue\r\n\r\n"
+
+let continue_final =
+  Printf.sprintf "HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\n%d" continue_size
+
+let continue_handler _ reqd =
+  let body = Request_descriptor.request_body reqd in
+  let received = ref 0 in
+  let rec on_read _ ~off:_ ~len =
+    received := !received + len;
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+  and on_eof () =
+    let s = string_of_int !received in
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create
+         ~headers:
+           (Headers.of_list
+              [ "content-length", string_of_int (String.length s) ])
+         `OK)
+      s
+  and on_error () = () in
+  Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+
+let auto_continue = { Config.default with auto_continue = true }
+
+let test_auto_continue_upload () =
+  Eio_main.run (fun env ->
+    let clock = Eio.Stdenv.clock env in
+    Eio.Switch.run (fun sw ->
+      let server, socket = Eio_unix.Net.socketpair_stream ~sw () in
+      Eio.Fiber.fork ~sw (fun () ->
+        Ache_eio.Server.create_connection_handler
+          ~config:auto_continue
+          ~date:false
+          ~idle_timeout:None
+          ~request_handler:continue_handler
+          ~error_handler
+          server
+          (`Unix "continue"));
+      let reader = Eio.Buf_read.of_flow socket ~max_size:4096 in
+      Eio.Flow.copy_string continue_request socket;
+      Alcotest.(check string)
+        "100 Continue within 0.5 s"
+        continue_100
+        (Eio.Time.with_timeout_exn clock 0.5 (fun () ->
+           Eio.Buf_read.take (String.length continue_100) reader));
+      Eio.Flow.copy_string (String.make continue_size 'x') socket;
+      Alcotest.(check string)
+        "the whole body was read"
+        continue_final
+        (Eio.Buf_read.take (String.length continue_final) reader);
+      Eio.Flow.shutdown socket `Send))
+
 let () =
   Alcotest.run
     "ache-eio loopback"
@@ -3568,6 +3633,9 @@ let () =
           , `Quick
           , test_stray_bytes_on_idle_connection )
         ; "Date header from the runtime", `Quick, test_date_header
+        ; ( "Expect: 100-continue upload with auto_continue"
+          , `Quick
+          , test_auto_continue_upload )
         ; "POST echo larger than the read buffer", `Quick, test_post_echo
         ; "two pipelined requests", `Quick, test_pipelined
         ; ( "many keep-alive requests on one connection keep the stack bounded"

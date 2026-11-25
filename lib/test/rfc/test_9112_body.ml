@@ -349,10 +349,24 @@ let ext_accept_cases =
   ]
 
 let trailer_accept_cases =
-  [ "3\r\nabc\r\n0\r\nX-T: 1\r\n\r\n"
-  ; "3\r\nabc\r\n0\r\nX-A: 1\r\nX-B: 2\r\nX-A: 3\r\n\r\n"
-  ; "3\r\nabc\r\n0\r\nX-T:\r\n\r\n"
+  [ "3\r\nabc\r\n0\r\nX-T: 1\r\n\r\n", [ "X-T", "1" ]
+  ; ( "3\r\nabc\r\n0\r\nX-A: 1\r\nX-B: 2\r\nX-A: 3\r\n\r\n"
+    , [ "X-A", "1"; "X-B", "2"; "X-A", "3" ] )
+  ; "3\r\nabc\r\n0\r\nX-T:\r\n\r\n", [ "X-T", "" ]
+  ; ( "3\r\n\
+       abc\r\n\
+       0\r\n\
+       X-T: 1\r\n\
+       Content-Length: 5\r\n\
+       Host: b\r\n\
+       transfer-encoding: chunked\r\n\
+       TRAILER: x-t\r\n\
+       X-U: 2\r\n\
+       \r\n"
+    , [ "X-T", "1"; "X-U", "2" ] )
   ]
+
+let fields = Alcotest.(list (pair string string))
 
 let size_reject_cases =
   [ "g\r\nabc\r\n0\r\n\r\n"
@@ -432,38 +446,59 @@ let chunked_tests =
   ; test
       "§7.1 client DEF: error and close for a bare LF in the chunked body"
       (fun () -> List.iter client_reject bare_lf_cases)
-  ; test "§7.1.2 server MAY: trailer fields are read and discarded" (fun () ->
-      List.iter
-        (fun c ->
-           accept_body c "abc";
-           let s = Server.run (post [ te "chunked" ] c) in
-           match Server.requests s with
-           | [ r ] ->
-             List.iter
-               (fun n ->
-                  Alcotest.(check (option string))
-                    (n ^ " not in headers")
-                    None
-                    (Headers.get r.headers n))
-               [ "x-t"; "x-a"; "x-b" ]
-           | _ -> Alcotest.fail "expected one request")
-        trailer_accept_cases)
-  ; test "§7.1.2 client MAY: trailer fields are read and discarded" (fun () ->
-      List.iter
-        (fun c ->
-           client_accept c "abc";
-           let _, ex = client_response (chunked_head ^ c) in
-           match ex.responses with
-           | [ r ] ->
-             List.iter
-               (fun n ->
-                  Alcotest.(check (option string))
-                    (n ^ " not in headers")
-                    None
-                    (Headers.get r.headers n))
-               [ "x-t"; "x-a"; "x-b" ]
-           | _ -> Alcotest.fail "expected one response")
-        trailer_accept_cases)
+  ; test
+      "§7.1.2 server MAY: trailer fields are kept apart, framing fields \
+       discarded"
+      (fun () ->
+         List.iter
+           (fun (c, expected) ->
+              accept_body c "abc";
+              let input = post [ te "chunked" ] c in
+              List.iter
+                (fun s ->
+                   match s.Server.exchanges with
+                   | [ ex ] ->
+                     Alcotest.(check fields)
+                       (String.escaped input)
+                       expected
+                       (Headers.to_list ex.trailers);
+                     Alcotest.(check (option string))
+                       "x-t not in headers"
+                       None
+                       (Headers.get ex.request.headers "x-t")
+                   | _ -> Alcotest.fail "expected one request")
+                [ Server.run input; run_split input ])
+           trailer_accept_cases)
+  ; test
+      "§7.1.2 client MAY: trailer fields are kept apart, framing fields \
+       discarded"
+      (fun () ->
+         List.iter
+           (fun (c, expected) ->
+              client_accept c "abc";
+              let whole = client_response (chunked_head ^ c) in
+              let split =
+                let c', ex = client_response "" in
+                String.iter
+                  (fun ch -> Client.feed c' (String.make 1 ch))
+                  (chunked_head ^ c);
+                c', ex
+              in
+              List.iter
+                (fun (_, (ex : Client.exchange)) ->
+                   Alcotest.(check fields)
+                     (String.escaped c)
+                     expected
+                     (Headers.to_list ex.trailers);
+                   match ex.responses with
+                   | [ r ] ->
+                     Alcotest.(check (option string))
+                       "x-t not in headers"
+                       None
+                       (Headers.get r.headers "x-t")
+                   | _ -> Alcotest.fail "expected one response")
+                [ whole; split ])
+           trailer_accept_cases)
   ; test
       "§7.1.2 server DEF: 400 then close for an invalid trailer field"
       (fun () -> List.iter reject_chunked trailer_reject_cases)
@@ -484,6 +519,79 @@ let chunked_tests =
            check_client_ok "first" ~body:"abc" a;
            check_client_ok "second" ~body:"ok" b
          | _ -> assert false)
+  ; test
+      "§7.1.2 server DEF: trailer fields follow the last chunk as field lines"
+      (fun () ->
+         let s =
+           Server.run
+             ~handler:(fun ex ->
+               let w =
+                 Request_descriptor.respond_with_streaming
+                   ex.Server.reqd
+                   (Response.create `OK)
+               in
+               Body.Writer.write_string w "abc";
+               Body.Writer.close
+                 ~trailers:(Headers.of_list [ "x-a", "1"; "x-b", "" ])
+                 w)
+             (get ~headers:[ host; "TE", "trailers" ] "/")
+         in
+         let body = (head_of (Server.output s)).Wire.body in
+         Alcotest.(check string)
+           "chunked body"
+           "3\r\nabc\r\n0\r\nx-a: 1\r\nx-b: \r\n\r\n"
+           body)
+  ; test
+      "§7.1.2 client DEF: trailer fields follow the last chunk as field lines"
+      (fun () ->
+         let c = Client.create () in
+         let ex =
+           Client.request
+             ~close_body:false
+             c
+             (Request.create
+                ~headers:
+                  (Headers.of_list
+                     [ "host", "example.com"; "transfer-encoding", "chunked" ])
+                `POST
+                "/")
+         in
+         Body.Writer.write_string ex.writer "abc";
+         Body.Writer.close ~trailers:(Headers.of_list [ "x-a", "1" ]) ex.writer;
+         Client.pump c;
+         let out = Client.written c in
+         Alcotest.(check string)
+           "chunked body"
+           "3\r\nabc\r\n0\r\nx-a: 1\r\n\r\n"
+           (head_of out).Wire.body)
+  ; test
+      "§7.4 server DEF: trailer fields are sent only when TE has trailers"
+      (fun () ->
+         List.iter
+           (fun (headers, sent) ->
+              let s =
+                Server.run
+                  ~handler:(fun ex ->
+                    let w =
+                      Request_descriptor.respond_with_streaming
+                        ex.Server.reqd
+                        (Response.create `OK)
+                    in
+                    Body.Writer.close
+                      ~trailers:(Headers.of_list [ "x-a", "1" ])
+                      w)
+                  (get ~headers:(host :: headers) "/")
+              in
+              Alcotest.(check string)
+                (String.concat ", " (List.map snd headers))
+                (if sent then "0\r\nx-a: 1\r\n\r\n" else "0\r\n\r\n")
+                (head_of (Server.output s)).Wire.body)
+           [ [ "TE", "trailers, deflate;q=0.5" ], true
+           ; [ "Connection", "TE"; "TE", "Trailers" ], true
+           ; [ "TE", "deflate" ], false
+           ; [ "TE", "" ], false
+           ; [], false
+           ])
   ]
 
 let server_response_tests =

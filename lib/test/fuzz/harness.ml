@@ -48,7 +48,7 @@ let response_summary { Response.version; status; reason; headers } =
     (headers_to_string headers)
 
 let server_error = function
-  | `Bad_request -> "Bad_request"
+  | `Bad_request _ -> "Bad_request"
   | `Not_implemented -> "Not_implemented"
   | `Http_version_not_supported -> "Http_version_not_supported"
   | `Uri_too_long -> "Uri_too_long"

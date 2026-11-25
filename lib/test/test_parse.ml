@@ -3,7 +3,7 @@ open Ache
 let iovecs_to_string = Helpers.Write_operation.iovecs_to_string
 
 let error_to_string = function
-  | `Bad_request -> "Bad_request"
+  | `Bad_request _ -> "Bad_request"
   | `Not_implemented -> "Not_implemented"
   | `Http_version_not_supported -> "Http_version_not_supported"
   | `Uri_too_long -> "Uri_too_long"

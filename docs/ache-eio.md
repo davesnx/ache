@@ -24,7 +24,11 @@ let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
   (match error with
   | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
-  | #Status.standard as status ->
+  | `Bad_request _ ->
+    Body.Writer.write_string body (Status.default_reason_phrase `Bad_request)
+  | ( #Status.server_error
+    | `Uri_too_long | `Request_header_fields_too_large | `Request_timeout ) as
+    status ->
     Body.Writer.write_string body (Status.default_reason_phrase status));
   Body.Writer.close body
 
@@ -144,7 +148,11 @@ let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
   (match error with
   | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
-  | #Status.standard as status ->
+  | `Bad_request _ ->
+    Body.Writer.write_string body (Status.default_reason_phrase `Bad_request)
+  | ( #Status.server_error
+    | `Uri_too_long | `Request_header_fields_too_large | `Request_timeout ) as
+    status ->
     Body.Writer.write_string body (Status.default_reason_phrase status));
   Body.Writer.close body
 
@@ -300,8 +308,9 @@ let request_handler _client_address reqd =
       ""
 ```
 
-- `upgrade` checks the handshake and responds with `101`, as
-  `Ache.Websocket.upgrade` does. On `Error _` it responds nothing: send the
+- `upgrade ?max_message_size ?headers` checks the handshake and responds with
+  `101`, as `Ache.Websocket.upgrade` does; `headers` answers a subprotocol
+  (see [Choose a subprotocol](ache.md#choose-a-subprotocol)). On `Error _` it responds nothing: send the
   response yourself, for example `426` with `Sec-WebSocket-Version: 13` for
   `` Error `Unsupported_version ``. Call it in the request handler of
   `Server.create_connection_handler`, `Server.run` or
@@ -528,7 +537,11 @@ let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
   (match error with
   | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
-  | #Status.standard as status ->
+  | `Bad_request _ ->
+    Body.Writer.write_string body (Status.default_reason_phrase `Bad_request)
+  | ( #Status.server_error
+    | `Uri_too_long | `Request_header_fields_too_large | `Request_timeout ) as
+    status ->
     Body.Writer.write_string body (Status.default_reason_phrase status));
   Body.Writer.close body
 

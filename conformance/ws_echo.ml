@@ -47,7 +47,15 @@ let close_on_message ws =
   }
 
 let upgrade reqd handler =
-  match Websocket.upgrade ~max_message_size reqd handler with
+  let headers =
+    if
+      List.mem
+        "chat"
+        (Websocket.requested_protocols (Request_descriptor.request reqd))
+    then Headers.of_list [ "sec-websocket-protocol", "chat" ]
+    else Headers.empty
+  in
+  match Websocket.upgrade ~max_message_size ~headers reqd handler with
   | Ok () -> ()
   | Error `Not_websocket ->
     respond reqd ~headers:[ "upgrade", "websocket" ] `Upgrade_required ""

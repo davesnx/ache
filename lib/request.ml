@@ -77,7 +77,7 @@ let body_length { headers; _ } : Body_length.t =
       if len >= 0L then `Fixed len else bad_request
 
 type error =
-  [ `Bad_request
+  [ `Bad_request of string
   | `Not_implemented
   | `Http_version_not_supported
   ]
@@ -211,32 +211,43 @@ let transfer_coding_error { version; headers; _ } =
   if not (Headers.mem headers "transfer-encoding")
   then None
   else if not (Message.at_least_v1_1 version)
-  then Some `Bad_request
+  then Some (`Bad_request "Transfer-Encoding in an HTTP/1.0 request")
   else
     match List.rev (transfer_codings headers) with
     | last :: rest when Headers.ci_equal last "chunked" ->
       if List.exists (Headers.ci_equal "chunked") rest
-      then Some `Bad_request
+      then Some (`Bad_request "chunked transfer coding applied twice")
       else if rest <> []
       then Some `Not_implemented
       else None
-    | _ -> Some `Bad_request
+    | _ -> Some (`Bad_request "chunked is not the final transfer coding")
 
 let received_body_length ({ meth; target; version; headers } as t) =
   if version.major <> 1
   then Error `Http_version_not_supported
   else
     match Headers.get_multi headers "host" with
-    | [] when Message.at_least_v1_1 version -> Error `Bad_request
-    | _ :: _ :: _ -> Error `Bad_request
-    | [ host ] when not (is_host_field host) -> Error `Bad_request
-    | _ when not (target_fits_method meth target) -> Error `Bad_request
+    | [] when Message.at_least_v1_1 version ->
+      Error (`Bad_request "missing Host field")
+    | _ :: _ :: _ -> Error (`Bad_request "more than one Host field")
+    | [ host ] when not (is_host_field host) ->
+      Error (`Bad_request "invalid Host field value")
+    | _
+      when meth <> `CONNECT
+           && is_absolute_form target
+           && not (has_valid_authority target) ->
+      Error (`Bad_request "userinfo or an empty host in the request-target")
+    | _ when not (target_fits_method meth target) ->
+      Error (`Bad_request "request-target does not fit the method")
     | _ ->
       (match transfer_coding_error t with
       | Some error -> Error error
       | None ->
         (match body_length t with
-        | `Error `Bad_request -> Error `Bad_request
+        | `Error `Bad_request ->
+          if Headers.mem headers "transfer-encoding"
+          then Error (`Bad_request "both Content-Length and Transfer-Encoding")
+          else Error (`Bad_request "invalid Content-Length")
         | (`Fixed _ | `Chunked) as length -> Ok length))
 
 let persistent_connection ?proxy { version; headers; _ } =

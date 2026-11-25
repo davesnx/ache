@@ -36,7 +36,7 @@ type request_handler = Request_descriptor.t -> unit
 
 type error =
   [ `Bad_gateway
-  | `Bad_request
+  | `Bad_request of string
   | `Not_implemented
   | `Http_version_not_supported
   | `Uri_too_long
@@ -104,7 +104,10 @@ let default_error_handler ?request:_ error handle =
   let message =
     match error with
     | `Exn exn -> Printexc.to_string exn
-    | (#Status.client_error | #Status.server_error) as error ->
+    | `Bad_request _ -> Status.to_string `Bad_request
+    | ( `Not_implemented | `Http_version_not_supported | `Uri_too_long
+      | `Bad_gateway | `Internal_server_error | `Request_header_fields_too_large
+      | `Request_timeout ) as error ->
       Status.to_string error
   in
   let body = handle Headers.empty in
@@ -217,6 +220,7 @@ let create
           ~max_discard_body:config.max_discard_body
           ~date
           ~keep_alive
+          ~auto_continue:config.auto_continue
           request
           request_body
       in
@@ -259,9 +263,13 @@ let set_error_and_handle ?request t error =
     wakeup_writer t)
   else
     let status =
-      match (error :> [ error | Status.standard ]) with
+      match error with
       | `Exn _ -> `Internal_server_error
-      | #Status.standard as status -> status
+      | `Bad_request _ -> `Bad_request
+      | ( `Not_implemented | `Http_version_not_supported | `Uri_too_long
+        | `Bad_gateway | `Internal_server_error
+        | `Request_header_fields_too_large | `Request_timeout ) as status ->
+        status
     in
     shutdown_reader t;
     let writer = t.writer in
@@ -299,6 +307,11 @@ let set_error_and_handle ?request t error =
                 * (is_active t == false), and are therefore not making use of
                 that * buffer. *)
              Body.Writer.create
+               ~send_trailers:
+                 (match encoding, request with
+                 | `Chunked, Some (request : Request.t) ->
+                   Message.accepts_trailers request.headers
+                 | _ -> false)
                t.response_body_buffer
                ~encoding
                ~writer:t.writer
@@ -430,8 +443,8 @@ and _final_read_operation_for t reqd =
 
 let next_read_operation t =
   match _next_read_operation t with
-  | `Error (`Parse _) ->
-    set_error_and_handle t `Bad_request;
+  | `Error (`Parse message) ->
+    set_error_and_handle t (`Bad_request message);
     `Close
   | `Error `Header_too_large ->
     set_error_and_handle t `Request_header_fields_too_large;

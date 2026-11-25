@@ -148,11 +148,13 @@ module Websocket : sig
 
   val upgrade :
      ?max_message_size:int
+    -> ?headers:Ache.Headers.t
     -> Ache.Request_descriptor.t
     -> (t -> unit)
     -> (unit, Ache.Websocket.handshake_error) result
-  (** [upgrade ?max_message_size reqd session] is {!Ache.Websocket.upgrade}:
-      it responds with [101] when the request is a valid opening handshake,
+  (** [upgrade ?max_message_size ?headers reqd session] is
+      {!Ache.Websocket.upgrade}: it responds with [101], with [headers]
+      added, when the request is a valid opening handshake,
       and then runs [session] in its own task. When it returns [Error _], it
       responded nothing: respond, for example with [400].
 
@@ -184,9 +186,9 @@ module Websocket : sig
       what one read buffer holds.
 
       @raise Invalid_argument
-        if [max_message_size] is not positive, or when [upgrade] is not
-        called from the request handler of a server of this library, while
-        the handler runs. *)
+        for the reasons that {!Ache.Websocket.upgrade} gives, or when
+        [upgrade] is not called from the request handler of a server of this
+        library, while the handler runs. *)
 
   val send_text : t -> string -> unit
   (** [send_text t message] sends [message] as one text frame and returns
