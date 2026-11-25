@@ -245,10 +245,19 @@ module Client : sig
 
   val create_connection :
      ?config:Ache.Config.t
+    -> ?input_waiting:(unit -> bool)
     -> sw:Eio.Switch.t
     -> _ Eio.Flow.two_way
     -> t
   (** [create_connection ~sw flow] runs an HTTP/1.1 client on [flow].
+
+      [input_waiting] replaces the look at the socket that {!request} makes
+      on an idle connection: it must not block, and returns [true] when bytes
+      other than CR and LF, or the end of input, wait to be read on [flow];
+      bytes it takes must stay for the next read of [flow]. By default
+      [request] peeks at a non-blocking socket ([eio_posix]) and looks at
+      nothing else. [ache-eio-tls] passes a look at the TLS records that
+      wait.
 
       When a response keeps the connection open with
       [Keep-Alive: timeout=n], the connection is not reused once the time

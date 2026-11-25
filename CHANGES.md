@@ -79,6 +79,9 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - Packages `ache-miou`, `ache-eio-tls`, `ache-lwt-tls` and `ache-miou-tls`.
 - `Server_connection.error_status` gives the status of the error response
   for each `Server_connection.error`.
+- `Ache_lwt.Make_with_idle_check`, `Ache_miou.Make_with_idle_check` and
+  `Ache_eio.Client.create_connection ?input_waiting`: a runtime on another
+  socket type can give `Client.request` its look at an idle connection.
 - `Ache.Testing` runs a request handler on bytes or on a `Request.t` and a
   body, with no sockets and no runtime.
 - `Request_descriptor.respond_with_informational`, for `100 Continue` and
@@ -225,9 +228,13 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `Host` fields and for conflicting or invalid `Content-Length` and
   `Transfer-Encoding`. It raised `Failure` for the latter.
 - Client: response bytes on an idle connection close it also before their
-  head is complete, and `Client.request` of the plain runtimes checks an
-  idle socket for such bytes before it writes (undici
-  GHSA-35p6-xmwp-9g52).
+  head is complete, and `Client.request` checks an idle socket for such
+  bytes before it writes (undici GHSA-35p6-xmwp-9g52). The TLS clients
+  decrypt the records that wait, so a session ticket or a key update does
+  not close the connection.
+- `ache-lwt-tls` and the client of `ache-eio-tls` drive `Tls.Engine`
+  themselves, as `ache-miou-tls` does, instead of `Tls_lwt.Unix` and
+  `Tls_eio`.
 
 httpun history
 ==============

@@ -828,14 +828,12 @@ let test_server_close () =
     (close_frame_out 1001)
     `Yield;
   Alcotest.(check string) "still reading" "`Read" (read_operation c);
-  feed
-    c
-    (client_frame 0x1 "dropped"
-    ^ client_frame 0x9 "no pong"
-    ^ client_frame 0x8 (close_payload 4000 ^ "done"));
+  feed c (client_frame 0x1 "dropped" ^ client_frame 0x9 "ping");
   check_messages c [];
+  check_output ~msg:"a ping after our close gets a pong" c "\x8a\x04ping" `Yield;
+  feed c (client_frame 0x8 (close_payload 4000 ^ "done"));
   check_reader_closed c;
-  check_output ~msg:"no pong, no second close frame" c "" `Close;
+  check_output ~msg:"no second close frame" c "" `Close;
   check_close_reasons c [ Some (4000, "done") ];
   Alcotest.check_raises
     "reserved code"

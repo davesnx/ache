@@ -3,6 +3,11 @@
  (modules ache_test_certs)
  (libraries mirage-crypto-rng.unix ptime ptime.clock.os tls x509))
 
+(library
+ (name ache_test_tls_stray)
+ (modules ache_test_tls_stray)
+ (libraries tls unix))
+
 (executable
  (name gen_test_certs)
  (modules gen_test_certs)

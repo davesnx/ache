@@ -46,29 +46,31 @@ let send t data =
 
 let send_ignoring_errors t data = try send t data with Unix.Unix_error _ -> ()
 
+let feed t raw =
+  match Tls.Engine.handle_tls t.state raw with
+  | Ok (state, eof, `Response response, `Data data) ->
+    t.state <- state;
+    if Option.is_some eof then t.close_notify_received <- true;
+    Option.iter
+      (fun data ->
+         t.plain <-
+           String.sub t.plain t.plain_off (String.length t.plain - t.plain_off)
+           ^ data;
+         t.plain_off <- 0)
+      data;
+    Option.iter (send_ignoring_errors t) response
+  | Error (failure, `Response response) ->
+    send_ignoring_errors t response;
+    raise
+      (match failure with
+      | `Alert alert -> Tls_miou_unix.Tls_alert alert
+      | failure -> Tls_miou_unix.Tls_failure failure)
+
 let pull t =
   match Miou_unix.read t.fd t.input with
   | 0 | (exception Unix.Unix_error ((ECONNRESET | ENOTCONN), _, _)) ->
     t.tcp_eof <- true
-  | n ->
-    (match Tls.Engine.handle_tls t.state (Bytes.sub_string t.input 0 n) with
-    | Ok (state, eof, `Response response, `Data data) ->
-      t.state <- state;
-      if Option.is_some eof then t.close_notify_received <- true;
-      Option.iter
-        (fun data ->
-           t.plain <-
-             String.sub t.plain t.plain_off (String.length t.plain - t.plain_off)
-             ^ data;
-           t.plain_off <- 0)
-        data;
-      Option.iter (send_ignoring_errors t) response
-    | Error (failure, `Response response) ->
-      send_ignoring_errors t response;
-      raise
-        (match failure with
-        | `Alert alert -> Tls_miou_unix.Tls_alert alert
-        | failure -> Tls_miou_unix.Tls_failure failure))
+  | n -> feed t (Bytes.sub_string t.input 0 n)
 
 let ended t = t.close_notify_received || t.tcp_eof
 
@@ -137,6 +139,39 @@ let coalesce iovecs =
   in
   let length = Ache.IOVec.lengthv iovecs in
   length, chunks [] length iovecs 0
+
+(* An idle client connection: without blocking, read the TCP bytes that wait and
+   give them to the TLS engine. Response bytes other than CR and LF, a
+   close_notify or the end of TCP mean that the connection must not be reused
+   (undici GHSA-35p6-xmwp-9g52). Decrypted bytes stay for the next read; a
+   session ticket or a key update is not input. *)
+let input_waiting t =
+  let fd = Miou_unix.to_file_descr t.fd in
+  let buf = Bytes.create 0x4000 in
+  let rec poll () =
+    if not (ended t)
+    then
+      match Unix.select [ fd ] [] [] 0. with
+      | [], _, _ -> ()
+      | _ :: _, _, _ ->
+        (match Unix.read fd buf 0 (Bytes.length buf) with
+        | 0 -> t.tcp_eof <- true
+        | n ->
+          feed t (Bytes.sub_string buf 0 n);
+          poll ())
+  in
+  let rec response_byte i =
+    i < String.length t.plain
+    && match t.plain.[i] with '\r' | '\n' -> response_byte (i + 1) | _ -> true
+  in
+  match poll () with
+  | () -> ended t || response_byte t.plain_off
+  | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK | EINTR), _, _) ->
+    ended t || response_byte t.plain_off
+  | exception
+      ( Unix.Unix_error _ | Tls_miou_unix.Tls_alert _
+      | Tls_miou_unix.Tls_failure _ ) ->
+    true
 
 module Io = struct
   type nonrec socket = socket
@@ -213,7 +248,12 @@ module Io = struct
     shutdown_tcp t command
 end
 
-include Ache_miou.Make (Io)
+include
+  Ache_miou.Make_with_idle_check
+    (Io)
+    (struct
+      let input_waiting = input_waiting
+    end)
 
 let handshake_limit idle_timeout head_timeout =
   match idle_timeout, head_timeout with

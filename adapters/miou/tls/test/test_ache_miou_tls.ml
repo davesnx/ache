@@ -1365,12 +1365,96 @@ let test_keep_alive_hint () =
         (raw_take raw (String.length expected))));
   check_no_handler_error ()
 
+let stray_outcome client =
+  let result = Miou.Computation.create () in
+  let finish r = ignore (Miou.Computation.try_return result r : bool) in
+  let writer =
+    Ache_miou_tls.Client.request
+      client
+      (Ache.Request.create
+         ~headers:(Ache.Headers.of_list [ "host", "localhost" ])
+         `GET
+         "/")
+      ~error_handler:(function
+        | `Connection_closed -> finish "Connection_closed"
+        | `Malformed_response _ -> finish "Malformed_response"
+        | `Invalid_response_body_length _ ->
+          finish "Invalid_response_body_length"
+        | `Exn exn -> finish (Printexc.to_string exn))
+      ~response_handler:(fun response reader ->
+        let body = Stdlib.Buffer.create 16 in
+        let rec loop () =
+          Ache.Body.Reader.schedule_read
+            reader
+            ~on_error:(fun () -> finish "body error")
+            ~on_eof:(fun () ->
+              finish
+                (Printf.sprintf
+                   "%d %s"
+                   (Ache.Status.to_code response.status)
+                   (Stdlib.Buffer.contents body)))
+            ~on_read:(fun bs ~off ~len ->
+              Stdlib.Buffer.add_string
+                body
+                (Ache.Bigstring.substring bs ~off ~len);
+              loop ())
+        in
+        loop ())
+  in
+  Ache.Body.Writer.close writer;
+  match Miou.Computation.await result with
+  | Ok outcome -> outcome
+  | Error (exn, bt) -> Printexc.raise_with_backtrace exn bt
+
+(* Client: TLS records that arrive on an idle connection (undici
+   GHSA-35p6-xmwp-9g52). Application data or a close_notify closes the
+   connection; a key update or an empty line does not. *)
+let test_stray_records_on_idle_connection () =
+  let port, server =
+    Ache_test_tls_stray.start server_config Ache_test_tls_stray.strays
+  in
+  List.iter
+    (fun (name, _, expected) ->
+       Miou_unix.run ~domains:0 (fun () ->
+         let socket = Miou_unix.tcpv4 () in
+         Miou_unix.connect
+           socket
+           (Unix.ADDR_INET (Unix.inet_addr_loopback, port));
+         let client =
+           Ache_miou_tls.Client.create_connection_with_fd
+             ~tls:client_config
+             ~peer:(`Host localhost)
+             socket
+         in
+         Alcotest.(check string)
+           (name ^ ": first")
+           "200 ok"
+           (stray_outcome client);
+         (* The stray records arrive while this domain does not run the read
+            loop. *)
+         Unix.sleepf 0.2;
+         Alcotest.(check string)
+           (name ^ ": second")
+           expected
+           (stray_outcome client);
+         Ache_miou_tls.Client.shutdown client;
+         Miou_unix.close socket))
+    Ache_test_tls_stray.cases;
+  Alcotest.(check (list bool))
+    "second requests sent"
+    Ache_test_tls_stray.second_requests_sent
+    (List.map (fun second -> second <> "") (Domain.join server))
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
     "ache-miou-tls"
     [ ( "tls"
       , [ Alcotest.test_case "GET" `Quick test_get
+        ; Alcotest.test_case
+            "client: TLS records on an idle connection"
+            `Quick
+            test_stray_records_on_idle_connection
         ; Alcotest.test_case "Keep-Alive hint" `Quick test_keep_alive_hint
         ; Alcotest.test_case
             "write timeout: a client that stops reading"

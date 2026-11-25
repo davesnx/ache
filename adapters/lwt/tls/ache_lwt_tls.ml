@@ -2,46 +2,34 @@ open Lwt.Infix
 
 exception Truncated
 
+(* A TLS session driven by [Tls.Engine] on the file descriptor, so that an idle
+   client can read the records that wait without blocking (see
+   [input_waiting]). *)
 type socket =
   { fd : Lwt_unix.file_descr
-  ; tls : Tls_lwt.Unix.t
-  ; output : Lwt_io.output_channel
-  ; tcp_eof : bool ref
-  ; closing : bool ref
+  ; mutable state : Tls.Engine.state
+  ; input : Bytes.t
+  ; mutable plain : string
+  ; mutable plain_off : int
+  ; mutable close_notify_received : bool
+  ; mutable tcp_eof : bool
+  ; mutable close_notify_sent : bool
+  ; writing : Lwt_mutex.t
   ; mutable close_delimited : bool
   }
 
-let channel_buffer_size = 17 * 1024
-
-let channels fd ~tcp_eof ~closing =
-  let input =
-    Lwt_io.make
-      ~buffer:(Lwt_bytes.create channel_buffer_size)
-      ~mode:Lwt_io.Input
-      (fun buf off len ->
-         Lwt_bytes.read fd buf off len >|= fun n ->
-         if n = 0 then tcp_eof := true;
-         n)
-  in
-  let output =
-    Lwt_io.make
-      ~buffer:(Lwt_bytes.create channel_buffer_size)
-      ~mode:Lwt_io.Output
-      (fun buf off len ->
-         if !closing
-         then
-           match
-             Unix.single_write_bigarray
-               (Lwt_unix.unix_file_descr fd)
-               buf
-               off
-               len
-           with
-           | n -> Lwt.return n
-           | exception exn -> Lwt.fail exn
-         else Lwt_bytes.write fd buf off len)
-  in
-  input, output
+let create fd state =
+  { fd
+  ; state
+  ; input = Bytes.create 0x4000
+  ; plain = ""
+  ; plain_off = 0
+  ; close_notify_received = false
+  ; tcp_eof = false
+  ; close_notify_sent = false
+  ; writing = Lwt_mutex.create ()
+  ; close_delimited = false
+  }
 
 let close_fd fd =
   match Lwt_unix.state fd with
@@ -50,18 +38,74 @@ let close_fd fd =
     (try Lwt_unix.shutdown fd SHUTDOWN_ALL with Unix.Unix_error _ -> ());
     Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
 
-let handshake fd start =
-  let tcp_eof = ref false
-  and closing = ref false in
-  let input, output = channels fd ~tcp_eof ~closing in
+(* Records go out in the order the engine made them: [send] takes the lock in
+   the same step as the engine call that made [data]. *)
+let send t data =
+  Lwt_mutex.with_lock t.writing (fun () ->
+    let rec write off =
+      if off = String.length data
+      then Lwt.return_unit
+      else
+        Lwt_unix.write_string t.fd data off (String.length data - off)
+        >>= fun n -> write (off + n)
+    in
+    write 0)
+
+let send_ignoring_errors t data =
+  Lwt.async (fun () ->
+    Lwt.catch (fun () -> send t data) (fun _ -> Lwt.return_unit))
+
+let feed t raw =
+  match Tls.Engine.handle_tls t.state raw with
+  | Ok (state, eof, `Response response, `Data data) ->
+    t.state <- state;
+    if Option.is_some eof then t.close_notify_received <- true;
+    Option.iter
+      (fun data ->
+         t.plain <-
+           String.sub t.plain t.plain_off (String.length t.plain - t.plain_off)
+           ^ data;
+         t.plain_off <- 0)
+      data;
+    Option.iter (send_ignoring_errors t) response
+  | Error (failure, `Response response) ->
+    send_ignoring_errors t response;
+    raise
+      (match failure with
+      | `Alert alert -> Tls_lwt.Tls_alert alert
+      | failure -> Tls_lwt.Tls_failure failure)
+
+let pull t =
+  Lwt.catch
+    (fun () -> Lwt_unix.read t.fd t.input 0 (Bytes.length t.input))
+    (function
+      | Unix.Unix_error ((EBADF | ECONNRESET | ENOTCONN | EPIPE), _, _) ->
+        Lwt.return 0
+      | exn -> Lwt.reraise exn)
+  >|= function
+  | 0 -> t.tcp_eof <- true
+  | n -> feed t (Bytes.sub_string t.input 0 n)
+
+let ended t = t.close_notify_received || t.tcp_eof
+
+let handshake fd state ~init =
+  let t = create fd state in
   Lwt.catch
     (fun () ->
-       start (input, output) >|= fun tls ->
-       { fd; tls; output; tcp_eof; closing; close_delimited = false })
+       Option.iter (send_ignoring_errors t) init;
+       let rec loop () =
+         if not (Tls.Engine.handshake_in_progress t.state)
+         then Lwt.return t
+         else if ended t
+         then Lwt.fail End_of_file
+         else pull t >>= loop
+       in
+       loop ())
     (fun exn -> close_fd fd >>= fun () -> Lwt.reraise exn)
 
 let server_of_fd config fd =
-  handshake fd (Tls_lwt.Unix.server_of_channels config)
+  Lwt.wrap (fun () -> Tls.Engine.server config) >>= fun state ->
+  handshake fd state ~init:None
 
 type peer =
   [ `Host of [ `host ] Domain_name.t
@@ -70,13 +114,52 @@ type peer =
   ]
 
 let client_of_fd config ~(peer : peer) fd =
-  let host, ip =
+  let config =
     match peer with
-    | `Host host -> Some host, None
-    | `Ip ip -> None, Some ip
-    | `Insecure_no_name_check -> None, None
+    | `Host host -> Tls.Config.peer config host
+    | `Ip ip -> Tls.Config.ip config ip
+    | `Insecure_no_name_check -> config
   in
-  handshake fd (Tls_lwt.Unix.client_of_channels config ?host ?ip)
+  let state, init = Tls.Engine.client config in
+  handshake fd state ~init:(Some init)
+
+(* An idle client connection: without blocking, read the TCP bytes that wait and
+   give them to the TLS engine. Response bytes other than CR and LF, a
+   close_notify or the end of TCP mean that the connection must not be reused
+   (undici GHSA-35p6-xmwp-9g52). Decrypted bytes stay for the next read; a
+   session ticket or a key update is not input. A blocking descriptor may be
+   read by a Lwt thread at the same time: only the bytes that reads returned are
+   looked at then. *)
+let input_waiting t =
+  let rec response_byte i =
+    i < String.length t.plain
+    && match t.plain.[i] with '\r' | '\n' -> response_byte (i + 1) | _ -> true
+  in
+  let fd = Lwt_unix.unix_file_descr t.fd in
+  let buf = Bytes.create 0x4000 in
+  let rec poll () =
+    if not (ended t)
+    then
+      match Unix.read fd buf 0 (Bytes.length buf) with
+      | 0 -> t.tcp_eof <- true
+      | n ->
+        feed t (Bytes.sub_string buf 0 n);
+        poll ()
+  in
+  match
+    if
+      Lwt_unix.state t.fd = Lwt_unix.Opened
+      &&
+      match Lwt.state (Lwt_unix.blocking t.fd) with
+      | Lwt.Return false -> true
+      | Lwt.Return true | Lwt.Fail _ | Lwt.Sleep -> false
+    then poll ()
+  with
+  | () | (exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK | EINTR), _, _)) ->
+    ended t || response_byte t.plain_off
+  | exception (Unix.Unix_error _ | Tls_lwt.Tls_alert _ | Tls_lwt.Tls_failure _)
+    ->
+    true
 
 let handshake_limit idle_timeout head_timeout =
   match idle_timeout, head_timeout with
@@ -84,7 +167,7 @@ let handshake_limit idle_timeout head_timeout =
   | Some seconds, None | None, Some seconds -> Some seconds
   | Some idle, Some head -> Some (Float.min idle head)
 
-let epoch t = Tls_lwt.Unix.epoch t.tls
+let epoch t = Tls.Engine.epoch t.state
 
 (* ocaml-tls makes one record for each string it is given, so the iovecs are
    joined into strings of up to 16 KiB, the largest record. *)
@@ -127,33 +210,41 @@ module Io = struct
   type nonrec socket = socket
   type addr = Unix.sockaddr
 
-  let read t buffer ~off ~len =
-    Lwt.catch
-      (fun () -> Tls_lwt.Unix.read_bytes t.tls buffer off len)
-      (function
-        | Unix.Unix_error ((ECONNRESET | ENOTCONN | EPIPE), _, _)
-          when t.close_delimited ->
-          Lwt.fail Truncated
-        | Unix.Unix_error ((EBADF | ECONNRESET | ENOTCONN | EPIPE), _, _)
-        | Lwt_io.Channel_closed _ ->
-          Lwt.return 0
-        | exn -> Lwt.fail exn)
-    >>= function
-    | 0 when t.close_delimited && !(t.tcp_eof) -> Lwt.fail Truncated
-    | 0 -> Lwt.fail End_of_file
-    | n -> Lwt.return n
+  let rec read t buffer ~off ~len =
+    let available = String.length t.plain - t.plain_off in
+    if available > 0
+    then (
+      let n = min len available in
+      Ache.Bigstring.blit_from_string
+        t.plain
+        ~src_off:t.plain_off
+        buffer
+        ~dst_off:off
+        ~len:n;
+      t.plain_off <- t.plain_off + n;
+      Lwt.return n)
+    else if t.close_notify_received
+    then Lwt.fail End_of_file
+    else if t.tcp_eof
+    then Lwt.fail (if t.close_delimited then Truncated else End_of_file)
+    else pull t >>= fun () -> read t buffer ~off ~len
 
   let writev t iovecs =
-    let length, strings = coalesce iovecs in
-    Lwt.catch
-      (fun () ->
-         Tls_lwt.Unix.writev t.tls strings >>= fun () ->
-         Lwt_io.flush t.output >|= fun () -> `Ok length)
-      (function
-        | Unix.Unix_error ((EBADF | EPIPE | ECONNRESET | ENOTCONN), _, _)
-        | Lwt_io.Channel_closed _ ->
-          Lwt.return `Closed
-        | exn -> Lwt.fail exn)
+    if t.close_notify_sent
+    then Lwt.return `Closed
+    else
+      let length, strings = coalesce iovecs in
+      match Tls.Engine.send_application_data t.state strings with
+      | None ->
+        Lwt.fail_invalid_arg "Ache_lwt_tls: the TLS session is not ready"
+      | Some (state, data) ->
+        t.state <- state;
+        Lwt.catch
+          (fun () -> send t data >|= fun () -> `Ok length)
+          (function
+            | Unix.Unix_error ((EBADF | EPIPE | ECONNRESET | ENOTCONN), _, _) ->
+              Lwt.return `Closed
+            | exn -> Lwt.reraise exn)
 
   let shutdown_receive t =
     if Lwt_unix.state t.fd <> Lwt_unix.Closed
@@ -161,16 +252,37 @@ module Io = struct
       try Lwt_unix.shutdown t.fd Unix.SHUTDOWN_RECEIVE with
       | Unix.Unix_error _ -> ()
 
+  (* close_notify goes out only if it does not wait: not behind a write in
+     progress, and in one write that does not block. *)
   let close t =
-    t.closing := true;
-    (if Lwt_io.is_busy t.output
-     then Lwt.return_unit
-     else
-       Lwt.catch (fun () -> Tls_lwt.Unix.close t.tls) (fun _ -> Lwt.return_unit))
-    >>= fun () -> close_fd t.fd
+    if
+      (not t.close_notify_sent)
+      && (not (Lwt_mutex.is_locked t.writing))
+      && Lwt_unix.state t.fd = Lwt_unix.Opened
+    then (
+      t.close_notify_sent <- true;
+      let state, data = Tls.Engine.send_close_notify t.state in
+      t.state <- state;
+      try
+        ignore
+          (Unix.single_write_substring
+             (Lwt_unix.unix_file_descr t.fd)
+             data
+             0
+             (String.length data)
+           : int)
+      with
+      | Unix.Unix_error _ -> ());
+    t.close_notify_sent <- true;
+    close_fd t.fd
 end
 
-include Ache_lwt.Make (Io)
+include
+  Ache_lwt.Make_with_idle_check
+    (Io)
+    (struct
+      let input_waiting = input_waiting
+    end)
 
 module Server = struct
   include Server
