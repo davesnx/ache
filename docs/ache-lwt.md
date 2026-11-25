@@ -141,8 +141,9 @@ let request_handler _client_address reqd =
 - `upgrade reqd session` checks the handshake and responds with `101`, as
   `Ache.Websocket.upgrade` does, then runs `session ws` like `Lwt.async`.
   `Ache_lwt.Websocket.Closed` raised by the session is ignored, so a session
-  ends quietly when a send finds the client gone; other exceptions go to
-  `Lwt.async_exception_hook`. On `Error _` it responds nothing and the
+  ends quietly when a send finds the client gone. Another exception sends a
+  close frame with code 1011, then goes to `Lwt.async_exception_hook`, whose
+  default exits the program: set your own. On `Error _` it responds nothing and the
   session does not run: send the response yourself, for example `426` with
   `Sec-WebSocket-Version: 13` for `` Error `Unsupported_version ``.
 - `receive` resolves with the next whole message, `Text s` or `Binary s`.

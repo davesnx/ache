@@ -120,7 +120,9 @@ module Websocket : sig
 
       [session] runs like [Lwt.async]: the request handler does not wait for
       it. {!Closed} raised by [session] is ignored, so a session can end on a
-      failed send. Other exceptions go to [Lwt.async_exception_hook].
+      failed send. Another exception sends a close frame with code [1011],
+      then goes to [Lwt.async_exception_hook]. The default hook exits the
+      program: a server sets its own.
 
       Messages that arrive before {!receive} is called are queued. When 8
       messages are queued, the connection stops reading from the client

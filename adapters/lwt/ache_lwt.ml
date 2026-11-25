@@ -348,7 +348,11 @@ module Websocket = struct
       Lwt.async (fun () ->
         Lwt.catch
           (fun () -> session t)
-          (function Closed -> Lwt.return_unit | exn -> Lwt.reraise exn));
+          (function
+            | Closed -> Lwt.return_unit
+            | exn ->
+              Ache.Websocket.close t.connection ~code:1011;
+              Lwt.reraise exn));
       Ok ()
 
   let written t =

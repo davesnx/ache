@@ -87,19 +87,25 @@ module Sessions = struct
 
   let create () = { pending = []; running = []; added = Signal.create () }
 
-  (* The sessions of the request handler that runs now in this domain. *)
-  let current : t option Domain.DLS.key = Domain.DLS.new_key (fun () -> None)
+  (* [Effect.perform Current] answers with the sessions of the request handler
+     that performs it. An effect handler, unlike a domain-local value, follows
+     the handler when it waits and another connection's handler runs: it is part
+     of the handler's stack. *)
+  type _ Effect.t += Current : t Effect.t
 
-  let with_current t f =
-    let previous = Domain.DLS.get current in
-    Domain.DLS.set current (Some t);
-    match f () with
-    | value ->
-      Domain.DLS.set current previous;
-      value
-    | exception exn ->
-      Domain.DLS.set current previous;
-      raise exn
+  let with_current (t : t) f =
+    let effc : type a.
+      a Effect.t -> ((a, _) Effect.Deep.continuation -> _) option
+      = function
+      | Current -> Some (fun k -> Effect.Deep.continue k t)
+      | _ -> None
+    in
+    Effect.Deep.try_with f () { effc }
+
+  let current () =
+    match Effect.perform Current with
+    | t -> Some t
+    | exception Effect.Unhandled _ -> None
 
   let add t session =
     t.pending <- session :: t.pending;
@@ -472,10 +478,9 @@ module Make (Io : IO) = struct
           write_task ();
           stop ())
       in
+      (* The session closed its WebSocket already (1011): keep the exception for
+         the end of the handler, without cutting the close frame. *)
       let session_failed exn bt =
-        (try Runtime.report_exn t exn with
-        | Miou.Cancelled as exn -> raise exn
-        | _ -> ());
         if Option.is_none !unreported then unreported := Some (exn, bt)
       in
       (match
@@ -906,7 +911,7 @@ module Websocket = struct
 
   let upgrade ?max_message_size reqd session =
     let sessions =
-      match Domain.DLS.get Sessions.current with
+      match Sessions.current () with
       | Some sessions -> sessions
       | None ->
         invalid_arg
@@ -951,7 +956,13 @@ module Websocket = struct
     | Ok () ->
       let t = Option.get !t in
       Sessions.add sessions (fun () ->
-        match session t with () -> () | exception Closed -> ());
+        match session t with
+        | () | (exception Closed) -> ()
+        | exception (Miou.Cancelled as exn) -> raise exn
+        | exception exn ->
+          let bt = Printexc.get_raw_backtrace () in
+          Ache.Websocket.close t.connection ~code:1011;
+          Printexc.raise_with_backtrace exn bt);
       Ok ()
 
   let written t =

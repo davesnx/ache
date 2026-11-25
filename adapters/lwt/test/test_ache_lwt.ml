@@ -100,6 +100,8 @@ let text_of = function Ache.Websocket.Text s -> s | Binary s -> "binary:" ^ s
 let receive_text ws =
   Lwt.map (Option.map text_of) (Ache_lwt.Websocket.receive ws)
 
+exception Ws_session_failed
+
 let ws_echo ws =
   let rec loop () =
     Lwt.bind (Ache_lwt.Websocket.receive ws) (function
@@ -200,6 +202,12 @@ let request_handler (_ : Unix.sockaddr) reqd =
       reqd
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (echo_server ())
+  | `GET, "/ws-raise" ->
+    (match
+       Ache_lwt.Websocket.upgrade reqd (fun _ -> Lwt.fail Ws_session_failed)
+     with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
   | `GET, ("/ws-echo" | "/ws-flood") ->
     (match
        Ache_lwt.Websocket.upgrade
@@ -858,6 +866,33 @@ let test_websocket_ping () =
     read_all socket >>= fun rest ->
     Alcotest.(check string) "then end of input" "" rest;
     Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+let test_websocket_session_exception () =
+  let hooked = ref [] in
+  let previous = !Lwt.async_exception_hook in
+  (Lwt.async_exception_hook := fun exn -> hooked := exn :: !hooked);
+  Fun.protect
+    ~finally:(fun () -> Lwt.async_exception_hook := previous)
+    (fun () ->
+       with_server (fun connect ->
+         connect () >>= fun socket ->
+         write_all socket (ws_handshake "/ws-raise") >>= fun () ->
+         read_head socket >>= fun head ->
+         Alcotest.(check string) "101" ws_101 head;
+         read_ws_frame socket >>= fun close ->
+         Alcotest.(check (pair int string))
+           "close 1011"
+           (0x88, "\x03\xf3")
+           close;
+         write_all socket (ws_frame 0x8 "\x03\xf3") >>= fun () ->
+         read_all socket >>= fun rest ->
+         Alcotest.(check string) "then end of input" "" rest;
+         Lwt_unix.close socket);
+       Alcotest.(check bool)
+         "the hook got the exception"
+         true
+         (!hooked = [ Ws_session_failed ]));
   check_server_sockets_closed ()
 
 let test_websocket_receive_backpressure () =
@@ -1762,6 +1797,9 @@ let () =
         ; "WebSocket echo and close", `Quick, test_websocket_echo
         ; "WebSocket server close", `Quick, test_websocket_server_close
         ; "WebSocket ping, pong and close reason", `Quick, test_websocket_ping
+        ; ( "WebSocket session exception closes 1011"
+          , `Quick
+          , test_websocket_session_exception )
         ; ( "WebSocket ping timeout and Closed"
           , `Quick
           , test_websocket_ping_timeout )

@@ -165,6 +165,10 @@ let ws_session = function
   | "/ws-raise" -> Some (fun (_ : Ws.t) -> raise Session_failed)
   | _ -> None
 
+(* Each /ws-wait handler waits on its own gate, in arrival order, before
+   [Ws.upgrade]. *)
+let ws_gates : unit Miou.Computation.t list ref = ref []
+
 let request_handler (_ : Unix.sockaddr) reqd =
   incr requests_seen;
   let request = Request_descriptor.request reqd in
@@ -207,6 +211,13 @@ let request_handler (_ : Unix.sockaddr) reqd =
       reqd
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (echo_server ())
+  | `GET, "/ws-wait" ->
+    let gate = Miou.Computation.create () in
+    ws_gates := !ws_gates @ [ gate ];
+    await gate;
+    (match Ws.upgrade reqd ws_echo with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
   | `GET, target when Option.is_some (ws_session target) ->
     (match Ws.upgrade reqd (Option.get (ws_session target)) with
     | Ok () -> ()
@@ -1073,12 +1084,97 @@ let test_websocket_session_exception () =
     on_socketpair (fun client ->
       send client (ws_handshake "/ws-raise");
       Alcotest.(check string) "101" ws_101 (take client (String.length ws_101));
+      Alcotest.(check (pair int string))
+        "close 1011"
+        (0x88, "\x03\xf3")
+        (read_ws_frame client);
+      send client (ws_frame 0x8 "\x03\xf3");
       Alcotest.(check string) "then end of input" "" (read_all client);
       shutdown_send client)
   with
   | Error Session_failed -> ()
   | Ok () -> Alcotest.fail "the handler returned"
   | Error exn -> raise exn
+
+(* Two request handlers on one domain both wait before [Ws.upgrade]: each
+   session must belong to its own connection. *)
+let test_websocket_waiting_handlers () =
+  ws_gates := [];
+  Miou_unix.run ~domains:0 (fun () ->
+    let pair () =
+      let server, client = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+      let server = Miou_unix.of_file_descr server
+      and client = Miou_unix.of_file_descr client in
+      let finished = Miou.Computation.create () in
+      let handler =
+        Miou.async (fun () ->
+          Fun.protect
+            ~finally:(fun () -> resolve finished ())
+            (fun () ->
+               Ache_miou.Server.create_connection_handler
+                 ~request_handler
+                 ~error_handler
+                 server
+                 (Unix.ADDR_UNIX "socketpair")))
+      in
+      server, client, handler, finished
+    in
+    let wait_gates n =
+      while List.length !ws_gates < n do
+        Miou_unix.sleep 0.001
+      done
+    in
+    let server_a, a, handler_a, finished_a = pair () in
+    let server_b, b, handler_b, finished_b = pair () in
+    Fun.protect
+      ~finally:(fun () ->
+        List.iter Miou_unix.close [ server_a; a; server_b; b ];
+        List.iter (fun gate -> resolve gate ()) !ws_gates)
+      (fun () ->
+         with_timeout 5.0 (fun () ->
+           send a (ws_handshake "/ws-wait");
+           wait_gates 1;
+           send b (ws_handshake "/ws-wait");
+           wait_gates 2;
+           let gate_a = List.nth !ws_gates 0 in
+           resolve gate_a ();
+           Alcotest.(check string)
+             "A: 101"
+             ws_101
+             (take a (String.length ws_101));
+           send a (ws_frame 0x1 "from A");
+           Alcotest.(check (pair int string))
+             "A: echo"
+             (0x81, "from A")
+             (read_ws_frame a);
+           send a (ws_frame 0x8 "\x03\xe8");
+           Alcotest.(check (pair int string))
+             "A: close"
+             (0x88, "\x03\xe8")
+             (read_ws_frame a);
+           shutdown_send a;
+           await finished_a;
+           Alcotest.(check bool)
+             "B still waits"
+             true
+             (Miou.Computation.is_running finished_b);
+           resolve (List.nth !ws_gates 1) ();
+           Alcotest.(check string)
+             "B: 101"
+             ws_101
+             (take b (String.length ws_101));
+           send b (ws_frame 0x8 "\x03\xe8");
+           Alcotest.(check (pair int string))
+             "B: close"
+             (0x88, "\x03\xe8")
+             (read_ws_frame b);
+           shutdown_send b);
+         List.iter
+           (fun handler ->
+              match Miou.await handler with
+              | Ok () -> ()
+              | Error exn -> raise exn)
+           [ handler_a; handler_b ]))
 
 let test_websocket_session_cancelled_with_connection () =
   let held = Miou.Computation.create () in
@@ -2328,6 +2424,9 @@ let () =
         ; ( "WebSocket session exception"
           , `Quick
           , test_websocket_session_exception )
+        ; ( "WebSocket upgrades of two waiting handlers"
+          , `Quick
+          , test_websocket_waiting_handlers )
         ; ( "WebSocket session cancelled with the connection"
           , `Quick
           , test_websocket_session_cancelled_with_connection )

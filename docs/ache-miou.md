@@ -229,9 +229,9 @@ let request_handler _client_address reqd =
   session when the socket closes: the session sees the end, because
   `receive` returns `None` and the other functions raise `Closed` or
   return. The session is cancelled only when the connection task is.
-- `Closed` raised by the session is ignored. Another exception closes the
-  connection, and the server handler raises it: with `Server.run`, it goes
-  to `on_error`.
+- `Closed` raised by the session is ignored. Another exception sends a
+  close frame with code 1011 and closes the connection, and the server
+  handler raises it: with `Server.run`, it goes to `on_error`.
 - `receive` returns the next whole message, `Text s` or `Binary s`. Once
   the connection has ended and no message waits, it returns `None`. The
   connection ends after the client's close frame, the end of the input, a

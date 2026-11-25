@@ -146,9 +146,14 @@ module Websocket : sig
       session that uses them ends. The session is cancelled only when the
       connection task is cancelled.
 
-      {!Closed} raised by [session] is ignored. Another exception closes the
-      connection, and the server handler raises it when it returns: with
-      {!Server.run}, it goes to [on_error].
+      {!Closed} raised by [session] is ignored. Another exception sends a
+      close frame with code [1011] and closes the connection, and the server
+      handler raises it when it returns: with {!Server.run}, it goes to
+      [on_error].
+
+      [upgrade] finds its connection through an effect handler around the
+      request handler, so call it from the request handler itself, not from
+      a task that the handler starts.
 
       Call the functions of this module from the session task or from tasks
       that it starts with [Miou.async]: the connection has no lock, so they
