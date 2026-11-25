@@ -128,14 +128,8 @@ let rec echo ws =
     echo ws
 
 let request_handler _client_address reqd =
-  match Ache_lwt.Websocket.upgrade reqd with
-  | Ok ws ->
-    Lwt.async (fun () ->
-      Lwt.catch
-        (fun () -> echo ws)
-        (function
-          | Ache_lwt.Websocket.Closed -> Lwt.return_unit
-          | exn -> Lwt.reraise exn))
+  match Ache_lwt.Websocket.upgrade reqd echo with
+  | Ok () -> ()
   | Error _ ->
     let headers = Headers.of_list [ "content-length", "0" ] in
     Request_descriptor.respond_with_string
@@ -144,10 +138,13 @@ let request_handler _client_address reqd =
       ""
 ```
 
-- `upgrade` checks the handshake and responds with `101`, as
-  `Ache.Websocket.upgrade` does. On `Error _` it responds nothing: send the
-  response yourself, for example `426` with `Sec-WebSocket-Version: 13` for
-  `` Error `Unsupported_version ``.
+- `upgrade reqd session` checks the handshake and responds with `101`, as
+  `Ache.Websocket.upgrade` does, then runs `session ws` like `Lwt.async`.
+  `Ache_lwt.Websocket.Closed` raised by the session is ignored, so a session
+  ends quietly when a send finds the client gone; other exceptions go to
+  `Lwt.async_exception_hook`. On `Error _` it responds nothing and the
+  session does not run: send the response yourself, for example `426` with
+  `Sec-WebSocket-Version: 13` for `` Error `Unsupported_version ``.
 - `receive` resolves with the next whole message, `Text s` or `Binary s`.
   Once the connection has ended and no message waits, it resolves with
   `None`. The connection ends after the client's close frame, the end of the

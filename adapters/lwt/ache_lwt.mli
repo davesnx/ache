@@ -110,15 +110,23 @@ module Websocket : sig
   val upgrade :
      ?max_message_size:int
     -> Ache.Request_descriptor.t
-    -> (t, Ache.Websocket.handshake_error) result
-  (** [upgrade ?max_message_size reqd] is {!Ache.Websocket.upgrade}: it
-      responds with [101] when the request is a valid opening handshake. When
-      it returns [Error _], it responded nothing: respond, for example with
-      [400]. Messages that arrive before {!receive} is called are queued.
-      When 8 messages are queued, the connection stops reading from the
-      client ({!Ache.Websocket.pause_reading}) until {!receive} takes one.
-      Frames that a read already holds are still queued, so the queue can
-      pass 8 by what one read buffer holds. *)
+    -> (t -> unit Lwt.t)
+    -> (unit, Ache.Websocket.handshake_error) result
+  (** [upgrade ?max_message_size reqd session] is {!Ache.Websocket.upgrade}:
+      it responds with [101] when the request is a valid opening handshake,
+      starts [session] with the new connection, and returns [Ok ()]. When it
+      returns [Error _], it responded nothing and [session] does not run:
+      respond, for example with [400].
+
+      [session] runs like [Lwt.async]: the request handler does not wait for
+      it. {!Closed} raised by [session] is ignored, so a session can end on a
+      failed send. Other exceptions go to [Lwt.async_exception_hook].
+
+      Messages that arrive before {!receive} is called are queued. When 8
+      messages are queued, the connection stops reading from the client
+      ({!Ache.Websocket.pause_reading}) until {!receive} takes one. Frames
+      that a read already holds are still queued, so the queue can pass 8 by
+      what one read buffer holds. *)
 
   val send_text : t -> string -> unit Lwt.t
   (** [send_text t message] sends [message] as one text frame. [message] must

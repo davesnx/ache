@@ -201,10 +201,12 @@ let request_handler (_ : Unix.sockaddr) reqd =
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (echo_server ())
   | `GET, ("/ws-echo" | "/ws-flood") ->
-    (match Ache_lwt.Websocket.upgrade reqd with
-    | Ok ws ->
-      Lwt.async (fun () ->
-        if request.target = "/ws-echo" then ws_echo ws else ws_flood ws)
+    (match
+       Ache_lwt.Websocket.upgrade
+         reqd
+         (if request.target = "/ws-echo" then ws_echo else ws_flood)
+     with
+    | Ok () -> ()
     | Error _ ->
       Request_descriptor.respond_with_string
         reqd
@@ -862,8 +864,12 @@ let test_websocket_receive_backpressure () =
   let ws = ref None in
   let server =
     Server_connection.create (fun reqd ->
-      match Ache_lwt.Websocket.upgrade reqd with
-      | Ok t -> ws := Some t
+      match
+        Ache_lwt.Websocket.upgrade reqd (fun t ->
+          ws := Some t;
+          fst (Lwt.wait ()))
+      with
+      | Ok () -> ()
       | Error _ -> Alcotest.fail "handshake rejected")
   in
   let feed s =
@@ -922,8 +928,12 @@ let ws_sans_io () =
   let ws = ref None in
   let server =
     Server_connection.create (fun reqd ->
-      match Ache_lwt.Websocket.upgrade reqd with
-      | Ok t -> ws := Some t
+      match
+        Ache_lwt.Websocket.upgrade reqd (fun t ->
+          ws := Some t;
+          fst (Lwt.wait ()))
+      with
+      | Ok () -> ()
       | Error _ -> Alcotest.fail "handshake rejected")
   in
   let feed s =

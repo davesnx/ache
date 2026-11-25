@@ -277,7 +277,7 @@ module Websocket = struct
          if Lwt.is_sleeping p then Queue.push waiter waiters)
       pending
 
-  let upgrade ?max_message_size reqd =
+  let create ?max_message_size reqd =
     let messages = Queue.create ()
     and receivers = Queue.create ()
     and pingers = Queue.create ()
@@ -340,6 +340,16 @@ module Websocket = struct
         ; client_close
         ; closed
         }
+
+  let upgrade ?max_message_size reqd session =
+    match create ?max_message_size reqd with
+    | Error _ as error -> error
+    | Ok t ->
+      Lwt.async (fun () ->
+        Lwt.catch
+          (fun () -> session t)
+          (function Closed -> Lwt.return_unit | exn -> Lwt.reraise exn));
+      Ok ()
 
   let written t =
     let p, u = Lwt.wait () in
