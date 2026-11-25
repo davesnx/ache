@@ -1142,6 +1142,10 @@ let test_websocket_echo () =
   check_no_handler_error ()
 
 let () =
+  (* On OCaml 5.5, the first Eio_main.run of a process opens a pipe pair that
+     stays open: run it once so the descriptor counts of with_server do not
+     include it. *)
+  Eio_main.run ignore;
   Alcotest.run
     "ache-eio-tls"
     [ ( "tls"

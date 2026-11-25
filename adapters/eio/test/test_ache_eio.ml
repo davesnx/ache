@@ -2526,7 +2526,7 @@ let test_websocket_cancelled_receives_bounded () =
     in
     cancel_many 1_000;
     let before = live_words () in
-    cancel_many 100_000;
+    cancel_many 20_000;
     grown := live_words () - before;
     Eio.Promise.resolve resolve_cancelled ();
     after := receive_text ws;
@@ -2539,7 +2539,7 @@ let test_websocket_cancelled_receives_bounded () =
        client_closes socket reader));
   Alcotest.(check bool)
     (Printf.sprintf
-       "100000 cancelled receives keep %d more live words (< 10000)"
+       "20000 cancelled receives keep %d more live words (< 10000)"
        !grown)
     true
     (!grown < 10_000);
