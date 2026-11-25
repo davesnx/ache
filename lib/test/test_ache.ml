@@ -16,6 +16,7 @@ let () =
     ; "client connection", Test_client_connection.tests
     ; "client", Test_client.tests
     ; "server connection", Test_server_connection.tests
+    ; "drain", Test_drain.tests
     ; "request syntax", Test_request_syntax.tests
     ; "websocket", Test_websocket.tests
     ; ( "bodies"

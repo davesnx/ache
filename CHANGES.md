@@ -57,6 +57,26 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   style, with the session in a fiber (Eio) or task (Miou) of the connection.
   A write to a client that reset the connection ends the connection
   (camlworks/dream#467).
+- `Server_connection.drain` makes the request in progress the last one on
+  a connection (an idle connection closes at once, a WebSocket sends close
+  1001), and `Config.max_requests_per_connection` (default `None`) makes
+  the n-th request the last one.
+- `ache-lwt`, `ache-lwt-tls`: graceful stop with `?stop:unit Lwt.t` and
+  `?grace:float` on `create_connection_handler` (and
+  `create_connection_handler_with_fd`). When `stop` resolves, each
+  connection drains; `grace` seconds later the ones still open are closed.
+- `ache-eio`, `ache-eio-tls`: graceful stop with `?stop:unit Eio.Promise.t`
+  and `?grace:float` on `Server.create_connection_handler` and
+  `Server.run`. When `stop` is resolved, `run` stops accepting, each
+  connection drains, `grace` seconds later the ones still open are
+  cancelled, and `run` returns when every connection has ended.
+- `ache-miou`, `ache-miou-tls`: graceful stop with
+  `?stop:unit Miou.Computation.t` and `?grace:float` on
+  `Server.create_connection_handler`, `Server.run` and
+  `create_connection_handler_with_fd`. When `stop` is resolved, from any
+  domain, `run` stops accepting, each connection drains in its own domain,
+  `grace` seconds later the ones still open are cancelled with their
+  WebSocket sessions, and `run` returns when every connection has ended.
 
 ### Changed
 

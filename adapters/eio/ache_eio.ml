@@ -472,13 +472,16 @@ module Server = struct
         ?idle_timeout
         ?head_timeout
         ?(date = true)
+        ?stop
+        ?grace
         ~request_handler
         ~error_handler
     =
     check_timeout "idle_timeout" idle_timeout;
     check_timeout "head_timeout" head_timeout;
-    (match clock, idle_timeout, head_timeout with
-    | None, Some _, _ | None, _, Some _ ->
+    check_timeout "grace" grace;
+    (match clock, idle_timeout, head_timeout, grace with
+    | None, Some _, _, _ | None, _, Some _, _ | None, _, _, Some _ ->
       invalid_arg
         "Ache_eio.Server.create_connection_handler: a timeout needs ~clock"
     | _ -> ());
@@ -577,40 +580,84 @@ module Server = struct
               Error `Timeout)
         | _ -> timeout phase
       in
-      Switch.run (fun sw ->
-        Fiber.with_binding
-          connection_context
-          { sw; session_failed = record_failure }
-          (fun () ->
-             IO_loop.start
-               (module Observed)
-               ~read_buffer_size:config.read_buffer_size
-               ~timeout
-               ~linger:(Option.is_some clock)
-               ~body_read:
-                 { stop =
-                     (fun () ->
-                       match Ache.Server_connection.read_timeout connection with
-                       | Some (`Body, on_timeout) -> Some on_timeout
-                       | Some ((`Idle | `Head), _) | None -> None)
-                 ; wait =
-                     (match clock, idle_timeout with
-                     | Some clock, Some seconds ->
-                       fun () -> Eio.Time.sleep clock seconds
-                     | _ -> ignore)
-                 ; linger =
-                     (match clock with
-                     | Some clock ->
-                       fun () ->
-                         Eio.Time.sleep
-                           clock
-                           (Option.value
-                              idle_timeout
-                              ~default:linger_without_idle_timeout)
-                     | None -> ignore)
-                 }
-               connection
-               socket));
+      let drained, resolve_drained = Promise.create () in
+      let drain () =
+        if not (Promise.is_resolved drained)
+        then (
+          Ache.Server_connection.drain connection;
+          Promise.resolve resolve_drained ())
+      in
+      (* An idle connection closes when it is drained: its read waits for
+         [drained] too. A read in another phase is not stopped. *)
+      let timeout =
+        match stop with
+        | None -> timeout
+        | Some _ ->
+          fun phase ->
+            (match phase, Ache.Server_connection.read_timeout connection with
+            | `Read, Some (`Idle, _) when not (Promise.is_resolved drained) ->
+              let limited =
+                match timeout phase with
+                | Some limited -> limited
+                | None -> fun read -> Ok (read ())
+              in
+              Some
+                (fun read ->
+                  Fiber.first
+                    (fun () -> limited read)
+                    (fun () ->
+                       Promise.await drained;
+                       Error `Timeout))
+            | _ -> timeout phase)
+      in
+      let serve () =
+        Switch.run (fun sw ->
+          Fiber.with_binding
+            connection_context
+            { sw; session_failed = record_failure }
+            (fun () ->
+               IO_loop.start
+                 (module Observed)
+                 ~read_buffer_size:config.read_buffer_size
+                 ~timeout
+                 ~linger:(Option.is_some clock)
+                 ~body_read:
+                   { stop =
+                       (fun () ->
+                         match
+                           Ache.Server_connection.read_timeout connection
+                         with
+                         | Some (`Body, on_timeout) -> Some on_timeout
+                         | Some ((`Idle | `Head), _) | None -> None)
+                   ; wait =
+                       (match clock, idle_timeout with
+                       | Some clock, Some seconds ->
+                         fun () -> Eio.Time.sleep clock seconds
+                       | _ -> ignore)
+                   ; linger =
+                       (match clock with
+                       | Some clock ->
+                         fun () ->
+                           Eio.Time.sleep
+                             clock
+                             (Option.value
+                                idle_timeout
+                                ~default:linger_without_idle_timeout)
+                       | None -> ignore)
+                   }
+                 connection
+                 socket))
+      in
+      (match stop with
+      | None -> serve ()
+      | Some stop ->
+        if Promise.is_resolved stop then drain ();
+        Fiber.first serve (fun () ->
+          Promise.await stop;
+          drain ();
+          match clock, grace with
+          | Some clock, Some seconds -> Eio.Time.sleep clock seconds
+          | _ -> Fiber.await_cancel ()));
       Option.iter
         (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
         !failure
@@ -632,6 +679,8 @@ module Server = struct
         ?idle_timeout
         ?head_timeout
         ?date
+        ?stop
+        ?grace
         ?(domains = Domain.recommended_domain_count ())
         ?(backlog = 128)
         ?(tcp_nodelay = false)
@@ -651,6 +700,8 @@ module Server = struct
         ?idle_timeout
         ?head_timeout
         ?date
+        ?stop
+        ?grace
         ~request_handler
         ~error_handler
     in
@@ -685,7 +736,11 @@ module Server = struct
           Eio_unix.sleep accept_retry_delay);
         accept ()
       in
-      accept ()
+      match stop with
+      | None -> accept ()
+      | Some stop ->
+        Fiber.first accept (fun () -> Promise.await stop);
+        Eio.Resource.close socket
     in
     Fiber.all
       (serve

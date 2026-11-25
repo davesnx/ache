@@ -163,6 +163,65 @@ let () =
     (`Tcp (Eio.Net.Ipaddr.V4.loopback, port))
 ```
 
+## Graceful stop
+
+`Server.run`, `Server.create_connection_handler` and the TLS handler take
+`?stop:unit Eio.Promise.t` and `?grace:float`. `grace` needs `?clock`. When
+`stop` is resolved:
+
+1. `run` stops accepting in every domain and closes its listening sockets.
+   Connections that the kernel queued and `run` did not accept are reset.
+2. Each connection calls `Ache.Server_connection.drain` in a fiber of its
+   own. An idle connection closes at once. A connection with a request in
+   progress serves it, with `Connection: close` if its head is not written
+   yet, and then closes; requests pipelined after it are not served. A
+   WebSocket connection sends a close frame with code 1001.
+3. `grace` seconds after `stop`, each connection that is still open is
+   cancelled, with its reads, writes and WebSocket sessions, and its handler
+   returns. Without `grace` there is no limit.
+4. `run` returns when every connection in every domain has ended.
+
+A connection that closes still lingers as after any closing response (see
+[Linger](#linger)): it drops input until the peer closes, for at most
+`idle_timeout` (2 s without one), and `grace` cuts that short too. A handler
+applied after `stop` was resolved closes the connection without reading a
+request, and the TLS handler starts no handshake; a TLS handshake in
+progress at `stop` is cancelled. With `create_connection_handler` on
+`Eio.Net.run_server`, give the same promise to the handler and to the
+`~stop` of `run_server`, which stops accepting.
+
+Stop on `SIGTERM`. `Eio.Condition.broadcast` is safe in a signal handler;
+`Eio.Promise.resolve` is not:
+
+```ocaml
+let () =
+  Eio_main.run @@ fun env ->
+  let stop, resolve_stop = Eio.Promise.create () in
+  let terminated = Eio.Condition.create () in
+  Sys.set_signal
+    Sys.sigterm
+    (Signal_handle (fun _ -> Eio.Condition.broadcast terminated));
+  Eio.Fiber.both
+    (fun () ->
+      Eio.Condition.await_no_mutex terminated;
+      Eio.Promise.resolve resolve_stop ())
+    (fun () ->
+      Ache_eio.Server.run
+        ~clock:(Eio.Stdenv.clock env)
+        ~stop
+        ~grace:10.
+        ~on_error:(Eio.traceln "connection error: %a" Fmt.exn)
+        ~net:(Eio.Stdenv.net env)
+        ~domain_mgr:(Eio.Stdenv.domain_mgr env)
+        ~request_handler
+        ~error_handler
+        (`Tcp (Eio.Net.Ipaddr.V4.loopback, 8080)))
+```
+
+Each connection waits for `stop` in a fiber that ends with the connection,
+so a `stop` that stays pending for the life of the server does not grow
+with the number of connections served.
+
 ## WebSocket
 
 `Ache_eio.Websocket` gives the WebSocket server of
@@ -321,10 +380,13 @@ read loop asks it to, and keeps the result until the read loop takes it.
   through the reader fiber, with or without `?clock`, so that the write
   loop can stop the wait when the response completes (see
   [Timeouts](ache.md#timeouts)).
+- With `?stop`, a read that waits for a new request goes through the
+  reader fiber, with or without `?clock`, so that the drain at `stop` can
+  end the wait.
 - Every other read is direct: the read loop calls `single_read` itself. A
-  server without `?clock` has no timeouts, so its other reads are direct.
-  With a clock, the reads of pipelined requests are direct, and the reads
-  that wait for a new request head use the reader fiber.
+  server without `?clock` and `?stop` has no timeouts, so its other reads
+  are direct. With a clock, the reads of pipelined requests are direct, and
+  the reads that wait for a new request head use the reader fiber.
 
 A direct read saves two fiber switches and an `Eio.Condition` handoff for
 each read, and the objects of one read die young. In alternating runs of a

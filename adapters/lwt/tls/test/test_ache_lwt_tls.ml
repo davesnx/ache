@@ -7,11 +7,15 @@ let client_config = Ache_test_certs.client_config certs
 let localhost = Domain_name.(host_exn (of_string_exn "localhost"))
 let server_errors : Server_connection.error list ref = ref []
 let partial_body_cut = ref false
+let slow_reqd : Request_descriptor.t option ref = ref None
 
 let request_handler (_ : Unix.sockaddr) reqd =
   let request = Request_descriptor.request reqd in
   let body = Request_descriptor.request_body reqd in
   match request.meth, request.target with
+  | `GET, "/slow" ->
+    Body.Reader.close body;
+    slow_reqd := Some reqd
   | `POST, "/echo" ->
     let headers =
       Headers.of_list
@@ -78,7 +82,7 @@ let with_listener handler f =
          (Lwt_unix.state fd = Lwt_unix.Closed))
     !accepted
 
-let with_server ?idle_timeout ?head_timeout f =
+let with_server ?idle_timeout ?head_timeout ?stop ?grace f =
   server_errors := [];
   partial_body_cut := false;
   run (fun () ->
@@ -87,6 +91,8 @@ let with_server ?idle_timeout ?head_timeout f =
          ~date:false
          ?idle_timeout
          ?head_timeout
+         ?stop
+         ?grace
          ~tls:server_config
          ~request_handler
          ~error_handler)
@@ -654,6 +660,37 @@ let test_cut_handshake_timers_bounded () =
   check_handshake_timers_bounded ~connections:1000 (fun fd ->
     Lwt_unix.sleep 0.001 >>= fun () -> Lwt_unix.close fd)
 
+let test_stop_drains () =
+  slow_reqd := None;
+  let stop, stop_now = Lwt.wait () in
+  with_server ~stop ~grace:5. (fun connect ->
+    connect () >>= fun stalled ->
+    connect () >>= raw_client >>= fun raw ->
+    raw_write raw "GET /slow HTTP/1.1\r\nhost: localhost\r\n\r\n" >>= fun () ->
+    let rec until_slow () =
+      match !slow_reqd with
+      | Some reqd -> Lwt.return reqd
+      | None -> Lwt_unix.sleep 0.005 >>= until_slow
+    in
+    until_slow () >>= fun reqd ->
+    let since = Unix.gettimeofday () in
+    Lwt.wakeup_later stop_now ();
+    let chunk = Bytes.create 16 in
+    Lwt_unix.read stalled chunk 0 16 >>= fun n ->
+    Alcotest.(check int) "handshake in progress closed" 0 n;
+    check_bounded "handshake closed" (Unix.gettimeofday () -. since);
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers:(Headers.of_list [ "content-length", "4" ]) `OK)
+      "done";
+    raw_read_until_eof raw >>= fun (output, ending) ->
+    Alcotest.(check string)
+      "response with connection: close"
+      "HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\ndone"
+      output;
+    Alcotest.(check bool) "close_notify" true (ending = `Close_notify);
+    Lwt_unix.close stalled >>= fun () -> raw_close raw)
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
@@ -732,6 +769,10 @@ let () =
             "peer `Insecure_no_name_check"
             `Quick
             test_peer_insecure
+        ; Alcotest.test_case
+            "stop closes a handshake and drains a request"
+            `Quick
+            test_stop_drains
         ; Alcotest.test_case "idle timeout" `Quick test_idle_timeout
         ; Alcotest.test_case "head timeout" `Quick test_head_timeout
         ; Alcotest.test_case

@@ -434,6 +434,25 @@ A read can start before the response is complete, and the response can
 complete while the read waits. Each time the write loop waits or ends, it
 tells the read loop, which then asks the core for the limit again.
 
+### Graceful stop
+
+`Server_connection.drain` makes the request in progress the last one on a
+connection. An idle connection closes at once: the core shuts down, and the
+runtime ends a read that waits for the next request, as when the idle
+timeout fires. A connection with a request in progress, or with a head
+partly read, serves that request and reads no other; its response gets
+`Connection: close` if its head is not written yet, and requests pipelined
+after it are not served. A WebSocket connection sends a close frame with
+code 1001. `drain` is not thread-safe: call it where the connection runs.
+
+The runtimes call `drain` for you. Their servers take a `stop` signal and a
+`grace` period in seconds: when `stop` resolves, `Server.run` (Eio, Miou)
+stops accepting, every connection drains, and what is left closes `grace`
+seconds later. With Lwt the caller stops its accept loop. See
+[ache-eio](ache-eio.md#graceful-stop),
+[ache-lwt](ache-lwt.md#graceful-stop) and
+[ache-miou](ache-miou.md#graceful-stop).
+
 ### Where the time of a request goes
 
 For a small `GET` with a small response on one core, most of the time is in

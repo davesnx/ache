@@ -445,6 +445,13 @@ module Config : sig
           connection reads and dispatches no new request. A client that
           pipelines requests and does not read the responses then stops
           being read. Default is [65536]. *)
+    ; max_requests_per_connection : int option
+      (** Server: with [Some n], the [n]-th request on a connection is the
+          last one. Its response gets [Connection: close], and the connection
+          closes after it (as after {!Server_connection.drain}). Default is
+          [None]: no limit.
+          {!Server_connection.create} raises [Invalid_argument] when [n] is
+          less than 1. *)
     }
 
   val default : t
@@ -607,6 +614,28 @@ module Server_connection : sig
   val error_code : t -> error option
   (** [error_code t] returns the [error_code] that caused the connection to
       close, if one exists. *)
+
+  val drain : t -> unit
+  (** [drain t] makes the request in progress the last one on [t], for a
+      graceful stop of a server:
+      - When no request is in progress and no byte of a next request has
+        been read, the connection closes at once: {!next_read_operation}
+        returns [`Close], and output that is not written yet is still
+        written. A runtime that waits for input stops waiting, as when its
+        idle timeout fires.
+      - When a request is in progress, or its head is partly read, the
+        connection serves it and reads no other request. Its response gets
+        [Connection: close] if its head is not written yet; otherwise the
+        response is sent as it was framed and the connection closes after
+        it. Requests that were pipelined after it are not served.
+      - On a connection upgraded with {!Websocket.upgrade}, the WebSocket
+        connection sends a close frame with code [1001] (going away) and
+        closes as {!Websocket.close} does. Another upgraded protocol is not
+        told; the runtime stops it when its grace period ends.
+
+      A runtime calls [drain] on each of its connections when it stops, and
+      closes the ones that are still open after a grace period. Calling
+      [drain] again does nothing. *)
 
   (**/**)
 

@@ -419,6 +419,8 @@ module Make (Io : IO) = struct
           ?idle_timeout
           ?head_timeout
           ?(date = true)
+          ?stop
+          ?grace
           ~request_handler
           ~error_handler
           client_addr
@@ -426,107 +428,165 @@ module Make (Io : IO) = struct
       =
       check_timeout "idle_timeout" idle_timeout;
       check_timeout "head_timeout" head_timeout;
-      let head_timer = Option.map Timeout.create head_timeout
-      and head_armed = ref false
-      and idle_timer = Option.map Timeout.create idle_timeout in
-      let stop_head_timer () =
-        head_armed := false;
-        Option.iter Timeout.stop head_timer
-      in
-      let connection =
-        Ache.Server_connection.create
-          ~config
-          ~error_handler:(error_handler client_addr)
-          ?date:(if date then Some current_date else None)
-          (fun reqd ->
-             stop_head_timer ();
-             request_handler client_addr reqd)
-      in
-      let observe () =
-        match head_timer with
-        | None -> ()
-        | Some timer ->
-          (match Ache.Server_connection.read_timeout connection with
-          | Some (`Head, _) ->
-            if not !head_armed
-            then (
-              head_armed := true;
-              Timeout.set timer)
-          | Some ((`Idle | `Body), _) | None -> stop_head_timer ())
-      in
-      let module Observed = struct
-        include Ache.Server_connection
-
-        let read t bs ~off ~len =
-          let n = read t bs ~off ~len in
-          observe ();
-          n
-
-        let read_eof t bs ~off ~len =
-          let n = read_eof t bs ~off ~len in
-          observe ();
-          n
-      end
-      in
-      let expire timer on_timeout =
-        Timeout.expired timer >|= fun () ->
-        on_timeout ();
-        Error `Timeout
-      in
-      let body_limit on_timeout =
-        match idle_timer with
-        | Some timer ->
-          Timeout.set timer;
-          expire timer on_timeout
-        | None ->
-          on_timeout ();
-          Lwt.return (Error `Timeout)
-      in
-      let writer_waits = Lwt_condition.create () in
-      let rec until_response_complete () =
-        match Ache.Server_connection.read_timeout connection with
-        | Some (`Body, on_timeout) -> body_limit on_timeout
-        | Some ((`Idle | `Head), _) | None ->
-          Lwt_condition.wait writer_waits >>= until_response_complete
-      in
-      let timed_read read =
-        observe ();
-        let reading = IO_loop.untimed_read read in
-        let limit =
-          if not (Lwt.is_sleeping reading)
-          then None
-          else
-            match
-              Ache.Server_connection.read_timeout connection, idle_timer
-            with
-            | Some (`Idle, on_timeout), Some timer ->
-              Timeout.set timer;
-              Some (expire timer on_timeout)
-            | Some (`Head, on_timeout), _ when !head_armed ->
-              Option.map (fun timer -> expire timer on_timeout) head_timer
-            | Some ((`Idle | `Head), _), _ -> None
-            | Some (`Body, on_timeout), _ -> Some (body_limit on_timeout)
-            | None, _ -> Some (until_response_complete ())
+      check_timeout "grace" grace;
+      let close = IO_loop.close_once Io.close socket in
+      match stop with
+      | Some stop when not (Lwt.is_sleeping stop) -> close ()
+      | _ ->
+        let head_timer = Option.map Timeout.create head_timeout
+        and head_armed = ref false
+        and idle_timer = Option.map Timeout.create idle_timeout in
+        let stop_head_timer () =
+          head_armed := false;
+          Option.iter Timeout.stop head_timer
         in
-        match limit with
-        | None -> reading
-        | Some limit -> Lwt.pick [ reading; limit ]
-      in
-      Lwt.finalize
-        (fun () ->
-           IO_loop.start
-             (module Io)
-             (module Observed)
-             connection
-             ~read_buffer_size:config.read_buffer_size
-             ~timed_read
-             ~close:(IO_loop.close_once Io.close socket)
-             ~writer_waits:(fun () -> Lwt_condition.broadcast writer_waits ())
-             socket)
-        (fun () ->
-           Option.iter Timeout.stop head_timer;
-           Option.iter Timeout.stop idle_timer;
-           Lwt.return_unit)
+        let connection =
+          Ache.Server_connection.create
+            ~config
+            ~error_handler:(error_handler client_addr)
+            ?date:(if date then Some current_date else None)
+            (fun reqd ->
+               stop_head_timer ();
+               request_handler client_addr reqd)
+        in
+        let observe () =
+          match head_timer with
+          | None -> ()
+          | Some timer ->
+            (match Ache.Server_connection.read_timeout connection with
+            | Some (`Head, _) ->
+              if not !head_armed
+              then (
+                head_armed := true;
+                Timeout.set timer)
+            | Some ((`Idle | `Body), _) | None -> stop_head_timer ())
+        in
+        let module Observed = struct
+          include Ache.Server_connection
+
+          let read t bs ~off ~len =
+            let n = read t bs ~off ~len in
+            observe ();
+            n
+
+          let read_eof t bs ~off ~len =
+            let n = read_eof t bs ~off ~len in
+            observe ();
+            n
+        end
+        in
+        let expire timer on_timeout =
+          Timeout.expired timer >|= fun () ->
+          on_timeout ();
+          Error `Timeout
+        in
+        let body_limit on_timeout =
+          match idle_timer with
+          | Some timer ->
+            Timeout.set timer;
+            expire timer on_timeout
+          | None ->
+            on_timeout ();
+            Lwt.return (Error `Timeout)
+        in
+        let writer_waits = Lwt_condition.create () in
+        let rec until_response_complete () =
+          match Ache.Server_connection.read_timeout connection with
+          | Some (`Body, on_timeout) -> body_limit on_timeout
+          | Some ((`Idle | `Head), _) | None ->
+            Lwt_condition.wait writer_waits >>= until_response_complete
+        in
+        (* The idle read in progress, which [drain] ends: a drained idle
+           connection reads nothing more. *)
+        let idle_read = ref None in
+        let drainable () =
+          let p, u = Lwt.wait () in
+          idle_read := Some (p, u);
+          p
+        in
+        let timed_read read =
+          observe ();
+          let reading = IO_loop.untimed_read read in
+          let limits =
+            if not (Lwt.is_sleeping reading)
+            then []
+            else
+              match
+                Ache.Server_connection.read_timeout connection, idle_timer
+              with
+              | Some (`Idle, on_timeout), Some timer ->
+                Timeout.set timer;
+                [ expire timer on_timeout ]
+              | Some (`Head, on_timeout), _ when !head_armed ->
+                Option.to_list
+                  (Option.map (fun timer -> expire timer on_timeout) head_timer)
+              | Some ((`Idle | `Head), _), _ -> []
+              | Some (`Body, on_timeout), _ -> [ body_limit on_timeout ]
+              | None, _ -> [ until_response_complete () ]
+          in
+          let limits =
+            match stop, Ache.Server_connection.read_timeout connection with
+            | Some _, Some (`Idle, _) when Lwt.is_sleeping reading ->
+              drainable () :: limits
+            | _ -> limits
+          in
+          match limits with
+          | [] -> reading
+          | limits -> Lwt.pick (reading :: limits)
+        in
+        let serving =
+          IO_loop.start
+            (module Io)
+            (module Observed)
+            connection
+            ~read_buffer_size:config.read_buffer_size
+            ~timed_read
+            ~close
+            ~writer_waits:(fun () -> Lwt_condition.broadcast writer_waits ())
+            socket
+        in
+        let cancelled, notify_cancelled = Lwt.wait () in
+        let ended =
+          Lwt.finalize
+            (fun () -> Lwt.choose [ serving; cancelled ])
+            (fun () ->
+               Option.iter Timeout.stop head_timer;
+               Option.iter Timeout.stop idle_timer;
+               Lwt.return_unit)
+        in
+        let cancel () =
+          (try Ache.Server_connection.shutdown connection with _ -> ());
+          Lwt.on_termination (close ()) (fun () ->
+            if Lwt.is_sleeping cancelled
+            then Lwt.wakeup_later notify_cancelled ())
+        in
+        let drain () =
+          Ache.Server_connection.drain connection;
+          (match !idle_read with
+          | Some (p, u) when Lwt.is_sleeping p ->
+            Lwt.wakeup_later u (Error `Timeout)
+          | Some _ | None -> ());
+          match grace with
+          | None -> ()
+          | Some seconds ->
+            let timer = Timeout.create seconds in
+            Timeout.set timer;
+            Lwt.on_termination
+              (Lwt.choose [ Timeout.expired timer; ended ])
+              (fun () ->
+                 Timeout.stop timer;
+                 if Lwt.is_sleeping ended then cancel ())
+        in
+        (* [Lwt.choose] removes its callback from [stop] when [ended] resolves
+           first, so a long-lived [stop] does not keep one callback for each
+           connection that ended. *)
+        Option.iter
+          (fun stop ->
+             Lwt.on_termination
+               (Lwt.choose [ stop; ended ])
+               (fun () -> if Lwt.is_sleeping ended then drain ()))
+          stop;
+        ended
   end
 
   module Client = struct

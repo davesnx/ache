@@ -281,6 +281,68 @@ Create the timeout once, for example with `Ache_lwt.Timeout.create 30.`, and
 reuse it for each read. Cancelling the `expired` promise, as `Lwt.pick` does,
 does not change the timeout.
 
+### Graceful stop
+
+`create_connection_handler` takes `?stop:unit Lwt.t` and `?grace:float`.
+Give the same `stop` promise to every connection. When it resolves, each
+connection calls `Ache.Server_connection.drain`:
+
+1. An idle connection closes at once.
+2. A connection with a request in progress serves it, with
+   `Connection: close` if its head is not written yet, and then closes.
+   Requests pipelined after it are not served.
+3. A WebSocket connection sends a close frame with code 1001.
+4. `grace` seconds after `stop`, a connection that is still open is
+   cancelled: its socket closes, and the promise of the connection
+   resolves without waiting for the request handler. Without `grace` there
+   is no limit.
+
+A connection handler applied after `stop` resolved closes the socket
+without reading a request. With `ache-lwt-tls`, a handshake in progress at
+`stop` is closed. The handler does not stop the accept loop; the server
+does that and waits for its connections:
+
+```ocaml
+let serve listen_address =
+  let open Lwt.Syntax in
+  let stop, stop_now = Lwt.wait () in
+  let (_ : Lwt_unix.signal_handler_id) =
+    Lwt_unix.on_signal Sys.sigterm (fun _ ->
+      if Lwt.is_sleeping stop then Lwt.wakeup_later stop_now ())
+  in
+  let open_connections = ref 0
+  and closed = Lwt_condition.create () in
+  let* server =
+    Lwt_io.establish_server_with_client_socket listen_address (fun addr fd ->
+      incr open_connections;
+      Lwt.finalize
+        (fun () ->
+          Ache_lwt.Server.create_connection_handler
+            ~stop
+            ~grace:10.
+            ~request_handler
+            ~error_handler
+            addr
+            fd)
+        (fun () ->
+          decr open_connections;
+          Lwt_condition.broadcast closed ();
+          Lwt.return_unit))
+  in
+  let* () = stop in
+  let* () = Lwt_io.shutdown_server server in
+  let rec all_closed () =
+    if !open_connections = 0
+    then Lwt.return_unit
+    else Lwt.bind (Lwt_condition.wait closed) all_closed
+  in
+  all_closed ()
+```
+
+The callback that each connection puts on `stop` is removed when the
+connection ends, so a `stop` that stays pending for the life of the server
+does not grow with the number of connections served.
+
 ## TLS
 
 To make the test certificates, and for the TLS notes, see

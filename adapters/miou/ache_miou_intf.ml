@@ -19,6 +19,8 @@ module type Server = sig
     -> ?idle_timeout:float
     -> ?head_timeout:float
     -> ?date:bool
+    -> ?stop:unit Miou.Computation.t
+    -> ?grace:float
     -> request_handler:(Unix.sockaddr -> Ache.Request_descriptor.t -> unit)
     -> error_handler:(Unix.sockaddr -> Ache.Server_connection.error_handler)
     -> socket
@@ -75,10 +77,31 @@ module type Server = sig
       The handler starts the sessions of [Ache_miou.Websocket.upgrade] in
       tasks of its own, and returns when they return.
 
+      Graceful stop: when [stop] is resolved (returned or cancelled, from any
+      domain), the connection is drained ({!Ache.Server_connection.drain}):
+      - An idle connection (no request in progress, no byte of a next request
+        read) closes at once. The read that waits is ended with a shutdown of
+        reading on [socket].
+      - A request in progress finishes. Its response gets
+        [Connection: close] if its head is not written yet, and the
+        connection closes after it. Pipelined requests are not served.
+      - A WebSocket connection sends a close frame with code 1001 and closes
+        when the frame is written.
+
+      [grace] counts from [stop]. When it passes, the connection tasks and
+      its WebSocket sessions are cancelled, the socket is shut down, and the
+      handler returns. A request handler that still runs is cancelled with
+      them. Without [grace], the handler waits for the connection to end. A
+      handler applied to a socket after [stop] is resolved returns at once
+      and reads nothing. [grace] without [stop] does nothing.
+
+      The handler waits for [stop] in a task of the connection, so [drain]
+      runs in the domain of the connection.
+
       @raise Invalid_argument
-        if a timeout is not positive. It is raised when [~error_handler] is
-        applied if all four optional arguments are given too, and otherwise
-        when the handler is applied to a socket. *)
+        if a timeout or [grace] is not positive. It is raised when
+        [~error_handler] is applied if all six optional arguments are given
+        too, and otherwise when the handler is applied to a socket. *)
 
   val linger_without_idle_timeout : float
   (** Seconds a connection with [head_timeout] and no [idle_timeout] waits

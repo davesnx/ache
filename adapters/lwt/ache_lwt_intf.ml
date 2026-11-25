@@ -46,6 +46,8 @@ module type Server = sig
     -> ?idle_timeout:float
     -> ?head_timeout:float
     -> ?date:bool
+    -> ?stop:unit Lwt.t
+    -> ?grace:float
     -> request_handler:(addr -> Ache.Request_descriptor.t -> unit)
     -> error_handler:(addr -> Ache.Server_connection.error_handler)
     -> addr

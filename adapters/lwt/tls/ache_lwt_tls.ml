@@ -149,6 +149,8 @@ module Server = struct
         ?idle_timeout
         ?head_timeout
         ?date
+        ?stop
+        ?grace
         ~tls
         ~request_handler
         ~error_handler
@@ -162,38 +164,52 @@ module Server = struct
            invalid_arg
              "Ache_lwt_tls.Server.create_connection_handler_with_fd: a timeout \
               must be positive"))
-      [ idle_timeout; head_timeout ];
-    let handshake = server_of_fd tls fd in
-    let handshake =
-      match handshake_limit idle_timeout head_timeout with
-      | None -> handshake
-      | Some seconds ->
-        let timer = Ache_lwt.Timeout.create seconds in
-        Ache_lwt.Timeout.set timer;
-        Lwt.finalize
-          (fun () ->
-             Lwt.pick
-               [ handshake
-               ; ( Ache_lwt.Timeout.expired timer >>= fun () ->
-                   Lwt.fail Lwt_unix.Timeout )
-               ])
-          (fun () ->
-             Ache_lwt.Timeout.stop timer;
-             Lwt.return_unit)
-    in
-    Lwt.try_bind
-      (fun () -> handshake)
-      (fun socket ->
-         create_connection_handler
-           ?config
-           ?idle_timeout
-           ?head_timeout
-           ?date
-           ~request_handler
-           ~error_handler
-           client_addr
-           socket)
-      (fun (_ : exn) -> close_fd fd)
+      [ idle_timeout; head_timeout; grace ];
+    match stop with
+    | Some stop when not (Lwt.is_sleeping stop) -> close_fd fd
+    | _ ->
+      let handshake = server_of_fd tls fd in
+      let handshake =
+        match handshake_limit idle_timeout head_timeout with
+        | None -> handshake
+        | Some seconds ->
+          let timer = Ache_lwt.Timeout.create seconds in
+          Ache_lwt.Timeout.set timer;
+          Lwt.finalize
+            (fun () ->
+               Lwt.pick
+                 [ handshake
+                 ; ( Ache_lwt.Timeout.expired timer >>= fun () ->
+                     Lwt.fail Lwt_unix.Timeout )
+                 ])
+            (fun () ->
+               Ache_lwt.Timeout.stop timer;
+               Lwt.return_unit)
+      in
+      (* A handshake in progress at [stop] is closed, as an idle connection. *)
+      Option.iter
+        (fun stop ->
+           Lwt.on_termination
+             (Lwt.choose [ stop; Lwt.map ignore handshake ])
+             (fun () ->
+                if Lwt.is_sleeping handshake
+                then Lwt.async (fun () -> close_fd fd)))
+        stop;
+      Lwt.try_bind
+        (fun () -> handshake)
+        (fun socket ->
+           create_connection_handler
+             ?config
+             ?idle_timeout
+             ?head_timeout
+             ?date
+             ?stop
+             ?grace
+             ~request_handler
+             ~error_handler
+             client_addr
+             socket)
+        (fun (_ : exn) -> close_fd fd)
 end
 
 let close_delimited (request : Ache.Request.t) (response : Ache.Response.t) =

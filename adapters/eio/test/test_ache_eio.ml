@@ -1350,6 +1350,8 @@ let test_timeout_check_timing () =
               ~clock:(Eio_mock.Clock.make ())
               ~idle_timeout:(-1.)
               ~head_timeout:1.
+              ~stop:(Eio.Promise.create_resolved ())
+              ~grace:1.
               ~request_handler
               ~error_handler
             : _ -> _ -> unit))))
@@ -2748,6 +2750,223 @@ let test_websocket_upgrade_outside_connection () =
     | `Yield -> true
     | `Write _ | `Close _ -> false)
 
+let with_stop_server ?(server_clock = true) ?grace f =
+  server_errors := [];
+  requests_seen := 0;
+  later_reqd := None;
+  Eio_main.run (fun env ->
+    let clock = Eio.Stdenv.clock env in
+    let server_clock = if server_clock then Some clock else None in
+    Eio.Time.with_timeout_exn clock 10.0 (fun () ->
+      Eio.Switch.run (fun sw ->
+        let net = Eio.Stdenv.net env in
+        let listening =
+          Eio.Net.listen
+            ~sw
+            ~backlog:16
+            ~reuse_addr:true
+            net
+            (`Tcp (Eio.Net.Ipaddr.V4.loopback, 0))
+        in
+        let stop, resolve_stop = Eio.Promise.create () in
+        let handled = Eio.Stream.create max_int in
+        Eio.Fiber.fork_daemon ~sw (fun () ->
+          let rec accept () =
+            Eio.Net.accept_fork
+              ~sw
+              listening
+              ~on_error:raise
+              (fun socket addr ->
+                 Ache_eio.Server.create_connection_handler
+                   ~date:false
+                   ?clock:server_clock
+                   ~stop
+                   ?grace
+                   ~request_handler
+                   ~error_handler
+                   socket
+                   addr;
+                 Eio.Stream.add handled ());
+            accept ()
+          in
+          accept ());
+        f
+          ~clock
+          ~sw
+          ~net
+          ~stop:(fun () ->
+            Eio.Promise.resolve resolve_stop ();
+            (* Let the connection fibers drain. *)
+            for _ = 1 to 3 do
+              Eio.Fiber.yield ()
+            done)
+          ~handled:(fun () -> Eio.Stream.take handled)
+          (Eio.Net.listening_addr listening))))
+
+let rec await_some clock r =
+  match !r with
+  | Some x ->
+    r := None;
+    x
+  | None ->
+    Eio.Time.sleep clock 0.001;
+    await_some clock r
+
+let get_later = "GET /later HTTP/1.1\r\nhost: localhost\r\n\r\n"
+
+let late_response_close =
+  "HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nlate"
+
+let respond_late reqd =
+  Request_descriptor.respond_with_string
+    reqd
+    (Response.create ~headers:(Headers.of_list [ "content-length", "4" ]) `OK)
+    "late"
+
+let within clock seconds f =
+  let start = Eio.Time.now clock in
+  let result = f () in
+  let elapsed = Eio.Time.now clock -. start in
+  if elapsed > seconds
+  then Alcotest.failf "took %.3f s, more than %.3f s" elapsed seconds;
+  result
+
+let test_stop_finishes_request () =
+  with_stop_server (fun ~clock ~sw ~net ~stop ~handled addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    Eio.Flow.copy_string get_later socket;
+    let reqd = await_some clock later_reqd in
+    stop ();
+    respond_late reqd;
+    Alcotest.(check string) "response" late_response_close (read_all socket);
+    Eio.Flow.close socket;
+    within clock 0.5 handled)
+
+let test_stop_closes_idle ?server_clock () =
+  with_stop_server ?server_clock (fun ~clock ~sw ~net ~stop ~handled addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string get_hello socket;
+    Alcotest.(check string)
+      "response"
+      hello_response
+      (Eio.Buf_read.take (String.length hello_response) reader);
+    stop ();
+    within clock 0.5 (fun () ->
+      Alcotest.(check bool) "EOF" true (Eio.Buf_read.at_end_of_input reader));
+    Eio.Flow.close socket;
+    within clock 0.5 handled;
+    Alcotest.(check int) "requests" 1 !requests_seen)
+
+let test_stop_grace_cancels () =
+  with_stop_server ~grace:0.2 (fun ~clock ~sw ~net ~stop ~handled addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    Eio.Flow.copy_string get_later socket;
+    let (_ : Request_descriptor.t) = await_some clock later_reqd in
+    stop ();
+    let output =
+      within clock 1.0 (fun () ->
+        match read_all socket with
+        | output -> output
+        | exception Eio.Io (Eio.Net.E (Connection_reset _), _) -> "")
+    in
+    Alcotest.(check string) "no response" "" output;
+    within clock 0.5 handled;
+    Eio.Flow.close socket)
+
+let test_stop_before_handler () =
+  server_errors := [];
+  requests_seen := 0;
+  Eio_main.run (fun _env ->
+    Eio.Switch.run (fun sw ->
+      let server, client = Eio_unix.Net.socketpair_stream ~sw () in
+      Eio.Flow.copy_string get_hello client;
+      Ache_eio.Server.create_connection_handler
+        ~date:false
+        ~stop:(Eio.Promise.create_resolved ())
+        ~request_handler
+        ~error_handler
+        server
+        (`Unix "socketpair");
+      Alcotest.(check string) "no response" "" (read_all client);
+      Alcotest.(check int) "requests" 0 !requests_seen))
+
+let test_server_run_stop () =
+  later_reqd := None;
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env
+    and clock = Eio.Stdenv.clock env in
+    let port =
+      Eio.Switch.run (fun sw ->
+        match
+          Eio.Net.listening_addr
+            (Eio.Net.listen
+               ~sw
+               ~backlog:1
+               net
+               (`Tcp (Eio.Net.Ipaddr.V4.loopback, 0)))
+        with
+        | `Tcp (_, port) -> port
+        | `Unix _ -> assert false)
+    in
+    let addr = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
+    let stop, resolve_stop = Eio.Promise.create () in
+    let returned = ref false in
+    Eio.Time.with_timeout_exn clock 10.0 (fun () ->
+      Eio.Fiber.both
+        (fun () ->
+           Ache_eio.Server.run
+             ~date:false
+             ~clock
+             ~stop
+             ~grace:1.0
+             ~domains:1
+             ~on_error:raise
+             ~net
+             ~domain_mgr:(Eio.Stdenv.domain_mgr env)
+             ~request_handler
+             ~error_handler
+             addr;
+           returned := true)
+        (fun () ->
+           Eio.Switch.run (fun sw ->
+             let rec connect () =
+               match Eio.Net.connect ~sw net addr with
+               | socket -> socket
+               | exception Eio.Io (Eio.Net.E (Connection_failure (Refused _)), _)
+                 ->
+                 Eio.Time.sleep clock 0.01;
+                 connect ()
+             in
+             let socket = connect () in
+             Eio.Flow.copy_string get_later socket;
+             let reqd = await_some clock later_reqd in
+             Eio.Promise.resolve resolve_stop ();
+             Eio.Time.sleep clock 0.05;
+             Alcotest.(check bool) "running" false !returned;
+             (match Eio.Net.connect ~sw net addr with
+             | late ->
+               Eio.Flow.copy_string get_hello late;
+               let output =
+                 match read_all late with
+                 | output -> output
+                 | exception Eio.Io (Eio.Net.E (Connection_reset _), _) -> ""
+               in
+               Alcotest.(check string) "after stop" "" output
+             | exception Eio.Io (Eio.Net.E (Connection_failure _), _) -> ());
+             Request_descriptor.respond_with_string
+               reqd
+               (Response.create
+                  ~headers:(Headers.of_list [ "content-length", "4" ])
+                  `OK)
+               "late";
+             Alcotest.(check string)
+               "response"
+               late_response_close
+               (read_all socket);
+             Eio.Flow.close socket));
+      Alcotest.(check bool) "returned" true !returned))
+
 let () =
   Alcotest.run
     "ache-eio loopback"
@@ -2832,6 +3051,26 @@ let () =
         ; ( "an exception from report_exn ends the connection"
           , `Quick
           , test_report_exn_raises )
+        ] )
+    ; ( "stop"
+      , [ ( "a request in flight finishes with connection: close"
+          , `Quick
+          , test_stop_finishes_request )
+        ; ( "an idle connection closes at once"
+          , `Quick
+          , test_stop_closes_idle ?server_clock:None )
+        ; ( "an idle connection closes at once, no clock"
+          , `Quick
+          , test_stop_closes_idle ~server_clock:false )
+        ; ( "a request still running after grace is cancelled"
+          , `Quick
+          , test_stop_grace_cancels )
+        ; ( "a handler applied after stop reads no request"
+          , `Quick
+          , test_stop_before_handler )
+        ; ( "Server.run stops accepting, drains and returns"
+          , `Quick
+          , test_server_run_stop )
         ] )
     ; ( "websocket"
       , [ "echo through Ache_eio.Websocket", `Quick, test_websocket_echo

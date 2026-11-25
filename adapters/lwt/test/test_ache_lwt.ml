@@ -159,6 +159,7 @@ exception Respond_later
 let late_error_response : (unit -> unit) option ref = ref None
 let pending_response : Request_descriptor.t option ref = ref None
 let pending_body_failed = ref false
+let slow_reqd : Request_descriptor.t option ref = ref None
 
 let request_handler (_ : Unix.sockaddr) reqd =
   incr requests_seen;
@@ -236,6 +237,9 @@ let request_handler (_ : Unix.sockaddr) reqd =
                 reqd
                 (Response.create `OK)))
         !stream_start)
+  | `GET, "/slow" ->
+    Body.Reader.close body;
+    slow_reqd := Some reqd
   | `GET, "/raise" -> failwith "handler failed"
   | `GET, "/raise-later" -> raise Respond_later
   | `POST, "/early-close" ->
@@ -289,12 +293,16 @@ let with_server
       ?idle_timeout
       ?head_timeout
       ?(date = false)
+      ?stop
+      ?grace
       ?(connection_handler =
         fun ~request_handler ~error_handler addr socket ->
           Ache_lwt.Server.create_connection_handler
             ~date
             ?idle_timeout
             ?head_timeout
+            ?stop
+            ?grace
             ~request_handler
             ~error_handler
             addr
@@ -1502,14 +1510,14 @@ let live_words () =
   Gc.full_major ();
   (Gc.stat ()).live_words
 
-let check_timers_bounded ?idle_timeout ?head_timeout ~requests send =
+let check_timers_bounded ?idle_timeout ?head_timeout ?stop ~requests send =
   let previous = Lwt_engine.get () in
   Lwt_engine.set ~destroy:false (new Lwt_engine.select);
   let growth = ref 0 in
   Fun.protect
     ~finally:(fun () -> Lwt_engine.set previous)
     (fun () ->
-       with_server ?idle_timeout ?head_timeout (fun connect ->
+       with_server ?idle_timeout ?head_timeout ?stop (fun connect ->
          let earlier_live_sleeper = Lwt_unix.sleep 20. in
          connect () >>= fun socket ->
          Lwt_unix.setsockopt socket Unix.TCP_NODELAY true;
@@ -1543,7 +1551,7 @@ let test_head_timer_bounded () =
     Lwt_unix.sleep 0.001 >>= fun () ->
     write_all socket "host: localhost\r\n\r\n")
 
-let check_connection_timers_bounded ~connections exchange =
+let check_connection_timers_bounded ?stop ~connections exchange =
   let previous = Lwt_engine.get () in
   Lwt_engine.set ~destroy:false (new Lwt_engine.select);
   let growth = ref 0 in
@@ -1566,6 +1574,7 @@ let check_connection_timers_bounded ~connections exchange =
                ~date:false
                ~idle_timeout:30.
                ~head_timeout:30.
+               ?stop
                ~request_handler
                ~error_handler
                client_addr
@@ -1626,6 +1635,15 @@ let test_idle_connection_timers_bounded () =
     write_all socket get_hello >>= fun () ->
     read_exactly socket (String.length hello_response) >|= fun response ->
     Alcotest.(check string) "response" hello_response response)
+
+let test_pending_stop_bounded () =
+  let stop, (_ : unit Lwt.u) = Lwt.wait () in
+  check_connection_timers_bounded ~stop ~connections:1000 (fun socket ->
+    write_all socket get_hello >>= fun () ->
+    read_exactly socket (String.length hello_response) >|= fun response ->
+    Alcotest.(check string) "response" hello_response response);
+  check_timers_bounded ~stop ~requests:10_000 (fun socket ->
+    write_all socket get_hello)
 
 let test_failing_shutdown_and_close () =
   fail_read := false;
@@ -1855,6 +1873,144 @@ let test_timeout_create_must_be_positive () =
        | exception Invalid_argument _ -> ())
     [ 0.; -1.; Float.nan ]
 
+let slow_request = "GET /slow HTTP/1.1\r\nhost: localhost\r\n\r\n"
+
+let rec until_slow () =
+  match !slow_reqd with
+  | Some reqd -> Lwt.return reqd
+  | None -> Lwt_unix.sleep 0.005 >>= until_slow
+
+let respond_done reqd =
+  Request_descriptor.respond_with_string
+    reqd
+    (Response.create ~headers:(Headers.of_list [ "content-length", "4" ]) `OK)
+    "done"
+
+(* [read_all], with a reset or a refused write read as the end of input. *)
+let read_all_or_reset socket =
+  Lwt.catch
+    (fun () -> read_all socket)
+    (function
+      | Unix.Unix_error ((ECONNRESET | EPIPE), _, _) -> Lwt.return ""
+      | exn -> Lwt.fail exn)
+
+let check_within name ~since ~min ~max =
+  let elapsed = Unix.gettimeofday () -. since in
+  if elapsed < min || elapsed > max
+  then
+    Alcotest.failf
+      "%s: after %.3f s, expected %.3f to %.3f s"
+      name
+      elapsed
+      min
+      max
+
+let test_drain_finishes_request () =
+  slow_reqd := None;
+  let stop, stop_now = Lwt.wait () in
+  with_server ~stop ~grace:5. (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (slow_request ^ get_hello) >>= until_slow >>= fun reqd ->
+    Lwt.wakeup_later stop_now ();
+    Lwt_unix.sleep 0.1 >>= fun () ->
+    respond_done reqd;
+    read_all socket >>= fun output ->
+    Alcotest.(check bool)
+      "connection: close"
+      true
+      (contains output "\r\nconnection: close\r\n");
+    Alcotest.(check bool)
+      "200 with its body, then end of input"
+      true
+      (String.starts_with ~prefix:"HTTP/1.1 200 OK\r\n" output
+      && String.ends_with ~suffix:"\r\n\r\ndone" output);
+    Lwt_unix.close socket);
+  Alcotest.(check int) "pipelined request not served" 1 !requests_seen;
+  check_server_sockets_closed ()
+
+let test_drain_idle () =
+  let stop, stop_now = Lwt.wait () in
+  with_server ~stop (fun connect ->
+    connect () >>= fun fresh ->
+    connect () >>= fun used ->
+    write_all used get_hello >>= fun () ->
+    read_exactly used (String.length hello_response) >>= fun first ->
+    Alcotest.(check string) "keep-alive response" hello_response first;
+    Lwt_unix.sleep 0.05 >>= fun () ->
+    let since = Unix.gettimeofday () in
+    Lwt.wakeup_later stop_now ();
+    read_all fresh >>= fun fresh_output ->
+    read_all used >>= fun used_output ->
+    check_within "idle connections closed" ~since ~min:0. ~max:0.3;
+    Alcotest.(check string) "new connection: nothing written" "" fresh_output;
+    Alcotest.(check string) "keep-alive: nothing more" "" used_output;
+    Lwt_unix.close fresh >>= fun () -> Lwt_unix.close used);
+  Alcotest.(check int) "no error" 0 (List.length !server_errors);
+  check_server_sockets_closed ()
+
+let test_drain_grace_cancels () =
+  slow_reqd := None;
+  let stop, stop_now = Lwt.wait () in
+  let started = Unix.gettimeofday () in
+  with_server ~stop ~grace:0.2 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket slow_request >>= until_slow
+    >>= fun (_ : Request_descriptor.t) ->
+    let since = Unix.gettimeofday () in
+    Lwt.wakeup_later stop_now ();
+    read_all_or_reset socket >>= fun output ->
+    check_within "closed at the grace" ~since ~min:0.15 ~max:1.0;
+    Alcotest.(check string) "no response" "" output;
+    Lwt_unix.close socket);
+  check_within "server ended" ~since:started ~min:0. ~max:2.0;
+  check_server_sockets_closed ();
+  (* The handler responds after the connection was cancelled. *)
+  respond_done (Option.get !slow_reqd)
+
+let test_handler_after_stop () =
+  with_server ~stop:Lwt.return_unit (fun connect ->
+    connect () >>= fun socket ->
+    Lwt.catch
+      (fun () -> write_all socket get_hello)
+      (fun (_ : exn) -> Lwt.return_unit)
+    >>= fun () ->
+    read_all_or_reset socket >>= fun output ->
+    Alcotest.(check string) "no response" "" output;
+    Lwt_unix.close socket);
+  Alcotest.(check int) "request handler not called" 0 !requests_seen;
+  check_server_sockets_closed ()
+
+let test_drain_websocket () =
+  let ended = wait_ws_end () in
+  let stop, stop_now = Lwt.wait () in
+  with_server ~stop ~grace:5. (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    Lwt.wakeup_later stop_now ();
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    write_all socket (ws_frame 0x8 "\x03\xe9") >>= fun () ->
+    read_all socket >>= fun rest ->
+    Alcotest.(check string) "then end of input" "" rest;
+    ended >>= fun (_ : (string, exn) result) -> Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+let test_grace_must_be_positive () =
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  (match
+     Ache_lwt.Server.create_connection_handler
+       ~grace:0.
+       ~request_handler
+       ~error_handler
+       (Unix.ADDR_INET (Unix.inet_addr_loopback, 0))
+       socket
+   with
+  | (_ : unit Lwt.t) -> Alcotest.fail "expected Invalid_argument"
+  | exception Invalid_argument _ -> ());
+  Lwt_main.run (Lwt_unix.close socket)
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
@@ -1969,6 +2125,23 @@ let () =
         ; ( "keep-alive connections closed while idle do not pile up timers"
           , `Quick
           , test_idle_connection_timers_bounded )
+        ] )
+    ; ( "drain"
+      , [ ( "a request in flight finishes with connection: close"
+          , `Quick
+          , test_drain_finishes_request )
+        ; "idle connections close at once", `Quick, test_drain_idle
+        ; ( "a request still running at the grace is cancelled"
+          , `Quick
+          , test_drain_grace_cancels )
+        ; ( "a connection handled after stop is closed unread"
+          , `Quick
+          , test_handler_after_stop )
+        ; "WebSocket gets close 1001", `Quick, test_drain_websocket
+        ; "grace must be positive", `Quick, test_grace_must_be_positive
+        ; ( "a pending stop does not grow with connections or requests"
+          , `Quick
+          , test_pending_stop_bounded )
         ] )
     ; ( "Timeout"
       , [ "expires after its deadline", `Quick, test_timeout_expires

@@ -161,6 +161,13 @@ let commit_persistence t (response : Response.t) =
       && not (t.request.meth = `CONNECT && Status.is_successful response.status);
   if not t.persistent then Reader.pause t.reader
 
+let close_after t =
+  match t.response_state with
+  | Upgrade _ -> ()
+  | Waiting | Fixed _ | Streaming _ ->
+    t.persistent <- false;
+    Reader.pause t.reader
+
 let has_body t encoding =
   encoding <> `No_body && not (Writer.is_closed t.writer)
 
@@ -313,7 +320,7 @@ let unsafe_respond_with_upgrade ?status t headers impl =
     Writer.flush t.writer (function
       | `Written when not closed -> t.upgrade impl
       | `Written | `Closed ->
-        let (Runtime.Impl ((module Engine), engine)) = impl in
+        let (Runtime.Impl ((module Engine), engine, _)) = impl in
         Engine.shutdown engine;
         Reader.force_close t.reader;
         Reader.wakeup t.reader);

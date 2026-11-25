@@ -212,6 +212,25 @@ end
     {!Ache.Server_connection.create} describes. The text is built at most once
     per second in each domain. With [~date:false] no [Date] is added.
 
+    Graceful stop: give the same [stop] promise to each connection. When
+    [stop] resolves (or is rejected):
+    + the connection calls {!Ache.Server_connection.drain}. An idle
+      connection closes at once. A connection with a request in progress
+      serves it, with [Connection: close] if its head is not written yet, and
+      then closes; requests pipelined after it are not served. A WebSocket
+      connection sends a close frame with code [1001].
+    + [grace] seconds later, a connection that is still open is cancelled:
+      it stops, and its socket is closed without waiting for the handler or
+      for pending output, and the promise of the connection resolves. Without [grace] the
+      connection has no time limit.
+
+    A handler applied to a socket after [stop] resolved closes the socket
+    and does not read a request. [create_connection_handler] does not stop
+    the accept loop: stop it yourself, for example with
+    [Lwt_io.shutdown_server], and wait for the promises of the connections.
+    A [stop] that is never resolved holds no memory for connections that
+    ended.
+
     Closing: when the connection stops reading it calls [shutdown_receive]
     and does not wait for the peer to close; it closes the socket once the
     response is written. Input that the peer sent and the connection did not
@@ -219,7 +238,7 @@ end
     instead reads and discards input for a bounded time first.
 
     [create_connection_handler] raises [Invalid_argument] when applied to a
-    socket if a timeout is not positive.
+    socket if a timeout or [grace] is not positive.
 
     The application must ignore [SIGPIPE], for example with
     [Sys.set_signal Sys.sigpipe Sys.Signal_ignore], before it serves

@@ -620,6 +620,8 @@ let test_timeout_check_timing () =
                 ~clock:(Eio.Stdenv.clock env)
                 ~idle_timeout:1.
                 ~head_timeout:(-1.)
+                ~stop:(Eio.Promise.create_resolved ())
+                ~grace:1.
                 ~tls:server_config
                 ~request_handler
                 ~error_handler
@@ -1145,6 +1147,77 @@ let test_websocket_echo () =
       Eio.Flow.close raw.tls));
   check_no_handler_error ()
 
+let with_stop_server f =
+  server_errors := [];
+  pending_body := None;
+  let fds = open_fds () in
+  run (fun env sw ->
+    let clock = Eio.Stdenv.clock env in
+    let stop, resolve_stop = Eio.Promise.create () in
+    with_listener
+      env
+      sw
+      (Ache_eio_tls.Server.create_connection_handler
+         ~date:false
+         ~clock
+         ~stop
+         ~grace:1.0
+         ~tls:server_config
+         ~request_handler
+         ~error_handler)
+      (f clock (fun () ->
+         Eio.Promise.resolve resolve_stop ();
+         for _ = 1 to 3 do
+           Eio.Fiber.yield ()
+         done)));
+  Alcotest.(check int) "no file descriptor leaked" fds (open_fds ())
+
+let test_stop_drains () =
+  with_stop_server (fun clock stop connect ->
+    Eio.Switch.run (fun sw ->
+      let raw = raw_client (connect sw) in
+      Eio.Flow.copy_string
+        "POST /respond-later HTTP/1.1\r\n\
+         host: localhost\r\n\
+         content-length: 0\r\n\
+         \r\n"
+        raw.tls;
+      let rec reqd () =
+        match !pending_body with
+        | Some reqd -> reqd
+        | None ->
+          Eio.Time.sleep clock 0.001;
+          reqd ()
+      in
+      let reqd = reqd () in
+      stop ();
+      Request_descriptor.respond_with_string
+        reqd
+        (Response.create
+           ~headers:(Headers.of_list [ "content-length", "4" ])
+           `OK)
+        "done";
+      let output, ending = raw_read_until_eof raw in
+      Alcotest.(check string)
+        "response"
+        "HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\ndone"
+        output;
+      Alcotest.(check bool) "close_notify" true (ending = `Close_notify)));
+  check_no_handler_error ()
+
+let test_stop_during_handshake () =
+  with_stop_server (fun clock stop connect ->
+    Eio.Switch.run (fun sw ->
+      let tcp = connect sw in
+      Eio.Time.sleep clock 0.02;
+      stop ();
+      let output =
+        Eio.Time.with_timeout_exn clock 0.5 (fun () ->
+          Eio.Buf_read.parse_exn Eio.Buf_read.take_all ~max_size:65536 tcp)
+      in
+      Alcotest.(check string) "nothing sent" "" output));
+  check_no_handler_error ()
+
 let () =
   Alcotest.run
     "ache-eio-tls"
@@ -1271,5 +1344,15 @@ let () =
             "Client.shutdown with a read pending"
             `Quick
             test_client_shutdown_with_pending_read
+        ] )
+    ; ( "stop"
+      , [ Alcotest.test_case
+            "a request in flight finishes with connection: close"
+            `Quick
+            test_stop_drains
+        ; Alcotest.test_case
+            "a handshake in progress is closed"
+            `Quick
+            test_stop_during_handshake
         ] )
     ]

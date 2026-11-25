@@ -225,7 +225,7 @@ let with_listener handler f =
              !handlers_done)));
   Alcotest.(check int) "no file descriptor leaked" fds (open_fds ())
 
-let with_server ?idle_timeout ?head_timeout f =
+let with_server ?idle_timeout ?head_timeout ?stop ?grace f =
   server_errors := [];
   partial_body_cut := false;
   with_listener
@@ -233,6 +233,8 @@ let with_server ?idle_timeout ?head_timeout f =
        ~date:false
        ?idle_timeout
        ?head_timeout
+       ?stop
+       ?grace
        ~tls:server_config
        ~request_handler
        ~error_handler)
@@ -617,6 +619,8 @@ let test_timeout_check_timing () =
               ~config:Ache.Config.default
               ~idle_timeout:1.
               ~head_timeout:(-1.)
+              ~stop:(Miou.Computation.create ())
+              ~grace:1.
               ~tls:server_config
               ~request_handler
               ~error_handler
@@ -1113,12 +1117,54 @@ let test_websocket_echo () =
       Alcotest.(check string) "then the end" "" rest));
   check_no_handler_error ()
 
+let hello_response = "HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\n/hello"
+
+let test_stop_idle_connection () =
+  let stop = Miou.Computation.create () in
+  with_server ~stop ~grace:2.0 (fun connect ->
+    with_raw_client connect (fun fd ->
+      let raw = raw_client fd in
+      raw_write raw "GET /hello HTTP/1.1\r\nhost: localhost\r\n\r\n";
+      Alcotest.(check string)
+        "response"
+        hello_response
+        (raw_take raw (String.length hello_response));
+      let since = Unix.gettimeofday () in
+      resolve stop ();
+      let rest, ending = raw_read_until_eof raw in
+      Alcotest.(check string) "nothing more" "" rest;
+      Alcotest.(check bool) "close_notify" true (ending = `Close_notify);
+      check_bounded "idle TLS connection" ~max:0.5 since));
+  check_no_handler_error ()
+
+let test_stop_during_handshake () =
+  let stop = Miou.Computation.create () in
+  with_server ~stop (fun connect ->
+    with_raw_client connect (fun fd ->
+      Miou_unix.sleep 0.1;
+      let since = Unix.gettimeofday () in
+      resolve stop ();
+      Alcotest.(check int)
+        "server closed"
+        0
+        (Miou_unix.read fd (Bytes.create 16));
+      check_bounded "handshake" ~max:0.5 since));
+  check_no_handler_error ()
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
     "ache-miou-tls"
     [ ( "tls"
       , [ Alcotest.test_case "GET" `Quick test_get
+        ; Alcotest.test_case
+            "stop closes an idle connection"
+            `Quick
+            test_stop_idle_connection
+        ; Alcotest.test_case
+            "stop ends a handshake in progress"
+            `Quick
+            test_stop_during_handshake
         ; Alcotest.test_case "WebSocket echo" `Quick test_websocket_echo
         ; Alcotest.test_case
             "client_of_fd, epoch and create_connection"

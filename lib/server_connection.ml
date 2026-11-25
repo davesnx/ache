@@ -73,6 +73,8 @@ type t =
   ; mutable upgraded : Runtime.impl option
   ; mutable reader_waits_for_output : bool
   ; date : (unit -> string) option
+  ; mutable requests : int
+  ; mutable draining : bool
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
@@ -139,10 +141,11 @@ let shutdown t =
     ~finally:(fun () -> shutdown_writer t)
     (fun () -> shutdown_reader t)
 
-let upgrade t (Runtime.Impl ((module Engine), engine) as impl) =
+let upgrade t (Runtime.Impl ((module Engine), engine, _) as impl) =
   let eof = Reader.is_closed t.reader in
   t.upgraded <- Some impl;
   shutdown t;
+  if t.draining then Runtime.drain impl;
   if eof
   then ignore (Engine.read_eof engine Bigstring.empty ~off:0 ~len:0 : int)
 
@@ -152,7 +155,20 @@ let create
       ?date
       request_handler
   =
-  let { Config.response_buffer_size; response_body_buffer_size; _ } = config in
+  let { Config.response_buffer_size
+      ; response_body_buffer_size
+      ; max_requests_per_connection
+      ; _
+      }
+    =
+    config
+  in
+  (match max_requests_per_connection with
+  | Some n when n < 1 ->
+    invalid_arg
+      "ache.Server_connection.create: max_requests_per_connection must be \
+       positive"
+  | _ -> ());
   let date =
     Option.map
       (fun date ->
@@ -186,6 +202,14 @@ let create
           request
           request_body
       in
+      t.requests <- t.requests + 1;
+      if
+        t.draining
+        ||
+        match max_requests_per_connection with
+        | Some n -> t.requests >= n
+        | None -> false
+      then Request_descriptor.close_after reqd;
       let call_handler = Queue.is_empty request_queue in
       Queue.push reqd request_queue;
       if call_handler then request_handler reqd
@@ -202,6 +226,8 @@ let create
     ; upgraded = None
     ; reader_waits_for_output = false
     ; date
+    ; requests = 0
+    ; draining = false
     }
   in
   self := Some (t, upgrade t);
@@ -297,6 +323,11 @@ let advance_request_queue t =
     | () -> ()
     | exception exn -> Request_descriptor.report_exn reqd exn
 
+let at_request_start t =
+  match Reader.next t.reader with
+  | `Start -> true
+  | `Read | `Close | `Error _ -> false
+
 let output_full t = Writer.pending_bytes t.writer > t.config.max_pending_output
 
 let wait_for_output t =
@@ -309,6 +340,9 @@ let rec _next_read_operation t =
     match t.error_code with
     | Error _ -> `Close
     | No_error when Writer.is_closed t.writer ->
+      shutdown t;
+      `Close
+    | No_error when t.draining && at_request_start t ->
       shutdown t;
       `Close
     | No_error when output_full t && not (Reader.is_closed t.reader) ->
@@ -485,60 +519,60 @@ let report_write_result t result =
 let next_read_operation t =
   match t.upgraded with
   | None -> next_read_operation t
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.next_read_operation engine
 
 let read t bs ~off ~len =
   match t.upgraded with
   | None -> read t bs ~off ~len
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.read engine bs ~off ~len
 
 let read_eof t bs ~off ~len =
   match t.upgraded with
   | None -> read_eof t bs ~off ~len
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.read_eof engine bs ~off ~len
 
 let yield_reader t k =
   match t.upgraded with
   | None -> yield_reader t k
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.yield_reader engine k
 
 let next_write_operation t =
   match t.upgraded with
   | None -> next_write_operation t
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.next_write_operation engine
 
 let report_write_result t result =
   match t.upgraded with
   | None -> report_write_result t result
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.report_write_result engine result
 
 let yield_writer t k =
   match t.upgraded with
   | None -> yield_writer t k
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.yield_writer engine k
 
 let report_exn t exn =
   match t.upgraded with
   | None -> report_exn t exn
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.report_exn engine exn
 
 let is_closed t =
   match t.upgraded with
   | None -> is_closed t
-  | Some (Runtime.Impl ((module Engine), engine)) -> Engine.is_closed engine
+  | Some (Runtime.Impl ((module Engine), engine, _)) -> Engine.is_closed engine
 
 let shutdown t =
   match t.upgraded with
   | None -> shutdown t
-  | Some (Runtime.Impl ((module Engine), engine)) -> Engine.shutdown engine
+  | Some (Runtime.Impl ((module Engine), engine, _)) -> Engine.shutdown engine
 
 let read_timeout t =
   match t.upgraded, t.error_code with
@@ -556,3 +590,21 @@ let read_timeout t =
       Some (`Body, fun () -> shutdown t)
     | _ -> None)
   | _ -> None
+
+let drain t =
+  if not t.draining
+  then (
+    t.draining <- true;
+    match t.upgraded with
+    | Some impl -> Runtime.drain impl
+    | None ->
+      (match t.error_code with
+      | Error _ -> ()
+      | No_error ->
+        if is_active t
+        then (
+          Request_descriptor.close_after (current_reqd_exn t);
+          wakeup_writer t)
+        else if at_request_start t
+        then shutdown t);
+      wakeup_reader t)

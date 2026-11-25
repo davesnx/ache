@@ -150,6 +150,8 @@ module Server = struct
         ?idle_timeout
         ?head_timeout
         ?date
+        ?stop
+        ?grace
         ~tls
         ~request_handler
         ~error_handler
@@ -161,12 +163,14 @@ module Server = struct
         ?idle_timeout
         ?head_timeout
         ?date
+        ?stop
+        ?grace
         ~request_handler
         ~error_handler
     in
     fun tcp client_addr ->
       let handshake () = Tls_eio.server_of_flow tls tcp in
-      let flow =
+      let handshake () =
         let limit =
           match idle_timeout, head_timeout with
           | None, None -> None
@@ -178,8 +182,23 @@ module Server = struct
           Eio.Time.with_timeout_exn clock seconds handshake
         | _ -> handshake ()
       in
-      handler
-        (Eio.Resource.T ({ Server_flow.tls = flow; tcp :> flow }, server_handler)
-         : flow)
-        client_addr
+      let flow =
+        match stop with
+        | None -> Some (handshake ())
+        | Some stop when Eio.Promise.is_resolved stop -> None
+        | Some stop ->
+          Eio.Fiber.first
+            (fun () -> Some (handshake ()))
+            (fun () ->
+               Eio.Promise.await stop;
+               None)
+      in
+      Option.iter
+        (fun flow ->
+           handler
+             (Eio.Resource.T
+                ({ Server_flow.tls = flow; tcp :> flow }, server_handler)
+              : flow)
+             client_addr)
+        flow
 end

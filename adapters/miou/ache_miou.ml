@@ -75,14 +75,40 @@ module Deadline = struct
   let stop t = Option.iter Miou.cancel t.timer
 end
 
+let sleep_until at =
+  let rec loop () =
+    let left = at -. Unix.gettimeofday () in
+    if left > 0.
+    then (
+      Miou_unix.sleep (Float.min Deadline.longest_sleep left);
+      loop ())
+  in
+  loop ()
+
+(* [await_stop stop] returns when [stop] is resolved, returned or cancelled.
+   When the calling task is cancelled first, it raises [Miou.Cancelled]. *)
+let await_stop stop =
+  match Miou.Computation.await stop with
+  | Error (exn, bt) when Miou.Computation.is_running stop ->
+    Printexc.raise_with_backtrace exn bt
+  | Ok () | Error _ -> ()
+
 module Sessions = struct
   type t =
     { mutable pending : (unit -> unit) list
     ; mutable running : unit Miou.t list
+    ; mutable live : int
+    ; mutable aborted : bool
     ; added : Signal.t
     }
 
-  let create () = { pending = []; running = []; added = Signal.create () }
+  let create () =
+    { pending = []
+    ; running = []
+    ; live = 0
+    ; aborted = false
+    ; added = Signal.create ()
+    }
 
   type _ Effect.t += Current : t Effect.t
 
@@ -110,12 +136,18 @@ module Sessions = struct
   let start t ~on_exn =
     List.iter
       (fun session ->
+         t.live <- t.live + 1;
          t.running <-
            Miou.async (fun () ->
-             match session () with
-             | () -> ()
-             | exception (Miou.Cancelled as exn) -> raise exn
-             | exception exn -> on_exn exn (Printexc.get_raw_backtrace ()))
+             Fun.protect
+               ~finally:(fun () ->
+                 t.live <- t.live - 1;
+                 Signal.wake t.added)
+               (fun () ->
+                  match session () with
+                  | () -> ()
+                  | exception (Miou.Cancelled as exn) -> raise exn
+                  | exception exn -> on_exn exn (Printexc.get_raw_backtrace ())))
            :: t.running)
       (List.rev t.pending);
     t.pending <- []
@@ -133,6 +165,8 @@ module Sessions = struct
     if t.running <> []
     then (
       shutdown ();
+      Signal.wait_until t.added (fun () -> t.live = 0 || t.aborted);
+      if t.aborted then List.iter Miou.cancel t.running;
       let (_ : (unit, exn) result list) = Miou.await_all t.running in
       t.running <- [])
 end
@@ -165,6 +199,12 @@ module Make (Io : IO) = struct
 
     let no_body_read = { stop = (fun () -> None); wait = 0.; linger = 0. }
 
+    type graceful =
+      { stop : unit Miou.Computation.t
+      ; grace : float option
+      ; drain : unit -> unit
+      }
+
     let start : type t.
       (module Ache.Runtime.ENGINE with type t = t)
       -> read_buffer_size:int
@@ -176,6 +216,7 @@ module Make (Io : IO) = struct
       -> linger:bool
       -> ?body_read:body_read
       -> ?sessions:Sessions.t
+      -> ?graceful:graceful
       -> stopped:[ `Done | `Abort ] Miou.Computation.t
       -> t
       -> Io.socket
@@ -189,6 +230,7 @@ module Make (Io : IO) = struct
        ~linger:lingers
        ?(body_read = no_body_read)
        ?sessions
+       ?graceful
        ~stopped
        t
        socket ->
@@ -471,6 +513,28 @@ module Make (Io : IO) = struct
           write_task ();
           stop ())
       in
+      let watcher =
+        Option.map
+          (fun { stop; grace; drain } ->
+             Miou.async (fun () ->
+               await_stop stop;
+               (match drain () with
+               | () ->
+                 (* An idle connection is closed now: end the read that
+                    waits. *)
+                 if Runtime.is_closed t then shutdown_once SHUTDOWN_RECEIVE
+               | exception (Miou.Cancelled as exn) -> raise exn
+               | exception exn -> fail exn);
+               Option.iter
+                 (fun grace ->
+                    sleep_until (Unix.gettimeofday () +. grace);
+                    Option.iter
+                      (fun sessions -> sessions.Sessions.aborted <- true)
+                      sessions;
+                    abort ())
+                 grace))
+          graceful
+      in
       let session_failed exn bt =
         if Option.is_none !unreported then unreported := Some (exn, bt)
       in
@@ -497,6 +561,7 @@ module Make (Io : IO) = struct
              | _ -> ()))
         sessions;
       Option.iter Miou.cancel stopper;
+      Option.iter Miou.cancel watcher;
       Option.iter
         (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
         !unreported
@@ -521,15 +586,18 @@ module Make (Io : IO) = struct
           ?idle_timeout
           ?head_timeout
           ?(date = true)
+          ?stop
+          ?grace
           ~request_handler
           ~error_handler
       =
       check_timeout "idle_timeout" idle_timeout;
       check_timeout "head_timeout" head_timeout;
+      check_timeout "grace" grace;
       let untimed =
         Option.is_none idle_timeout && Option.is_none head_timeout
       in
-      fun socket client_addr ->
+      let serve socket client_addr =
         let head_deadline = ref None
         and error_handler_failure = ref None
         and sessions = Sessions.create () in
@@ -622,12 +690,25 @@ module Make (Io : IO) = struct
                 Option.value idle_timeout ~default:linger_without_idle_timeout
             }
           ~sessions
+          ?graceful:
+            (Option.map
+               (fun stop ->
+                  { IO_loop.stop
+                  ; grace
+                  ; drain = (fun () -> Ache.Server_connection.drain connection)
+                  })
+               stop)
           ~stopped:(Miou.Computation.create ())
           connection
           socket;
         Option.iter
           (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
           !error_handler_failure
+      in
+      fun socket client_addr ->
+        match stop with
+        | Some stop when not (Miou.Computation.is_running stop) -> ()
+        | _ -> serve socket client_addr
   end
 
   module Client = struct
@@ -742,6 +823,40 @@ module Server = struct
       let (_ : (unit, exn) result) = Miou.await connection in
       clean_up orphans
 
+  (* [await_orphans orphans] awaits the tasks of [orphans]; they have all
+     returned or are about to. *)
+  let rec await_orphans orphans =
+    match Miou.care orphans with
+    | None -> ()
+    | Some None ->
+      Miou.yield ();
+      await_orphans orphans
+    | Some (Some connection) ->
+      let (_ : (unit, exn) result) = Miou.await connection in
+      await_orphans orphans
+
+  (* [accept_until stop listening] accepts a connection, or returns [None] once
+     [stop] is resolved. *)
+  let accept_until stop listening =
+    let fd = Miou_unix.to_file_descr listening in
+    let rec go () =
+      if not (Miou.Computation.is_running stop)
+      then None
+      else
+        match Unix.accept fd with
+        | client, client_addr ->
+          Some (Miou_unix.of_file_descr ~non_blocking:true client, client_addr)
+        | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK | EINTR), _, _) ->
+          let (_ : (unit, exn) result) =
+            Miou.await_first
+              [ Miou.async (fun () -> Miou_unix.blocking_read fd)
+              ; Miou.async (fun () -> await_stop stop)
+              ]
+          in
+          go ()
+    in
+    go ()
+
   let accept_pause = 0.1
 
   let run
@@ -752,6 +867,8 @@ module Server = struct
         ?domains
         ?(backlog = 128)
         ?(tcp_nodelay = false)
+        ?stop
+        ?grace
         ~on_error
         ~request_handler
         ~error_handler
@@ -786,6 +903,8 @@ module Server = struct
         ?idle_timeout
         ?head_timeout
         ?date
+        ?stop
+        ?grace
         ~request_handler
         ~error_handler
     in
@@ -798,19 +917,34 @@ module Server = struct
       else handler
     in
     let failed = Miou.Computation.create () in
+    let next_client =
+      match stop with
+      | None -> fun listening -> Some (Miou_unix.accept listening)
+      | Some stop -> accept_until stop
+    in
     let serve () =
       let listening = socket () in
-      Fun.protect ~finally:(fun () -> Miou_unix.close listening) @@ fun () ->
+      let closed = ref false in
+      let close () =
+        if not !closed
+        then (
+          closed := true;
+          Miou_unix.close listening)
+      in
+      Fun.protect ~finally:close @@ fun () ->
       Miou_unix.bind_and_listen
         ~backlog
         ~reuseaddr:true
         ~reuseport:true
         listening
         addr;
-      let orphans = Miou.orphans () in
+      let orphans = Miou.orphans ()
+      and live = ref 0
+      and ended = Signal.create () in
       let rec accept () =
         clean_up orphans;
-        match Miou_unix.accept listening with
+        match next_client listening with
+        | None -> ()
         | exception
             (Unix.Unix_error ((EMFILE | ENFILE | ENOBUFS | ENOMEM), _, _) as exn)
           ->
@@ -825,11 +959,15 @@ module Server = struct
                , _ ) as exn) ->
           on_error exn;
           accept ()
-        | client, client_addr ->
+        | Some (client, client_addr) ->
+          incr live;
           ignore
             (Miou.async ~orphans (fun () ->
                Fun.protect
-                 ~finally:(fun () -> Miou_unix.close client)
+                 ~finally:(fun () ->
+                   Miou_unix.close client;
+                   decr live;
+                   Signal.wake ended)
                  (fun () ->
                     match handler client client_addr with
                     | () -> ()
@@ -843,16 +981,37 @@ module Server = struct
              : unit Miou.t);
           accept ()
       in
-      accept ()
+      accept ();
+      close ();
+      Signal.wait_until ended (fun () -> !live = 0);
+      await_orphans orphans
     in
-    let loops =
-      Miou.async (fun () -> Miou.Computation.await_exn failed)
-      :: Miou.async serve
-      :: List.map
-           (fun pin -> Miou.call ~pin serve)
-           (List.filteri (fun i _ -> i < domains - 1) others)
+    let serve () =
+      match serve () with
+      | () -> ()
+      | exception (Miou.Cancelled as exn) -> raise exn
+      | exception exn ->
+        let bt = Printexc.get_raw_backtrace () in
+        ignore (Miou.Computation.try_cancel failed (exn, bt) : bool)
     in
-    match Miou.await_first loops with Ok () -> () | Error exn -> raise exn
+    let loops () =
+      let (_ : (unit, exn) result list) =
+        Miou.await_all
+          (Miou.async serve
+          :: List.map
+               (fun pin -> Miou.call ~pin serve)
+               (List.filteri (fun i _ -> i < domains - 1) others))
+      in
+      ()
+    in
+    match
+      Miou.await_first
+        [ Miou.async (fun () -> Miou.Computation.await_exn failed)
+        ; Miou.async loops
+        ]
+    with
+    | Ok () -> ()
+    | Error exn -> raise exn
 end
 
 module Websocket = struct

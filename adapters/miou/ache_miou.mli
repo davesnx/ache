@@ -49,6 +49,8 @@ module Server : sig
     -> ?domains:int
     -> ?backlog:int
     -> ?tcp_nodelay:bool
+    -> ?stop:unit Miou.Computation.t
+    -> ?grace:float
     -> on_error:(exn -> unit)
     -> request_handler:(Unix.sockaddr -> Ache.Request_descriptor.t -> unit)
     -> error_handler:(Unix.sockaddr -> Ache.Server_connection.error_handler)
@@ -68,7 +70,8 @@ module Server : sig
       Call it inside [Miou_unix.run]. Each accepted socket is served in its
       own task, in the domain that accepted it, by the handler from
       {!create_connection_handler}, which takes [config], [idle_timeout],
-      [head_timeout], [date], [request_handler] and [error_handler].
+      [head_timeout], [date], [stop], [grace], [request_handler] and
+      [error_handler].
       [request_handler] and [error_handler] run in several domains at the
       same time. When the handler of a connection raises (see
       {!create_connection_handler}), [on_error] is called with the exception
@@ -89,9 +92,21 @@ module Server : sig
       [domains] defaults to all domains: [Miou_unix.run ~domains:n] gives
       [n + 1]. [backlog] defaults to 128, [tcp_nodelay] to [false].
 
-      [run] does not return. Cancel its task to stop all domains. If
-      [on_error] raises, or a listen or another accept error occurs in one
-      domain, [run] cancels all domains and raises the exception.
+      Graceful stop: when [stop] is resolved (returned or cancelled, from any
+      domain), each domain stops accepting and closes its listening socket.
+      A connection that the kernel queued but that was not accepted yet is
+      reset when the socket closes; one accepted at the same time as [stop]
+      is closed without a response. Each connection is drained as
+      {!create_connection_handler} describes for [stop] and [grace]: idle
+      connections close at once, requests in progress finish with
+      [Connection: close], and [grace] seconds after [stop] what is left is
+      cancelled. [run] returns when every connection of every domain has
+      ended.
+
+      Without [stop], [run] does not return. Cancelling its task stops all
+      domains at once, with their connections. If [on_error] raises, or a
+      listen or another accept error occurs in one domain, [run] cancels all
+      domains and raises the exception.
 
       @raise Invalid_argument
         if [domains] is less than 1 or more than the domains available, if

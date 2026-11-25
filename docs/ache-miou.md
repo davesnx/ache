@@ -184,6 +184,33 @@ let () =
     Unix.(ADDR_INET (inet_addr_loopback, port))
 ```
 
+## Graceful stop
+
+`Server.run`, `Server.create_connection_handler` and the TLS
+`create_connection_handler_with_fd` take `?stop:unit Miou.Computation.t`
+and `?grace:float`. Resolve `stop` with `Miou.Computation.try_return`
+(or cancel it) from any task of any domain. Then:
+
+1. `run` stops accepting in each domain and closes its listening sockets.
+   A connection accepted at the same moment is closed without a response,
+   and so is a socket given to a handler after `stop`.
+2. Each connection is drained (see [Graceful stop](ache.md#graceful-stop)
+   in ache.md). An idle connection closes at once: the runtime shuts down
+   reading on the socket to end the read that waits. A request in progress
+   finishes and its response gets `Connection: close`. A WebSocket gets a
+   close frame with code 1001. A TLS handshake in progress stops.
+3. `grace` seconds after `stop`, each connection that is still open is
+   cancelled with its tasks, its request handler and its WebSocket
+   sessions, and the socket is shut down. Without `grace` there is no
+   limit.
+4. `run` returns when every connection of every domain has ended.
+
+Each connection waits for `stop` in a task of its own, in the domain that
+accepted it, so `Server_connection.drain` runs where the connection runs.
+`grace` must be positive, or the handler raises `Invalid_argument`.
+Without `stop`, `run` does not return; cancelling its task still stops
+everything at once.
+
 ## WebSocket
 
 `Ache_miou.Websocket` gives the WebSocket server of
@@ -344,6 +371,14 @@ core connection and starts the two loops as two child tasks:
   leaves the message for the next one. A cancelled wait completes its
   computation, and the next wait drops the completed ones, so many
   cancelled calls do not pile up.
+- **Graceful stop.** With `stop`, the connection task starts one more
+  child task that waits for `stop`. It calls `Server_connection.drain`,
+  shuts down reading on the socket when the connection is then closed, and
+  sleeps `grace`. Then it marks the sessions to be cancelled and stops the
+  connection as an error does: the connection task cancels the read and
+  write tasks and the sessions. With `stop`, the accept loop of `run`
+  waits for the listening socket or `stop`, whichever comes first, and
+  accepts with a non-blocking `accept`.
 
 ### Several domains
 

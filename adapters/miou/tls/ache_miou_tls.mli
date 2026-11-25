@@ -92,6 +92,8 @@ module Server : sig
     -> ?idle_timeout:float
     -> ?head_timeout:float
     -> ?date:bool
+    -> ?stop:unit Miou.Computation.t
+    -> ?grace:float
     -> tls:Tls.Config.server
     -> request_handler:(Unix.sockaddr -> Ache.Request_descriptor.t -> unit)
     -> error_handler:(Unix.sockaddr -> Ache.Server_connection.error_handler)
@@ -100,8 +102,10 @@ module Server : sig
     -> unit
   (** [create_connection_handler_with_fd ~tls ~request_handler ~error_handler
        fd addr] does the TLS handshake on the accepted [fd] and then serves
-      HTTP/1.1 as {!create_connection_handler} does, with the same timeouts
-      and [date].
+      HTTP/1.1 as {!create_connection_handler} does, with the same timeouts,
+      [date], [stop] and [grace]. A handshake in progress when [stop] is
+      resolved is treated as an idle connection: it stops, and the handler
+      returns.
       When [idle_timeout] or [head_timeout] is set, the handshake must be
       complete within the smaller of them; without either, it has no time
       limit.

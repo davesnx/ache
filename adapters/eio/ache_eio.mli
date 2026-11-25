@@ -38,6 +38,8 @@ module Server : sig
     -> ?idle_timeout:float
     -> ?head_timeout:float
     -> ?date:bool
+    -> ?stop:unit Eio.Promise.t
+    -> ?grace:float
     -> request_handler:
          (Eio.Net.Sockaddr.stream -> Ache.Request_descriptor.t -> unit)
     -> error_handler:
@@ -96,6 +98,23 @@ module Server : sig
       The handler returns when the connection has ended and the sessions
       that {!Websocket.upgrade} started have returned.
 
+      Graceful stop: when [stop] is resolved, the handler calls
+      {!Ache.Server_connection.drain} on the connection, in a fiber of the
+      connection:
+      - An idle connection (no request in progress, no byte of a next
+        request read) closes at once: a read that waits stops, and the
+        connection closes as described below.
+      - A request in progress, or one whose head is partly read, is served;
+        its response gets [Connection: close] if its head is not written
+        yet. No other request is read; pipelined requests are not served.
+      - A WebSocket connection sends a close frame with code [1001].
+      When [stop] is already resolved when the handler is applied, the
+      connection closes without reading a request. [grace] is in seconds
+      and needs [clock]: [grace] seconds after [stop] is resolved, the
+      handler cancels what is left of the connection (its reads, writes and
+      WebSocket sessions) and returns. Without [grace] it waits for the
+      connection to end. The handler does not close [flow].
+
       When [error_handler] or a WebSocket session raises, the connection
       closes, and after the connection ends the handler raises the first
       such exception with its backtrace, so that the [on_error] of [Eio.Net.run_server],
@@ -105,9 +124,9 @@ module Server : sig
       error, and the handler returns normally.
 
       @raise Invalid_argument
-        if a timeout is given without [clock] or a timeout is not positive.
-        It is raised when [~error_handler] is applied if all five optional
-        arguments are given too, and otherwise when the handler is applied
+        if a timeout or [grace] is given without [clock], or one of them is
+        not positive. It is raised when [~error_handler] is applied if all
+        seven optional arguments are given too, and otherwise when the handler is applied
         to a flow: with [Eio.Net.run_server], in each connection fiber. *)
 
   val run :
@@ -116,6 +135,8 @@ module Server : sig
     -> ?idle_timeout:float
     -> ?head_timeout:float
     -> ?date:bool
+    -> ?stop:unit Eio.Promise.t
+    -> ?grace:float
     -> ?domains:int
     -> ?backlog:int
     -> ?tcp_nodelay:bool
@@ -142,7 +163,7 @@ module Server : sig
       Each loop accepts connections with [Eio.Net.accept_fork] and [on_error],
       and serves them with the handler from {!create_connection_handler},
       which takes [config], [clock], [idle_timeout], [head_timeout], [date],
-      [request_handler] and [error_handler].
+      [stop], [grace], [request_handler] and [error_handler].
       [request_handler] and [error_handler] run in several domains at the
       same time.
 
@@ -162,7 +183,14 @@ module Server : sig
       [on_error], waits 50 ms and accepts again. The connections in progress
       continue.
 
-      [run] does not return. Cancel its fiber to stop all domains. If
+      Without [stop], [run] does not return: cancel its fiber to stop all
+      domains at once. When [stop] is resolved, each domain stops accepting
+      and closes its listening socket, so connections that the kernel
+      queued and [run] did not accept are reset. Each connection then
+      drains, as {!create_connection_handler} describes: a connection
+      accepted just before [stop] closes without reading a request, and
+      what is left [grace] seconds after [stop] is cancelled. [run] returns
+      when every connection in every domain has ended. If
       [on_error] raises, a listen fails, or an accept fails because the
       listening socket is not usable ([EBADF], [EINVAL], [ENOTSOCK],
       [EFAULT], or an operation that is not available) in one domain, [run]

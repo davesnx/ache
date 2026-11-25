@@ -190,6 +190,8 @@ module Server = struct
         ?idle_timeout
         ?head_timeout
         ?date
+        ?stop
+        ?grace
         ~tls
         ~request_handler
         ~error_handler
@@ -200,10 +202,24 @@ module Server = struct
         ?idle_timeout
         ?head_timeout
         ?date
+        ?stop
+        ?grace
         ~request_handler
         ~error_handler
     in
     fun fd client_addr ->
+      let stopped =
+        match stop with
+        | None -> []
+        | Some stop ->
+          [ Miou.async (fun () ->
+              (match Miou.Computation.await stop with
+              | Error (exn, bt) when Miou.Computation.is_running stop ->
+                Printexc.raise_with_backtrace exn bt
+              | Ok () | Error _ -> ());
+              None)
+          ]
+      in
       let timer =
         match handshake_limit idle_timeout head_timeout with
         | None -> []
@@ -216,7 +232,8 @@ module Server = struct
       in
       match
         Miou.await_first
-          (Miou.async (fun () -> Some (server_of_fd tls fd)) :: timer)
+          ((Miou.async (fun () -> Some (server_of_fd tls fd)) :: timer)
+          @ stopped)
       with
       | Ok (Some socket) -> handler socket client_addr
       | Ok None | Error _ -> ()

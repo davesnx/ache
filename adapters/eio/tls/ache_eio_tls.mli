@@ -99,6 +99,8 @@ module Server : sig
     -> ?idle_timeout:float
     -> ?head_timeout:float
     -> ?date:bool
+    -> ?stop:unit Eio.Promise.t
+    -> ?grace:float
     -> tls:Tls.Config.server
     -> request_handler:
          (Eio.Net.Sockaddr.stream -> Ache.Request_descriptor.t -> unit)
@@ -111,7 +113,9 @@ module Server : sig
       passed to [Eio.Net.run_server]. In the connection fiber, it does the TLS
       handshake on the accepted flow and then serves HTTP/1.1 as
       {!Ache_eio.Server.create_connection_handler} does, with the same
-      timeouts and [date]. When [idle_timeout] or [head_timeout] is set (both need
+      timeouts, [date], [stop] and [grace]. A handshake in progress when [stop]
+      is resolved is treated as an idle connection: it is cancelled and the
+      handler returns. When [stop] is already resolved, no handshake starts. When [idle_timeout] or [head_timeout] is set (both need
       [clock]), the handshake must be complete within the smaller of them.
       Without either, the handshake has no time limit: a client that sends plain HTTP to the TLS port gets no
       answer (ocaml-tls waits for the rest of what it reads as a TLS record),
@@ -124,7 +128,7 @@ module Server : sig
 
       @raise Invalid_argument
         in the cases of {!Ache_eio.Server.create_connection_handler}: when
-        [~error_handler] is applied if all five optional arguments are given
+        [~error_handler] is applied if all seven optional arguments are given
         too, and otherwise when the handler is applied to a flow, before the
         handshake. *)
 end

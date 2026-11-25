@@ -613,5 +613,8 @@ let upgrade ?(max_message_size = default_max_message_size) reqd make_handler =
          ; "connection", "Upgrade"
          ; "sec-websocket-accept", accept
          ])
-      (Runtime.make (module Engine) t);
+      (Runtime.make_with_hooks
+         (module Engine)
+         t
+         { drain = (fun t -> fail t 1001) });
     Ok ()
