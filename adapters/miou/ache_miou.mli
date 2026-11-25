@@ -45,6 +45,7 @@ module Server : sig
      ?config:Ache.Config.t
     -> ?idle_timeout:float
     -> ?head_timeout:float
+    -> ?date:bool
     -> ?domains:int
     -> ?backlog:int
     -> ?tcp_nodelay:bool
@@ -67,7 +68,7 @@ module Server : sig
       Call it inside [Miou_unix.run]. Each accepted socket is served in its
       own task, in the domain that accepted it, by the handler from
       {!create_connection_handler}, which takes [config], [idle_timeout],
-      [head_timeout], [request_handler] and [error_handler].
+      [head_timeout], [date], [request_handler] and [error_handler].
       [request_handler] and [error_handler] run in several domains at the
       same time. When the handler of a connection raises (see
       {!create_connection_handler}), [on_error] is called with the exception

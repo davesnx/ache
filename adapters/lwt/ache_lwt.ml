@@ -399,6 +399,8 @@ module Websocket = struct
     t.closed
 end
 
+let current_date = Ache.Ache_private.Http_date.now
+
 module Make (Io : IO) = struct
   module Server = struct
     type socket = Io.socket
@@ -416,6 +418,7 @@ module Make (Io : IO) = struct
           ?(config = Ache.Config.default)
           ?idle_timeout
           ?head_timeout
+          ?(date = true)
           ~request_handler
           ~error_handler
           client_addr
@@ -434,6 +437,7 @@ module Make (Io : IO) = struct
         Ache.Server_connection.create
           ~config
           ~error_handler:(error_handler client_addr)
+          ?date:(if date then Some current_date else None)
           (fun reqd ->
              stop_head_timer ();
              request_handler client_addr reqd)

@@ -310,6 +310,46 @@ let date_tests =
       in
       check_status "error response" [ 400 ] error;
       check_no_date "error response" error)
+  ; test
+      "§6.6.1 server MUST: with a clock, one Date in 2xx, 3xx, 4xx and 5xx"
+      (fun () ->
+         let date = "Sun, 06 Nov 1994 08:49:37 GMT" in
+         let date_count s =
+           String.split_on_char '\n' (String.lowercase_ascii (Server.output s))
+           |> List.filter (fun line -> String.starts_with ~prefix:"date:" line)
+           |> List.length
+         in
+         let check_one_date msg s =
+           if
+             date_count s <> 1
+             || not (contains (Server.output s) ("Date: " ^ date ^ "\r\n"))
+           then Alcotest.failf "%s: expected one Date: %S" msg (Server.output s)
+         in
+         List.iter
+           (fun (status, code) ->
+              let s =
+                Server.run
+                  ~date:(fun () -> date)
+                  ~handler:(Server.respond ~body:"" status)
+                  (get "/")
+              in
+              check_status (string_of_int code) [ code ] s;
+              check_one_date (string_of_int code) s)
+           [ `OK, 200
+           ; `Moved_permanently, 301
+           ; `Not_found, 404
+           ; `Internal_server_error, 500
+           ];
+         let error =
+           Server.run
+             ~date:(fun () -> date)
+             (req
+                ~headers:[ "Host", "example.com"; "Content-Length", "-1" ]
+                "POST"
+                "/")
+         in
+         check_status "error response" [ 400 ] error;
+         check_one_date "error response" error)
   ]
 
 let tests =

@@ -37,6 +37,7 @@ module Server : sig
     -> ?clock:_ Eio.Time.clock
     -> ?idle_timeout:float
     -> ?head_timeout:float
+    -> ?date:bool
     -> request_handler:
          (Eio.Net.Sockaddr.stream -> Ache.Request_descriptor.t -> unit)
     -> error_handler:
@@ -59,6 +60,11 @@ module Server : sig
         response. Each request head, pipelined or not, has its own limit.
 
       A request body or a response in progress is never timed out.
+
+      [date] defaults to [true]: each response that is not 1xx and has no
+      [Date] field gets [Date] with the current time (RFC 9110 §6.6.1), as
+      {!Ache.Server_connection.create} describes. The text is built at most
+      once per second in each domain. With [~date:false] no [Date] is added.
 
       Closing: when the connection stops reading (after a response with
       [Connection: close], an error response, or a timeout), it reads and
@@ -100,7 +106,7 @@ module Server : sig
 
       @raise Invalid_argument
         if a timeout is given without [clock] or a timeout is not positive.
-        It is raised when [~error_handler] is applied if all four optional
+        It is raised when [~error_handler] is applied if all five optional
         arguments are given too, and otherwise when the handler is applied
         to a flow: with [Eio.Net.run_server], in each connection fiber. *)
 
@@ -109,6 +115,7 @@ module Server : sig
     -> ?clock:_ Eio.Time.clock
     -> ?idle_timeout:float
     -> ?head_timeout:float
+    -> ?date:bool
     -> ?domains:int
     -> ?backlog:int
     -> ?tcp_nodelay:bool
@@ -134,7 +141,7 @@ module Server : sig
 
       Each loop accepts connections with [Eio.Net.accept_fork] and [on_error],
       and serves them with the handler from {!create_connection_handler},
-      which takes [config], [clock], [idle_timeout], [head_timeout],
+      which takes [config], [clock], [idle_timeout], [head_timeout], [date],
       [request_handler] and [error_handler].
       [request_handler] and [error_handler] run in several domains at the
       same time.

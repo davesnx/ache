@@ -207,6 +207,11 @@ end
     A request body or a response in progress is never timed out. Each request
     head, pipelined or not, has its own limit.
 
+    [date] defaults to [true]: each response that is not 1xx and has no [Date]
+    field gets [Date] with the current time (RFC 9110 §6.6.1), as
+    {!Ache.Server_connection.create} describes. The text is built at most once
+    per second in each domain. With [~date:false] no [Date] is added.
+
     Closing: when the connection stops reading it calls [shutdown_receive]
     and does not wait for the peer to close; it closes the socket once the
     response is written. Input that the peer sent and the connection did not

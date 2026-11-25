@@ -91,6 +91,7 @@ module Server : sig
      ?config:Ache.Config.t
     -> ?idle_timeout:float
     -> ?head_timeout:float
+    -> ?date:bool
     -> tls:Tls.Config.server
     -> request_handler:(Unix.sockaddr -> Ache.Request_descriptor.t -> unit)
     -> error_handler:(Unix.sockaddr -> Ache.Server_connection.error_handler)
@@ -101,7 +102,7 @@ module Server : sig
       can be passed to [Lwt_io.establish_server_with_client_socket]. It does the
       TLS handshake on the accepted file descriptor and then serves HTTP/1.1 as
       {!Ache_lwt.Server.create_connection_handler} does, with the same
-      timeouts. When [idle_timeout] or [head_timeout] is set, the handshake
+      timeouts and [date]. When [idle_timeout] or [head_timeout] is set, the handshake
       must be complete within the smaller of them; without either, it has no
       time limit.
 

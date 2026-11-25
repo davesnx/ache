@@ -82,6 +82,7 @@ type t =
   ; mutable response_state : Response_state.t
   ; mutable error_code : [ `Ok | error ]
   ; proxy : bool
+  ; date : (unit -> string) option
   }
 
 let create
@@ -91,6 +92,7 @@ let create
       ~writer
       ~response_body_buffer
       ~proxy
+      ~date
       request
       request_body
   =
@@ -105,6 +107,7 @@ let create
   ; response_state = Waiting
   ; error_code = `Ok
   ; proxy
+  ; date
   }
 
 let request { request; _ } = request
@@ -137,10 +140,18 @@ let frame ~fn ~length t (response : Response.t) =
     ~length
     response
 
+let needs_date (response : Response.t) =
+  (not (Status.is_informational response.status))
+  && not (Headers.mem response.headers "date")
+
 let write_response t response =
   if Writer.is_closed t.writer
   then Serialize.check_response response
-  else Writer.write_response t.writer response
+  else
+    match t.date with
+    | Some date when needs_date response ->
+      Writer.write_response_with_date t.writer response (date ())
+    | _ -> Writer.write_response t.writer response
 
 let commit_persistence t (response : Response.t) =
   if t.persistent

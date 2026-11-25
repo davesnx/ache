@@ -374,6 +374,11 @@ peer closes, for at most `idle_timeout` (2 s without
 one), so that the peer can read the response before the connection is
 reset. Without a clock it closes at once.
 
+The server adds a `Date` field with the current time to each response that
+is not 1xx and has none (RFC 9110 §6.6.1). The text is formatted once per
+second in each domain. `~date:false` on `create_connection_handler`, `run`
+or the TLS handler turns it off.
+
 ## TLS
 
 To make the test certificates, and for the TLS notes, see

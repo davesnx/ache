@@ -12,8 +12,8 @@ Test names are in `lib/test/rfc/test_s*.ml`; a name followed by "(RFC 9112 suite
 
 | Status | Rows |
 |---|---|
-| Tested | 93 |
-| Out of scope | 352 |
+| Tested | 96 |
+| Out of scope | 349 |
 | Total | 445 (412 keyword sentences, 33 DEF rows) |
 
 ## Requirements
@@ -82,7 +82,7 @@ Test names are in `lib/test/rfc/test_s*.ml`; a name followed by "(RFC 9112 suite
 | §5.6.4#D1 | both | DEF | quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE | `§5.6.4 server DEF: quoted-string and comment values reach the handler`<br>`§5.6.4 client DEF: quoted-string and comment values reach the client` |
 | §5.6.5#D1 | both | DEF | comment = "(" *( ctext / quoted-pair / comment ) ")" | `§5.6.4 server DEF: quoted-string and comment values reach the handler`<br>`§5.6.4 client DEF: quoted-string and comment values reach the client` |
 | §5.6.7#1 | n/a | MUST | A recipient that parses a timestamp value in an HTTP field MUST accept all three HTTP-date formats. | out of scope: the library does not parse HTTP-date (no date code in lib/) |
-| §5.6.7#2 | n/a | MUST | When a sender generates a field that contains one or more timestamps defined as HTTP-date, the sender MUST generate those timestamps in the IMF-fixdate format. | out of scope: the library does not generate Date or other timestamps; the application does |
+| §5.6.7#2 | server | MUST | When a sender generates a field that contains one or more timestamps defined as HTTP-date, the sender MUST generate those timestamps in the IMF-fixdate format. | `Http_date.imf_fixdate` (lib/test/test_server_connection.ml)<br>`Date header from the runtime` (ache-eio, ache-lwt and ache-miou suites); other timestamps come from the application |
 | §5.6.7#3 | n/a | MUST NOT | A sender MUST NOT generate additional whitespace in an HTTP-date beyond that specifically included as SP in the grammar. | out of scope: the library does not generate HTTP-date values |
 | §5.6.7#4 | n/a | MUST | Recipients of a timestamp value in rfc850-date format, which uses a two-digit year, MUST interpret a timestamp that appears to be more than 50 years ... | out of scope: the library does not parse HTTP-date (no date code in lib/) |
 | §6#1 | client | MUST | However, a client MUST retain knowledge of the request when parsing, interpreting, or caching a corresponding response. | `§6 client MUST: HEAD response with Content-Length ends after the head`<br>`§6 client MUST: HEAD response with chunked framing ends after the head`<br>`§6.4.1 client DEF: 204 response ends after the head`<br>`§6.4.1 client DEF: 304 response with Content-Length ends after the head` |
@@ -99,8 +99,8 @@ Test names are in `lib/test/rfc/test_s*.ml`; a name followed by "(RFC 9112 suite
 | §6.5.1#3 | n/a | SHOULD NOT | Because of the potential for trailer fields to be discarded in transit, a server SHOULD NOT generate trailer fields that it believes are necessary for ... | out of scope: the library has no API to send trailer fields |
 | §6.5.2#1 | n/a | MUST | Trailer fields that might be generated more than once during a message MUST be defined as a list-based field even if each member value is ... | out of scope: field definitions: requirement on specification authors |
 | §6.5.2#2 | n/a | MAY | At the end of a message, a recipient MAY treat the set of received trailer fields as a data structure of name/value pairs, similar to ... | out of scope: MAY: the library exposes no trailer data structure |
-| §6.6.1#1 | n/a | SHOULD | A sender that generates a Date header field SHOULD generate its field value as the best available approximation of the date and time of message ... | out of scope: application: the library has no clock and leaves Date to the application |
-| §6.6.1#2 | n/a | MUST | An origin server with a clock (as defined in Section 5.6.7) MUST generate a Date header field in all 2xx (Successful), 3xx (Redirection), and 4xx ... | out of scope: application: the library has no clock and leaves Date to the application |
+| §6.6.1#1 | server | SHOULD | A sender that generates a Date header field SHOULD generate its field value as the best available approximation of the date and time of message ... | `Date header from the runtime` (ache-eio, ache-lwt and ache-miou suites: within a few seconds of the test clock) |
+| §6.6.1#2 | server | MUST | An origin server with a clock (as defined in Section 5.6.7) MUST generate a Date header field in all 2xx (Successful), 3xx (Redirection), and 4xx ... | `§6.6.1 server MUST: with a clock, one Date in 2xx, 3xx, 4xx and 5xx` |
 | §6.6.1#3 | server | MUST NOT | An origin server without a clock MUST NOT generate a Date header field. | `§6.6.1 server MUST NOT: library adds no Date field` |
 | §6.6.1#4 | n/a | MUST | A recipient with a clock that receives a response message without a Date header field MUST record the time it was received and append a ... | out of scope: caches and forwarding recipients only |
 | §6.6.1#5 | n/a | MAY | A recipient with a clock that receives a response with an invalid Date header field value MAY replace that value with the time that response ... | out of scope: the library has no clock and does not interpret Date |

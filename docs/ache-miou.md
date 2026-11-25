@@ -372,6 +372,11 @@ callbacks run in the connection tasks and must not leave a child task that
 they do not await. `Client.shutdown` must be called by the task that
 created the connection.
 
+The server adds a `Date` field with the current time to each response that
+is not 1xx and has none (RFC 9110 §6.6.1). The text is formatted once per
+second in each domain. `~date:false` on `create_connection_handler`, `run`
+or the TLS handler turns it off.
+
 ## TLS
 
 To make the test certificates, and for the TLS notes, see

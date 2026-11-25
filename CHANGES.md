@@ -35,6 +35,10 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `103 Early Hints`.
 - Server timeouts `?idle_timeout` and `?head_timeout`, and
   `Config.max_header_size`.
+- `Server_connection.create ?date` adds a `Date` field to each final
+  response that has none. The servers of `ache-eio`, `ache-lwt` and
+  `ache-miou` now send `Date` by default (RFC 9110 §6.6.1); `~date:false`
+  turns it off.
 - `Config.max_pending_output` (64 KiB): while more response bytes wait to
   be written, the server reads no new request.
 - `Server.run` in `ache-eio` and `ache-miou`: one accept loop for each

@@ -312,6 +312,7 @@ let with_server
       ?clock
       ?idle_timeout
       ?head_timeout
+      ?(date = false)
       f
   =
   server_errors := [];
@@ -340,6 +341,7 @@ let with_server
               ~on_error:raise
               (fun socket addr ->
                  Ache_eio.Server.create_connection_handler
+                   ~date
                    ?clock
                    ?idle_timeout
                    ?head_timeout
@@ -402,6 +404,80 @@ let test_get () =
     Alcotest.(check int) "status" 200 (Status.to_code response.status);
     Alcotest.(check string) "body" "hello world" body;
     Eio.Promise.await (Ache_eio.Client.shutdown client))
+
+(* [value] is an IMF-fixdate (RFC 9110 §5.6.7) within a few seconds of now. *)
+let check_date_value value =
+  let digits from len =
+    String.for_all
+      (function '0' .. '9' -> true | _ -> false)
+      (String.sub value from len)
+  in
+  let one_of from names = List.mem (String.sub value from 3) names in
+  let format_ok =
+    String.length value = 29
+    && one_of 0 [ "Mon"; "Tue"; "Wed"; "Thu"; "Fri"; "Sat"; "Sun" ]
+    && String.sub value 3 2 = ", "
+    && digits 5 2
+    && value.[7] = ' '
+    && one_of
+         8
+         [ "Jan"
+         ; "Feb"
+         ; "Mar"
+         ; "Apr"
+         ; "May"
+         ; "Jun"
+         ; "Jul"
+         ; "Aug"
+         ; "Sep"
+         ; "Oct"
+         ; "Nov"
+         ; "Dec"
+         ]
+    && value.[11] = ' '
+    && digits 12 4
+    && value.[16] = ' '
+    && digits 17 2
+    && value.[19] = ':'
+    && digits 20 2
+    && value.[22] = ':'
+    && digits 23 2
+    && String.sub value 25 4 = " GMT"
+  in
+  if not format_ok then Alcotest.failf "Date %S is not an IMF-fixdate" value;
+  let now = int_of_float (Unix.gettimeofday ()) in
+  let near =
+    List.init 11 (fun i ->
+      Ache.Ache_private.Http_date.imf_fixdate (now - 5 + i))
+  in
+  if not (List.mem value near)
+  then Alcotest.failf "Date %S is not within 5 s of now" value
+
+let test_date_header () =
+  List.iter
+    (fun date ->
+       with_server ~date (fun ~sw ~net addr ->
+         let client =
+           Ache_eio.Client.create_connection ~sw (Eio.Net.connect ~sw net addr)
+         in
+         let response, _ =
+           request
+             client
+             (Request.create
+                ~headers:(Headers.of_list [ "host", "localhost" ])
+                `GET
+                "/hello")
+         in
+         (match date, Headers.get_multi response.headers "date" with
+         | true, [ value ] -> check_date_value value
+         | false, [] -> ()
+         | _, values ->
+           Alcotest.failf
+             "date:%b: Date fields %s"
+             date
+             (String.concat ", " values));
+         Eio.Promise.await (Ache_eio.Client.shutdown client)))
+    [ true; false ]
 
 let test_post_echo () =
   with_server (fun ~sw ~net addr ->
@@ -1217,6 +1293,7 @@ let test_timeout_needs_clock () =
   Eio_mock.Backend.run (fun () ->
     match
       Ache_eio.Server.create_connection_handler
+        ~date:false
         ~idle_timeout:1.
         ~request_handler
         ~error_handler
@@ -1235,6 +1312,7 @@ let test_timeout_check_timing () =
     let flow = Eio_mock.Flow.make "flow" in
     let bound =
       Ache_eio.Server.create_connection_handler
+        ~date:false
         ~idle_timeout:(-1.)
         ~request_handler
         ~error_handler
@@ -1253,6 +1331,7 @@ let test_timeout_check_timing () =
            Some
              (take
                 (Ache_eio.Server.create_connection_handler
+                   ~date:false
                    ~idle_timeout:(-1.)
                    ~request_handler
                    ~error_handler))));
@@ -1266,6 +1345,7 @@ let test_timeout_check_timing () =
       (raises (fun () ->
          ignore
            (Ache_eio.Server.create_connection_handler
+              ~date:false
               ~config:Ache.Config.default
               ~clock:(Eio_mock.Clock.make ())
               ~idle_timeout:(-1.)
@@ -1283,6 +1363,7 @@ let test_cancel_is_not_an_error () =
       Eio.Fiber.first
         (fun () ->
            Ache_eio.Server.create_connection_handler
+             ~date:false
              ~request_handler
              ~error_handler
              server
@@ -1370,6 +1451,7 @@ let test_run_server () =
                ~on_error:raise
                listening
                (Ache_eio.Server.create_connection_handler
+                  ~date:false
                   ~request_handler
                   ~error_handler))
           (fun () ->
@@ -1780,6 +1862,7 @@ let test_server_run_domains () =
       Eio.Fiber.first
         (fun () ->
            Ache_eio.Server.run
+             ~date:false
              ~domains:2
              ~on_error:raise
              ~net
@@ -1878,6 +1961,7 @@ let test_server_run_tcp_nodelay ?tcp_nodelay expected () =
       Eio.Fiber.first
         (fun () ->
            Ache_eio.Server.run
+             ~date:false
              ~domains:1
              ?tcp_nodelay
              ~on_error:raise
@@ -2121,6 +2205,7 @@ let test_server_run_error_handler_exception () =
       Eio.Fiber.first
         (fun () ->
            Ache_eio.Server.run
+             ~date:false
              ~domains:1
              ~on_error:(Eio.Stream.add errors)
              ~net
@@ -2329,6 +2414,7 @@ let with_ws_session ?(on_upgrade = ignore) session client =
             resolve_handled
             (match
                Ache_eio.Server.create_connection_handler
+                 ~date:false
                  ~request_handler:(fun _ reqd ->
                    match Ache_eio.Websocket.upgrade reqd (session clock) with
                    | Ok () -> on_upgrade ()
@@ -2609,6 +2695,7 @@ let test_websocket_session_cancelled () =
       Eio.Fiber.first
         (fun () ->
            Ache_eio.Server.create_connection_handler
+             ~date:false
              ~request_handler:(fun _ reqd ->
                match
                  Ache_eio.Websocket.upgrade reqd (fun ws ->
@@ -2666,6 +2753,7 @@ let () =
     "ache-eio loopback"
     [ ( "loopback"
       , [ "GET", `Quick, test_get
+        ; "Date header from the runtime", `Quick, test_date_header
         ; "POST echo larger than the read buffer", `Quick, test_post_echo
         ; "two pipelined requests", `Quick, test_pipelined
         ; ( "many keep-alive requests on one connection keep the stack bounded"

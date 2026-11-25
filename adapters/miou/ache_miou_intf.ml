@@ -18,6 +18,7 @@ module type Server = sig
      ?config:Ache.Config.t
     -> ?idle_timeout:float
     -> ?head_timeout:float
+    -> ?date:bool
     -> request_handler:(Unix.sockaddr -> Ache.Request_descriptor.t -> unit)
     -> error_handler:(Unix.sockaddr -> Ache.Server_connection.error_handler)
     -> socket
@@ -37,6 +38,11 @@ module type Server = sig
         response. Each request head, pipelined or not, has its own limit.
 
       A request body or a response in progress is never timed out.
+
+      [date] defaults to [true]: each response that is not 1xx and has no
+      [Date] field gets [Date] with the current time (RFC 9110 §6.6.1), as
+      {!Ache.Server_connection.create} describes. The text is built at most
+      once per second in each domain. With [~date:false] no [Date] is added.
 
       Closing: when the connection stops reading (after a response with
       [Connection: close], an error response, or a timeout), it reads and
@@ -71,7 +77,7 @@ module type Server = sig
 
       @raise Invalid_argument
         if a timeout is not positive. It is raised when [~error_handler] is
-        applied if all three optional arguments are given too, and otherwise
+        applied if all four optional arguments are given too, and otherwise
         when the handler is applied to a socket. *)
 
   val linger_without_idle_timeout : float

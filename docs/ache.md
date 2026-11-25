@@ -119,6 +119,12 @@ httpun rejected chunk extensions and trailers.
   persistent connection. Otherwise a streaming body ends when the connection
   closes.
 - A response to `HEAD`, and a 1xx, 204 or 304 response, has no body.
+- `Server_connection.create ~date` adds `Date: (date ())` after the other
+  fields of each response that is not 1xx and has no `Date` field, error
+  responses included (RFC 9110 §6.6.1). A `Date` set by the application is
+  kept. Without `~date` the core adds no `Date`. The servers of `ache-eio`,
+  `ache-lwt` and `ache-miou` pass the current time by default, formatted
+  once per second in each domain; `~date:false` turns it off.
 - Each final response after which the connection closes has
   `connection: close`. A response to an HTTP/1.0 request on a connection that
   stays open has `connection: keep-alive`.

@@ -244,6 +244,11 @@ and `writev` returns `` `Closed `` when the peer is gone. The `Ache_lwt.IO`
 documentation has the full contract. The Lwt server does not wait for the
 peer to close after the last response.
 
+The server adds a `Date` field with the current time to each response that
+is not 1xx and has none (RFC 9110 §6.6.1). The text is formatted once per
+second in each domain. `~date:false` on `create_connection_handler` or the
+TLS handler turns it off.
+
 ### Timeouts
 
 With Lwt's `select` and `poll` engines, a cancelled `Lwt_unix.sleep` stays in

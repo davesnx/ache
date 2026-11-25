@@ -456,6 +456,7 @@ end
 
 module Server = struct
   let linger_without_idle_timeout = 2.0
+  let current_date = Ache.Ache_private.Http_date.now
 
   let check_timeout name = function
     | Some seconds when not (seconds > 0.) ->
@@ -470,6 +471,7 @@ module Server = struct
         ?clock
         ?idle_timeout
         ?head_timeout
+        ?(date = true)
         ~request_handler
         ~error_handler
     =
@@ -495,9 +497,13 @@ module Server = struct
           Printexc.raise_with_backtrace exn bt
       in
       let connection =
-        Ache.Server_connection.create ~config ~error_handler (fun reqd ->
-          head_deadline := None;
-          request_handler client_addr reqd)
+        Ache.Server_connection.create
+          ~config
+          ~error_handler
+          ?date:(if date then Some current_date else None)
+          (fun reqd ->
+             head_deadline := None;
+             request_handler client_addr reqd)
       in
       let observe () =
         match clock, head_timeout with
@@ -625,6 +631,7 @@ module Server = struct
         ?clock
         ?idle_timeout
         ?head_timeout
+        ?date
         ?(domains = Domain.recommended_domain_count ())
         ?(backlog = 128)
         ?(tcp_nodelay = false)
@@ -643,6 +650,7 @@ module Server = struct
         ?clock
         ?idle_timeout
         ?head_timeout
+        ?date
         ~request_handler
         ~error_handler
     in

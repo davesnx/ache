@@ -72,6 +72,7 @@ type t =
        that might be streaming to the client. *)
   ; mutable upgraded : Runtime.impl option
   ; mutable reader_waits_for_output : bool
+  ; date : (unit -> string) option
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
@@ -148,9 +149,23 @@ let upgrade t (Runtime.Impl ((module Engine), engine) as impl) =
 let create
       ?(config = Config.default)
       ?(error_handler = default_error_handler)
+      ?date
       request_handler
   =
   let { Config.response_buffer_size; response_body_buffer_size; _ } = config in
+  let date =
+    Option.map
+      (fun date ->
+         let checked = ref "" in
+         fun () ->
+           let d = date () in
+           if d != !checked
+           then (
+             Serialize.check_date d;
+             checked := d);
+           d)
+      date
+  in
   let writer = Writer.create ~buffer_size:response_buffer_size () in
   let request_queue = Queue.create () in
   let response_body_buffer = Bigstring.create response_body_buffer_size in
@@ -167,6 +182,7 @@ let create
           ~writer
           ~response_body_buffer
           ~proxy:config.proxy
+          ~date
           request
           request_body
       in
@@ -185,6 +201,7 @@ let create
     ; config
     ; upgraded = None
     ; reader_waits_for_output = false
+    ; date
     }
   in
   self := Some (t, upgrade t);
@@ -242,7 +259,10 @@ let set_error_and_handle ?request t error =
                ~encoding
                ~writer:t.writer
            in
-           Writer.write_response writer response;
+           (match t.date with
+           | Some date when Request_descriptor.needs_date response ->
+             Writer.write_response_with_date writer response (date ())
+           | _ -> Writer.write_response writer response);
            t.error_code <-
              Error
                { request; response_state = Streaming (response, response_body) };

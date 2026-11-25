@@ -189,6 +189,7 @@ module Server = struct
         ?config
         ?idle_timeout
         ?head_timeout
+        ?date
         ~tls
         ~request_handler
         ~error_handler
@@ -198,6 +199,7 @@ module Server = struct
         ?config
         ?idle_timeout
         ?head_timeout
+        ?date
         ~request_handler
         ~error_handler
     in

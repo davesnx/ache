@@ -465,10 +465,19 @@ module Server_connection : sig
   val create :
      ?config:Config.t
     -> ?error_handler:error_handler
+    -> ?date:(unit -> string)
     -> request_handler
     -> t
-  (** [create ?config ?error_handler ~request_handler] creates a connection
-      handler that will service individual requests with [request_handler].
+  (** [create ?config ?error_handler ?date request_handler] creates a
+      connection handler that will service individual requests with
+      [request_handler].
+
+      With [date], every response that is not 1xx and has no [Date] field
+      (in any case) gets [Date: (date ())] after its other fields (RFC 9110
+      §6.6.1: an origin server with a clock sends [Date]). [date] returns an
+      IMF-fixdate such as [Sun, 06 Nov 1994 08:49:37 GMT]; the runtimes pass
+      a function that formats the time once per second. Without [date] the
+      connection adds no [Date] field.
 
       The connection rejects a request before [request_handler] runs, calls
       [error_handler] and closes after the error response:
@@ -965,6 +974,22 @@ module Ache_private : sig
         -> (int -> unit)
         -> unit
     end
+  end
+
+  module Http_date : sig
+    val imf_fixdate : int -> string
+    (** [imf_fixdate seconds] is the IMF-fixdate (RFC 9110 §5.6.7) of
+        [seconds] since the Unix epoch, such as
+        [Sun, 06 Nov 1994 08:49:37 GMT]. *)
+
+    val cached : int -> string
+    (** [cached seconds] is [imf_fixdate seconds], kept per domain: it
+        allocates only when [seconds] differs from the previous call in the
+        same domain. *)
+
+    val now : unit -> string
+    (** [now ()] is [cached] of the current second ([time(2)]): the [Date]
+        function that the runtimes give to {!Server_connection.create}. *)
   end
 
   module Response_descriptor : sig

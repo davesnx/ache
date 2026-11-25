@@ -22,6 +22,8 @@ module Ache_private = struct
     module Buffer = Runtime.Buffer
   end
 
+  module Http_date = Http_date
+
   module Response_descriptor = struct
     type t = Response_descriptor.t
 

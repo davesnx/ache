@@ -285,6 +285,7 @@ let with_server ?(timeouts = false) ?idle_timeout ?head_timeout f =
       env
       sw
       (Ache_eio_tls.Server.create_connection_handler
+         ~date:false
          ?clock
          ?idle_timeout
          ?head_timeout
@@ -598,6 +599,7 @@ let test_timeout_check_timing () =
       let flow, _peer = Eio_unix.Net.socketpair_stream ~sw () in
       let bound =
         Ache_eio_tls.Server.create_connection_handler
+          ~date:false
           ~head_timeout:(-1.)
           ~tls:server_config
           ~request_handler
@@ -613,6 +615,7 @@ let test_timeout_check_timing () =
         (raises (fun () ->
            ignore
              (Ache_eio_tls.Server.create_connection_handler
+                ~date:false
                 ~config:Ache.Config.default
                 ~clock:(Eio.Stdenv.clock env)
                 ~idle_timeout:1.
@@ -804,6 +807,7 @@ let test_cancel_connection_fiber () =
          Eio.Fiber.first
            (fun () ->
               Ache_eio_tls.Server.create_connection_handler
+                ~date:false
                 ~tls:server_config
                 ~request_handler
                 ~error_handler

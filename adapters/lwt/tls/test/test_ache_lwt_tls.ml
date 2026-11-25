@@ -84,6 +84,7 @@ let with_server ?idle_timeout ?head_timeout f =
   run (fun () ->
     with_listener
       (Ache_lwt_tls.Server.create_connection_handler_with_fd
+         ~date:false
          ?idle_timeout
          ?head_timeout
          ~tls:server_config
@@ -390,6 +391,7 @@ let test_timeout_check_timing () =
   let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, 0) in
   let bound =
     Ache_lwt_tls.Server.create_connection_handler_with_fd
+      ~date:false
       ~config:Ache.Config.default
       ~idle_timeout:0.
       ~head_timeout:1.
@@ -587,6 +589,7 @@ let check_handshake_timers_bounded ~connections exchange =
          incr open_connections;
          Lwt.async (fun () ->
            Ache_lwt_tls.Server.create_connection_handler_with_fd
+             ~date:false
              ~idle_timeout:30.
              ~head_timeout:30.
              ~tls:server_config

@@ -230,6 +230,7 @@ let with_server ?idle_timeout ?head_timeout f =
   partial_body_cut := false;
   with_listener
     (Ache_miou_tls.Server.create_connection_handler_with_fd
+       ~date:false
        ?idle_timeout
        ?head_timeout
        ~tls:server_config
@@ -596,6 +597,7 @@ let test_timeout_check_timing () =
     let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, 0) in
     let bound =
       Ache_miou_tls.Server.create_connection_handler_with_fd
+        ~date:false
         ~head_timeout:(-1.)
         ~tls:server_config
         ~request_handler
@@ -611,6 +613,7 @@ let test_timeout_check_timing () =
       (raises (fun () ->
          ignore
            (Ache_miou_tls.Server.create_connection_handler_with_fd
+              ~date:false
               ~config:Ache.Config.default
               ~idle_timeout:1.
               ~head_timeout:(-1.)
@@ -1004,6 +1007,7 @@ let check_handshake_timers_bounded ~connections exchange =
     let closed = ref 0 in
     let handler =
       Ache_miou_tls.Server.create_connection_handler_with_fd
+        ~date:false
         ~idle_timeout:30.
         ~head_timeout:30.
         ~tls:server_config
