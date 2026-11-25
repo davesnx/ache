@@ -93,6 +93,78 @@ exception Respond_later
 let late_error_response : (unit -> unit) option ref = ref None
 let big_body = String.make (16 * 1024 * 1024) 'a'
 
+module Ws = Ache_miou.Websocket
+
+let ws_ended : (string, exn) result Miou.Computation.t option ref = ref None
+let ws_held : Ws.t Miou.Computation.t option ref = ref None
+let ws_release : unit Miou.Computation.t option ref = ref None
+
+let end_ws result =
+  Option.iter (fun ended -> resolve ended result) !ws_ended;
+  ws_ended := None
+
+let text_of = function Websocket.Text s -> s | Binary s -> "binary:" ^ s
+
+let ws_echo ws =
+  let rec loop () =
+    match Ws.receive ws with
+    | Some (Text "close-me") ->
+      Ws.close ws 1001;
+      end_ws
+        (Ok
+           (match Ws.receive ws with
+           | None -> "closed, receive None"
+           | Some m -> "received " ^ text_of m))
+    | Some (Text "ping-me") ->
+      Ws.ping ws "are you there";
+      Ws.send_text ws "pong seen";
+      loop ()
+    | Some (Text "bye-reason") ->
+      Ws.close ~reason:"done here" ws 4000;
+      end_ws (Ok "closed with a reason")
+    | Some (Text message) ->
+      Ws.send_text ws message;
+      loop ()
+    | Some (Binary message) ->
+      Ws.send_binary ws message;
+      loop ()
+    | None ->
+      end_ws
+        (Ok
+           (match Ws.client_close ws with
+           | None -> "receive None"
+           | Some { code; reason } ->
+             Printf.sprintf "receive None, client close %d %S" code reason))
+  in
+  loop ()
+
+let ws_send_loop ws =
+  let chunk = String.make 4096 'x' in
+  let rec loop () =
+    Ws.send_text ws chunk;
+    loop ()
+  in
+  match (loop () : unit) with
+  | () -> ()
+  | exception exn ->
+    end_ws
+      (match Ws.receive ws with
+      | None -> Error exn
+      | Some _ -> Ok "receive returned a message after the reset")
+
+let ws_hold ws =
+  Option.iter (fun held -> resolve held ws) !ws_held;
+  Option.iter await !ws_release
+
+exception Session_failed
+
+let ws_session = function
+  | "/ws-echo" -> Some ws_echo
+  | "/ws-send-loop" -> Some ws_send_loop
+  | "/ws-hold" -> Some ws_hold
+  | "/ws-raise" -> Some (fun (_ : Ws.t) -> raise Session_failed)
+  | _ -> None
+
 let request_handler (_ : Unix.sockaddr) reqd =
   incr requests_seen;
   let request = Request_descriptor.request reqd in
@@ -135,6 +207,10 @@ let request_handler (_ : Unix.sockaddr) reqd =
       reqd
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (echo_server ())
+  | `GET, target when Option.is_some (ws_session target) ->
+    (match Ws.upgrade reqd (Option.get (ws_session target)) with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
   | `GET, "/ws-flood" ->
     (match
        Websocket.upgrade reqd (fun ws ->
@@ -636,6 +712,415 @@ let test_websocket_peer_reset () =
       true
       (elapsed < 1.0));
   on_ws_closed := ignore
+
+let ws_handshake target =
+  Printf.sprintf
+    "GET %s HTTP/1.1\r\n\
+     host: localhost\r\n\
+     upgrade: websocket\r\n\
+     connection: Upgrade\r\n\
+     sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+     sec-websocket-version: 13\r\n\
+     \r\n"
+    target
+
+let ws_frame ?(fin = true) opcode payload =
+  let mask = "\x01\x02\x03\x04" in
+  let len = String.length payload in
+  assert (len < 126);
+  String.make 1 (Char.chr ((if fin then 0x80 else 0) lor opcode))
+  ^ String.make 1 (Char.chr (0x80 lor len))
+  ^ mask
+  ^ String.mapi
+      (fun i c -> Char.chr (Char.code c lxor Char.code mask.[i land 3]))
+      payload
+
+let read_ws_frame socket =
+  let head = take socket 2 in
+  let len = Char.code head.[1] in
+  assert (len < 126);
+  Char.code head.[0], take socket len
+
+let first_of tasks =
+  match Miou.await_first (List.map Miou.async tasks) with
+  | Ok value -> value
+  | Error exn -> raise exn
+
+let sleep_then seconds value () =
+  Miou_unix.sleep seconds;
+  value
+
+let wait_ws_end () =
+  let ended = Miou.Computation.create () in
+  ws_ended := Some ended;
+  ended
+
+let ws_connect addr target =
+  let socket = connect addr in
+  send socket (ws_handshake target);
+  Alcotest.(check string) "101" ws_101 (take socket (String.length ws_101));
+  socket
+
+let test_websocket_echo () =
+  let ended = wait_ws_end () in
+  with_server (fun addr ->
+    let socket = ws_connect addr "/ws-echo" in
+    send socket (ws_frame 0x1 "hello");
+    let first = read_ws_frame socket in
+    send
+      socket
+      (ws_frame ~fin:false 0x1 "w\xc3"
+      ^ ws_frame 0x9 "ping"
+      ^ ws_frame 0x0 "\xb6rld");
+    let second = read_ws_frame socket in
+    let third = read_ws_frame socket in
+    send socket (ws_frame 0x2 "\x00\xff");
+    let fourth = read_ws_frame socket in
+    Alcotest.(check (list (pair int string)))
+      "echo, pong, echo of the fragmented message, binary echo"
+      [ 0x81, "hello"; 0x8a, "ping"; 0x81, "w\xc3\xb6rld"; 0x82, "\x00\xff" ]
+      [ first; second; third; fourth ];
+    send socket (ws_frame 0x8 "\x03\xe8bye");
+    Alcotest.(check (pair int string))
+      "close echoed"
+      (0x88, "\x03\xe8")
+      (read_ws_frame socket);
+    Alcotest.(check string) "then end of input" "" (read_all socket);
+    Alcotest.(check (result string reject))
+      "session"
+      (Ok "receive None, client close 1000 \"bye\"")
+      (await ended);
+    Miou_unix.close socket;
+    wait_connection_done ())
+
+let test_websocket_server_close () =
+  let ended = wait_ws_end () in
+  with_server (fun addr ->
+    let socket = ws_connect addr "/ws-echo" in
+    send socket (ws_frame 0x1 "close-me");
+    Alcotest.(check (pair int string))
+      "close 1001"
+      (0x88, "\x03\xe9")
+      (read_ws_frame socket);
+    Alcotest.(check (result string reject))
+      "close returned"
+      (Ok "closed, receive None")
+      (await ended);
+    send socket (ws_frame 0x8 "\x03\xe9");
+    Alcotest.(check string) "then end of input" "" (read_all socket);
+    Miou_unix.close socket;
+    wait_connection_done ())
+
+let test_websocket_ping () =
+  let ended = wait_ws_end () in
+  with_server (fun addr ->
+    let socket = ws_connect addr "/ws-echo" in
+    send socket (ws_frame 0x1 "ping-me");
+    Alcotest.(check (pair int string))
+      "server ping"
+      (0x89, "are you there")
+      (read_ws_frame socket);
+    send socket (ws_frame 0xA "are you there");
+    Alcotest.(check (pair int string))
+      "ping returned at the pong"
+      (0x81, "pong seen")
+      (read_ws_frame socket);
+    send socket (ws_frame 0x1 "bye-reason");
+    Alcotest.(check (pair int string))
+      "close with a reason"
+      (0x88, "\x0f\xa0done here")
+      (read_ws_frame socket);
+    send socket (ws_frame 0x8 "\x0f\xa0");
+    Alcotest.(check (result string reject))
+      "close returned"
+      (Ok "closed with a reason")
+      (await ended);
+    Alcotest.(check string) "then end of input" "" (read_all socket);
+    Miou_unix.close socket;
+    wait_connection_done ())
+
+let test_websocket_send_loop_peer_reset () =
+  let ended = wait_ws_end () in
+  with_server (fun addr ->
+    let socket = ws_connect addr "/ws-send-loop" in
+    Alcotest.(check string)
+      "server is sending"
+      "\x81\x7e\x10\x00"
+      (take socket 4);
+    Unix.setsockopt_optint
+      (Miou_unix.to_file_descr socket)
+      Unix.SO_LINGER
+      (Some 0);
+    let reset_at = Unix.gettimeofday () in
+    Miou_unix.close socket;
+    let result =
+      first_of
+        [ (fun () -> await ended)
+        ; sleep_then 2.0 (Ok "still running 2 s after the reset")
+        ]
+    in
+    let elapsed = Unix.gettimeofday () -. reset_at in
+    Alcotest.(check bool)
+      "send_text raised Closed, receive is None"
+      true
+      (result = Error Ws.Closed);
+    Alcotest.(check bool)
+      (Printf.sprintf "ended within 1 s (%.3f s)" elapsed)
+      true
+      (elapsed < 1.0);
+    wait_connection_done ())
+
+(* Runs [f] with a session that waits until [f] returns, and calls its functions
+   from the test task. *)
+let with_held_session f =
+  let held = Miou.Computation.create ()
+  and release = Miou.Computation.create () in
+  ws_held := Some held;
+  ws_release := Some release;
+  with_server (fun addr ->
+    let socket = ws_connect addr "/ws-hold" in
+    let ws = await held in
+    Fun.protect ~finally:(fun () -> resolve release ()) (fun () -> f socket ws);
+    Miou_unix.close socket;
+    wait_connection_done ());
+  ws_held := None;
+  ws_release := None
+
+let receive_text ws = Option.map text_of (Ws.receive ws)
+
+let receive_within seconds ws =
+  first_of
+    [ (fun () -> receive_text ws); sleep_then seconds (Some "<timeout>") ]
+
+let cancel_receive ws =
+  let receiving = Miou.async (fun () -> Ws.receive ws) in
+  Miou.yield ();
+  Miou.cancel receiving
+
+let test_websocket_receive_backpressure () =
+  with_held_session (fun socket ws ->
+    send
+      socket
+      (String.concat "" (List.init 8 (fun i -> ws_frame 0x1 (string_of_int i))));
+    Miou_unix.sleep 0.05;
+    send socket (ws_frame 0x9 "p");
+    Alcotest.(check (option (pair int string)))
+      "8 unread messages: reading paused, no pong"
+      None
+      (first_of
+         [ (fun () -> Some (read_ws_frame socket)); sleep_then 0.2 None ]);
+    Alcotest.(check (option string))
+      "first message"
+      (Some "0")
+      (receive_text ws);
+    Alcotest.(check (pair int string))
+      "receive resumes reading: the pong comes"
+      (0x8a, "p")
+      (read_ws_frame socket);
+    Alcotest.(check (list (option string)))
+      "the rest, in order"
+      (List.init 7 (fun i -> Some (string_of_int (i + 1))))
+      (List.init 7 (fun _ -> receive_text ws)))
+
+let test_websocket_cancelled_receive () =
+  with_held_session (fun socket ws ->
+    Alcotest.(check (option string))
+      "first receive times out"
+      (Some "<timeout>")
+      (receive_within 0.01 ws);
+    send socket (ws_frame 0x1 "hello");
+    Alcotest.(check (option string))
+      "the next receive gets the message"
+      (Some "hello")
+      (receive_within 1.0 ws);
+    cancel_receive ws;
+    send socket (ws_frame 0x1 "again");
+    Alcotest.(check (option string))
+      "the receive after Miou.cancel gets the message"
+      (Some "again")
+      (receive_within 1.0 ws))
+
+let test_websocket_cancelled_receive_then_close () =
+  with_held_session (fun socket ws ->
+    cancel_receive ws;
+    Alcotest.(check (option string))
+      "receive times out"
+      (Some "<timeout>")
+      (receive_within 0.01 ws);
+    send socket (ws_frame 0x8 "\x03\xe8");
+    Alcotest.(check (option string))
+      "a later receive gives None"
+      None
+      (receive_within 1.0 ws);
+    Alcotest.(check (pair int string))
+      "close echoed"
+      (0x88, "\x03\xe8")
+      (read_ws_frame socket))
+
+let test_websocket_cancelled_receives_bounded () =
+  with_held_session (fun socket ws ->
+    let cancel_many n =
+      for _ = 1 to n do
+        cancel_receive ws
+      done
+    in
+    let live_words () =
+      Gc.full_major ();
+      (Gc.stat ()).live_words
+    in
+    cancel_many 1_000;
+    let before = live_words () in
+    cancel_many 20_000;
+    let grown = live_words () - before in
+    Alcotest.(check bool)
+      (Printf.sprintf
+         "20000 cancelled receives keep %d more live words (< 10000)"
+         grown)
+      true
+      (grown < 10_000);
+    send socket (ws_frame 0x1 "after");
+    Alcotest.(check (option string))
+      "a receive still gets the next message"
+      (Some "after")
+      (receive_within 1.0 ws))
+
+let raises_closed f =
+  match f () with () -> false | exception Ws.Closed -> true
+
+let test_websocket_ping_timeout () =
+  with_held_session (fun socket ws ->
+    Alcotest.(check bool)
+      "no pong: the sleep wins"
+      true
+      (first_of
+         [ (fun () ->
+             Ws.ping ws "";
+             false)
+         ; sleep_then 0.05 true
+         ]);
+    Alcotest.(check (pair int string))
+      "first ping"
+      (0x89, "")
+      (read_ws_frame socket);
+    let answered = Miou.async (fun () -> Ws.ping ws "x") in
+    Alcotest.(check (pair int string))
+      "second ping"
+      (0x89, "x")
+      (read_ws_frame socket);
+    send socket (ws_frame 0xA "x");
+    Alcotest.(check (result unit reject))
+      "a pong ends the ping"
+      (Ok ())
+      (Miou.await answered);
+    let pending =
+      Miou.async (fun () -> raises_closed (fun () -> Ws.ping ws "y"))
+    in
+    Alcotest.(check (pair int string))
+      "third ping"
+      (0x89, "y")
+      (read_ws_frame socket);
+    send socket (ws_frame 0x8 "\x03\xe8");
+    Alcotest.(check bool)
+      "close ends the ping with Closed"
+      true
+      (Miou.await_exn pending);
+    Alcotest.(check bool)
+      "client_close"
+      true
+      (Ws.client_close ws = Some { Websocket.code = 1000; reason = "" });
+    Alcotest.(check bool)
+      "ping after close raises Closed"
+      true
+      (raises_closed (fun () -> Ws.ping ws ""));
+    Alcotest.(check bool)
+      "send_text after close raises Closed"
+      true
+      (raises_closed (fun () -> Ws.send_text ws "late"));
+    Ws.close ws 1000;
+    Alcotest.(check (option string)) "receive is None" None (receive_text ws);
+    Alcotest.(check (pair int string))
+      "close echoed"
+      (0x88, "\x03\xe8")
+      (read_ws_frame socket))
+
+(* Serves one connection on a socket pair: runs [client] on the other end,
+   cancels the connection task when [cancel] is set, and returns how the server
+   handler ended. *)
+let on_socketpair ?(cancel = false) client_side =
+  Miou_unix.run ~domains:0 (fun () ->
+    let server, client = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+    let server = Miou_unix.of_file_descr server
+    and client = Miou_unix.of_file_descr client in
+    let handler =
+      Miou.async (fun () ->
+        Ache_miou.Server.create_connection_handler
+          ~request_handler
+          ~error_handler
+          server
+          (Unix.ADDR_UNIX "socketpair"))
+    in
+    Fun.protect
+      ~finally:(fun () ->
+        Miou_unix.close server;
+        Miou_unix.close client)
+      (fun () ->
+         with_timeout 5.0 (fun () -> client_side client);
+         if cancel then Miou.cancel handler;
+         Miou.await handler))
+
+let test_websocket_session_exception () =
+  match
+    on_socketpair (fun client ->
+      send client (ws_handshake "/ws-raise");
+      Alcotest.(check string) "101" ws_101 (take client (String.length ws_101));
+      Alcotest.(check string) "then end of input" "" (read_all client);
+      shutdown_send client)
+  with
+  | Error Session_failed -> ()
+  | Ok () -> Alcotest.fail "the handler returned"
+  | Error exn -> raise exn
+
+let test_websocket_session_cancelled_with_connection () =
+  let held = Miou.Computation.create () in
+  ws_held := Some held;
+  ws_release := Some (Miou.Computation.create ());
+  let result =
+    on_socketpair ~cancel:true (fun client ->
+      send client (ws_handshake "/ws-hold");
+      Alcotest.(check string) "101" ws_101 (take client (String.length ws_101));
+      let (_ : Ws.t) = await held in
+      ())
+  in
+  ws_held := None;
+  ws_release := None;
+  match result with
+  | Error Miou.Cancelled -> ()
+  | Ok () -> Alcotest.fail "the handler returned"
+  | Error exn -> raise exn
+
+let test_websocket_upgrade_outside_server () =
+  let raised = ref None in
+  let server =
+    Server_connection.create (fun reqd ->
+      match Ws.upgrade reqd ignore with
+      | Ok () | Error _ -> ()
+      | exception Invalid_argument message -> raised := Some message)
+  in
+  let request = ws_handshake "/ws" in
+  let len = String.length request in
+  let (_ : int) =
+    Server_connection.read
+      server
+      (Ache.Bigstring.of_string ~off:0 ~len request)
+      ~off:0
+      ~len
+  in
+  Alcotest.(check (option string))
+    "Invalid_argument"
+    (Some
+       "Ache_miou.Websocket.upgrade: call it from the request handler of an \
+        Ache_miou server")
+    !raised
 
 let test_flush_after_peer_closed () =
   let flushed = Miou.Computation.create () in
@@ -1821,6 +2306,34 @@ let () =
         ; ( "WebSocket server sending to a reset peer ends the connection"
           , `Quick
           , test_websocket_peer_reset )
+        ; "WebSocket echo", `Quick, test_websocket_echo
+        ; "WebSocket server close", `Quick, test_websocket_server_close
+        ; "WebSocket ping", `Quick, test_websocket_ping
+        ; ( "WebSocket send loop to a reset peer ends"
+          , `Quick
+          , test_websocket_send_loop_peer_reset )
+        ; ( "WebSocket receive backpressure"
+          , `Quick
+          , test_websocket_receive_backpressure )
+        ; ( "WebSocket cancelled receive"
+          , `Quick
+          , test_websocket_cancelled_receive )
+        ; ( "WebSocket cancelled receive then close"
+          , `Quick
+          , test_websocket_cancelled_receive_then_close )
+        ; ( "WebSocket cancelled receives bounded"
+          , `Quick
+          , test_websocket_cancelled_receives_bounded )
+        ; "WebSocket ping timeout", `Quick, test_websocket_ping_timeout
+        ; ( "WebSocket session exception"
+          , `Quick
+          , test_websocket_session_exception )
+        ; ( "WebSocket session cancelled with the connection"
+          , `Quick
+          , test_websocket_session_cancelled_with_connection )
+        ; ( "WebSocket upgrade outside a server"
+          , `Quick
+          , test_websocket_upgrade_outside_server )
         ; ( "normal close with trailing bytes"
           , `Quick
           , test_close_with_trailing_bytes )

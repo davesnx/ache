@@ -75,6 +75,69 @@ module Deadline = struct
   let stop t = Option.iter Miou.cancel t.timer
 end
 
+(* Sessions that a request handler starts, for example a WebSocket session. The
+   connection task starts each one in its own task, so that a session can wait
+   while the read loop runs, and awaits it before it returns. *)
+module Sessions = struct
+  type t =
+    { mutable pending : (unit -> unit) list
+    ; mutable running : unit Miou.t list
+    ; added : Signal.t
+    }
+
+  let create () = { pending = []; running = []; added = Signal.create () }
+
+  (* The sessions of the request handler that runs now in this domain. *)
+  let current : t option Domain.DLS.key = Domain.DLS.new_key (fun () -> None)
+
+  let with_current t f =
+    let previous = Domain.DLS.get current in
+    Domain.DLS.set current (Some t);
+    match f () with
+    | value ->
+      Domain.DLS.set current previous;
+      value
+    | exception exn ->
+      Domain.DLS.set current previous;
+      raise exn
+
+  let add t session =
+    t.pending <- session :: t.pending;
+    Signal.wake t.added
+
+  let start t ~on_exn =
+    List.iter
+      (fun session ->
+         t.running <-
+           Miou.async (fun () ->
+             match session () with
+             | () -> ()
+             | exception (Miou.Cancelled as exn) -> raise exn
+             | exception exn -> on_exn exn (Printexc.get_raw_backtrace ()))
+           :: t.running)
+      (List.rev t.pending);
+    t.pending <- []
+
+  (* Starts the sessions that are added until [stopped] completes. *)
+  let rec serve t ~stopped ~on_exn =
+    Signal.wait_until t.added (fun () ->
+      t.pending <> [] || not (Miou.Computation.is_running stopped));
+    start t ~on_exn;
+    if Miou.Computation.is_running stopped
+    then serve t ~stopped ~on_exn
+    else await_or_raise stopped
+
+  (* Waits for the sessions to return. [shutdown] ends the connection first, so
+     that a session that waits for it sees the end. *)
+  let finish t ~on_exn ~shutdown =
+    start t ~on_exn;
+    if t.running <> []
+    then (
+      shutdown ();
+      let (_ : (unit, exn) result list) = Miou.await_all t.running in
+      t.running <- [])
+end
+
 module type IO = Ache_miou_intf.IO
 module type Server = Ache_miou_intf.Server
 module type Client = Ache_miou_intf.Client
@@ -113,6 +176,7 @@ module Make (Io : IO) = struct
             -> ([ `Idle | `Head ] * float * (unit -> unit)) option)
       -> linger:bool
       -> ?body_read:body_read
+      -> ?sessions:Sessions.t
       -> stopped:[ `Done | `Abort ] Miou.Computation.t
       -> t
       -> Io.socket
@@ -125,6 +189,7 @@ module Make (Io : IO) = struct
        ~timeout
        ~linger:lingers
        ?(body_read = no_body_read)
+       ?sessions
        ~stopped
        t
        socket ->
@@ -152,9 +217,13 @@ module Make (Io : IO) = struct
         | false, true -> shutdown socket SHUTDOWN_SEND
         | false, false -> ()
       in
-      let abort () =
-        ignore (Miou.Computation.try_return stopped `Abort : bool)
+      let complete outcome =
+        ignore (Miou.Computation.try_return stopped outcome : bool);
+        Option.iter
+          (fun sessions -> Signal.wake sessions.Sessions.added)
+          sessions
       in
+      let abort () = complete `Abort in
       let report_exn exn =
         match Runtime.report_exn t exn with
         | () -> true
@@ -392,8 +461,7 @@ module Make (Io : IO) = struct
       in
       let stop () =
         decr running;
-        if !running = 0
-        then ignore (Miou.Computation.try_return stopped `Done : bool)
+        if !running = 0 then complete `Done
       in
       let reading =
         Miou.async (fun () ->
@@ -404,7 +472,18 @@ module Make (Io : IO) = struct
           write_task ();
           stop ())
       in
-      (match await_or_raise stopped with
+      let session_failed exn bt =
+        (try Runtime.report_exn t exn with
+        | Miou.Cancelled as exn -> raise exn
+        | _ -> ());
+        if Option.is_none !unreported then unreported := Some (exn, bt)
+      in
+      (match
+         match sessions with
+         | None -> await_or_raise stopped
+         | Some sessions ->
+           Sessions.serve sessions ~stopped ~on_exn:session_failed
+       with
       | `Abort ->
         Miou.cancel reading;
         Miou.cancel writing;
@@ -414,6 +493,13 @@ module Make (Io : IO) = struct
           Miou.await_all [ reading; writing ]
         in
         ());
+      Option.iter
+        (fun sessions ->
+           Sessions.finish sessions ~on_exn:session_failed ~shutdown:(fun () ->
+             try Runtime.shutdown t with
+             | Miou.Cancelled as exn -> raise exn
+             | _ -> ()))
+        sessions;
       Option.iter Miou.cancel stopper;
       Option.iter
         (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
@@ -447,7 +533,8 @@ module Make (Io : IO) = struct
       in
       fun socket client_addr ->
         let head_deadline = ref None
-        and error_handler_failure = ref None in
+        and error_handler_failure = ref None
+        and sessions = Sessions.create () in
         let error_handler ?request error start_response =
           try error_handler client_addr ?request error start_response with
           | Miou.Cancelled as exn -> raise exn
@@ -460,7 +547,8 @@ module Make (Io : IO) = struct
         let connection =
           Ache.Server_connection.create ~config ~error_handler (fun reqd ->
             head_deadline := None;
-            request_handler client_addr reqd)
+            Sessions.with_current sessions (fun () ->
+              request_handler client_addr reqd))
         in
         let observe () =
           match head_timeout with
@@ -531,6 +619,7 @@ module Make (Io : IO) = struct
             ; linger =
                 Option.value idle_timeout ~default:linger_without_idle_timeout
             }
+          ~sessions
           ~stopped:(Miou.Computation.create ())
           connection
           socket;
@@ -760,4 +849,151 @@ module Server = struct
            (List.filteri (fun i _ -> i < domains - 1) others)
     in
     match Miou.await_first loops with Ok () -> () | Error exn -> raise exn
+end
+
+module Websocket = struct
+  type t =
+    { connection : Ache.Websocket.t
+    ; messages : Ache.Websocket.message Queue.t
+    ; receivers : unit Miou.Computation.t Queue.t
+    ; pingers : unit Miou.Computation.t Queue.t
+    ; mutable ended : bool
+    ; mutable client_close : Ache.Websocket.close option
+    ; closed : unit Miou.Computation.t
+    }
+
+  exception Closed
+
+  let max_queued_messages = 8
+
+  let rec wake_one waiters =
+    match Queue.take_opt waiters with
+    | Some waiter ->
+      if not (Miou.Computation.try_return waiter ()) then wake_one waiters
+    | None -> ()
+
+  let end_all waiters result =
+    Queue.iter
+      (fun waiter ->
+         ignore
+           ((match result with
+            | Ok () -> Miou.Computation.try_return waiter ()
+            | Error error -> Miou.Computation.try_cancel waiter error)
+            : bool))
+      waiters;
+    Queue.clear waiters
+
+  (* Waits until [waiters] wakes this caller. A cancelled caller leaves a
+     completed waiter, which the next [wait] drops, so that a loop of cancelled
+     calls keeps the queue short. *)
+  let wait waiters =
+    let pending = Queue.of_seq (Queue.to_seq waiters) in
+    Queue.clear waiters;
+    Queue.iter
+      (fun waiter ->
+         if Miou.Computation.is_running waiter then Queue.push waiter waiters)
+      pending;
+    let waiter = Miou.Computation.create () in
+    Queue.push waiter waiters;
+    let fail exn bt =
+      ignore (Miou.Computation.try_cancel waiter (exn, bt) : bool);
+      Printexc.raise_with_backtrace exn bt
+    in
+    match Miou.Computation.await waiter with
+    | Ok () -> ()
+    | Error (exn, bt) -> fail exn bt
+    | exception exn -> fail exn (Printexc.get_raw_backtrace ())
+
+  let upgrade ?max_message_size reqd session =
+    let sessions =
+      match Domain.DLS.get Sessions.current with
+      | Some sessions -> sessions
+      | None ->
+        invalid_arg
+          "Ache_miou.Websocket.upgrade: call it from the request handler of an \
+           Ache_miou server"
+    in
+    let messages = Queue.create ()
+    and receivers = Queue.create ()
+    and pingers = Queue.create ()
+    and closed = Miou.Computation.create () in
+    let t = ref None in
+    match
+      Ache.Websocket.upgrade ?max_message_size reqd (fun connection ->
+        let ws =
+          { connection
+          ; messages
+          ; receivers
+          ; pingers
+          ; ended = false
+          ; client_close = None
+          ; closed
+          }
+        in
+        t := Some ws;
+        { on_message =
+            (fun message ->
+              Queue.push message messages;
+              if Queue.length messages >= max_queued_messages
+              then Ache.Websocket.pause_reading connection;
+              wake_one receivers)
+        ; on_pong = (fun (_ : string) -> end_all pingers (Ok ()))
+        ; on_close =
+            (fun close ->
+              ws.ended <- true;
+              ws.client_close <- close;
+              end_all receivers (Ok ());
+              end_all pingers (Error (Closed, Printexc.get_callstack 0));
+              ignore (Miou.Computation.try_return closed () : bool))
+        })
+    with
+    | Error _ as error -> error
+    | Ok () ->
+      let t = Option.get !t in
+      Sessions.add sessions (fun () ->
+        match session t with () -> () | exception Closed -> ());
+      Ok ()
+
+  let written t =
+    let flushed = Miou.Computation.create () in
+    Ache.Websocket.flush t.connection (fun result ->
+      ignore (Miou.Computation.try_return flushed result : bool));
+    match await_or_raise flushed with `Written -> () | `Closed -> raise Closed
+
+  let send_text t message =
+    Ache.Websocket.send_text t.connection message;
+    written t
+
+  let send_binary t message =
+    Ache.Websocket.send_binary t.connection message;
+    written t
+
+  let rec receive t =
+    match Queue.take_opt t.messages with
+    | Some message ->
+      if Queue.length t.messages < max_queued_messages
+      then Ache.Websocket.resume_reading t.connection;
+      Some message
+    | None when t.ended -> None
+    | None ->
+      Ache.Websocket.resume_reading t.connection;
+      (match wait t.receivers with
+      | () -> ()
+      | exception exn ->
+        let bt = Printexc.get_raw_backtrace () in
+        (* This caller may have been woken for a message: pass it on. *)
+        if not (Queue.is_empty t.messages) then wake_one t.receivers;
+        Printexc.raise_with_backtrace exn bt);
+      receive t
+
+  let ping t payload =
+    Ache.Websocket.ping t.connection payload;
+    if t.ended then raise Closed;
+    wait t.pingers
+
+  let client_close t = t.client_close
+
+  let close ?reason t code =
+    Ache.Websocket.close ?reason t.connection ~code;
+    await_or_raise t.closed
 end
