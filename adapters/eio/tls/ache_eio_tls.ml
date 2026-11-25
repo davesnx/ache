@@ -23,6 +23,26 @@ module Tcp = struct
   let close t = Eio.Resource.close t.flow
 end
 
+(* tls-eio makes one record for each buffer it is given. [single_write] joins
+   the leading buffers into one record of up to 16 KiB, the largest record,
+   through [scratch], one buffer for each connection. A first buffer of 16 KiB
+   or more goes as is. [Eio.Flow.write] calls it again for the rest. *)
+let record_size = 0x4000
+let scratch () = Cstruct.create record_size
+
+let single_write tls scratch = function
+  | first :: _ when Cstruct.length first >= record_size ->
+    Eio.Flow.single_write tls [ first ]
+  | bufs ->
+    let rec fill pos = function
+      | [] -> pos
+      | buf :: rest ->
+        let n = min (Cstruct.length buf) (record_size - pos) in
+        Cstruct.blit buf 0 scratch pos n;
+        if pos + n < record_size then fill (pos + n) rest else pos + n
+    in
+    Eio.Flow.single_write tls [ Cstruct.sub scratch 0 (fill 0 bufs) ]
+
 type guard =
   { tcp_eof : bool ref
   ; mutable close_delimited : bool
@@ -32,6 +52,7 @@ module Guarded = struct
   type t =
     { tls : Tls_eio.t
     ; guard : guard
+    ; scratch : Cstruct.t
     }
 
   let read_methods = []
@@ -46,7 +67,7 @@ module Guarded = struct
       when t.guard.close_delimited ->
       raise Truncated
 
-  let single_write t bufs = Eio.Flow.single_write t.tls bufs
+  let single_write t bufs = single_write t.tls t.scratch bufs
   let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
   let shutdown t command = Eio.Flow.shutdown t.tls command
   let close t = Eio.Resource.close t.tls
@@ -56,11 +77,12 @@ module Server_flow = struct
   type t =
     { tls : Tls_eio.t
     ; tcp : flow
+    ; scratch : Cstruct.t
     }
 
   let read_methods = []
   let single_read t buf = Eio.Flow.single_read t.tls buf
-  let single_write t bufs = Eio.Flow.single_write t.tls bufs
+  let single_write t bufs = single_write t.tls t.scratch bufs
   let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
 
   let shutdown t = function
@@ -118,7 +140,8 @@ module Client = struct
       | `Insecure_no_name_check -> Tls_eio.client_of_flow tls tcp
     in
     let guarded : flow =
-      Eio.Resource.T ({ Guarded.tls; guard }, guarded_handler)
+      Eio.Resource.T
+        ({ Guarded.tls; guard; scratch = scratch () }, guarded_handler)
     in
     { client = Ache_eio.Client.create_connection ?config ~sw guarded; guard }
 
@@ -177,7 +200,9 @@ module Server = struct
         | _ -> handshake ()
       in
       handler
-        (Eio.Resource.T ({ Server_flow.tls = flow; tcp :> flow }, server_handler)
+        (Eio.Resource.T
+           ( { Server_flow.tls = flow; tcp :> flow; scratch = scratch () }
+           , server_handler )
          : flow)
         client_addr
 end

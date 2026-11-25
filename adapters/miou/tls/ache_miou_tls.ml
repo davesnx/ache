@@ -101,6 +101,43 @@ let client_of_fd config ~(peer : peer) fd =
 
 let epoch t = Tls.Engine.epoch t.state
 
+(* ocaml-tls makes one record for each string it is given, so the iovecs are
+   joined into strings of up to 16 KiB, the largest record. *)
+let record_size = 0x4000
+
+let coalesce iovecs =
+  let rec fill chunk pos iovecs src_off =
+    let size = Bytes.length chunk in
+    match iovecs with
+    | [] -> [], 0
+    | _ when pos = size -> iovecs, src_off
+    | { Ache.IOVec.buffer; off; len } :: rest ->
+      let n = min (len - src_off) (size - pos) in
+      Ache.Bigstring.unsafe_blit_to_bytes
+        buffer
+        ~src_off:(off + src_off)
+        chunk
+        ~dst_off:pos
+        ~len:n;
+      if src_off + n = len
+      then fill chunk (pos + n) rest 0
+      else iovecs, src_off + n
+  in
+  let rec chunks acc remaining iovecs src_off =
+    if remaining = 0
+    then List.rev acc
+    else
+      let chunk = Bytes.create (min record_size remaining) in
+      let iovecs, src_off = fill chunk 0 iovecs src_off in
+      chunks
+        (Bytes.unsafe_to_string chunk :: acc)
+        (remaining - Bytes.length chunk)
+        iovecs
+        src_off
+  in
+  let length = Ache.IOVec.lengthv iovecs in
+  length, chunks [] length iovecs 0
+
 module Io = struct
   type nonrec socket = socket
 
@@ -129,13 +166,7 @@ module Io = struct
     if t.close_notify_sent
     then `Closed
     else
-      let length, strings =
-        List.fold_left_map
-          (fun acc { Ache.IOVec.buffer; off; len } ->
-             acc + len, Ache.Bigstring.substring buffer ~off ~len)
-          0
-          iovecs
-      in
+      let length, strings = coalesce iovecs in
       match Tls.Engine.send_application_data t.state strings with
       | None -> invalid_arg "Ache_miou_tls: the TLS session is not ready"
       | Some (state, data) ->
