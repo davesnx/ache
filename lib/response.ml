@@ -109,6 +109,10 @@ let final_coding = function
      | [] -> Some ""
      | coding :: _ -> Some coding )
 
+(* RFC 9112 §6.1: a Transfer-Encoding field that lists no coding. *)
+let has_empty_transfer_encoding { headers; _ } =
+  final_coding (fields headers).codings = Some ""
+
 let length_of_fields ~proxy f : Body_length.t =
   match final_coding f.codings with
   | Some coding when Headers.ci_equal coding "chunked" -> `Chunked

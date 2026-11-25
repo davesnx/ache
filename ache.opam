@@ -18,6 +18,7 @@ depends: [
   "dune" {>= "3.17"}
   "ocaml" {>= "5.3"}
   "alcotest" {with-test}
+  "qcheck-core" {with-test}
   "ocamlformat" {= "0.29.0" & with-dev-setup}
   "odoc" {with-doc}
 ]

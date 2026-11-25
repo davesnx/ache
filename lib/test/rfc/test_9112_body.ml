@@ -113,7 +113,9 @@ let client_reject chunks =
   check_client_error msg c ex
 
 let pipelined requests raw =
-  let c = Client.create () in
+  let c =
+    Client.create ~config:{ Config.default with max_pipelined_requests = 16 } ()
+  in
   let exs = List.map (fun r -> Client.request c r) requests in
   Client.feed c raw;
   c, exs
@@ -638,11 +640,11 @@ let server_response_tests =
 let client_framing_tests =
   [ test
       "§6.3 client DEF: 204 and 304 with Transfer-Encoding chunked end after \
-       the head"
+       the head, and the connection closes"
       (fun () ->
          List.iter
            (fun (status, line) ->
-              let _, exs =
+              let c, exs =
                 pipelined
                   [ client_get "/a"; client_get "/b" ]
                   (line ^ "\r\ntransfer-encoding: chunked\r\n\r\n" ^ next_ok)
@@ -657,7 +659,11 @@ let client_framing_tests =
                   (Client.statuses a);
                 Alcotest.(check string) "first body" "" a.body;
                 Alcotest.(check bool) "first complete" true a.body_eof;
-                check_client_ok "second" ~body:"ok" b
+                Alcotest.(check (list string))
+                  "second: Connection_closed"
+                  [ "Connection_closed" ]
+                  b.errors;
+                Alcotest.(check bool) "closed" true (Client.is_closed c)
               | _ -> assert false)
            [ 204, "HTTP/1.1 204 No Content"; 304, "HTTP/1.1 304 Not Modified" ])
   ; test

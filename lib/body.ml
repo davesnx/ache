@@ -144,6 +144,7 @@ module Reader = struct
 
   let has_pending_output t = t.len > 0
   let is_read_scheduled t = t.read_scheduled
+  let is_discarding t = t.discarding
 end
 
 module Writer = struct

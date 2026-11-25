@@ -1,0 +1,8 @@
+(rule
+ (copy ../grammar_corpus.ml grammar_corpus.ml))
+
+(test
+ (name fuzz)
+ (package ache)
+ (libraries ache qcheck-core qcheck-core.runner)
+ (deps ../oracle/oracle.data))

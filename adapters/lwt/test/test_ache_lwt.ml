@@ -1283,6 +1283,42 @@ let test_unread_body_without_idle_timeout () =
          Lwt_unix.close socket))
     [ "/early-close", early_close_response; "/early-413", early_413_response ]
 
+(* Decision 0010: the server drains at most 256 KiB of an unread body. *)
+let large_413_head =
+  "POST /early-413 HTTP/1.1\r\n\
+   host: localhost\r\n\
+   content-length: 10000000\r\n\
+   \r\n"
+
+let large_413_response =
+  "HTTP/1.1 413 Content Too Large\r\n\
+   content-length: 2\r\n\
+   connection: close\r\n\
+   \r\n\
+   no"
+
+let test_unread_body_drain_limit () =
+  with_server ~idle_timeout:5.0 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket large_413_head >>= fun () ->
+    read_exactly socket (String.length large_413_response) >>= fun response ->
+    Alcotest.(check string) "413 closes" large_413_response response;
+    let since = Unix.gettimeofday () in
+    Lwt.catch
+      (fun () -> write_all socket (String.make 0x50000 'x'))
+      (fun _ -> Lwt.return_unit)
+    >>= fun () ->
+    Lwt.catch
+      (fun () -> read_all socket)
+      (function
+        | Unix.Unix_error (Unix.ECONNRESET, _, _) -> Lwt.return ""
+        | exn -> Lwt.fail exn)
+    >>= fun rest ->
+    Alcotest.(check string) "then closed" "" rest;
+    if Unix.gettimeofday () -. since > 2.0
+    then Alcotest.fail "closed by the idle timeout, not after 256 KiB";
+    Lwt_unix.close socket)
+
 let test_unread_body_idle_timeout () =
   with_server ~idle_timeout:0.3 (fun connect ->
     connect () >>= fun socket ->
@@ -1777,12 +1813,144 @@ let test_timeout_create_must_be_positive () =
        | exception Invalid_argument _ -> ())
     [ 0.; -1.; Float.nan ]
 
+(* Client: response bytes on an idle connection (undici GHSA-35p6-xmwp-9g52).
+   The server runs in another domain with blocking sockets, so that the client
+   domain can block while the stray bytes arrive. For each of [strays], it
+   accepts a connection, answers the first request, sends the stray bytes 50 ms
+   later, and answers a second request if one comes within 1 s. The domain
+   returns the second requests. *)
+let stray_server strays =
+  let listening = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Unix.setsockopt listening Unix.SO_REUSEADDR true;
+  Unix.bind listening (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.listen listening 1;
+  let port =
+    match Unix.getsockname listening with
+    | Unix.ADDR_INET (_, port) -> port
+    | Unix.ADDR_UNIX _ -> assert false
+  in
+  let serve stray =
+    let socket, _ = Unix.accept listening in
+    let write s =
+      try ignore (Unix.write_substring socket s 0 (String.length s) : int) with
+      | Unix.Unix_error _ -> ()
+    in
+    let buf = Bytes.create 4096 in
+    let rec read_head acc =
+      let rec has_end i =
+        i + 4 <= String.length acc
+        && (String.sub acc i 4 = "\r\n\r\n" || has_end (i + 1))
+      in
+      if has_end 0
+      then acc
+      else
+        match Unix.read socket buf 0 (Bytes.length buf) with
+        | 0 -> acc
+        | n -> read_head (acc ^ Bytes.sub_string buf 0 n)
+        | exception Unix.Unix_error _ -> acc
+    in
+    ignore (read_head "" : string);
+    write "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    Unix.sleepf 0.05;
+    write stray;
+    Unix.setsockopt_float socket Unix.SO_RCVTIMEO 1.0;
+    let second = read_head "" in
+    if second <> ""
+    then write "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal";
+    Unix.close socket;
+    second
+  in
+  ( port
+  , Domain.spawn (fun () ->
+      Fun.protect
+        ~finally:(fun () -> Unix.close listening)
+        (fun () -> List.map serve strays)) )
+
+let stray_cases =
+  [ "a response", "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nevil"
+  ; "part of a head", "HTTP/1.1 200 OK\r\n"
+  ]
+
+let stray_outcome client =
+  let result, resolve = Lwt.wait () in
+  let finish r = if Lwt.is_sleeping result then Lwt.wakeup_later resolve r in
+  let writer =
+    Ache_lwt.Client.request
+      client
+      (Ache.Request.create
+         ~headers:(Ache.Headers.of_list [ "host", "localhost" ])
+         `GET
+         "/")
+      ~error_handler:(function
+        | `Connection_closed -> finish "Connection_closed"
+        | `Malformed_response _ -> finish "Malformed_response"
+        | `Invalid_response_body_length _ ->
+          finish "Invalid_response_body_length"
+        | `Exn exn -> finish (Printexc.to_string exn))
+      ~response_handler:(fun response reader ->
+        let body = Stdlib.Buffer.create 16 in
+        let rec loop () =
+          Ache.Body.Reader.schedule_read
+            reader
+            ~on_error:(fun () -> finish "body error")
+            ~on_eof:(fun () ->
+              finish
+                (Printf.sprintf
+                   "%d %s"
+                   (Ache.Status.to_code response.status)
+                   (Stdlib.Buffer.contents body)))
+            ~on_read:(fun bs ~off ~len ->
+              Stdlib.Buffer.add_string
+                body
+                (Ache.Bigstring.substring bs ~off ~len);
+              loop ())
+        in
+        loop ())
+  in
+  Ache.Body.Writer.close writer;
+  result
+
+let test_stray_bytes_on_idle_connection () =
+  let port, server = stray_server (List.map snd stray_cases) in
+  List.iter
+    (fun (name, _) ->
+       Lwt_main.run
+         (Lwt_unix.with_timeout 10.0 (fun () ->
+            let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+            Lwt.bind
+              (Lwt_unix.connect
+                 socket
+                 (Unix.ADDR_INET (Unix.inet_addr_loopback, port)))
+              (fun () ->
+                 Lwt.bind (Ache_lwt.Client.create_connection socket)
+                 @@ fun client ->
+                 Lwt.bind (stray_outcome client) @@ fun first ->
+                 Alcotest.(check string) (name ^ ": first") "200 ok" first;
+                 (* The stray bytes arrive while this thread does not run the
+                    read loop. *)
+                 Unix.sleepf 0.2;
+                 Lwt.bind (stray_outcome client) @@ fun second ->
+                 Alcotest.(check string)
+                   (name ^ ": second")
+                   "Connection_closed"
+                   second;
+                 Ache_lwt.Client.shutdown client)));
+       ())
+    stray_cases;
+  Alcotest.(check (list string))
+    "second requests not sent"
+    (List.map (fun _ -> "") stray_cases)
+    (Domain.join server)
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
     "ache-lwt loopback"
     [ ( "loopback"
       , [ "GET", `Quick, test_get
+        ; ( "client: response bytes on an idle connection are not a response"
+          , `Quick
+          , test_stray_bytes_on_idle_connection )
         ; "POST echo larger than the read buffer", `Quick, test_post_echo
         ; "two pipelined requests", `Quick, test_pipelined
         ; ( "a flooding client does not block the event loop"
@@ -1862,6 +2030,9 @@ let () =
         ; ( "unread body after the response: idle_timeout"
           , `Quick
           , test_unread_body_idle_timeout )
+        ; ( "unread body past 256 KiB closes the connection"
+          , `Quick
+          , test_unread_body_drain_limit )
         ; ( "response while a body read waits, no idle_timeout: closes"
           , `Quick
           , test_respond_while_body_read_pending )

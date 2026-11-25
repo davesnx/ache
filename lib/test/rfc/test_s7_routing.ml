@@ -98,7 +98,39 @@ let switching_head =
 let long_target = "/" ^ String.make 7999 'a'
 
 let tests =
-  [ test "§7.6.1 server DEF: Connection: close ends the connection" (fun () ->
+  [ test "§4.2.1 server MUST: 400 for an http URI with an empty host" (fun () ->
+      List.iter
+        (fun input -> check_rejected (Server.run input))
+        [ get "http:///x"
+        ; get "http://:80/"
+        ; get "http://"
+        ; get ~headers:[ "Host", ":80" ] "/"
+        ])
+  ; test
+      "§4.2.2 server MUST: 400 for an https URI with an empty host"
+      (fun () ->
+         List.iter
+           (fun input -> check_rejected (Server.run input))
+           [ get "https:///x"; get "https://:443/" ])
+  ; test
+      "§4.2.4 server SHOULD: 400 for userinfo in an http or https target"
+      (fun () ->
+         List.iter
+           (fun input -> check_rejected (Server.run input))
+           [ get "http://u:p@example.com/"
+           ; get "http://u@example.com/"
+           ; get "https://@example.com/"
+           ])
+  ; test
+      "§4.2.4 server DEF: an @ after the authority is not userinfo"
+      (fun () ->
+         let s = Server.run (get "http://example.com/a?u@b") in
+         check_status "200" [ 200 ] s;
+         Alcotest.(check (list string))
+           "target"
+           [ "http://example.com/a?u@b" ]
+           (targets s))
+  ; test "§7.6.1 server DEF: Connection: close ends the connection" (fun () ->
       served_then_closed "close" ())
   ; test
       "§7.6.1 server DEF: connection option close matched case-insensitively"

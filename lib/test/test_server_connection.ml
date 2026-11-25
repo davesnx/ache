@@ -3102,10 +3102,267 @@ let test_unread_body_discarded_after_response () =
                 !held
                 (min chunk size))
          [ "content-length", fixed size; "chunked", chunked size ])
-    [ "one read", max_int, 0x100000
-    ; "4096-byte reads", 0x1000, 0x100000
+    [ "one read", max_int, 100 * 1024
+    ; "4096-byte reads", 0x1000, 100 * 1024
     ; "one byte per read", 1, 0x2000
     ]
+
+let post_head n =
+  Printf.sprintf "POST / HTTP/1.1\r\nHost: a\r\ncontent-length: %d\r\n\r\n" n
+
+let drain_splits =
+  [ "one read", max_int; "7-byte reads", 7; "one byte per read", 1 ]
+
+let early_response ?(status = `OK) reqd =
+  Request_descriptor.respond_with_string reqd (Response.create status) "no"
+
+(* Feeds [head] and [body_bytes] bytes of body, the response is sent before the
+   body is read. *)
+let drain
+      ?config
+      ?(handler = early_response ?status:None)
+      ~chunk
+      ~head
+      ~body_bytes
+      ()
+  =
+  let t = Raw.create ?config handler in
+  Raw.feed ~chunk t head;
+  let response =
+    Raw.take_output t
+    ^
+    (ignore (Raw.write_all t);
+     Raw.take_output t)
+  in
+  Raw.feed ~chunk t (String.make body_bytes 'x');
+  t, response
+
+let check_drain_closed label t ~unread =
+  Alcotest.(check int)
+    (label ^ ": body bytes left unread")
+    unread
+    (String.length t.Raw.pending);
+  Alcotest.check
+    read_operation
+    (label ^ ": reader closed")
+    `Close
+    (Raw.read_op t);
+  Alcotest.(check bool)
+    (label ^ ": writer closed")
+    true
+    (Raw.write_all t = `Close);
+  Alcotest.(check bool)
+    (label ^ ": connection closed")
+    true
+    (Server_connection.is_closed t.conn)
+
+let test_unread_body_drain_limit () =
+  List.iter
+    (fun (split, chunk) ->
+       let config = { Config.default with max_discard_body = 1000 } in
+       let label = "content-length 1001, " ^ split in
+       let t, response =
+         drain ~config ~chunk ~head:(post_head 1001) ~body_bytes:1001 ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response closes")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nno"
+         response;
+       check_drain_closed label t ~unread:1;
+       let label = "content-length 1000, " ^ split in
+       let t, response =
+         drain ~config ~chunk ~head:(post_head 1000) ~body_bytes:1000 ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response keeps the connection")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         response;
+       Raw.feed ~chunk t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         (label ^ ": next request served")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         (Raw.take_output t);
+       let label = "chunked, " ^ split in
+       let t, response =
+         drain
+           ~config
+           ~chunk
+           ~head:
+             "POST / HTTP/1.1\r\nHost: a\r\ntransfer-encoding: chunked\r\n\r\n"
+           ~body_bytes:0
+           ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response keeps the connection")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         response;
+       let chunks =
+         String.concat
+           ""
+           (List.init 20 (fun _ -> "64\r\n" ^ String.make 100 'x' ^ "\r\n"))
+         ^ "0\r\n\r\n"
+       in
+       Raw.feed ~chunk t chunks;
+       check_drain_closed label t ~unread:(String.length chunks - 1000))
+    drain_splits
+
+let test_unread_body_413_default_limit () =
+  List.iter
+    (fun (split, chunk) ->
+       let t = Raw.create (early_response ~status:`Content_too_large) in
+       Raw.feed ~chunk t (post_head 10_000_000);
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         (split ^ ": 413 closes")
+         "HTTP/1.1 413 Content Too Large\r\n\
+          content-length: 2\r\n\
+          connection: close\r\n\
+          \r\n\
+          no"
+         (Raw.take_output t);
+       Raw.feed ~chunk t (String.make 0x50000 'x');
+       check_drain_closed split t ~unread:(0x50000 - 0x40000))
+    [ "one read", max_int; "4096-byte reads", 4096 ]
+
+(* The application closes the body instead of reading it: the server drops it
+   within the same budget. *)
+let close_body_and_respond ?status reqd =
+  Body.Reader.close (Request_descriptor.request_body reqd);
+  early_response ?status reqd
+
+let test_closed_body_drain_limit () =
+  List.iter
+    (fun (split, chunk) ->
+       let config = { Config.default with max_discard_body = 1000 } in
+       let handler = close_body_and_respond ?status:None in
+       let label = "closed, content-length 1001, " ^ split in
+       let t, response =
+         drain
+           ~config
+           ~handler
+           ~chunk
+           ~head:(post_head 1001)
+           ~body_bytes:1001
+           ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response closes")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nno"
+         response;
+       check_drain_closed label t ~unread:1001;
+       let label = "closed, content-length 1000, " ^ split in
+       let t, response =
+         drain
+           ~config
+           ~handler
+           ~chunk
+           ~head:(post_head 1000)
+           ~body_bytes:1000
+           ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response keeps the connection")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         response;
+       Raw.feed ~chunk t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         (label ^ ": next request served")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         (Raw.take_output t);
+       let chunked_head =
+         "POST / HTTP/1.1\r\nHost: a\r\ntransfer-encoding: chunked\r\n\r\n"
+       in
+       let chunks n =
+         String.concat
+           ""
+           (List.init n (fun _ -> "64\r\n" ^ String.make 100 'x' ^ "\r\n"))
+         ^ "0\r\n\r\n"
+       in
+       let label = "closed, chunked within the limit, " ^ split in
+       let t, response =
+         drain ~config ~handler ~chunk ~head:chunked_head ~body_bytes:0 ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response keeps the connection")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         response;
+       Raw.feed ~chunk t (chunks 5 ^ "GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         (label ^ ": next request served")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         (Raw.take_output t);
+       let label = "closed, chunked past the limit, " ^ split in
+       let t, _ =
+         drain ~config ~handler ~chunk ~head:chunked_head ~body_bytes:0 ()
+       in
+       let chunks = chunks 20 in
+       Raw.feed ~chunk t chunks;
+       check_drain_closed label t ~unread:(String.length chunks - 1000))
+    drain_splits
+
+let test_closed_body_413_default_limit () =
+  List.iter
+    (fun (split, chunk) ->
+       let t = Raw.create (close_body_and_respond ~status:`Content_too_large) in
+       Raw.feed ~chunk t (post_head 10_000_000_000);
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         (split ^ ": 413 closes")
+         "HTTP/1.1 413 Content Too Large\r\n\
+          content-length: 2\r\n\
+          connection: close\r\n\
+          \r\n\
+          no"
+         (Raw.take_output t);
+       Raw.feed ~chunk t (String.make 0x50000 'x');
+       check_drain_closed split t ~unread:0x50000)
+    [ "one read", max_int; "4096-byte reads", 4096 ]
+
+(* A read that ends the input and holds more than the drain budget: the bytes
+   past the budget are offered again, so a pipelined request after a body at the
+   limit is served. *)
+let test_drain_budget_read_eof () =
+  List.iter
+    (fun (split, chunk) ->
+       List.iter
+         (fun (case, config, size) ->
+            let label = case ^ ", " ^ split in
+            let t, response =
+              drain ?config ~chunk ~head:(post_head size) ~body_bytes:0 ()
+            in
+            Alcotest.(check string)
+              (label ^ ": response keeps the connection")
+              "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+              response;
+            Raw.feed
+              ~eof:true
+              ~chunk
+              t
+              (String.make size 'x' ^ "GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+            if Raw.read_op t = `Read then ignore (Raw.read t ~eof:true 0 : int);
+            ignore (Raw.write_all t);
+            Alcotest.(check string)
+              (label ^ ": pipelined request served")
+              "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+              (Raw.take_output t);
+            Alcotest.(check int)
+              (label ^ ": all input read")
+              0
+              (String.length t.Raw.pending);
+            Alcotest.check
+              read_operation
+              (label ^ ": reader closed")
+              `Close
+              (Raw.read_op t))
+         [ ( "limit 1000"
+           , Some { Config.default with max_discard_body = 1000 }
+           , 1000 )
+         ; "default limit", None, 262144
+         ])
+    drain_splits
 
 let test_eof_in_discarded_body () =
   List.iter
@@ -3282,7 +3539,16 @@ let test_bytes_after_upgrade_request_parsed_after_other_response () =
     Raw.feed ~chunk t "";
     ignore (Raw.write_all t);
     let output = first ^ Raw.take_output t in
-    let response = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n" in
+    let connect = String.starts_with ~prefix:"CONNECT" request in
+    let response =
+      if connect
+      then
+        "HTTP/1.1 404 Not Found\r\n\
+         content-length: 0\r\n\
+         connection: close\r\n\
+         \r\n"
+      else "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"
+    in
     Alcotest.(check bool)
       (label ^ ": 404 first")
       true
@@ -3293,7 +3559,21 @@ let test_bytes_after_upgrade_request_parsed_after_other_response () =
         (String.length response)
         (String.length output - String.length response)
     in
-    if trailing = "ping"
+    if connect
+    then (
+      (* A CONNECT not tunnelled closes: the bytes after it may be tunnel
+         data. *)
+      Alcotest.(check string) (label ^ ": nothing more written") "" rest;
+      Alcotest.check
+        read_operation
+        (label ^ ": reader closed")
+        `Close
+        (Raw.read_op t);
+      Alcotest.(check bool)
+        (label ^ ": writer closed")
+        true
+        (Raw.write_all t = `Close))
+    else if trailing = "ping"
     then (
       Alcotest.(check string)
         (label ^ ": incomplete head consumed")
@@ -4165,9 +4445,6 @@ let test_pipelined_handler_exception () =
          (Raw.read_op t))
     splits
 
-let post_head n =
-  Printf.sprintf "POST / HTTP/1.1\r\nHost: a\r\ncontent-length: %d\r\n\r\n" n
-
 let read_timeout_kind conn =
   match Server_connection.read_timeout conn with
   | None -> "none"
@@ -4546,6 +4823,21 @@ let tests =
     , `Quick
     , test_unread_body_discarded_after_response )
   ; "EOF in a discarded request body", `Quick, test_eof_in_discarded_body
+  ; ( "unread body: drain limit -1, at, +1, chunked past it"
+    , `Quick
+    , test_unread_body_drain_limit )
+  ; ( "closed body: drain limit, at, chunked within and past it"
+    , `Quick
+    , test_closed_body_drain_limit )
+  ; ( "closed body: 413 to a 10 GB upload reads none of it"
+    , `Quick
+    , test_closed_body_413_default_limit )
+  ; ( "drain budget: read_eof past it serves a pipelined request"
+    , `Quick
+    , test_drain_budget_read_eof )
+  ; ( "unread body: 413 to a 10 MB body reads 256 KiB, then closes"
+    , `Quick
+    , test_unread_body_413_default_limit )
   ; ( "error handler with invalid headers closes the connection"
     , `Quick
     , test_error_handler_invalid_headers_closes )

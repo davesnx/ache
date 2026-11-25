@@ -95,6 +95,10 @@ module type Client = sig
     -> error_handler:Ache.Client_connection.error_handler
     -> response_handler:Ache.Client_connection.response_handler
     -> Ache.Body.Writer.t
+  (** [request] is {!Ache.Client_connection.request}. For {!Ache_miou.Client},
+      when no request waits for a response and response bytes or the end of
+      input already wait on the socket, it first closes the connection: the
+      request then gets [`Connection_closed]. *)
 
   val shutdown : t -> unit
   (** [shutdown t] closes the connection at once and waits for its task to

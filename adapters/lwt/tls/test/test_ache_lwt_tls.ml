@@ -8,6 +8,10 @@ let localhost = Domain_name.(host_exn (of_string_exn "localhost"))
 let server_errors : Server_connection.error list ref = ref []
 let partial_body_cut = ref false
 
+(* A chunked response of many small buffers, each its own iovec. *)
+let stream_piece = String.make 64 'x'
+let stream_pieces = 1024
+
 let request_handler (_ : Unix.sockaddr) reqd =
   let request = Request_descriptor.request reqd in
   let body = Request_descriptor.request_body reqd in
@@ -39,6 +43,25 @@ let request_handler (_ : Unix.sockaddr) reqd =
     and on_eof () = Alcotest.fail "a cut body completed"
     and on_error () = partial_body_cut := true in
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+  | `GET, "/stream" ->
+    Body.Reader.close body;
+    let response_body =
+      Request_descriptor.respond_with_streaming
+        reqd
+        (Response.create
+           ~headers:(Headers.of_list [ "transfer-encoding", "chunked" ])
+           `OK)
+    in
+    let piece =
+      Ache.Bigstring.of_string
+        ~off:0
+        ~len:(String.length stream_piece)
+        stream_piece
+    in
+    for _ = 1 to stream_pieces do
+      Body.Writer.schedule_bigstring response_body piece
+    done;
+    Body.Writer.close response_body
   | _, target ->
     Body.Reader.close body;
     Request_descriptor.respond_with_string reqd (Response.create `OK) target
@@ -190,6 +213,126 @@ let connect_client connect =
     ~tls:client_config
     ~peer:(`Host localhost)
     fd
+
+(* A TLS client that decrypts the bytes from the server one record at a time, to
+   count the records that carry response bytes. *)
+module Records = struct
+  type t =
+    { mutable state : Tls.Engine.state
+    ; mutable pending : string
+    ; plain : Stdlib.Buffer.t
+    ; mutable data_records : int
+    ; mutable closed : bool
+    }
+
+  let create state =
+    { state
+    ; pending = ""
+    ; plain = Stdlib.Buffer.create 4096
+    ; data_records = 0
+    ; closed = false
+    }
+
+  let rec take t replies =
+    let available = String.length t.pending in
+    let size =
+      if available < 5
+      then max_int
+      else 5 + ((Char.code t.pending.[3] lsl 8) lor Char.code t.pending.[4])
+    in
+    if available < size
+    then List.rev replies
+    else
+      let record = String.sub t.pending 0 size in
+      t.pending <- String.sub t.pending size (available - size);
+      match Tls.Engine.handle_tls t.state record with
+      | Ok (state, eof, `Response reply, `Data data) ->
+        t.state <- state;
+        if Option.is_some eof then t.closed <- true;
+        (match data with
+        | Some data when data <> "" ->
+          t.data_records <- t.data_records + 1;
+          Stdlib.Buffer.add_string t.plain data
+        | _ -> ());
+        take t (Option.fold ~none:replies ~some:(fun r -> r :: replies) reply)
+      | Error (failure, _) ->
+        Alcotest.failf "TLS client: %s" (Tls.Engine.string_of_failure failure)
+
+  (* The replies to send back. *)
+  let feed t bytes =
+    t.pending <- t.pending ^ bytes;
+    take t []
+
+  let send t s =
+    match Tls.Engine.send_application_data t.state [ s ] with
+    | Some (state, data) ->
+      t.state <- state;
+      data
+    | None -> Alcotest.fail "TLS client not ready"
+end
+
+let stream_request =
+  "GET /stream HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+
+let check_stream_records (records : Records.t) =
+  let plain = Stdlib.Buffer.contents records.plain in
+  let body =
+    String.concat "" (List.init stream_pieces (fun _ -> stream_piece))
+  in
+  Alcotest.(check bool)
+    "chunked body"
+    true
+    (String.ends_with
+       ~suffix:
+         (Printf.sprintf "%x\r\n%s\r\n0\r\n\r\n" (String.length body) body)
+       plain);
+  (* One record for each 16 KiB, and one more in case the head goes in a write
+     of its own. Without coalescing it is one for each iovec. *)
+  let limit = ((String.length plain + 0x3fff) / 0x4000) + 1 in
+  if records.data_records > limit
+  then
+    Alcotest.failf
+      "%d application-data records for %d bytes, expected at most %d"
+      records.data_records
+      (String.length plain)
+      limit
+
+let test_stream_records () =
+  with_server (fun connect ->
+    connect () >>= fun fd ->
+    let state, init =
+      Tls.Engine.client (Tls.Config.peer client_config localhost)
+    in
+    let records = Records.create state in
+    let rec write s off =
+      if off = String.length s
+      then Lwt.return_unit
+      else
+        Lwt_unix.write_string fd s off (String.length s - off) >>= fun n ->
+        write s (off + n)
+    in
+    let buf = Bytes.create 0x4000 in
+    let rec pump ~reply until =
+      if until ()
+      then Lwt.return_unit
+      else
+        Lwt_unix.read fd buf 0 (Bytes.length buf) >>= function
+        | 0 -> Lwt.return_unit
+        | n ->
+          let replies = Records.feed records (Bytes.sub_string buf 0 n) in
+          (if reply
+           then Lwt_list.iter_s (fun s -> write s 0) replies
+           else Lwt.return_unit)
+          >>= fun () -> pump ~reply until
+    in
+    write init 0 >>= fun () ->
+    pump ~reply:true (fun () ->
+      not (Tls.Engine.handshake_in_progress records.state))
+    >>= fun () ->
+    write (Records.send records stream_request) 0 >>= fun () ->
+    pump ~reply:false (fun () -> records.closed) >>= fun () ->
+    check_stream_records records;
+    Lwt_unix.close fd)
 
 let body_result = Alcotest.(result string string)
 
@@ -657,6 +800,10 @@ let () =
     "ache-lwt-tls"
     [ ( "tls"
       , [ Alcotest.test_case "GET" `Quick test_get
+        ; Alcotest.test_case
+            "a streamed response: one TLS record for each 16 KiB"
+            `Quick
+            test_stream_records
         ; Alcotest.test_case "POST echo of 200 kB" `Quick test_post_echo
         ; Alcotest.test_case "client pipelines" `Quick test_client_pipelined
         ; Alcotest.test_case

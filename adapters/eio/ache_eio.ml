@@ -53,18 +53,20 @@ module IO_loop = struct
         | Eio.Io (Eio.Net.E (Connection_reset _), _) ) ->
       `Closed
 
-  let read_once flow buffer =
+  let read_once ~on_read flow buffer =
     let result = ref 0 in
     Buffer.put
       ~f:(fun buf ~off ~len k ->
         let cstruct = Cstruct.of_bigarray buf ~off ~len in
-        k (Eio.Flow.single_read flow cstruct))
+        let n = Eio.Flow.single_read flow cstruct in
+        on_read buf ~off ~len:n;
+        k n)
       buffer
       (fun n -> result := n);
     !result
 
-  let read flow buffer =
-    match read_once flow buffer with
+  let read ~on_read flow buffer =
+    match read_once ~on_read flow buffer with
     | r -> r
     | exception
         ( Unix.Unix_error (ENOTCONN, _, _)
@@ -94,6 +96,7 @@ module IO_loop = struct
           -> ((unit -> int) -> (int, [ `Timeout ]) result) option)
     -> linger:bool
     -> ?body_read:body_read
+    -> ?on_read:(Ache.Bigstring.t -> off:int -> len:int -> unit)
     -> t
     -> _ Eio.Flow.two_way
     -> unit
@@ -104,6 +107,7 @@ module IO_loop = struct
      ~timeout
      ~linger:lingers
      ?(body_read = no_body_read)
+     ?(on_read = fun _ ~off:_ ~len:_ -> ())
      t
      socket ->
     Switch.run @@ fun sw ->
@@ -202,7 +206,7 @@ module IO_loop = struct
         then Eio.Condition.loop_no_mutex request_read requested;
         read_requested := false;
         (read_result :=
-           match read socket read_buffer with
+           match read ~on_read socket read_buffer with
            | n -> Some (Ok n)
            | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
            | exception exn -> Some (Error exn));
@@ -243,7 +247,7 @@ module IO_loop = struct
         | None when interruptible || !pending_read -> Ok (daemon_read ())
         | None ->
           direct_pending := true;
-          (match read socket read_buffer with
+          (match read ~on_read socket read_buffer with
           | n ->
             direct_read_ended ();
             Ok n
@@ -691,7 +695,40 @@ module Client = struct
     ; runtime : Upgradable.t
     ; shutdown_reader : unit -> unit
     ; shutdown_complete : unit Promise.t
+    ; fd : Eio_unix.Fd.t option
+    ; unread : bool ref
     }
+
+  let rec has_response_byte buf i stop =
+    i < stop
+    &&
+    match Ache.Bigstring.unsafe_get buf i with
+    | '\r' | '\n' -> has_response_byte buf (i + 1) stop
+    | _ -> true
+
+  (* Bytes other than empty lines, or the end of input, that wait on [fd]. Only
+     for a non-blocking [fd], so that [recv] does not wait. *)
+  let input_waiting fd =
+    Eio_unix.Fd.use
+      fd
+      ~if_closed:(fun () -> false)
+      (fun fd ->
+         let buf = Bytes.create 64 in
+         match Unix.recv fd buf 0 (Bytes.length buf) [ Unix.MSG_PEEK ] with
+         | n ->
+           n = 0
+           || Bytes.exists
+                (function '\r' | '\n' -> false | _ -> true)
+                (Bytes.sub buf 0 n)
+         | exception Unix.Unix_error ((ECONNRESET | ECONNABORTED | EPIPE), _, _)
+           ->
+           true
+         | exception Unix.Unix_error _ -> false)
+
+  let non_blocking fd =
+    match Eio_unix.Fd.is_blocking fd with
+    | blocking -> not blocking
+    | exception _ -> false
 
   let create_connection ?(config = Ache.Config.default) ~sw socket =
     let connection = Ache.Client_connection.create ~config () in
@@ -701,15 +738,33 @@ module Client = struct
     in
     let shutdown_p, shutdown_u = Promise.create () in
     let read_closed = Promise.create () in
+    (* [unread]: a read returned response bytes that the connection has not been
+       given yet. The read runs in its own fiber, so the read loop gets them
+       later. *)
+    let unread = ref false in
+    let module Engine = struct
+      include Upgradable
+
+      let read t buf ~off ~len =
+        unread := false;
+        Upgradable.read t buf ~off ~len
+
+      let read_eof t buf ~off ~len =
+        unread := false;
+        Upgradable.read_eof t buf ~off ~len
+    end
+    in
     Fiber.fork ~sw (fun () ->
       Fun.protect ~finally:(Promise.resolve shutdown_u) (fun () ->
         match
           IO_loop.start
-            (module Upgradable)
+            (module Engine)
             ~read_buffer_size:config.read_buffer_size
             ~read_closed
             ~timeout:IO_loop.no_timeout
             ~linger:true
+            ~on_read:(fun buf ~off ~len ->
+              if has_response_byte buf off (off + len) then unread := true)
             runtime
             socket
         with
@@ -724,13 +779,50 @@ module Client = struct
           if not (Promise.is_resolved cancel_reader)
           then Promise.resolve resolve_cancel_reader ())
     ; shutdown_complete = shutdown_p
+    ; fd =
+        (match Eio_unix.Resource.fd_opt socket with
+        | Some fd when non_blocking fd -> Some fd
+        | Some _ | None -> None)
+    ; unread
     }
 
-  let request t = Ache.Client_connection.request t.connection
+  let shutdown_now t =
+    t.shutdown_reader ();
+    Upgradable.shutdown t.runtime
+
+  let request
+        t
+        ?flush_headers_immediately
+        request
+        ~error_handler
+        ~response_handler
+    =
+    (* Response bytes that wait on an idle connection would be taken as the
+       response to this request (undici GHSA-35p6-xmwp-9g52): close the
+       connection instead. io_uring completes a read before its fiber runs:
+       yield so that a complete read returns, then look at what reads returned
+       and at the socket. *)
+    let waiting () =
+      Ache.Ache_private.Client_connection.is_waiting t.connection
+    in
+    if waiting ()
+    then (
+      Fiber.yield ();
+      Fiber.yield ();
+      if
+        waiting ()
+        && (!(t.unread)
+           || match t.fd with Some fd -> input_waiting fd | None -> false)
+      then shutdown_now t);
+    Ache.Client_connection.request
+      t.connection
+      ?flush_headers_immediately
+      request
+      ~error_handler
+      ~response_handler
 
   let shutdown t =
-    t.shutdown_reader ();
-    Upgradable.shutdown t.runtime;
+    shutdown_now t;
     t.shutdown_complete
 
   let is_closed t = Upgradable.is_closed t.runtime

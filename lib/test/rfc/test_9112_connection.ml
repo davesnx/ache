@@ -504,7 +504,11 @@ let client_tests =
   [ test
       "§9.2 client MUST: pipelined responses matched to requests in order"
       (fun () ->
-         let c = Client.create () in
+         let c =
+           Client.create
+             ~config:{ Config.default with max_pipelined_requests = 16 }
+             ()
+         in
          let ex1 = client_send c "/1" in
          let ex2 = client_send c "/2" in
          Alcotest.(check string)
@@ -633,7 +637,11 @@ let client_tests =
       "§9.3.2 client SHOULD: unanswered pipelined request reported when the \
        connection closes"
       (fun () ->
-         let c = Client.create () in
+         let c =
+           Client.create
+             ~config:{ Config.default with max_pipelined_requests = 16 }
+             ()
+         in
          let _ex1 = client_send c "/1" in
          let ex2 = client_send c "/2" in
          Alcotest.(check string)

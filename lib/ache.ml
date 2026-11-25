@@ -39,6 +39,10 @@ module Ache_private = struct
       respd
   end
 
+  module Client_connection = struct
+    let is_waiting = Client_connection.is_waiting
+  end
+
   module Parse = Parse
   module Serialize = Serialize
 end

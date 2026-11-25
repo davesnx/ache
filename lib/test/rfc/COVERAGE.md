@@ -12,8 +12,8 @@ Test names are in `lib/test/rfc/test_s*.ml`; a name followed by "(RFC 9112 suite
 
 | Status | Rows |
 |---|---|
-| Tested | 93 |
-| Out of scope | 352 |
+| Tested | 96 |
+| Out of scope | 349 |
 | Total | 445 (412 keyword sentences, 33 DEF rows) |
 
 ## Requirements
@@ -32,15 +32,15 @@ Test names are in `lib/test/rfc/test_s*.ml`; a name followed by "(RFC 9112 suite
 | §3.3#1 | n/a | MUST NOT | As a result, a server MUST NOT assume that two requests on the same connection are from the same user agent unless the connection is ... | out of scope: library has no notion of user agent identity across requests; application concern |
 | §3.8#1 | n/a | MAY | Any client or server MAY employ a cache, though a cache cannot be used while acting as a tunnel. | out of scope: caches (RFC 9111); the library has no cache |
 | §4.1#1 | both | RECOMMENDED | It is RECOMMENDED that all senders and recipients support, at a minimum, URIs with lengths of 8000 octets in protocol elements. | `§4.1 server RECOMMENDED: an 8000-octet request target reaches the handler`<br>`§4.1 client RECOMMENDED: an 8000-octet request target is written unchanged` |
-| §4.2.1#1 | n/a | MUST NOT | A sender MUST NOT generate an "http" URI with an empty host identifier. | out of scope: URI processing: the library keeps the request-target as an opaque string and does not resolve URIs |
-| §4.2.1#2 | n/a | MUST | A recipient that processes such a URI reference MUST reject it as invalid. | out of scope: URI processing: the library keeps the request-target as an opaque string and does not resolve URIs |
-| §4.2.2#1 | n/a | MUST NOT | A sender MUST NOT generate an "https" URI with an empty host identifier. | out of scope: URI processing: the library keeps the request-target as an opaque string and does not resolve URIs |
-| §4.2.2#2 | n/a | MUST | A recipient that processes such a URI reference MUST reject it as invalid. | out of scope: URI processing: the library keeps the request-target as an opaque string and does not resolve URIs |
+| §4.2.1#1 | n/a | MUST NOT | A sender MUST NOT generate an "http" URI with an empty host identifier. | out of scope: the application chooses the request-target; Client_connection writes it unchanged |
+| §4.2.1#2 | server | MUST | A recipient that processes such a URI reference MUST reject it as invalid. | `§4.2.1 server MUST: 400 for an http URI with an empty host` |
+| §4.2.2#1 | n/a | MUST NOT | A sender MUST NOT generate an "https" URI with an empty host identifier. | out of scope: the application chooses the request-target; Client_connection writes it unchanged |
+| §4.2.2#2 | server | MUST | A recipient that processes such a URI reference MUST reject it as invalid. | `§4.2.2 server MUST: 400 for an https URI with an empty host` |
 | §4.2.2#3 | n/a | MUST | A client MUST ensure that its HTTP requests for an "https" resource are secured, prior to being communicated, and that it only accepts secured responses ... | out of scope: URI processing: the library keeps the request-target as an opaque string and does not resolve URIs |
 | §4.2.3#1 | n/a | MAY | Two HTTP URIs that are equivalent after normalization (using any method) can be assumed to identify the same resource, and any HTTP component MAY perform ... | out of scope: URI normalization and resource naming: application |
 | §4.2.3#2 | n/a | SHOULD NOT | As a result, distinct resources SHOULD NOT be identified by HTTP URIs that are equivalent after normalization (using any method defined in Section 6.2 of ... | out of scope: URI normalization and resource naming: application |
-| §4.2.4#1 | n/a | MUST NOT | A sender MUST NOT generate the userinfo subcomponent (and its "@" delimiter) when an "http" or "https" URI reference is generated within a message as ... | out of scope: URI processing: the library keeps the request-target as an opaque string and does not resolve URIs |
-| §4.2.4#2 | n/a | SHOULD | Before making use of an "http" or "https" URI reference received from an untrusted source, a recipient SHOULD parse for userinfo and treat its presence ... | out of scope: URI processing: the library keeps the request-target as an opaque string and does not resolve URIs |
+| §4.2.4#1 | n/a | MUST NOT | A sender MUST NOT generate the userinfo subcomponent (and its "@" delimiter) when an "http" or "https" URI reference is generated within a message as ... | out of scope: the application chooses the request-target; Client_connection writes it unchanged |
+| §4.2.4#2 | server | SHOULD | Before making use of an "http" or "https" URI reference received from an untrusted source, a recipient SHOULD parse for userinfo and treat its presence ... | `§4.2.4 server SHOULD: 400 for userinfo in an http or https target`<br>`§4.2.4 server DEF: an @ after the authority is not userinfo` |
 | §4.3.2#1 | n/a | MAY | When an "http" URI is used within a context that calls for access to the indicated resource, a client MAY attempt access by resolving the ... | out of scope: connection establishment, TLS and certificate checks belong to the runtime/TLS layer, not the core library |
 | §4.3.3#1 | n/a | MAY | When an "https" URI is used within a context that calls for access to the indicated resource, a client MAY attempt access by resolving the ... | out of scope: connection establishment, TLS and certificate checks belong to the runtime/TLS layer, not the core library |
 | §4.3.4#1 | n/a | MUST | To establish a secured connection to dereference a URI, a client MUST verify that the service's identity is an acceptable match for the URI's origin ... | out of scope: connection establishment, TLS and certificate checks belong to the runtime/TLS layer, not the core library |

@@ -28,6 +28,7 @@
   (ocaml
    (>= 5.3))
   (alcotest :with-test)
+  (qcheck-core :with-test)
   (ocamlformat
    (and
     (= 0.29.0)

@@ -167,6 +167,7 @@ let create
           ~writer
           ~response_body_buffer
           ~proxy:config.proxy
+          ~max_discard_body:config.max_discard_body
           request
           request_body
       in
@@ -308,7 +309,11 @@ let rec _next_read_operation t =
       | Complete ->
         if Option.is_some (Request_descriptor.response reqd)
         then Body.Reader.discard (Request_descriptor.request_body reqd);
-        Reader.next t.reader
+        if Request_descriptor.discard_budget_spent reqd
+        then (
+          shutdown t;
+          `Close)
+        else Reader.next t.reader
       | Wait | Ready ->
         (* `Wait` signals that we should add backpressure to the read channel, *
            meaning the reader should tell the runtime to yield. * * The
@@ -371,7 +376,27 @@ let next_read_operation t =
 let read_with_more t bs ~off ~len more =
   Writer.hold t.writer;
   match
+    let discarding =
+      if is_active t
+      then
+        let reqd = current_reqd_exn t in
+        Option.map
+          (fun budget -> reqd, budget)
+          (Request_descriptor.discard_budget reqd)
+      else None
+    in
+    let len, more =
+      match discarding with
+      | Some (_, budget) when budget < len ->
+        (* Bytes past the budget are not offered, so the input has not ended
+           yet: the runtime offers them again. *)
+        budget, Parse.Incomplete
+      | Some _ | None -> len, more
+    in
     let consumed = Reader.read_with_more t.reader bs ~off ~len more in
+    (match discarding with
+    | Some (reqd, _) -> Request_descriptor.add_discarded reqd consumed
+    | None -> ());
     (if is_active t
      then
        let reqd = current_reqd_exn t in

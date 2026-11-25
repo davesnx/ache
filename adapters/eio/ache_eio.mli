@@ -186,6 +186,11 @@ module Client : sig
     -> error_handler:Ache.Client_connection.error_handler
     -> response_handler:Ache.Client_connection.response_handler
     -> Ache.Body.Writer.t
+  (** [request] is {!Ache.Client_connection.request}. When no request waits
+      for a response, it first yields twice, so that a read that is complete
+      reaches the connection, and closes the connection if response bytes
+      or the end of input already arrived: the request then gets
+      [`Connection_closed]. *)
 
   val shutdown : t -> unit Eio.Promise.t
   val is_closed : t -> bool
