@@ -39,6 +39,9 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   body, with no sockets and no runtime.
 - `Request_descriptor.respond_with_informational`, for `100 Continue` and
   `103 Early Hints`.
+- `Config.auto_continue` (default `false`): the first read of the body of a
+  request with `Expect: 100-continue` sends `100 Continue`, unless a
+  response has started.
 - Server timeouts `?idle_timeout` and `?head_timeout`, and
   `Config.max_header_size`.
 - `Config.max_pending_output` (64 KiB): while more response bytes wait to

@@ -84,6 +84,21 @@ type t =
   ; proxy : bool
   }
 
+let continue_response = Response.create `Continue
+
+let expects_continue (request : Request.t) =
+  Message.at_least_v1_1 request.version
+  && Message.has_member
+       (Headers.get_multi request.headers "expect")
+       "100-continue"
+
+let send_continue t =
+  match t.response_state, t.error_code with
+  | Waiting, `Ok when not (Writer.is_closed t.writer) ->
+    Writer.write_response t.writer continue_response;
+    Writer.wakeup t.writer
+  | _ -> ()
+
 let create
       ~error_handler
       ~upgrade
@@ -91,21 +106,33 @@ let create
       ~writer
       ~response_body_buffer
       ~proxy
+      ~auto_continue
       request
       request_body
   =
-  { request
-  ; request_body
-  ; reader
-  ; writer
-  ; response_body_buffer
-  ; error_handler
-  ; upgrade
-  ; persistent = Request.persistent_connection request
-  ; response_state = Waiting
-  ; error_code = `Ok
-  ; proxy
-  }
+  let t =
+    { request
+    ; request_body
+    ; reader
+    ; writer
+    ; response_body_buffer
+    ; error_handler
+    ; upgrade
+    ; persistent = Request.persistent_connection request
+    ; response_state = Waiting
+    ; error_code = `Ok
+    ; proxy
+    }
+  in
+  if
+    auto_continue
+    && (not (Body.Reader.is_closed request_body))
+    && expects_continue request
+  then
+    Body.Reader.set_on_first_read
+      request_body
+      (Optional_thunk.some (fun () -> send_continue t));
+  t
 
 let request { request; _ } = request
 let request_body { request_body; _ } = request_body
@@ -230,6 +257,8 @@ let respond_with_informational t (response : Response.t) =
        transfer-encoding in a 1xx";
   match t.response_state with
   | Waiting ->
+    if Status.to_code response.status = 100
+    then Body.Reader.set_on_first_read t.request_body Optional_thunk.none;
     if Message.at_least_v1_1 t.request.version
     then (
       write_response t response;

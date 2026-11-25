@@ -106,7 +106,10 @@ module Body : sig
 
         [on_read] receives every byte available at the time of the call. The
         library does not reuse the bytes it passes to [on_read], so the
-        application may keep them after [on_read] returns. *)
+        application may keep them after [on_read] returns.
+
+        With {!Config.auto_continue}, the first call on a server request body
+        may send [100 Continue]. *)
 
     val close : t -> unit
     (** [close t] closes [t]: input received after it is discarded. Bytes
@@ -391,8 +394,9 @@ module Request_descriptor : sig
       for example [100 Continue] to a request with [Expect: 100-continue]
       (RFC 9110 §10.1.1), or [103 Early Hints]. Only the head is sent. A final
       response must follow with one of the other [respond_with_*] functions.
-      It can be called more than once. ache never sends [100 Continue] on its
-      own: the request handler decides.
+      It can be called more than once. ache sends [100 Continue] on its own
+      only with {!Config.auto_continue}; then an explicit [100 Continue] sent
+      first is not sent again.
 
       Nothing is sent to an HTTP/1.0 request (RFC 9110 §15.2).
 
@@ -445,6 +449,15 @@ module Config : sig
           connection reads and dispatches no new request. A client that
           pipelines requests and does not read the responses then stops
           being read. Default is [65536]. *)
+    ; auto_continue : bool
+      (** Server: when [true], the first {!Body.Reader.schedule_read} on the
+          body of an HTTP/1.1 request with [Expect: 100-continue] sends
+          [100 Continue] (RFC 9110 §10.1.1), unless a response has started or
+          a [100 Continue] was sent with
+          {!Request_descriptor.respond_with_informational}. It is sent even
+          when body bytes already arrived. A request without a body, an
+          HTTP/1.0 request, or one that the handler answers without reading
+          its body gets no [100 Continue]. Default is [false]. *)
     }
 
   val default : t

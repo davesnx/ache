@@ -6,6 +6,7 @@ type t =
   ; max_header_size : int
   ; proxy : bool
   ; max_pending_output : int
+  ; auto_continue : bool
   }
 
 let default =
@@ -16,4 +17,5 @@ let default =
   ; max_header_size = 0x4000
   ; proxy = false
   ; max_pending_output = 0x10000
+  ; auto_continue = false
   }

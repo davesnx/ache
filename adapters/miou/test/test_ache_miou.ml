@@ -2362,6 +2362,77 @@ let test_server_run_on_error () =
       "on_error got [%s], expected [Error_handler_failed]"
       (String.concat "; " (List.map Printexc.to_string errors))
 
+let continue_size = 2 * 1024 * 1024
+
+let continue_request =
+  Printf.sprintf
+    "POST /upload HTTP/1.1\r\n\
+     host: localhost\r\n\
+     expect: 100-continue\r\n\
+     content-length: %d\r\n\
+     \r\n"
+    continue_size
+
+let continue_100 = "HTTP/1.1 100 Continue\r\n\r\n"
+
+let continue_final =
+  Printf.sprintf "HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\n%d" continue_size
+
+let continue_handler _ reqd =
+  let body = Request_descriptor.request_body reqd in
+  let received = ref 0 in
+  let rec on_read _ ~off:_ ~len =
+    received := !received + len;
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+  and on_eof () =
+    let s = string_of_int !received in
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create
+         ~headers:
+           (Headers.of_list
+              [ "content-length", string_of_int (String.length s) ])
+         `OK)
+      s
+  and on_error () = () in
+  Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+
+let auto_continue = { Config.default with auto_continue = true }
+
+let test_auto_continue_upload () =
+  Miou_unix.run ~domains:0 (fun () ->
+    let server, client = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+    let server = Miou_unix.of_file_descr server
+    and client = Miou_unix.of_file_descr client in
+    let handler =
+      Miou.async (fun () ->
+        Ache_miou.Server.create_connection_handler
+          ~config:auto_continue
+          ~request_handler:continue_handler
+          ~error_handler
+          server
+          (Unix.ADDR_UNIX "socketpair"))
+    in
+    Fun.protect
+      ~finally:(fun () ->
+        Miou_unix.close server;
+        Miou_unix.close client)
+      (fun () ->
+         with_timeout 5.0 (fun () ->
+           send client continue_request;
+           Alcotest.(check string)
+             "100 Continue within 0.5 s"
+             continue_100
+             (with_timeout 0.5 (fun () ->
+                take client (String.length continue_100)));
+           send client (String.make continue_size 'x');
+           Alcotest.(check string)
+             "the whole body was read"
+             continue_final
+             (take client (String.length continue_final));
+           shutdown_send client);
+         match Miou.await handler with Ok () -> () | Error exn -> raise exn))
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Option.iter
@@ -2373,6 +2444,9 @@ let () =
     "ache-miou loopback"
     [ ( "loopback"
       , [ "GET", `Quick, test_get
+        ; ( "Expect: 100-continue upload with auto_continue"
+          , `Quick
+          , test_auto_continue_upload )
         ; "POST echo larger than the read buffer", `Quick, test_post_echo
         ; "two pipelined requests", `Quick, test_pipelined
         ; "101 upgrade to an echo protocol", `Quick, test_upgrade

@@ -1775,12 +1775,73 @@ let test_timeout_create_must_be_positive () =
        | exception Invalid_argument _ -> ())
     [ 0.; -1.; Float.nan ]
 
+let continue_size = 2 * 1024 * 1024
+
+let continue_request =
+  Printf.sprintf
+    "POST /upload HTTP/1.1\r\n\
+     host: localhost\r\n\
+     expect: 100-continue\r\n\
+     content-length: %d\r\n\
+     \r\n"
+    continue_size
+
+let continue_100 = "HTTP/1.1 100 Continue\r\n\r\n"
+
+let continue_final =
+  Printf.sprintf "HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\n%d" continue_size
+
+let continue_handler _ reqd =
+  let body = Request_descriptor.request_body reqd in
+  let received = ref 0 in
+  let rec on_read _ ~off:_ ~len =
+    received := !received + len;
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+  and on_eof () =
+    let s = string_of_int !received in
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create
+         ~headers:
+           (Headers.of_list
+              [ "content-length", string_of_int (String.length s) ])
+         `OK)
+      s
+  and on_error () = () in
+  Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+
+let auto_continue = { Config.default with auto_continue = true }
+
+let test_auto_continue_upload () =
+  with_server
+    ~connection_handler:(fun ~request_handler:_ ~error_handler addr socket ->
+      Ache_lwt.Server.create_connection_handler
+        ~config:auto_continue
+        ~request_handler:continue_handler
+        ~error_handler
+        addr
+        socket)
+    (fun connect ->
+       connect () >>= fun socket ->
+       write_all socket continue_request >>= fun () ->
+       Lwt_unix.with_timeout 0.5 (fun () ->
+         read_exactly socket (String.length continue_100))
+       >>= fun interim ->
+       Alcotest.(check string) "100 Continue within 0.5 s" continue_100 interim;
+       write_all socket (String.make continue_size 'x') >>= fun () ->
+       read_exactly socket (String.length continue_final) >>= fun final ->
+       Alcotest.(check string) "the whole body was read" continue_final final;
+       Lwt_unix.close socket)
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
     "ache-lwt loopback"
     [ ( "loopback"
       , [ "GET", `Quick, test_get
+        ; ( "Expect: 100-continue upload with auto_continue"
+          , `Quick
+          , test_auto_continue_upload )
         ; "POST echo larger than the read buffer", `Quick, test_post_echo
         ; "two pipelined requests", `Quick, test_pipelined
         ; ( "a flooding client does not block the event loop"

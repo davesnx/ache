@@ -43,6 +43,7 @@ module Reader = struct
     ; mutable eof_has_been_called : bool
     ; mutable on_read : Bigstring.t -> off:int -> len:int -> unit
     ; when_ready_to_read : Optional_thunk.t
+    ; mutable on_first_read : Optional_thunk.t
     }
 
   let default_on_eof = Sys.opaque_identity (fun () -> ())
@@ -62,6 +63,7 @@ module Reader = struct
     ; discarding = false
     ; on_read = default_on_read
     ; when_ready_to_read
+    ; on_first_read = Optional_thunk.none
     }
 
   let create_empty () =
@@ -70,6 +72,7 @@ module Reader = struct
     t
 
   let is_closed t = t.closed
+  let set_on_first_read t f = t.on_first_read <- f
   let ready_to_read t = Optional_thunk.call_if_some t.when_ready_to_read
 
   (* The application may keep bytes passed to [on_read]: never reuse them. *)
@@ -122,6 +125,11 @@ module Reader = struct
       t.on_eof <- on_eof;
       t.on_error <- on_error;
       t.on_read <- on_read);
+    if Optional_thunk.is_some t.on_first_read
+    then (
+      let f = t.on_first_read in
+      t.on_first_read <- Optional_thunk.none;
+      Optional_thunk.call_if_some f);
     do_execute_read t ~on_error on_eof on_read;
     ready_to_read t
 

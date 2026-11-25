@@ -51,9 +51,9 @@ let feed s input =
   s.pending <- s.pending ^ input;
   pump s
 
-let server ?(error_handler = fun ?request:_ _ _ -> ()) handler input =
+let server ?config ?(error_handler = fun ?request:_ _ _ -> ()) handler input =
   let s =
-    { conn = Server_connection.create ~error_handler handler
+    { conn = Server_connection.create ?config ~error_handler handler
     ; out = Buffer.create 256
     ; pending = ""
     ; read_op = `Read
@@ -663,6 +663,131 @@ let tests =
       , `Quick
       , test_several_informational )
     ; "1xx misuse raises Invalid_argument", `Quick, test_informational_misuse
+    ]
+
+let auto_continue = { Config.default with auto_continue = true }
+let continue_head = "HTTP/1.1 100 Continue\r\n\r\n"
+let got_hello = "HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\ngot hello"
+
+let test_auto_continue () =
+  List.iter
+    (fun (label, request, body) ->
+       let s =
+         server ~config:auto_continue (informational_then_final []) request
+       in
+       Alcotest.(check string)
+         (label ^ ": 100 at the first read")
+         continue_head
+         (Buffer.contents s.out);
+       feed s body;
+       Alcotest.(check string)
+         (label ^ ": final response after the body")
+         (continue_head ^ got_hello)
+         (Buffer.contents s.out))
+    [ "Content-Length", expect_continue (), "hello"
+    ; ( "chunked, mixed case"
+      , req
+          ~headers:[ "Expect", "100-Continue"; "Transfer-Encoding", "chunked" ]
+          "POST"
+      , "5\r\nhello\r\n0\r\n\r\n" )
+    ]
+
+let test_auto_continue_body_arrived () =
+  let s =
+    server
+      ~config:auto_continue
+      (informational_then_final [])
+      (expect_continue () ^ "hello")
+  in
+  Alcotest.(check string)
+    "100, then the final response"
+    (continue_head ^ got_hello)
+    (Buffer.contents s.out)
+
+let test_auto_continue_response_first () =
+  let s =
+    server
+      ~config:auto_continue
+      (fun reqd ->
+         with_string `Content_too_large "" reqd;
+         Body.Reader.schedule_read
+           (Request_descriptor.request_body reqd)
+           ~on_eof:ignore
+           ~on_error:ignore
+           ~on_read:(fun _ ~off:_ ~len:_ -> ()))
+      (expect_continue ())
+  in
+  Alcotest.(check string)
+    "only the final response"
+    "HTTP/1.1 413 Content Too Large\r\ncontent-length: 0\r\n\r\n"
+    (Buffer.contents s.out)
+
+let test_auto_continue_not_sent () =
+  List.iter
+    (fun (label, request, final) ->
+       let s =
+         server ~config:auto_continue (informational_then_final []) request
+       in
+       Alcotest.(check string) label final (Buffer.contents s.out))
+    [ ( "HTTP/1.0"
+      , expect_continue ~version:"HTTP/1.0" () ^ "hello"
+      , "HTTP/1.1 200 OK\r\n\
+         content-length: 9\r\n\
+         connection: close\r\n\
+         \r\n\
+         got hello" )
+    ; ( "no expectation"
+      , req ~headers:[ "Content-Length", "5" ] "POST" ^ "hello"
+      , got_hello )
+    ; ( "another expectation"
+      , req ~headers:[ "Expect", "x"; "Content-Length", "5" ] "POST" ^ "hello"
+      , got_hello )
+    ; ( "empty body"
+      , req ~headers:[ "Expect", "100-continue"; "Content-Length", "0" ] "POST"
+      , "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\ngot " )
+    ]
+
+let test_auto_continue_not_doubled () =
+  List.iter
+    (fun (label, interim, expected) ->
+       let s =
+         server
+           ~config:auto_continue
+           (informational_then_final interim)
+           (expect_continue () ^ "hello")
+       in
+       Alcotest.(check string) label expected (Buffer.contents s.out))
+    [ "explicit 100", [ `Continue ], continue_head ^ got_hello
+    ; ( "explicit 103"
+      , [ `Early_hints ]
+      , "HTTP/1.1 103 Early Hints\r\n\r\n" ^ continue_head ^ got_hello )
+    ]
+
+let test_auto_continue_off_by_default () =
+  let s = server (informational_then_final []) (expect_continue ()) in
+  Alcotest.(check string) "nothing before the body" "" (Buffer.contents s.out);
+  feed s "hello";
+  Alcotest.(check string)
+    "only the final response"
+    got_hello
+    (Buffer.contents s.out)
+
+let tests =
+  tests
+  @ [ "auto_continue: 100 at the first read", `Quick, test_auto_continue
+    ; ( "auto_continue: 100 when the body already arrived"
+      , `Quick
+      , test_auto_continue_body_arrived )
+    ; ( "auto_continue: a response first cancels it"
+      , `Quick
+      , test_auto_continue_response_first )
+    ; ( "auto_continue: not for HTTP/1.0, other or no expectation, or no body"
+      , `Quick
+      , test_auto_continue_not_sent )
+    ; ( "auto_continue: an explicit 100 is not doubled"
+      , `Quick
+      , test_auto_continue_not_doubled )
+    ; "auto_continue: off by default", `Quick, test_auto_continue_off_by_default
     ]
 
 let test_pipelined_after_no_body () =

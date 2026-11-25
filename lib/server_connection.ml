@@ -170,6 +170,7 @@ let create
           ~writer
           ~response_body_buffer
           ~proxy:config.proxy
+          ~auto_continue:config.auto_continue
           request
           request_body
       in

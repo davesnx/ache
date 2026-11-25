@@ -135,6 +135,11 @@ httpun rejected chunk extensions and trailers.
   write past its `Content-Length`.
 - `Request_descriptor.respond_with_informational` sends `100 Continue`,
   `103 Early Hints` or another interim response before the final response.
+  With `Config.auto_continue` (default `false`), the first
+  `Body.Reader.schedule_read` on the body of an HTTP/1.1 request with
+  `Expect: 100-continue` sends `100 Continue`, unless a response has started
+  or a `100 Continue` was already sent. A handler that responds without
+  reading the body sends no `100 Continue`.
 - `Request_descriptor.respond_with_upgrade` on a `CONNECT` request sends a
   2xx (`200` unless `?status` says otherwise) and gives the connection to
   the tunnel, with the bytes that came after the `CONNECT` head. A 2xx
