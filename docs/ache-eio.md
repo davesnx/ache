@@ -165,10 +165,83 @@ let () =
 
 ## WebSocket
 
-`ache-eio` has no promise API for WebSocket. Use the callbacks of
-`Ache.Websocket` in the request handler, as in [WebSocket in
-ache.md](ache.md#websocket). The callbacks run in the read and write loops of
-the connection. The connection has no lock: call `send_text`, `flush`,
+`Ache_eio.Websocket` gives the WebSocket server of
+[ache.md](ache.md#websocket) a direct-style API. Call `upgrade` in the
+request handler with the function that runs the session:
+
+```ocaml
+open Ache
+
+let rec echo ws =
+  match Ache_eio.Websocket.receive ws with
+  | None -> ()
+  | Some (Text "bye") -> Ache_eio.Websocket.close ~reason:"bye" ws 1000
+  | Some (Text message) ->
+    Ache_eio.Websocket.send_text ws message;
+    echo ws
+  | Some (Binary message) ->
+    Ache_eio.Websocket.send_binary ws message;
+    echo ws
+
+let request_handler _client_address reqd =
+  match Ache_eio.Websocket.upgrade reqd echo with
+  | Ok () -> ()
+  | Error _ ->
+    let headers = Headers.of_list [ "content-length", "0" ] in
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers `Bad_request)
+      ""
+```
+
+- `upgrade` checks the handshake and responds with `101`, as
+  `Ache.Websocket.upgrade` does. On `Error _` it responds nothing: send the
+  response yourself, for example `426` with `Sec-WebSocket-Version: 13` for
+  `` Error `Unsupported_version ``. Call it in the request handler of
+  `Server.create_connection_handler`, `Server.run` or
+  `Ache_eio_tls.Server`, or in a fiber forked from it; elsewhere it raises
+  `Invalid_argument`.
+- The session runs in its own fiber of the connection, on the domain that
+  runs the connection, after `upgrade` has returned. The connection handler
+  returns when the connection has ended and the session has returned. The
+  session is not cancelled when the socket closes: `receive` then returns
+  `None`, and the other functions return or raise
+  `Ache_eio.Websocket.Closed`, so the session ends. It is cancelled when the
+  connection's fiber is, for example when the server stops.
+- A session that raises `Closed` ends normally. When it raises another
+  exception, the connection sends a close frame with code `1011`, and the
+  handler raises the exception after the connection ends, to the `on_error`
+  of `Eio.Net.run_server` or `Server.run`.
+- `receive` waits for the next whole message, `Text s` or `Binary s`. Once
+  the connection has ended and no message waits, it returns `None`. The
+  connection ends after the client's close frame, the end of the input, a
+  reset, a protocol error, or your `close`. `client_close ws` then gives the
+  client's close code and reason, if it sent a valid close frame.
+- `send_text` and `send_binary` return when the frame is written. They raise
+  `Closed` when the connection is gone, also when it was gone before the
+  call, so a send loop ends when the client leaves.
+- `ping ws payload` sends a ping and returns when the next pong arrives, or
+  raises `Closed` when the connection ends first. To find a client that is
+  gone: `Eio.Time.with_timeout_exn clock 30. (fun () ->
+  Ache_eio.Websocket.ping ws "")`, and `close` on `Eio.Time.Timeout`. The
+  pong comes after the messages the client sent before it, so keep calling
+  `receive` in another fiber meanwhile: while 8 messages wait, reading is
+  paused and the pong is not seen.
+- `close ?reason ws code` sends a close frame and returns when the frame is
+  written or the connection has ended. It raises `Invalid_argument` at once
+  for a code that an endpoint may not send, or a reason that is not UTF-8 or
+  longer than 123 bytes. The socket closes when the read in progress ends
+  too: when the client answers with its close frame or closes the
+  connection. There is no timeout for a client that does neither.
+- Messages that you have not received wait in a queue. When 8 messages wait,
+  the connection stops reading from the client until `receive` takes one.
+  Frames that one read already holds still join the queue.
+- You can cancel a `receive`, for example with `Eio.Fiber.first` or
+  `Eio.Time.with_timeout`. No message is lost: the next `receive` gets it.
+
+With the callbacks of `Ache.Websocket` instead, as in [WebSocket in
+ache.md](ache.md#websocket), the callbacks run in the read and write loops
+of the connection. The connection has no lock: call `send_text`, `flush`,
 `close`, `pause_reading` and `resume_reading` from the domain that runs the
 connection. `adapters/eio/test/test_ache_eio.ml` has a server that sends in a
 loop on `flush` and stops at `` `Closed ``.

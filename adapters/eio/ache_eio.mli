@@ -87,9 +87,12 @@ module Server : sig
       [Tls_eio] flow, keeps that read until input arrives;
       [Ache_eio_tls.Server] passes this shutdown to the TCP flow.
 
-      When [error_handler] raises, the connection closes, and after the
-      connection ends the handler raises the first such exception with its
-      backtrace, so that the [on_error] of [Eio.Net.run_server],
+      The handler returns when the connection has ended and the sessions
+      that {!Websocket.upgrade} started have returned.
+
+      When [error_handler] or a WebSocket session raises, the connection
+      closes, and after the connection ends the handler raises the first
+      such exception with its backtrace, so that the [on_error] of [Eio.Net.run_server],
       [Eio.Net.accept_fork] or {!run} gets it. An exception that the
       connection gets from the core while it reports an error is raised in
       the same way. A peer that closes or resets the connection is not an
@@ -190,4 +193,107 @@ module Client : sig
   val upgrade : t -> Ache.Runtime.impl -> unit
   (** [upgrade t impl] shuts down the HTTP state of [t] and hands reading and
       writing on its flow to [impl]. *)
+end
+
+(** A direct-style API for {!Ache.Websocket}. It does not depend on the flow
+    type, so the servers of [Ache_eio.Server] and [Ache_eio_tls.Server] use
+    it alike. *)
+module Websocket : sig
+  type t
+
+  exception Closed
+  (** The connection closed before a message given to {!send_text} or
+      {!send_binary} was written, or before a pong answered {!ping}. *)
+
+  val upgrade :
+     ?max_message_size:int
+    -> Ache.Request_descriptor.t
+    -> (t -> unit)
+    -> (unit, Ache.Websocket.handshake_error) result
+  (** [upgrade ?max_message_size reqd session] is {!Ache.Websocket.upgrade}:
+      it responds with [101] when the request is a valid opening handshake
+      and returns [Ok ()]. When it returns [Error _], it responded nothing:
+      respond, for example with [400].
+
+      After [Ok ()], [session t] runs in a new fiber of the connection, on the
+      domain that runs it, once [upgrade] has returned. The handler of
+      {!Server.create_connection_handler} returns when the connection has
+      ended and [session] has returned: it does not cancel [session] when the
+      socket closes. Once the connection has ended, {!receive} returns [None]
+      and the other functions return or raise {!Closed}, so a session that
+      uses them ends. [session] is cancelled only when the connection's fiber
+      is, for example when the server stops.
+
+      When [session] raises {!Closed}, it is ignored. When it raises another
+      exception, the connection sends a close frame with code [1011] and the
+      handler raises the exception after the connection ends, as for
+      [error_handler].
+
+      Messages that arrive before {!receive} is called are queued. When 8
+      messages are queued, the connection stops reading from the client
+      ({!Ache.Websocket.pause_reading}) until {!receive} takes one. Frames
+      that a read already holds are still queued, so the queue can pass 8 by
+      what one read buffer holds.
+
+      @raise Invalid_argument
+        if it is not called in a request handler of
+        {!Server.create_connection_handler}, {!Server.run} or
+        [Ache_eio_tls.Server], or in a fiber forked from it. *)
+
+  val send_text : t -> string -> unit
+  (** [send_text t message] sends [message] as one text frame and returns
+      when the frame is written. [message] must be valid UTF-8; it is not
+      checked.
+
+      @raise Closed
+        when the connection closed before, also when it closed before
+        [send_text] was called: a loop of [send_text] ends when the client is
+        gone. *)
+
+  val send_binary : t -> string -> unit
+  (** [send_binary t message] is {!send_text} for one binary frame. *)
+
+  val receive : t -> Ache.Websocket.message option
+  (** [receive t] waits for the next whole message. It returns [None] after
+      the connection closed, whether the client sent a close frame, the
+      connection ended, or the server closed it. {!client_close} then tells
+      which.
+
+      [receive] can be cancelled, for example by [Eio.Fiber.first] or
+      [Eio.Time.with_timeout]. No message is lost: the next [receive] gets
+      it. *)
+
+  val ping : t -> string -> unit
+  (** [ping t payload] sends a ping and returns when the next pong from the
+      client arrives (any pong: RFC 6455 §5.5.3 lets a client answer only the
+      latest ping, or send pongs unasked). To find a client that is gone:
+      [Eio.Time.with_timeout_exn clock 30. (fun () -> ping t "")], then
+      {!close} on [Eio.Time.Timeout]. [ping] can be cancelled.
+
+      The pong comes after the messages the client sent before it. While 8
+      messages wait for {!receive}, reading is paused, so the pong is not
+      seen until {!receive} takes messages: keep receiving in another fiber
+      while you wait for a pong.
+
+      @raise Closed when the connection closes first, or closed before.
+      @raise Invalid_argument
+        at once if [payload] is longer than 125 bytes. *)
+
+  val client_close : t -> Ache.Websocket.close option
+  (** [client_close t] is the client's close frame (code and reason), once
+      {!receive} returned [None]: see the [on_close] of
+      {!Ache.Websocket.handler}. [None] before that, or when the client sent
+      no valid close frame. *)
+
+  val close : ?reason:string -> t -> int -> unit
+  (** [close ?reason t code] sends a close frame with [code] and [reason] (see
+      {!Ache.Websocket.close}) and returns when the connection is closed: the
+      frame is written, or the connection ended. The socket closes when the
+      read in progress also ends: when the client answers with its close
+      frame or closes the connection. There is no timeout for a client that
+      does neither.
+
+      @raise Invalid_argument
+        at once if [code] is not one an endpoint may send, or [reason] is not
+        valid UTF-8 or longer than 123 bytes. *)
 end

@@ -336,6 +336,129 @@ module IO_loop = struct
   let no_timeout _ = None
 end
 
+(* The connection that runs the current request handler:
+   create_connection_handler binds it, and Websocket.upgrade forks the session
+   on its switch. *)
+type connection_context =
+  { sw : Switch.t
+  ; session_failed : exn -> Printexc.raw_backtrace -> unit
+  }
+
+let connection_context : connection_context Fiber.key = Fiber.create_key ()
+
+module Websocket = struct
+  type t =
+    { connection : Ache.Websocket.t
+    ; messages : Ache.Websocket.message Queue.t
+    ; changed : Eio.Condition.t
+    ; mutable pongs : int
+    ; mutable ended : bool
+    ; mutable client_close : Ache.Websocket.close option
+    }
+
+  exception Closed
+
+  let max_queued_messages = 8
+
+  let upgrade ?max_message_size reqd session =
+    let context =
+      match Fiber.get connection_context with
+      | Some context -> context
+      | None ->
+        invalid_arg
+          "Ache_eio.Websocket.upgrade: not called in a request handler of \
+           Ache_eio.Server"
+    in
+    let state = ref None in
+    match
+      Ache.Websocket.upgrade ?max_message_size reqd (fun connection ->
+        let t =
+          { connection
+          ; messages = Queue.create ()
+          ; changed = Eio.Condition.create ()
+          ; pongs = 0
+          ; ended = false
+          ; client_close = None
+          }
+        in
+        state := Some t;
+        { on_message =
+            (fun message ->
+              Queue.push message t.messages;
+              if Queue.length t.messages >= max_queued_messages
+              then Ache.Websocket.pause_reading connection;
+              Eio.Condition.broadcast t.changed)
+        ; on_pong =
+            (fun (_ : string) ->
+              t.pongs <- t.pongs + 1;
+              Eio.Condition.broadcast t.changed)
+        ; on_close =
+            (fun close ->
+              t.ended <- true;
+              t.client_close <- close;
+              Eio.Condition.broadcast t.changed)
+        })
+    with
+    | Error _ as error -> error
+    | Ok () ->
+      let t = Option.get !state in
+      Fiber.fork ~sw:context.sw (fun () ->
+        (* The fork runs at once: wait until [upgrade] has returned. *)
+        Fiber.yield ();
+        match session t with
+        | () | (exception Closed) -> ()
+        | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+        | exception exn ->
+          context.session_failed exn (Printexc.get_raw_backtrace ());
+          Ache.Websocket.close t.connection ~code:1011);
+      Ok ()
+
+  let written t =
+    let p, u = Promise.create () in
+    Ache.Websocket.flush t.connection (Promise.resolve u);
+    match Promise.await p with `Written -> () | `Closed -> raise Closed
+
+  let send_text t message =
+    Ache.Websocket.send_text t.connection message;
+    written t
+
+  let send_binary t message =
+    Ache.Websocket.send_binary t.connection message;
+    written t
+
+  (* A message is taken only by a fiber that is not cancelled, and returned
+     without a suspension, so a cancelled receive leaves it in the queue. *)
+  let receive t =
+    Eio.Condition.loop_no_mutex t.changed (fun () ->
+      Fiber.check ();
+      match Queue.take_opt t.messages with
+      | Some message ->
+        if Queue.length t.messages < max_queued_messages
+        then Ache.Websocket.resume_reading t.connection;
+        Some (Some message)
+      | None when t.ended -> Some None
+      | None ->
+        Ache.Websocket.resume_reading t.connection;
+        None)
+
+  let ping t payload =
+    Ache.Websocket.ping t.connection payload;
+    let pongs = t.pongs in
+    Eio.Condition.loop_no_mutex t.changed (fun () ->
+      if t.pongs > pongs
+      then Some ()
+      else if t.ended
+      then raise Closed
+      else None)
+
+  let client_close t = t.client_close
+
+  let close ?reason t code =
+    Ache.Websocket.close ?reason t.connection ~code;
+    Eio.Condition.loop_no_mutex t.changed (fun () ->
+      if t.ended then Some () else None)
+end
+
 module Server = struct
   let linger_without_idle_timeout = 2.0
 
@@ -364,14 +487,16 @@ module Server = struct
     | _ -> ());
     fun socket client_addr ->
       let head_deadline = ref None
-      and error_handler_failure = ref None in
+      and failure = ref None in
+      let record_failure exn bt =
+        if Option.is_none !failure then failure := Some (exn, bt)
+      in
       let error_handler ?request error start_response =
         try error_handler client_addr ?request error start_response with
         | Eio.Cancel.Cancelled _ as exn -> raise exn
         | exn ->
           let bt = Printexc.get_raw_backtrace () in
-          if Option.is_none !error_handler_failure
-          then error_handler_failure := Some (exn, bt);
+          record_failure exn bt;
           Printexc.raise_with_backtrace exn bt
       in
       let connection =
@@ -451,38 +576,44 @@ module Server = struct
               Error `Timeout)
         | _ -> timeout phase
       in
-      IO_loop.start
-        (module Observed)
-        ~read_buffer_size:config.read_buffer_size
-        ~timeout
-        ~linger:(Option.is_some clock)
-        ~body_read:
-          { stop =
-              (fun () ->
-                match Ache.Server_connection.read_timeout connection with
-                | Some (`Body, on_timeout) -> Some on_timeout
-                | Some ((`Idle | `Head), _) | None -> None)
-          ; wait =
-              (match clock, idle_timeout with
-              | Some clock, Some seconds ->
-                fun () -> Eio.Time.sleep clock seconds
-              | _ -> ignore)
-          ; linger =
-              (match clock with
-              | Some clock ->
-                fun () ->
-                  Eio.Time.sleep
-                    clock
-                    (Option.value
-                       idle_timeout
-                       ~default:linger_without_idle_timeout)
-              | None -> ignore)
-          }
-        connection
-        socket;
+      (* WebSocket sessions are forked on [sw]: the handler waits for them. *)
+      Switch.run (fun sw ->
+        Fiber.with_binding
+          connection_context
+          { sw; session_failed = record_failure }
+          (fun () ->
+             IO_loop.start
+               (module Observed)
+               ~read_buffer_size:config.read_buffer_size
+               ~timeout
+               ~linger:(Option.is_some clock)
+               ~body_read:
+                 { stop =
+                     (fun () ->
+                       match Ache.Server_connection.read_timeout connection with
+                       | Some (`Body, on_timeout) -> Some on_timeout
+                       | Some ((`Idle | `Head), _) | None -> None)
+                 ; wait =
+                     (match clock, idle_timeout with
+                     | Some clock, Some seconds ->
+                       fun () -> Eio.Time.sleep clock seconds
+                     | _ -> ignore)
+                 ; linger =
+                     (match clock with
+                     | Some clock ->
+                       fun () ->
+                         Eio.Time.sleep
+                           clock
+                           (Option.value
+                              idle_timeout
+                              ~default:linger_without_idle_timeout)
+                     | None -> ignore)
+                 }
+               connection
+               socket));
       Option.iter
         (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
-        !error_handler_failure
+        !failure
 
   let accept_retry_delay = 0.05
 
