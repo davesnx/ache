@@ -44,6 +44,14 @@ type error =
 type error_handler =
   ?request:Request.t -> error -> (Headers.t -> Body.Writer.t) -> unit
 
+let error_status : error -> Status.t = function
+  | `Exn _ -> `Internal_server_error
+  | `Bad_request _ -> `Bad_request
+  | ( `Not_implemented | `Http_version_not_supported | `Uri_too_long
+    | `Bad_gateway | `Internal_server_error | `Request_header_fields_too_large
+    | `Request_timeout ) as status ->
+    (status :> Status.t)
+
 module Reader = Parse.Reader
 module Writer = Serialize.Writer
 
@@ -420,15 +428,7 @@ let report_error t error =
   match t.response_state, t.error_code with
   | Waiting, `Ok ->
     t.error_code <- (error :> [ `Ok | error ]);
-    let status =
-      match error with
-      | `Exn _ -> `Internal_server_error
-      | `Bad_request _ -> `Bad_request
-      | ( `Not_implemented | `Http_version_not_supported | `Uri_too_long
-        | `Bad_gateway | `Internal_server_error
-        | `Request_header_fields_too_large | `Request_timeout ) as status ->
-        status
-    in
+    let status = error_status error in
     (match
        t.error_handler ~request:t.request error (fun headers ->
          let response_body =

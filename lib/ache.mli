@@ -516,6 +516,15 @@ end
 module Server_connection : sig
   type t
   type error = Request_descriptor.error
+
+  val error_status : error -> Status.t
+  (** [error_status error] is the status of the error response that the
+      connection starts for [error]: [`Bad_request _] is [`Bad_request] (400),
+      [`Exn _] is [`Internal_server_error] (500), and every other case is the
+      status of the same name. An error handler that only needs the status
+      can write [Status.to_code (error_status error)] instead of matching
+      every case. *)
+
   type request_handler = Request_descriptor.t -> unit
 
   type error_handler =

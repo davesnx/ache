@@ -4206,6 +4206,25 @@ let test_default_error_handler_hides_reason () =
          (Raw.take_output t))
     bad_request_inputs
 
+(* Decision 0018. *)
+let test_error_status () =
+  List.iter
+    (fun (case, error, code) ->
+       Alcotest.(check int)
+         case
+         code
+         (Status.to_code (Server_connection.error_status error)))
+    [ "Bad_request", `Bad_request "invalid Content-Length", 400
+    ; "Not_implemented", `Not_implemented, 501
+    ; "Http_version_not_supported", `Http_version_not_supported, 505
+    ; "Uri_too_long", `Uri_too_long, 414
+    ; "Bad_gateway", `Bad_gateway, 502
+    ; "Internal_server_error", `Internal_server_error, 500
+    ; "Request_header_fields_too_large", `Request_header_fields_too_large, 431
+    ; "Request_timeout", `Request_timeout, 408
+    ; "Exn", `Exn Exit, 500
+    ]
+
 let test_error_handler_flush_then_raise () =
   List.iter
     (fun (case, input, handler) ->
@@ -5228,6 +5247,7 @@ let tests =
   ; ( "default error handler does not send the reason"
     , `Quick
     , test_default_error_handler_hides_reason )
+  ; "error_status: the status of each error", `Quick, test_error_status
   ; ( "report_exn while the error handler has not responded"
     , `Quick
     , test_report_exn_while_error_handler_pending )

@@ -70,15 +70,9 @@ module Server = struct
     | `Exn exn ->
       Body.Writer.write_string response_body (Printexc.to_string exn);
       Body.Writer.write_string response_body "\n"
-    | `Bad_request _ ->
+    | error ->
       Body.Writer.write_string
         response_body
-        (Status.default_reason_phrase `Bad_request)
-    | ( #Status.server_error
-      | `Uri_too_long | `Request_header_fields_too_large | `Request_timeout ) as
-      error ->
-      Body.Writer.write_string
-        response_body
-        (Status.default_reason_phrase error));
+        (Status.to_string (Server_connection.error_status error)));
     Body.Writer.close response_body
 end

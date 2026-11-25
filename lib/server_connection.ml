@@ -99,16 +99,13 @@ let yield_writer t k =
   if Writer.is_closed t.writer then k () else Writer.on_wakeup t.writer k
 
 let wakeup_writer t = Writer.wakeup t.writer
+let error_status = Request_descriptor.error_status
 
 let default_error_handler ?request:_ error handle =
   let message =
     match error with
     | `Exn exn -> Printexc.to_string exn
-    | `Bad_request _ -> Status.to_string `Bad_request
-    | ( `Not_implemented | `Http_version_not_supported | `Uri_too_long
-      | `Bad_gateway | `Internal_server_error | `Request_header_fields_too_large
-      | `Request_timeout ) as error ->
-      Status.to_string error
+    | error -> Status.to_string (error_status error)
   in
   let body = handle Headers.empty in
   Body.Writer.write_string body message;
@@ -262,15 +259,7 @@ let set_error_and_handle ?request t error =
     Request_descriptor.report_error reqd error;
     wakeup_writer t)
   else
-    let status =
-      match error with
-      | `Exn _ -> `Internal_server_error
-      | `Bad_request _ -> `Bad_request
-      | ( `Not_implemented | `Http_version_not_supported | `Uri_too_long
-        | `Bad_gateway | `Internal_server_error
-        | `Request_header_fields_too_large | `Request_timeout ) as status ->
-        status
-    in
+    let status = error_status error in
     shutdown_reader t;
     let writer = t.writer in
     match t.error_code with

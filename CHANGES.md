@@ -63,7 +63,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - `Server_connection.error` has `` `Bad_request of string `` instead of
   `` `Bad_request ``: the reason the request was rejected, for logs. The
   default error handler does not send it. An error handler that matches
-  `#Status.standard` must match `` `Bad_request _ `` first.
+  `#Status.standard` must match `` `Bad_request _ `` first, or get the
+  status with `Server_connection.error_status error`.
 - `Body.Writer.close` has the type `?trailers:Headers.t -> t -> unit`. A call
   compiles as before; a module that gives it where a `t -> unit` value is
   expected must apply it (`fun w -> Body.Writer.close w`).
@@ -71,6 +72,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 ### New
 
 - Packages `ache-miou`, `ache-eio-tls`, `ache-lwt-tls` and `ache-miou-tls`.
+- `Server_connection.error_status` gives the status of the error response
+  for each `Server_connection.error`.
 - `Ache.Testing` runs a request handler on bytes or on a `Request.t` and a
   body, with no sockets and no runtime.
 - `Request_descriptor.respond_with_informational`, for `100 Continue` and
