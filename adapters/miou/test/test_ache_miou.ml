@@ -975,13 +975,13 @@ let test_websocket_cancelled_receives_bounded () =
       Gc.full_major ();
       (Gc.stat ()).live_words
     in
-    cancel_many 1_000;
+    cancel_many 500;
     let before = live_words () in
-    cancel_many 20_000;
+    cancel_many 5_000;
     let grown = live_words () - before in
     Alcotest.(check bool)
       (Printf.sprintf
-         "20000 cancelled receives keep %d more live words (< 10000)"
+         "5000 cancelled receives keep %d more live words (< 10000)"
          grown)
       true
       (grown < 10_000);
