@@ -938,6 +938,85 @@ module Client_connection : sig
       the connection, rendering it unusable for any further communication. *)
 end
 
+(** {2 Testing} *)
+
+(** Run a request handler on bytes, without sockets and without a runtime.
+
+    The functions drive a {!Server_connection} the way a runtime does, but
+    in the calling thread: they give it the input, write its output to a
+    buffer, and stop when neither side can make progress. An exception that
+    the request handler raises while the connection reads goes to
+    {!Server_connection.report_exn}, as in the runtimes, so the error
+    handler answers ([500] by default).
+
+    {!serve} and {!serve_request} give the connection all of the input and
+    the end of input, then return. They see only what the handler does
+    before they return: a response that the handler gives later, for
+    example when a promise resolves, is not in their result. For such a
+    handler, use {!create}, {!feed} and {!output}: run your scheduler until
+    the handler has responded, then call {!output}. The request handler
+    must return without blocking, as with every runtime.
+
+    After a protocol upgrade, the functions drive the new protocol with the
+    rest of the input. *)
+module Testing : sig
+  val serve :
+     ?config:Config.t
+    -> ?error_handler:Server_connection.error_handler
+    -> Server_connection.request_handler
+    -> string
+    -> string
+  (** [serve ?config ?error_handler handler input] creates a connection that
+      serves [handler], gives it [input] then the end of input, and returns
+      every byte that the connection writes. [input] may hold several
+      pipelined requests. *)
+
+  val serve_request :
+     ?config:Config.t
+    -> ?error_handler:Server_connection.error_handler
+    -> ?body:string
+    -> Server_connection.request_handler
+    -> Request.t
+    -> Response.t * string
+  (** [serve_request ?config ?error_handler ?body handler request] writes
+      [request] and [body] (default: no body) as a client does, runs them
+      through {!serve}, and returns the final response with its decoded body.
+      When [body] is given and [request] has neither [Content-Length] nor
+      [Transfer-Encoding], it adds [Content-Length]. A chunked request body
+      is chunked. Interim [1xx] responses are dropped, and a chunked or
+      close-delimited response body is decoded, as by
+      {!Client_connection}.
+
+      Raises [Invalid_argument] when the head of [request] is invalid (see
+      {!Client_connection.request}), and [Failure] when no complete response
+      comes. *)
+
+  type t
+  (** A server connection driven step by step. *)
+
+  val create :
+     ?config:Config.t
+    -> ?error_handler:Server_connection.error_handler
+    -> Server_connection.request_handler
+    -> t
+
+  val feed : t -> string -> unit
+  (** [feed t input] gives [input] to the connection and runs it until it
+      cannot progress. Raises [Invalid_argument] after {!feed_eof}. *)
+
+  val feed_eof : t -> unit
+  (** [feed_eof t] gives the end of input to the connection and runs it
+      until it cannot progress. *)
+
+  val output : t -> string
+  (** [output t] runs the connection until it cannot progress, and returns
+      the bytes that it wrote since the last call to [output]. *)
+
+  val is_closed : t -> bool
+  (** [is_closed t] is [true] once both the read and the write sides of the
+      connection are closed. *)
+end
+
 (**/**)
 
 module Ache_private : sig

@@ -35,6 +35,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 ### New
 
 - Packages `ache-miou`, `ache-eio-tls`, `ache-lwt-tls` and `ache-miou-tls`.
+- `Ache.Testing` runs a request handler on bytes or on a `Request.t` and a
+  body, with no sockets and no runtime.
 - `Request_descriptor.respond_with_informational`, for `100 Continue` and
   `103 Early Hints`.
 - Server timeouts `?idle_timeout` and `?head_timeout`, and

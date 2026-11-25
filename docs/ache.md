@@ -481,6 +481,58 @@ runtimes.
   keeps the connection open until you close the socket.
 - The API is not stable before 1.0.
 
+## Test a handler
+
+`Ache.Testing` runs a request handler without sockets and without a
+runtime, so a unit test can call it directly:
+
+- `Testing.serve handler input` gives the bytes `input` to a server
+  connection, then the end of input, and returns every byte the connection
+  writes. `input` can hold several pipelined requests.
+- `Testing.serve_request ?body handler request` writes `request` and `body`
+  as a client does (it adds `Content-Length` when the request has no framing
+  field), and returns the final response and its decoded body: a chunked
+  body is decoded, and `1xx` responses are dropped. It raises `Failure` when
+  no complete response comes.
+
+An exception that the handler raises gets the error handler's response,
+`500` by default, as with a runtime.
+
+<!-- example: examples/readme/testing_example.ml -->
+```ocaml
+open Ache
+
+let request_handler reqd =
+  let request = Request_descriptor.request reqd in
+  Request_descriptor.respond_with_string
+    reqd
+    (Response.create `OK)
+    ("Hello, " ^ request.target)
+
+let () =
+  let output =
+    Testing.serve request_handler "GET /a HTTP/1.1\r\nHost: a\r\n\r\n"
+  in
+  assert (output = "HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\nHello, /a");
+  let response, body =
+    Testing.serve_request
+      request_handler
+      (Request.create ~headers:(Headers.of_list [ "host", "a" ]) `GET "/b")
+  in
+  assert (response.status = `OK);
+  assert (body = "Hello, /b")
+```
+
+`serve` and `serve_request` return when the input is used up. They see
+only what the handler does before that: a response that the handler gives
+later, for example when a promise resolves, is not in their result. For
+such a handler, drive the connection step by step: `Testing.create`, then
+`Testing.feed t bytes`, run your scheduler until the handler has responded,
+then `Testing.output t` returns the bytes written since the last call.
+`Testing.feed_eof t` ends the input, and `Testing.is_closed t` tells when
+the connection has closed. The handler itself must return without
+blocking, as with every runtime.
+
 ## Testing
 
 `dune test` runs these suites (counts from `dune test --force` on
