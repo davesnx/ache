@@ -162,15 +162,20 @@ let write_response t response =
   if Writer.is_closed t.writer
   then Serialize.check_response response
   else
-    let date =
-      match t.date with
-      | Some date when needs_date response -> date ()
-      | _ -> ""
-    in
-    let keep_alive = if needs_keep_alive t response then t.keep_alive else "" in
-    if date == "" && keep_alive == ""
-    then Writer.write_response t.writer response
-    else Writer.write_response_with t.writer response ~date ~keep_alive
+    match t.date, t.keep_alive with
+    | None, "" -> Writer.write_response t.writer response
+    | _ ->
+      let date =
+        match t.date with
+        | Some date when needs_date response -> date ()
+        | _ -> ""
+      in
+      let keep_alive =
+        if needs_keep_alive t response then t.keep_alive else ""
+      in
+      if date == "" && keep_alive == ""
+      then Writer.write_response t.writer response
+      else Writer.write_response_with t.writer response ~date ~keep_alive
 
 let commit_persistence t (response : Response.t) =
   t.persistent <- persists_after t response;
