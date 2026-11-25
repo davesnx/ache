@@ -97,9 +97,11 @@ let ws_echo ws =
       W.close ws 1001;
       Eio.Stream.add
         ws_reports
-        (match W.receive ws with
-        | None -> "closed, receive None"
-        | Some m -> "received " ^ text_of m)
+        (match W.receive ws, W.client_close ws with
+        | None, None -> "closed, no client close"
+        | None, Some { code; reason } ->
+          Printf.sprintf "closed, client close %d %S" code reason
+        | Some m, _ -> "received " ^ text_of m)
     | Some (Text "ping-me") ->
       W.ping ws "are you there";
       W.send_text ws "pong seen";
@@ -2433,11 +2435,15 @@ let test_websocket_server_close () =
     let socket, reader = ws_connect ~sw ~net addr "/ws-echo" in
     Eio.Flow.copy_string (ws_frame 0x1 "close-me") socket;
     Alcotest.check frame "close 1001" (0x88, "\x03\xe9") (read_ws_frame reader);
+    (* The server waits for the client's close frame and drops the message
+       before it. *)
+    Eio.Flow.copy_string
+      (ws_frame 0x1 "dropped" ^ ws_frame 0x8 "\x0f\xa0done")
+      socket;
     Alcotest.(check string)
-      "close returned"
-      "closed, receive None"
+      "close returned with the client's close frame"
+      "closed, client close 4000 \"done\""
       (Eio.Stream.take ws_reports);
-    Eio.Flow.copy_string (ws_frame 0x8 "\x03\xe9") socket;
     Alcotest.(check string)
       "then end of input"
       ""
@@ -2776,9 +2782,25 @@ let test_websocket_session_exception () =
          "close 1011"
          (0x88, "\x03\xf3")
          (read_ws_frame reader);
-       (* The server does not wait for a close frame: sending one could meet a
-          closed socket and a reset. *)
-       Eio.Flow.shutdown socket `Send;
+       Eio.Flow.copy_string (ws_frame 0x8 "\x03\xf3") socket;
+       Alcotest.(check string)
+         "then end of input"
+         ""
+         (Eio.Buf_read.take_all reader)))
+
+let test_websocket_session_return_closes () =
+  let session _ ws = Ache_eio.Websocket.send_text ws "hi" in
+  check_handled
+    (with_ws_session session (fun _ socket reader ->
+       Alcotest.check frame "hi" (0x81, "hi") (read_ws_frame reader);
+       Alcotest.check
+         frame
+         "close 1000 when the session returns"
+         (0x88, "\x03\xe8")
+         (read_ws_frame reader);
+       Eio.Flow.copy_string
+         (ws_frame 0x1 "unread" ^ ws_frame 0x8 "\x03\xe8")
+         socket;
        Alcotest.(check string)
          "then end of input"
          ""
@@ -3794,6 +3816,9 @@ let () =
         ; ( "the session starts after upgrade, the handler waits for it"
           , `Quick
           , test_websocket_session_after_upgrade )
+        ; ( "a session that returns closes with 1000"
+          , `Quick
+          , test_websocket_session_return_closes )
         ; ( "a session exception closes with 1011 and goes to the handler"
           , `Quick
           , test_websocket_session_exception )

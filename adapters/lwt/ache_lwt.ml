@@ -348,9 +348,15 @@ module Websocket = struct
     | Ok t ->
       Lwt.async (fun () ->
         Lwt.catch
-          (fun () -> session t)
+          (fun () ->
+             session t >|= fun () ->
+             (* Nothing reads the messages any more: close, unless the
+                connection already ended. *)
+             Ache.Websocket.close t.connection ~code:1000)
           (function
-            | Closed -> Lwt.return_unit
+            | Closed ->
+              Ache.Websocket.close t.connection ~code:1000;
+              Lwt.return_unit
             | exn ->
               Ache.Websocket.close t.connection ~code:1011;
               Lwt.reraise exn));
