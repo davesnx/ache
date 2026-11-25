@@ -330,7 +330,7 @@ let host_rejected () =
        check_rejected_both ~status:400 input;
        let s = serve input in
        match s.errors with
-       | [ (`Bad_request, Some r) ] ->
+       | [ (`Bad_request _, Some r) ] ->
          Alcotest.(check string) "error handler gets the request" "/" r.target
        | _ -> Alcotest.failf "%S: expected one Bad_request with request" input)
     [ "GET / HTTP/1.1\r\n\r\n"

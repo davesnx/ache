@@ -291,7 +291,7 @@ module Request_descriptor : sig
   type t
 
   type error =
-    [ `Bad_request
+    [ `Bad_request of string
     | `Not_implemented
     | `Http_version_not_supported
     | `Uri_too_long
@@ -472,7 +472,7 @@ module Server_connection : sig
 
       The connection rejects a request before [request_handler] runs, calls
       [error_handler] and closes after the error response:
-      - [`Bad_request] (400): the request line or a field line does not match
+      - [`Bad_request reason] (400): the request line or a field line does not match
         RFC 9112 §3 and §5 (lines end with CRLF; a bare LF is an error;
         obs-fold is an error); an HTTP/1.1 request has no Host field; a request
         has more than one Host field or a Host value that is not
@@ -485,7 +485,11 @@ module Server_connection : sig
         method; one such as [127.0.0.1:80] or [[::1]:80] is not); Content-Length is not a list of one
         repeated [1*DIGIT] value; the request has both Content-Length and
         Transfer-Encoding; an HTTP/1.0 request has Transfer-Encoding; chunked
-        is not the final transfer coding or is applied twice.
+        is not the final transfer coding or is applied twice. The string is
+        a short reason for logs, such as [unexpected ' ' in field line] or
+        [invalid Content-Length]; it shows a received byte or value only
+        escaped as an OCaml character or string literal. The default error
+        handler does not send it.
       - [`Not_implemented] (501): a transfer coding other than chunked, or a
         method that reaches [Config.max_header_size] before its end.
       - [`Uri_too_long] (414): a request-target that reaches
@@ -989,7 +993,10 @@ module Ache_private : sig
       type request_error =
         [ `Invalid_request of
             Request.t
-            * [ `Bad_request | `Not_implemented | `Http_version_not_supported ]
+            * [ `Bad_request of string
+              | `Not_implemented
+              | `Http_version_not_supported
+              ]
         | `Parse of string
         | `Method_too_long
         | `Target_too_long

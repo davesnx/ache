@@ -30,7 +30,7 @@
   ----------------------------------------------------------------------------*)
 
 type error =
-  [ `Bad_request
+  [ `Bad_request of string
   | `Not_implemented
   | `Http_version_not_supported
   | `Uri_too_long
@@ -329,9 +329,13 @@ let report_error t error =
   | Waiting, `Ok ->
     t.error_code <- (error :> [ `Ok | error ]);
     let status =
-      match (error :> [ error | Status.standard ]) with
+      match error with
       | `Exn _ -> `Internal_server_error
-      | #Status.standard as status -> status
+      | `Bad_request _ -> `Bad_request
+      | ( `Not_implemented | `Http_version_not_supported | `Uri_too_long
+        | `Bad_gateway | `Internal_server_error
+        | `Request_header_fields_too_large | `Request_timeout ) as status ->
+        status
     in
     (match
        t.error_handler ~request:t.request error (fun headers ->

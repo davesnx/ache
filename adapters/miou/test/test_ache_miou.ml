@@ -656,7 +656,7 @@ let test_eof_mid_body () =
     Miou_unix.close socket);
   Alcotest.(check bool) "request body cut" true !partial_body_cut;
   match !server_errors with
-  | [ `Bad_request ] -> ()
+  | [ `Bad_request _ ] -> ()
   | _ ->
     Alcotest.failf
       "expected one Bad_request, got %d errors"

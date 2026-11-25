@@ -27,6 +27,10 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   codes have constructors.
 - The `respond_with_*` functions and `Client_connection.request` raise
   `Invalid_argument` for a head they cannot send correctly.
+- `Server_connection.error` has `` `Bad_request of string `` instead of
+  `` `Bad_request ``: the reason the request was rejected, for logs. The
+  default error handler does not send it. An error handler that matches
+  `#Status.standard` must match `` `Bad_request _ `` first.
 
 ### New
 

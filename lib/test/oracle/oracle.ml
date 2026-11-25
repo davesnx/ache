@@ -113,7 +113,7 @@ module Run (Parser : module type of Ache_private.Parse) = struct
         ^ " "
         ^
           (match error with
-          | `Bad_request -> "bad_request"
+          | `Bad_request _ -> "bad_request"
           | `Not_implemented -> "not_implemented"
           | `Http_version_not_supported -> "http_version_not_supported") )
     | `Parse message -> "parse", message

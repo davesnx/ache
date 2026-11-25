@@ -29,7 +29,11 @@ let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
   (match error with
   | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
-  | #Status.standard as status ->
+  | `Bad_request _ ->
+    Body.Writer.write_string body (Status.default_reason_phrase `Bad_request)
+  | ( #Status.server_error
+    | `Uri_too_long | `Request_header_fields_too_large | `Request_timeout ) as
+    status ->
     Body.Writer.write_string body (Status.default_reason_phrase status));
   Body.Writer.close body
 
@@ -166,7 +170,11 @@ let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
   (match error with
   | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
-  | #Status.standard as status ->
+  | `Bad_request _ ->
+    Body.Writer.write_string body (Status.default_reason_phrase `Bad_request)
+  | ( #Status.server_error
+    | `Uri_too_long | `Request_header_fields_too_large | `Request_timeout ) as
+    status ->
     Body.Writer.write_string body (Status.default_reason_phrase status));
   Body.Writer.close body
 
@@ -401,7 +409,11 @@ let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
   (match error with
   | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
-  | #Status.standard as status ->
+  | `Bad_request _ ->
+    Body.Writer.write_string body (Status.default_reason_phrase `Bad_request)
+  | ( #Status.server_error
+    | `Uri_too_long | `Request_header_fields_too_large | `Request_timeout ) as
+    status ->
     Body.Writer.write_string body (Status.default_reason_phrase status));
   Body.Writer.close body
 

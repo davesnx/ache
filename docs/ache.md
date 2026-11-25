@@ -90,7 +90,10 @@ the client closes it.
 
 The server calls the error handler, sends the error response with
 `connection: close`, and closes the connection. Requests that came before it
-on the same connection get their responses first.
+on the same connection get their responses first. For a 400 the error handler
+gets `` `Bad_request reason ``, a short text for logs such as
+`"unexpected ' ' in field line"` or `"invalid Content-Length"`. The default
+error handler does not send it.
 
 | Request | Response |
 |---|---|

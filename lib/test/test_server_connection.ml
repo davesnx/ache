@@ -14,7 +14,7 @@ let request_to_string ?body (r : Request.t) =
 let trace fmt = Format.ksprintf (Format.printf "%s\n%!") fmt
 
 let request_error_pp_hum fmt = function
-  | `Bad_request -> Format.fprintf fmt "Bad_request"
+  | `Bad_request reason -> Format.fprintf fmt "Bad_request %S" reason
   | `Not_implemented -> Format.fprintf fmt "Not_implemented"
   | `Http_version_not_supported ->
     Format.fprintf fmt "Http_version_not_supported"
@@ -917,7 +917,10 @@ let test_chunked_encoding () =
 let test_chunked_encoding_for_error () =
   let error_handler ?request error start_response =
     Alcotest.(check (option request)) "No parsed request" None request;
-    Alcotest.(check request_error) "Request error" `Bad_request error;
+    Alcotest.(check request_error)
+      "Request error"
+      (`Bad_request "unexpected ' ' in request-line")
+      error;
     let body = start_response Headers.encoding_chunked in
     Body.Writer.write_string body "Bad";
     Body.Writer.flush body (function
@@ -1687,7 +1690,10 @@ let test_failed_request_parse () =
   let error_handler ?request error start_response =
     error_handler_fired := true;
     Alcotest.(check (option request)) "No parsed request" None request;
-    Alcotest.(check request_error) "Request error" `Bad_request error;
+    Alcotest.(check request_error)
+      "Request error"
+      (`Bad_request "unexpected ' ' in field line")
+      error;
     start_response Headers.empty |> Body.Writer.close
   in
   let request_handler _reqd = assert false in
@@ -1718,7 +1724,10 @@ let test_bad_request () =
   let error_handler ?request:request' error start_response =
     error_handler_fired := true;
     Alcotest.(check (option request)) "Parsed request" (Some request) request';
-    Alcotest.(check request_error) "Request error" `Bad_request error;
+    Alcotest.(check request_error)
+      "Request error"
+      (`Bad_request "invalid Content-Length")
+      error;
     start_response Headers.empty |> Body.Writer.close
   in
   let request_handler _reqd = assert false in
@@ -2174,7 +2183,11 @@ let test_parse_failure_after_checkpoint () =
   reader_closed t;
   match !error_queue with
   | None -> Alcotest.fail "Expected error"
-  | Some error -> Alcotest.(check request_error) "Error" error `Bad_request
+  | Some error ->
+    Alcotest.(check request_error)
+      "Error"
+      (`Bad_request "unexpected ' ' in field line")
+      error
 
 let test_parse_failure_at_eof () =
   let error_queue = ref None in
@@ -2198,7 +2211,11 @@ let test_parse_failure_at_eof () =
   reader_closed t;
   (match !error_queue with
   | None -> Alcotest.fail "Expected error"
-  | Some error -> Alcotest.(check request_error) "Error" error `Bad_request);
+  | Some error ->
+    Alcotest.(check request_error)
+      "Error"
+      (`Bad_request "unexpected ' ' in field line")
+      error);
   !continue ();
   write_response
     t
@@ -2997,10 +3014,12 @@ let test_incomplete_request_body_not_complete () =
               (label ^ ": bytes received")
               received
               events.received;
-            Alcotest.(check (option request_error))
+            Alcotest.(check bool)
               (label ^ ": error code")
-              (Some `Bad_request)
-              (Request_descriptor.error_code (Option.get events.reqd)))
+              true
+              (match Request_descriptor.error_code (Option.get events.reqd) with
+              | Some (`Bad_request _) -> true
+              | _ -> false))
          [ "content-length: 5\r\n", "ab", true, "ab"
          ; "transfer-encoding: chunked\r\n", "3\r\nab", true, "ab"
          ; "transfer-encoding: chunked\r\n", "3\r\nabc\r\n", true, "abc"
@@ -3802,6 +3821,66 @@ let test_error_handler_respond_twice () =
     "HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n"
     (Raw.take_output t)
 
+let bad_request_inputs =
+  [ ( "bare LF"
+    , "GET / HTTP/1.1\nHost: a\r\n\r\n"
+    , "unexpected '\\n' in request-line" )
+  ; ( "obs-fold"
+    , "GET / HTTP/1.1\r\nHost: a\r\nX: b\r\n c\r\n\r\n"
+    , "unexpected ' ' in field line" )
+  ; ( "bad Content-Length"
+    , "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1x\r\n\r\n"
+    , "invalid Content-Length" )
+  ; ( "bad target"
+    , "GET index.html HTTP/1.1\r\nHost: a\r\n\r\n"
+    , "request-target does not fit the method" )
+  ]
+
+let test_bad_request_reasons () =
+  let reasons =
+    List.map
+      (fun (case, input, expected) ->
+         let errors = ref [] in
+         let t =
+           Raw.create
+             ~error_handler:(fun ?request:_ error respond ->
+               errors := error :: !errors;
+               Body.Writer.close (respond Headers.empty))
+             (fun _ -> Alcotest.fail "request handler called")
+         in
+         Raw.feed ~chunk:max_int t input;
+         ignore (Raw.write_all t);
+         Alcotest.(check (list request_error))
+           case
+           [ `Bad_request expected ]
+           !errors;
+         expected)
+      bad_request_inputs
+  in
+  Alcotest.(check int)
+    "distinct reasons"
+    (List.length reasons)
+    (List.length (List.sort_uniq String.compare reasons))
+
+let test_default_error_handler_hides_reason () =
+  List.iter
+    (fun (case, input, _) ->
+       let t =
+         { Raw.conn =
+             Server_connection.create (fun _ ->
+               Alcotest.fail "request handler called")
+         ; pending = ""
+         ; out = Buffer.create 256
+         }
+       in
+       Raw.feed ~chunk:max_int t input;
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         case
+         "HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n400"
+         (Raw.take_output t))
+    bad_request_inputs
+
 let test_error_handler_flush_then_raise () =
   List.iter
     (fun (case, input, handler) ->
@@ -4580,6 +4659,10 @@ let tests =
   ; ( "error handler flushes then raises"
     , `Quick
     , test_error_handler_flush_then_raise )
+  ; "bad request reasons", `Quick, test_bad_request_reasons
+  ; ( "default error handler does not send the reason"
+    , `Quick
+    , test_default_error_handler_hides_reason )
   ; ( "report_exn while the error handler has not responded"
     , `Quick
     , test_report_exn_while_error_handler_pending )

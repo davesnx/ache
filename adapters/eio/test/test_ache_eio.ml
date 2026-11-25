@@ -706,7 +706,7 @@ let test_eof_mid_body () =
     Eio.Flow.close socket);
   Alcotest.(check bool) "request body cut" true !partial_body_cut;
   match !server_errors with
-  | [ `Bad_request ] -> ()
+  | [ `Bad_request _ ] -> ()
   | _ ->
     Alcotest.failf
       "expected one Bad_request, got %d errors"
@@ -2115,7 +2115,7 @@ let test_server_run_error_handler_exception () =
     let error_handler _ ?request:_ error start_response =
       match error with
       | `Exn _ -> raise Error_handler_failed
-      | #Status.standard -> Body.Writer.close (start_response Headers.empty)
+      | _ -> Body.Writer.close (start_response Headers.empty)
     in
     Eio.Time.with_timeout_exn clock 10.0 (fun () ->
       Eio.Fiber.first
