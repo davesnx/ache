@@ -442,6 +442,29 @@ a failed write (`` `Closed ``).
 All four timeouts are on by default in every runtime: head 30 s, idle,
 body and write 60 s. Passing `None` turns one off.
 
+### Keep-Alive
+
+A client cannot see when a server closes an idle connection. If it sends a
+request just as the server closes, the request is lost, and it cannot
+always be retried. ache announces the limit and keeps a margin on both
+sides (Node's `keepAliveTimeoutBuffer`, undici's reading of the hint):
+
+- The server: with an idle timeout of 1 s or more, every response after
+  which the connection stays open gets `Keep-Alive: timeout=n`, `n` being
+  the idle timeout rounded down (`Server_connection.create
+  ?keep_alive_timeout`), with `, max=m` when
+  `Config.max_requests_per_connection` is set. A response that closes the
+  connection, a 1xx, a tunnel, or a response whose handler set
+  `Keep-Alive` itself gets none. The runtimes then wait 1 s longer than
+  they announced before they close an idle connection. With the idle
+  timeout off there is no hint.
+- The client: after a response with `Keep-Alive: timeout=n` that keeps the
+  connection open, `Client_connection.reuse_timeout` gives `n - 2` seconds
+  (`n` at most 600). The runtimes count from the end of the response and,
+  when that time has passed with no request started, close the
+  connection; a request after it gets `` `Connection_closed `` and nothing
+  is written. Without the hint a connection is reused as before.
+
 ### Graceful stop
 
 `Server_connection.drain` makes the request in progress the last one on a

@@ -413,6 +413,13 @@ socket. For another socket type, implement `Ache_miou.IO` and apply
 its own task for each accepted socket, and close the socket when it
 returns. The server timeouts are on by default (idle 60 s, head 30 s,
 body 60 s, write 60 s); `~idle_timeout:None` and the others turn one off.
+With an idle timeout of at least 1 s, persistent responses carry
+`Keep-Alive: timeout=n` (the idle timeout rounded down, with `max=` when
+`Config.max_requests_per_connection` is set), and the server waits 1 s
+longer than it announces. The client honours the hint: `n - 2` seconds
+(at most 598) after a response with `Keep-Alive: timeout=n`, an idle
+client connection closes, and `Client.request` on it after that time gets
+`` `Connection_closed `` before anything is written.
 Timeouts use `Miou_unix.sleep` and need no clock. With
 `?idle_timeout` or `?head_timeout`, when the server stops reading it reads
 and drops input until the peer stops sending. It waits at most

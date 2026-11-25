@@ -620,7 +620,21 @@ module Server = struct
     let time =
       match clock with Some clock -> Time.of_clock clock | None -> Time.system
     in
+    let keep_alive_timeout =
+      match idle_timeout with
+      | Some seconds when seconds >= 1. -> Some (int_of_float seconds)
+      | Some _ | None -> None
+    in
     fun socket client_addr ->
+      let last_reqd = ref None in
+      let upgraded () =
+        match !last_reqd with
+        | Some reqd ->
+          (match Ache.Request_descriptor.response reqd with
+          | Some { Ache.Response.status = `Switching_protocols; _ } -> true
+          | Some _ | None -> false)
+        | None -> false
+      in
       let head_deadline = ref None
       and body_spent = ref 0.
       and body_progress = ref 0
@@ -641,7 +655,9 @@ module Server = struct
           ~config
           ~error_handler
           ?date:(if date then Some current_date else None)
+          ?keep_alive_timeout
           (fun reqd ->
+             last_reqd := Some reqd;
              head_deadline := None;
              body_spent := 0.;
              body_progress := 0;
@@ -718,7 +734,16 @@ module Server = struct
           (match Ache.Server_connection.read_timeout connection with
           | Some (`Idle, _) ->
             (match idle_timeout with
-            | Some seconds -> Some (limit (time.now () +. seconds) `Idle)
+            | Some seconds ->
+              (* The hint promises [keep_alive_timeout]: wait 1 s longer, so
+                 that a client that trusts it does not write into a closing
+                 connection. Not after an upgrade (WebSocket). *)
+              let seconds =
+                if Option.is_some keep_alive_timeout && not (upgraded ())
+                then seconds +. 1.
+                else seconds
+              in
+              Some (limit (time.now () +. seconds) `Idle)
             | None when Option.is_some stop && not !drained ->
               (* Only so that a drain can stop the wait. *)
               Some (limit Float.infinity `Idle)
@@ -855,7 +880,12 @@ module Client = struct
     ; runtime : Upgradable.t
     ; shutdown_reader : unit -> unit
     ; shutdown_complete : unit Promise.t
+    ; reuse_deadline : float ref
     }
+
+  let close_now t =
+    t.shutdown_reader ();
+    Upgradable.shutdown t.runtime
 
   let create_connection ?(config = Ache.Config.default) ~sw socket =
     let connection = Ache.Client_connection.create ~config () in
@@ -865,11 +895,80 @@ module Client = struct
     in
     let shutdown_p, shutdown_u = Promise.create () in
     let read_closed = Promise.create () in
+    let reuse_deadline = ref Float.infinity
+    and watchdog_target = ref Float.infinity
+    and rearm = Eio.Condition.create () in
+    let t =
+      { connection
+      ; runtime
+      ; shutdown_reader =
+          (fun () ->
+            let cancel_reader, resolve_cancel_reader = read_closed in
+            if not (Promise.is_resolved cancel_reader)
+            then Promise.resolve resolve_cancel_reader ())
+      ; shutdown_complete = shutdown_p
+      ; reuse_deadline
+      }
+    in
+    (* The server's [Keep-Alive: timeout] hint: the connection is not reused
+       once [reuse_timeout] seconds have passed since the response ended. One
+       watchdog fiber closes it then. *)
+    let observe () =
+      match
+        if Ache.Client_connection.is_closed connection
+        then None (* closed, or upgraded *)
+        else Ache.Client_connection.reuse_timeout connection
+      with
+      | Some seconds when Float.equal !reuse_deadline Float.infinity ->
+        reuse_deadline := Unix.gettimeofday () +. seconds;
+        if !reuse_deadline < !watchdog_target then Eio.Condition.broadcast rearm
+      | Some _ -> ()
+      | None -> reuse_deadline := Float.infinity
+    in
+    let module Observed = struct
+      include Upgradable
+
+      let next_read_operation t =
+        let operation = next_read_operation t in
+        observe ();
+        operation
+
+      let read t bs ~off ~len =
+        let n = read t bs ~off ~len in
+        observe ();
+        n
+
+      let read_eof t bs ~off ~len =
+        let n = read_eof t bs ~off ~len in
+        observe ();
+        n
+    end
+    in
+    Fiber.fork_daemon ~sw (fun () ->
+      let rec watch () =
+        let deadline = !reuse_deadline in
+        watchdog_target := deadline;
+        (if Float.equal deadline Float.infinity
+         then Eio.Condition.await_no_mutex rearm
+         else
+           let seconds = deadline -. Unix.gettimeofday () in
+           if seconds > 0.
+           then
+             Fiber.first
+               (fun () -> Eio_unix.sleep seconds)
+               (fun () -> Eio.Condition.await_no_mutex rearm));
+        watchdog_target := Float.infinity;
+        if !reuse_deadline <= Unix.gettimeofday ()
+        then close_now t
+        else watch ()
+      in
+      Fiber.first watch (fun () -> Promise.await shutdown_p);
+      `Stop_daemon);
     Fiber.fork ~sw (fun () ->
       Fun.protect ~finally:(Promise.resolve shutdown_u) (fun () ->
         match
           IO_loop.start
-            (module Upgradable)
+            (module Observed)
             ~read_buffer_size:config.read_buffer_size
             ~read_closed
             ~timeout:IO_loop.no_timeout
@@ -880,21 +979,20 @@ module Client = struct
         | () -> ()
         | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
         | exception _ -> ()));
-    { connection
-    ; runtime
-    ; shutdown_reader =
-        (fun () ->
-          let cancel_reader, resolve_cancel_reader = read_closed in
-          if not (Promise.is_resolved cancel_reader)
-          then Promise.resolve resolve_cancel_reader ())
-    ; shutdown_complete = shutdown_p
-    }
+    t
 
-  let request t = Ache.Client_connection.request t.connection
+  let request t ?flush_headers_immediately request =
+    (* Past the deadline, the request gets [`Connection_closed] and nothing is
+       written. *)
+    if !(t.reuse_deadline) <= Unix.gettimeofday () then close_now t;
+    t.reuse_deadline := Float.infinity;
+    Ache.Client_connection.request
+      t.connection
+      ?flush_headers_immediately
+      request
 
   let shutdown t =
-    t.shutdown_reader ();
-    Upgradable.shutdown t.runtime;
+    close_now t;
     t.shutdown_complete
 
   let is_closed t = Upgradable.is_closed t.runtime

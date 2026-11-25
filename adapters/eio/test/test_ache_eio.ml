@@ -1333,7 +1333,10 @@ let test_default_timeouts () =
   in
   run "" (fun clock client ->
     advance clock;
-    Alcotest.(check (float 0.)) "idle" 60. (Eio.Time.now clock);
+    Alcotest.(check (float 0.))
+      "idle: 1 s after the hint"
+      61.
+      (Eio.Time.now clock);
     Alcotest.(check string) "idle: closed" "" (read_all client));
   run "GET /hello HTTP/1.1\r\nHo" (fun clock client ->
     advance clock;
@@ -2194,7 +2197,13 @@ let test_server_run_survives_accept_errors () =
             connect ()
         in
         let get = "GET / HTTP/1.1\r\nhost: localhost\r\n\r\n"
-        and ok = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok" in
+        and ok =
+          "HTTP/1.1 200 OK\r\n\
+           content-length: 2\r\n\
+           Keep-Alive: timeout=60\r\n\
+           \r\n\
+           ok"
+        in
         let first = connect () in
         let first_reader = Eio.Buf_read.of_flow first ~max_size:65536 in
         Eio.Flow.copy_string get first;
@@ -2841,6 +2850,7 @@ let with_stop_server ?(server_clock = true) ?grace f =
                  Ache_eio.Server.create_connection_handler
                    ~date:false
                    ?clock:server_clock
+                   ~idle_timeout:None
                    ~stop
                    ?grace
                    ~request_handler
@@ -3180,6 +3190,210 @@ let test_websocket_idle_timeout () =
     [ "receive None"; "session ended" ]
     (List.rev !log)
 
+(* Serves [n] GET requests one after the other on a socket pair, and returns the
+   head of each response. *)
+let keep_alive_heads ?config ~idle_timeout n =
+  Eio_main.run (fun _env ->
+    Eio.Switch.run (fun sw ->
+      let server, client = Eio_unix.Net.socketpair_stream ~sw () in
+      let heads = ref [] in
+      Eio.Fiber.both
+        (fun () ->
+           Ache_eio.Server.create_connection_handler
+             ~date:false
+             ?config
+             ~idle_timeout
+             ~request_handler
+             ~error_handler
+             server
+             (`Unix "socketpair"))
+        (fun () ->
+           let reader = Eio.Buf_read.of_flow client ~max_size:65536 in
+           for _ = 1 to n do
+             Eio.Flow.copy_string get_hello client;
+             let rec head acc =
+               match Eio.Buf_read.line reader with
+               | "" -> List.rev acc
+               | line -> head (line :: acc)
+             in
+             heads := String.concat "\n" (head []) :: !heads;
+             ignore (Eio.Buf_read.take 11 reader : string)
+           done;
+           Eio.Flow.close client);
+      List.rev !heads))
+
+let heads = Alcotest.(list string)
+
+let test_keep_alive_hint () =
+  Alcotest.check
+    heads
+    "idle_timeout 3.5"
+    [ "HTTP/1.1 200 OK\ncontent-length: 11\nKeep-Alive: timeout=3" ]
+    (keep_alive_heads ~idle_timeout:(Some 3.5) 1);
+  Alcotest.check
+    heads
+    "no idle_timeout"
+    [ "HTTP/1.1 200 OK\ncontent-length: 11" ]
+    (keep_alive_heads ~idle_timeout:None 1);
+  Alcotest.check
+    heads
+    "idle_timeout 0.5: no hint"
+    [ "HTTP/1.1 200 OK\ncontent-length: 11" ]
+    (keep_alive_heads ~idle_timeout:(Some 0.5) 1);
+  Alcotest.check
+    heads
+    "max_requests_per_connection 3"
+    [ "HTTP/1.1 200 OK\ncontent-length: 11\nKeep-Alive: timeout=3, max=2"
+    ; "HTTP/1.1 200 OK\ncontent-length: 11\nKeep-Alive: timeout=3, max=1"
+    ; "HTTP/1.1 200 OK\ncontent-length: 11\nconnection: close"
+    ]
+    (keep_alive_heads
+       ~config:{ Ache.Config.default with max_requests_per_connection = Some 3 }
+       ~idle_timeout:(Some 3.5)
+       3)
+
+let test_keep_alive_idle_one_second_longer () =
+  with_server ~idle_timeout:1. (fun ~sw ~net addr ->
+    let clock = !real_clock in
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string get_hello socket;
+    let response =
+      "HTTP/1.1 200 OK\r\n\
+       content-length: 11\r\n\
+       Keep-Alive: timeout=1\r\n\
+       \r\n\
+       hello world"
+    in
+    Alcotest.(check string)
+      "response"
+      response
+      (Eio.Buf_read.take (String.length response) reader);
+    let start = Eio.Time.now clock in
+    let open_at_1_4 =
+      Eio.Fiber.first
+        (fun () ->
+           ignore (Eio.Buf_read.at_end_of_input reader : bool);
+           false)
+        (fun () ->
+           Eio.Time.sleep clock 1.4;
+           true)
+    in
+    Alcotest.(check bool) "open 1.4 s after the response" true open_at_1_4;
+    Alcotest.(check bool) "closed" true (Eio.Buf_read.at_end_of_input reader);
+    let elapsed = Eio.Time.now clock -. start in
+    if elapsed < 1.9 || elapsed > 2.3
+    then Alcotest.failf "closed after %.3f s" elapsed;
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
+(* A client on a socket pair; the test plays the server. *)
+let with_raw_server f =
+  Eio_main.run (fun env ->
+    let clock = Eio.Stdenv.clock env in
+    Eio.Time.with_timeout_exn clock 10.0 (fun () ->
+      Eio.Switch.run (fun sw ->
+        let client_socket, server = Eio_unix.Net.socketpair_stream ~sw () in
+        let client = Ache_eio.Client.create_connection ~sw client_socket in
+        let reader = Eio.Buf_read.of_flow server ~max_size:65536 in
+        let serve response =
+          let rec head () = if Eio.Buf_read.line reader <> "" then head () in
+          head ();
+          Eio.Flow.copy_string response server
+        in
+        f ~clock ~client ~server ~reader ~serve)))
+
+let try_request client =
+  let p, u = Eio.Promise.create () in
+  let body =
+    Ache_eio.Client.request
+      client
+      (Request.create
+         ~headers:(Headers.of_list [ "host", "localhost" ])
+         `GET
+         "/")
+      ~error_handler:(fun error ->
+        Eio.Promise.resolve
+          u
+          (match error with
+          | `Connection_closed -> Error "Connection_closed"
+          | _ -> Error "another error"))
+      ~response_handler:(fun response body ->
+        Body.Reader.close body;
+        Eio.Promise.resolve u (Ok (Status.to_code response.status)))
+  in
+  Body.Writer.close body;
+  p
+
+let outcome = Alcotest.(result int string)
+
+let hinted =
+  "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nKeep-Alive: timeout=3\r\n\r\n"
+
+let test_client_reuse_deadline () =
+  with_raw_server (fun ~clock ~client ~server:_ ~reader ~serve ->
+    let first = try_request client in
+    serve hinted;
+    Alcotest.check outcome "first" (Ok 200) (Eio.Promise.await first);
+    Eio.Time.sleep clock 0.3;
+    let second = try_request client in
+    serve hinted;
+    Alcotest.check
+      outcome
+      "reused within the hint"
+      (Ok 200)
+      (Eio.Promise.await second);
+    Eio.Time.sleep clock 0.6;
+    Alcotest.(check bool)
+      "open after 0.6 s"
+      false
+      (Ache_eio.Client.is_closed client);
+    Eio.Time.sleep clock 0.6;
+    Alcotest.(check bool)
+      "closed after 1.2 s"
+      true
+      (Ache_eio.Client.is_closed client);
+    Alcotest.check
+      outcome
+      "a request after the deadline"
+      (Error "Connection_closed")
+      (Eio.Promise.await (try_request client));
+    Alcotest.(check string)
+      "no bytes reach the server"
+      ""
+      (Eio.Buf_read.take_all reader))
+
+let test_client_deadline_before_timer () =
+  (* timeout=2 gives 0 s: the next request closes the connection first, even if
+     the timer has not run. *)
+  with_raw_server (fun ~clock:_ ~client ~server:_ ~reader ~serve ->
+    let first = try_request client in
+    serve
+      "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nKeep-Alive: timeout=2\r\n\r\n";
+    Alcotest.check outcome "first" (Ok 200) (Eio.Promise.await first);
+    Alcotest.check
+      outcome
+      "next request"
+      (Error "Connection_closed")
+      (Eio.Promise.await (try_request client));
+    Alcotest.(check string)
+      "no bytes reach the server"
+      ""
+      (Eio.Buf_read.take_all reader))
+
+let test_client_no_hint () =
+  with_raw_server (fun ~clock ~client ~server:_ ~reader:_ ~serve ->
+    let plain = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n" in
+    let first = try_request client in
+    serve plain;
+    Alcotest.check outcome "first" (Ok 200) (Eio.Promise.await first);
+    Eio.Time.sleep clock 1.2;
+    Alcotest.(check bool) "open" false (Ache_eio.Client.is_closed client);
+    let second = try_request client in
+    serve plain;
+    Alcotest.check outcome "reused" (Ok 200) (Eio.Promise.await second);
+    Eio.Promise.await (Ache_eio.Client.shutdown client))
+
 let () =
   Alcotest.run
     "ache-eio loopback"
@@ -3281,6 +3495,21 @@ let () =
         ; ( "an idle WebSocket closes with 1001"
           , `Quick
           , test_websocket_idle_timeout )
+        ] )
+    ; ( "keep-alive"
+      , [ "the server sends the hint", `Quick, test_keep_alive_hint
+        ; ( "the idle timer runs 1 s longer than the hint"
+          , `Quick
+          , test_keep_alive_idle_one_second_longer )
+        ; ( "the client closes the connection at the reuse deadline"
+          , `Quick
+          , test_client_reuse_deadline )
+        ; ( "a request past the deadline closes first, before the timer"
+          , `Quick
+          , test_client_deadline_before_timer )
+        ; ( "without a hint the client keeps the connection"
+          , `Quick
+          , test_client_no_hint )
         ] )
     ; ( "stop"
       , [ ( "a request in flight finishes with connection: close"

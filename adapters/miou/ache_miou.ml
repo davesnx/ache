@@ -593,8 +593,18 @@ module Make (Io : IO) = struct
       let untimed =
         Option.is_none idle_timeout && Option.is_none head_timeout
       in
+      (* With an idle timeout of at least 1 s, persistent responses announce it
+         in [Keep-Alive: timeout=n], and the idle timer between requests runs 1
+         s longer, so that a client that trusts the hint does not write into a
+         connection that is closing. *)
+      let keep_alive_timeout =
+        match idle_timeout with
+        | Some seconds when seconds >= 1. -> Some (int_of_float seconds)
+        | Some _ | None -> None
+      in
       let serve socket client_addr =
         let head_deadline = ref None
+        and last_request = ref None
         and body_spent = ref 0.
         and body_received = ref 0
         and error_handler_failure = ref None
@@ -614,8 +624,10 @@ module Make (Io : IO) = struct
             ~config
             ~error_handler
             ?date:(if date then Some current_date else None)
+            ?keep_alive_timeout
             (fun reqd ->
                head_deadline := None;
+               last_request := Some reqd;
                body_spent := 0.;
                body_received := 0;
                with_sessions (fun () -> request_handler client_addr reqd))
@@ -657,8 +669,22 @@ module Make (Io : IO) = struct
             observe ();
             (match Ache.Server_connection.read_timeout connection with
             | Some (`Idle, on_timeout) ->
+              (* [`Idle] after a [101] is the idle timeout of a WebSocket, which
+                 announces nothing. *)
+              let upgraded =
+                match
+                  Option.bind !last_request Ache.Request_descriptor.response
+                with
+                | Some { status = `Switching_protocols; _ } -> true
+                | Some _ | None -> false
+              in
               Option.map
                 (fun seconds ->
+                   let seconds =
+                     if Option.is_some keep_alive_timeout && not upgraded
+                     then seconds +. 1.
+                     else seconds
+                   in
                    `Idle, Unix.gettimeofday () +. seconds, on_timeout)
                 idle_timeout
             | Some (`Head, on_timeout) ->
@@ -730,7 +756,21 @@ module Make (Io : IO) = struct
       ; stopped : [ `Done | `Abort ] Miou.Computation.t
       ; task : unit Miou.t
       ; mutable awaited : bool
+      ; reuse : reuse
       }
+
+    (* The connection is not reused after [deadline]: the server announced with
+       [Keep-Alive: timeout=n] that it may close it then. *)
+    and reuse =
+      { mutable deadline : float option
+      ; mutable upgraded : bool
+      }
+
+    (* [close_idle] closes the connection as {!shutdown} does, from any task of
+       the connection, without waiting for its task. *)
+    let close_idle runtime read_closed =
+      Read_closed.close read_closed;
+      Upgradable.shutdown runtime
 
     let create_connection ?(config = Ache.Config.default) socket =
       let connection = Ache.Client_connection.create ~config () in
@@ -739,7 +779,36 @@ module Make (Io : IO) = struct
           (Ache.Runtime.make (module Ache.Client_connection) connection)
       in
       let read_closed = Read_closed.create ()
-      and stopped = Miou.Computation.create () in
+      and stopped = Miou.Computation.create ()
+      and reuse = { deadline = None; upgraded = false } in
+      (* Before each read, arm the reuse deadline once a response has given a
+         hint; the read then waits at most until the deadline. *)
+      let timeout = function
+        | `Linger -> None
+        | `Read when reuse.upgraded -> None
+        | `Read ->
+          (match Ache.Client_connection.reuse_timeout connection with
+          | None -> None
+          | Some seconds ->
+            let deadline =
+              match reuse.deadline with
+              | Some deadline -> deadline
+              | None ->
+                let deadline = Unix.gettimeofday () +. seconds in
+                reuse.deadline <- Some deadline;
+                deadline
+            in
+            let expire () =
+              match reuse.deadline with
+              | Some current
+                when current = deadline
+                     && Option.is_some
+                          (Ache.Client_connection.reuse_timeout connection) ->
+                close_idle runtime read_closed
+              | Some _ | None -> ()
+            in
+            Some (`Idle, deadline, expire))
+      in
       let task =
         Miou.async (fun () ->
           IO_loop.start
@@ -747,15 +816,28 @@ module Make (Io : IO) = struct
             ~read_buffer_size:config.read_buffer_size
             ~read_closed
             ~interruptible:true
-            ~timeout:(fun _ -> None)
+            ~timeout
             ~linger:true
             ~stopped
             runtime
             socket)
       in
-      { connection; runtime; read_closed; stopped; task; awaited = false }
+      { connection
+      ; runtime
+      ; read_closed
+      ; stopped
+      ; task
+      ; awaited = false
+      ; reuse
+      }
 
-    let request t = Ache.Client_connection.request t.connection
+    let request t =
+      (match t.reuse.deadline with
+      | Some deadline when deadline <= Unix.gettimeofday () ->
+        close_idle t.runtime t.read_closed
+      | Some _ | None -> ());
+      t.reuse.deadline <- None;
+      Ache.Client_connection.request t.connection
 
     let shutdown t =
       Read_closed.close t.read_closed;
@@ -768,7 +850,11 @@ module Make (Io : IO) = struct
         ())
 
     let is_closed t = Upgradable.is_closed t.runtime
-    let upgrade t impl = Upgradable.upgrade t.runtime impl
+
+    let upgrade t impl =
+      t.reuse.upgraded <- true;
+      t.reuse.deadline <- None;
+      Upgradable.upgrade t.runtime impl
   end
 end
 

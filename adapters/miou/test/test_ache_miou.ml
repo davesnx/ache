@@ -405,6 +405,7 @@ let with_timeout seconds f =
 
 (* Timeouts that a test does not give are off, not at their defaults. *)
 let with_server
+      ?config
       ?idle_timeout
       ?head_timeout
       ?body_timeout
@@ -437,6 +438,7 @@ let with_server
                  (fun () ->
                     Ache_miou.Server.create_connection_handler
                       ~date
+                      ?config
                       ~idle_timeout
                       ~head_timeout
                       ~body_timeout
@@ -557,6 +559,22 @@ let hello_response_close =
    connection: close\r\n\
    \r\n\
    hello world"
+
+(* [keep_alive ?idle_timeout response] is [response] with the [Keep-Alive:
+   timeout=n] field that a server with [idle_timeout] adds. *)
+let keep_alive ?idle_timeout response =
+  match idle_timeout with
+  | Some seconds when seconds >= 1. ->
+    let head_end =
+      let rec find i =
+        if String.sub response i 4 = "\r\n\r\n" then i else find (i + 1)
+      in
+      find 0
+    in
+    String.sub response 0 (head_end + 2)
+    ^ Printf.sprintf "Keep-Alive: timeout=%d\r\n" (int_of_float seconds)
+    ^ String.sub response (head_end + 2) (String.length response - head_end - 2)
+  | Some _ | None -> response
 
 let status_line output =
   match String.index_opt output '\r' with
@@ -1515,9 +1533,11 @@ let half_close_during_large_response ?idle_timeout ?head_timeout () =
     let output = read_all socket in
     Miou_unix.close socket;
     let head =
-      Printf.sprintf
-        "HTTP/1.1 200 OK\r\ncontent-length: %d\r\n\r\n"
-        (String.length big_body)
+      keep_alive
+        ?idle_timeout
+        (Printf.sprintf
+           "HTTP/1.1 200 OK\r\ncontent-length: %d\r\n\r\n"
+           (String.length big_body))
     in
     Alcotest.(check int)
       "bytes received"
@@ -1597,6 +1617,7 @@ let check_timers_bounded ?idle_timeout ?head_timeout ~requests send_request =
     let earlier_live_sleeper = Miou.async (fun () -> Miou_unix.sleep 20.) in
     let socket = connect addr in
     Unix.setsockopt (Miou_unix.to_file_descr socket) Unix.TCP_NODELAY true;
+    let hello_response = keep_alive ?idle_timeout hello_response in
     let get_hellos n =
       for _ = 1 to n do
         send_request socket;
@@ -1721,6 +1742,7 @@ let test_closed_connection_timers_bounded () =
       (take socket (String.length hello_response_close)))
 
 let test_idle_connection_timers_bounded () =
+  let hello_response = keep_alive ~idle_timeout:30. hello_response in
   check_connection_timers_bounded ~connections:1000 (fun socket ->
     send socket get_hello;
     Alcotest.(check string)
@@ -2500,7 +2522,9 @@ let test_server_run_accept_error () =
          with_timeout 20.0 (fun () ->
            let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, port) in
            let response body =
-             "HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n" ^ body
+             keep_alive
+               ~idle_timeout:60.
+               ("HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n" ^ body)
            in
            let get socket =
              send socket get_hello;
@@ -2602,6 +2626,7 @@ let stop_closes_idle_connection ?idle_timeout () =
   with_server ?idle_timeout ~stop (fun addr ->
     let socket = connect addr in
     send socket get_hello;
+    let hello_response = keep_alive ?idle_timeout hello_response in
     Alcotest.(check string)
       "response"
       hello_response
@@ -2708,6 +2733,7 @@ let test_server_run_stop () =
       ~finally:(fun () -> Miou.cancel server)
       (fun () ->
          with_timeout 10.0 (fun () ->
+           let hello_response = keep_alive ~idle_timeout:60. hello_response in
            let idle = connect_retrying addr in
            send idle get_hello;
            Alcotest.(check string)
@@ -2872,6 +2898,152 @@ let test_idle_timeout_none () =
        Miou_unix.close socket;
        wait_connection_done ())
 
+let hello_with_hint hint =
+  "HTTP/1.1 200 OK\r\ncontent-length: 11\r\nKeep-Alive: "
+  ^ hint
+  ^ "\r\n\r\nhello world"
+
+let test_keep_alive_hint () =
+  with_server ~idle_timeout:3.5 (fun addr ->
+    let socket = connect addr in
+    send socket get_hello;
+    let expected = hello_with_hint "timeout=3" in
+    Alcotest.(check string)
+      "hint"
+      expected
+      (take socket (String.length expected));
+    Miou_unix.close socket);
+  with_server (fun addr ->
+    let socket = connect addr in
+    send socket get_hello;
+    Alcotest.(check string)
+      "no hint without idle_timeout"
+      hello_response
+      (take socket (String.length hello_response));
+    Miou_unix.close socket);
+  let config = { Config.default with max_requests_per_connection = Some 3 } in
+  with_server ~config ~idle_timeout:3.5 (fun addr ->
+    let socket = connect addr in
+    send socket (get_hello ^ get_hello ^ get_hello);
+    Alcotest.(check string)
+      "max counts down, the last response closes"
+      (hello_with_hint "timeout=3, max=2"
+      ^ hello_with_hint "timeout=3, max=1"
+      ^ hello_response_close)
+      (read_all socket);
+    Miou_unix.close socket)
+
+let test_keep_alive_idle_timer () =
+  with_server ~idle_timeout:1. (fun addr ->
+    let socket = connect addr in
+    send socket get_hello;
+    let expected = hello_with_hint "timeout=1" in
+    Alcotest.(check string)
+      "hint"
+      expected
+      (take socket (String.length expected));
+    let from = Unix.gettimeofday () in
+    Alcotest.(check bool) "closed" true (at_end_of_input socket);
+    check_elapsed "idle timer is 1 s longer" ~from ~min:1.4 ~max:2.6;
+    Miou_unix.close socket)
+
+(* [hint_server listening ~hint] serves the requests of one connection with "ok"
+   and [hint] as the Keep-Alive field, and returns how many it served and
+   whether any byte came after the last one. *)
+let hint_server listening ~hint =
+  let socket, _ = Miou_unix.accept listening in
+  Fun.protect
+    ~finally:(fun () -> Miou_unix.close socket)
+    (fun () ->
+       let served = ref 0
+       and extra = ref false in
+       let response =
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n"
+         ^ (match hint with
+           | Some hint -> "Keep-Alive: " ^ hint ^ "\r\n"
+           | None -> "")
+         ^ "\r\nok"
+       in
+       let byte = Bytes.create 1 in
+       (* [line] holds the bytes of the current line, [pending] whether a byte
+          came since the last response. *)
+       let rec loop line =
+         match Miou_unix.read socket byte with
+         | 0 | (exception Unix.Unix_error _) -> ()
+         | _ ->
+           extra := true;
+           (match Bytes.get byte 0 with
+           | '\n' when line = "" ->
+             incr served;
+             extra := false;
+             Miou_unix.write socket response;
+             loop ""
+           | '\n' -> loop ""
+           | '\r' -> loop line
+           | c -> loop (line ^ String.make 1 c))
+       in
+       loop "";
+       !served, !extra)
+
+let test_client_reuse_deadline () =
+  let run ~hint ~closes =
+    Miou_unix.run ~domains:0 (fun () ->
+      let listening = Miou_unix.tcpv4 () in
+      Miou_unix.bind_and_listen
+        listening
+        (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+      let addr = Unix.getsockname (Miou_unix.to_file_descr listening) in
+      let server = Miou.async (fun () -> hint_server listening ~hint) in
+      with_timeout 10.0 (fun () ->
+        let socket = connect addr in
+        let client = Ache_miou.Client.create_connection socket in
+        let get () =
+          request
+            client
+            (Request.create
+               ~headers:(Headers.of_list [ "host", "localhost" ])
+               `GET
+               "/")
+        in
+        Alcotest.(check string) "first" "ok" (snd (get ()));
+        Miou_unix.sleep 0.3;
+        Alcotest.(check string) "reused" "ok" (snd (get ()));
+        Miou_unix.sleep 1.3;
+        Alcotest.(check bool)
+          "closed after the reuse deadline"
+          closes
+          (Ache_miou.Client.is_closed client);
+        if closes
+        then (
+          let errors = ref [] in
+          let body =
+            Ache_miou.Client.request
+              client
+              (Request.create
+                 ~headers:(Headers.of_list [ "host", "localhost" ])
+                 `GET
+                 "/")
+              ~error_handler:(fun error -> errors := error :: !errors)
+              ~response_handler:(fun _ _ -> Alcotest.fail "a response")
+          in
+          Body.Writer.close body;
+          Alcotest.(check bool)
+            "Connection_closed"
+            true
+            (match !errors with [ `Connection_closed ] -> true | _ -> false))
+        else Alcotest.(check string) "third" "ok" (snd (get ()));
+        Ache_miou.Client.shutdown client;
+        Miou_unix.close socket);
+      let served, extra =
+        match Miou.await server with Ok v -> v | Error exn -> raise exn
+      in
+      Alcotest.(check int) "requests served" (if closes then 2 else 3) served;
+      Alcotest.(check bool) "no byte after the last request" false extra;
+      Miou_unix.close listening)
+  in
+  run ~hint:(Some "timeout=3") ~closes:true;
+  run ~hint:None ~closes:false
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Option.iter
@@ -3004,6 +3176,15 @@ let () =
         ; ( "Server.run stops accepting, drains, and returns"
           , `Quick
           , test_server_run_stop )
+        ] )
+    ; ( "keep-alive"
+      , [ "Keep-Alive hint", `Quick, test_keep_alive_hint
+        ; ( "the idle timer runs 1 s longer than the hint"
+          , `Quick
+          , test_keep_alive_idle_timer )
+        ; ( "client: not reused after the Keep-Alive deadline"
+          , `Quick
+          , test_client_reuse_deadline )
         ] )
     ; ( "timeouts"
       , [ "idle connection is closed", `Quick, test_idle_timeout

@@ -153,6 +153,7 @@ let create
       ?(config = Config.default)
       ?(error_handler = default_error_handler)
       ?date
+      ?keep_alive_timeout
       request_handler
   =
   let { Config.response_buffer_size
@@ -169,6 +170,14 @@ let create
       "ache.Server_connection.create: max_requests_per_connection must be \
        positive"
   | _ -> ());
+  let keep_alive =
+    match keep_alive_timeout with
+    | None -> ""
+    | Some s when s < 1 ->
+      invalid_arg
+        "ache.Server_connection.create: keep_alive_timeout must be positive"
+    | Some s -> "timeout=" ^ string_of_int s
+  in
   let date =
     Option.map
       (fun date ->
@@ -190,6 +199,13 @@ let create
     match !self with
     | None -> assert false
     | Some (t, upgrade) ->
+      t.requests <- t.requests + 1;
+      let keep_alive =
+        match max_requests_per_connection with
+        | Some n when keep_alive <> "" && n > t.requests ->
+          keep_alive ^ ", max=" ^ string_of_int (n - t.requests)
+        | _ -> keep_alive
+      in
       let reqd =
         Request_descriptor.create
           ~error_handler
@@ -199,10 +215,10 @@ let create
           ~response_body_buffer
           ~proxy:config.proxy
           ~date
+          ~keep_alive
           request
           request_body
       in
-      t.requests <- t.requests + 1;
       if
         t.draining
         ||
@@ -288,7 +304,11 @@ let set_error_and_handle ?request t error =
            in
            (match t.date with
            | Some date when Request_descriptor.needs_date response ->
-             Writer.write_response_with_date writer response (date ())
+             Writer.write_response_with
+               writer
+               response
+               ~date:(date ())
+               ~keep_alive:""
            | _ -> Writer.write_response writer response);
            t.error_code <-
              Error

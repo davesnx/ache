@@ -259,6 +259,20 @@ turns one off. The TLS handler takes the same arguments.
 | `?body_timeout` | `Some 60.` | the connection waits for request body bytes (408 if no response started, else close) |
 | `?write_timeout` | `Some 60.` | output waits to be written, for example to a client that stopped reading (close) |
 
+With `?idle_timeout:(Some x)` and `x >= 1.`, a response after which the
+connection stays open gets `Keep-Alive: timeout=n`, with `n` the whole
+seconds of `x` (and `, max=m` when `Config.max_requests_per_connection` is
+set), unless the application set `Keep-Alive`. The timer between requests
+then runs `x + 1` seconds, so that a client that trusts the hint never
+writes into a connection that is closing. A WebSocket keeps `x`.
+
+The client reads the hint: `Client_connection.reuse_timeout` gives `s`,
+`timeout` (at most 600) minus 2 seconds. `s` seconds after it sees the end
+of the response, an idle `Ache_lwt.Client` connection shuts down, and a
+`request` made after that time gets `` `Connection_closed `` without
+writing anything, also when the timer has not run yet. The TLS client does
+the same.
+
 Before each read, the server asks the core which timeout applies
 (`Server_connection.read_timeout`). While the request handler runs and the
 connection waits for nothing from the client, no timeout applies.

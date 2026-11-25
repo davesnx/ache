@@ -58,9 +58,15 @@ module Server : sig
       Timeouts are in seconds. Each is on by default; [None] turns it off.
       - [idle_timeout] (default [Some 60.]): when no request is in progress
         and no byte arrives for [idle_timeout], the connection closes
-        without a response. On a connection upgraded with
-        {!Websocket.upgrade}, when no byte arrives for [idle_timeout], the
-        connection sends a close frame with code [1001] and closes.
+        without a response. When [idle_timeout] is at least 1 s, each
+        response after which the connection stays open gets
+        [Keep-Alive: timeout=n], [n] being [idle_timeout] rounded down
+        (see [keep_alive_timeout] in {!Ache.Server_connection.create}), and
+        the connection then waits [idle_timeout + 1.] seconds for the next
+        request, so that a client that trusts the hint does not send a
+        request into a connection that is closing. On a connection upgraded
+        with {!Websocket.upgrade}, when no byte arrives for [idle_timeout],
+        the connection sends a close frame with code [1001] and closes.
       - [head_timeout] (default [Some 30.]): when a request head is not
         complete [head_timeout] after its first byte was read,
         [error_handler] is called with [`Request_timeout] (408) and the
@@ -232,6 +238,16 @@ module Client : sig
     -> sw:Eio.Switch.t
     -> _ Eio.Flow.two_way
     -> t
+  (** [create_connection ~sw flow] runs an HTTP/1.1 client on [flow].
+
+      When a response keeps the connection open with
+      [Keep-Alive: timeout=n], the connection is not reused once the time
+      that {!Ache.Client_connection.reuse_timeout} gives ([n] minus 2 s)
+      has passed since the response ended: one fiber of [sw] then shuts it
+      down as {!shutdown} does, if no request has started. A {!request}
+      after that time, also before that fiber has run, shuts the connection
+      down first, and gets [`Connection_closed] without writing anything.
+      Without the hint, the connection stays open. *)
 
   val request :
      t

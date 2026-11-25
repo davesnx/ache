@@ -57,7 +57,18 @@ module type Server = Ache_lwt_intf.Server
 
 module type Client = Ache_lwt_intf.Client
 (** [Client.upgrade t impl] shuts down the HTTP state of [t] and hands reading
-    and writing on its socket to [impl]. *)
+    and writing on its socket to [impl].
+
+    Reuse deadline: when a response keeps the connection open and has
+    [Keep-Alive: timeout=n], the connection is not reused after [s] seconds,
+    from when its reader sees the end of that response ([s] is
+    {!Ache.Client_connection.reuse_timeout}: [min n 600] minus 2). When [s]
+    passes and no request was made, the connection shuts down as with
+    [shutdown]: [is_closed] becomes [true] and the socket closes. A
+    [request] made after [s] passed shuts the connection down first, so its
+    [error_handler] gets [`Connection_closed] and nothing is written. A new
+    [request] before [s] clears the deadline. Without the hint nothing
+    changes. *)
 
 (** Timeouts that share one Lwt timer for each length.
 
@@ -221,6 +232,16 @@ end
       because the client stopped reading. The connection closes its socket
       and ends; pending [Body.Writer.flush] callbacks get [`Closed]. The
       clock restarts when all output is written and after each 2048 bytes.
+
+    Keep-Alive hint: when [idle_timeout] is [Some x] with [x >= 1.], each
+    response after which the connection stays open gets
+    [Keep-Alive: timeout=n] ([n] is [x] rounded down), with [, max=m] when
+    [Config.max_requests_per_connection] is set, unless the application set
+    a [Keep-Alive] field (see {!Ache.Server_connection.create}). The timer
+    between requests then runs [x +. 1.] seconds, so that a client that
+    trusts the hint does not write into a connection that is closing. The
+    WebSocket idle timer stays [x]. With [x < 1.] or [None] no hint is
+    sent.
 
     While the request handler runs and the connection waits for nothing
     from the client, no timeout applies.

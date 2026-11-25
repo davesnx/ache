@@ -451,6 +451,10 @@ module Make (Io : IO) = struct
         let head_timer = Option.map Timeout.create head_timeout
         and head_armed = ref false
         and idle_timer = Option.map Timeout.create idle_timeout
+        and keep_alive_timeout =
+          match idle_timeout with
+          | Some seconds when seconds >= 1. -> Some (int_of_float seconds)
+          | Some _ | None -> None
         and tick_timer =
           Option.map
             (fun seconds -> Timeout.create (seconds /. float body_ticks))
@@ -466,6 +470,20 @@ module Make (Io : IO) = struct
           ticks := 0;
           body_progress := 0
         in
+        (* Between requests the idle timer runs 1 s longer than the [Keep-Alive]
+           hint, so that a client that trusts the hint does not write into a
+           connection that is closing. *)
+        let between_requests_timer =
+          match keep_alive_timeout, idle_timeout with
+          | Some _, Some seconds -> Some (Timeout.create (seconds +. 1.))
+          | None, _ -> idle_timer
+          | Some _, None -> None
+        and last_reqd = ref None in
+        let upgraded () =
+          match Option.bind !last_reqd Ache.Request_descriptor.response with
+          | Some { Ache.Response.status = `Switching_protocols; _ } -> true
+          | Some _ | None -> false
+        in
         let stop_head_timer () =
           head_armed := false;
           Option.iter Timeout.stop head_timer
@@ -475,7 +493,9 @@ module Make (Io : IO) = struct
             ~config
             ~error_handler:(error_handler client_addr)
             ?date:(if date then Some current_date else None)
+            ?keep_alive_timeout
             (fun reqd ->
+               last_reqd := Some reqd;
                stop_head_timer ();
                restart_body_clock ();
                request_handler client_addr reqd)
@@ -574,7 +594,9 @@ module Make (Io : IO) = struct
             else
               match phase with
               | Some (`Idle, on_timeout) ->
-                (match idle_timer with
+                (match
+                   if upgraded () then idle_timer else between_requests_timer
+                 with
                 | Some timer ->
                   Timeout.set timer;
                   [ expire timer on_timeout ]
@@ -676,6 +698,7 @@ module Make (Io : IO) = struct
             (fun () ->
                Option.iter Timeout.stop head_timer;
                Option.iter Timeout.stop idle_timer;
+               Option.iter Timeout.stop between_requests_timer;
                Option.iter Timeout.stop tick_timer;
                Option.iter Timeout.stop write_timer;
                Lwt.return_unit)
@@ -716,7 +739,43 @@ module Make (Io : IO) = struct
       { connection : Ache.Client_connection.t
       ; runtime : Upgradable.t
       ; close : unit -> unit Lwt.t
+      ; reuse : reuse
       }
+
+    (* The deadline after which the connection is not reused, from the
+       [Keep-Alive] hint of the last response. *)
+    and reuse =
+      { mutable deadline : float option
+      ; mutable timer : Timeout.t option
+      ; mutable upgraded : bool
+      }
+
+    let shutdown_runtime runtime close =
+      Upgradable.shutdown runtime;
+      close ()
+
+    let arm reuse connection runtime close =
+      if (not reuse.upgraded) && Option.is_none reuse.deadline
+      then
+        match Ache.Client_connection.reuse_timeout connection with
+        | None -> ()
+        | Some seconds when not (seconds > 0.) ->
+          reuse.deadline <- Some (Unix.gettimeofday ());
+          Lwt.async (fun () -> shutdown_runtime runtime close)
+        | Some seconds ->
+          reuse.deadline <- Some (Unix.gettimeofday () +. seconds);
+          (* [seconds] is a whole number of at most 598: at most 598 queues. *)
+          let timer = Timeout.create seconds in
+          reuse.timer <- Some timer;
+          Timeout.set timer;
+          Lwt.on_success (Timeout.expired timer) (fun () ->
+            match reuse.timer with
+            | Some armed when armed == timer ->
+              reuse.timer <- None;
+              if
+                Option.is_some (Ache.Client_connection.reuse_timeout connection)
+              then Lwt.async (fun () -> shutdown_runtime runtime close)
+            | Some _ | None -> ())
 
     let create_connection ?(config = Ache.Config.default) socket =
       let connection = Ache.Client_connection.create ~config () in
@@ -725,25 +784,74 @@ module Make (Io : IO) = struct
           (Ache.Runtime.make (module Ache.Client_connection) connection)
       in
       let close = IO_loop.close_once Io.close socket in
+      let reuse = { deadline = None; timer = None; upgraded = false } in
+      let module Observed = struct
+        include Upgradable
+
+        let next_read_operation t =
+          let operation = next_read_operation t in
+          arm reuse connection runtime close;
+          operation
+
+        let read t bs ~off ~len =
+          let n = read t bs ~off ~len in
+          arm reuse connection runtime close;
+          n
+
+        let read_eof t bs ~off ~len =
+          let n = read_eof t bs ~off ~len in
+          arm reuse connection runtime close;
+          n
+      end
+      in
       Lwt.async (fun () ->
-        IO_loop.start
-          (module Io)
-          (module Upgradable)
-          runtime
-          ~read_buffer_size:config.read_buffer_size
-          ~timed_read:IO_loop.untimed_read
-          ~close
-          socket);
-      Lwt.return { connection; runtime; close }
+        Lwt.finalize
+          (fun () ->
+             IO_loop.start
+               (module Io)
+               (module Observed)
+               runtime
+               ~read_buffer_size:config.read_buffer_size
+               ~timed_read:IO_loop.untimed_read
+               ~close
+               socket)
+          (fun () ->
+             Option.iter Timeout.stop reuse.timer;
+             reuse.timer <- None;
+             Lwt.return_unit));
+      Lwt.return { connection; runtime; close; reuse }
 
-    let request t = Ache.Client_connection.request t.connection
+    let request
+          t
+          ?flush_headers_immediately
+          request
+          ~error_handler
+          ~response_handler
+      =
+      (match t.reuse.deadline with
+      | Some deadline when Unix.gettimeofday () >= deadline ->
+        Upgradable.shutdown t.runtime;
+        Lwt.async t.close
+      | Some _ | None -> ());
+      t.reuse.deadline <- None;
+      Option.iter Timeout.stop t.reuse.timer;
+      t.reuse.timer <- None;
+      Ache.Client_connection.request
+        t.connection
+        ?flush_headers_immediately
+        request
+        ~error_handler
+        ~response_handler
 
-    let shutdown t =
-      Upgradable.shutdown t.runtime;
-      t.close ()
-
+    let shutdown t = shutdown_runtime t.runtime t.close
     let is_closed t = Upgradable.is_closed t.runtime
-    let upgrade t impl = Upgradable.upgrade t.runtime impl
+
+    let upgrade t impl =
+      t.reuse.upgraded <- true;
+      t.reuse.deadline <- None;
+      Option.iter Timeout.stop t.reuse.timer;
+      t.reuse.timer <- None;
+      Upgradable.upgrade t.runtime impl
   end
 end
 

@@ -473,11 +473,22 @@ module Server_connection : sig
      ?config:Config.t
     -> ?error_handler:error_handler
     -> ?date:(unit -> string)
+    -> ?keep_alive_timeout:int
     -> request_handler
     -> t
-  (** [create ?config ?error_handler ?date request_handler] creates a
-      connection handler that will service individual requests with
-      [request_handler].
+  (** [create ?config ?error_handler ?date ?keep_alive_timeout
+       request_handler] creates a connection handler that will service
+      individual requests with [request_handler].
+
+      With [keep_alive_timeout], every response after which the connection
+      stays open (not 1xx, not a tunnel, no [Connection: close]) and that
+      has no [Keep-Alive] field gets [Keep-Alive: timeout=n], with
+      [, max=m] when [Config.max_requests_per_connection] is set ([m] is
+      the number of requests the connection still serves after this one).
+      [n] is the idle timeout that the runtime announces; the runtime keeps
+      its own idle timer 1 s longer, so that a client that trusts the hint
+      never writes into a connection that is closing. Raises
+      [Invalid_argument] when [n] is less than 1.
 
       With [date], every response that is not 1xx and has no [Date] field
       (in any case) gets [Date: (date ())] after its other fields (RFC 9110
@@ -883,6 +894,16 @@ module Client_connection : sig
   type error_handler = error -> unit
 
   val create : ?config:Config.t -> unit -> t
+
+  val reuse_timeout : t -> float option
+  (** [reuse_timeout t] is [Some s] when no request is in progress on [t]
+      and the last response kept the connection open with a [Keep-Alive]
+      field that has [timeout=n] ([n] is digits; other parameters and
+      invalid values are ignored). The server may close the connection [n]
+      seconds after that response, so a runtime does not reuse it once [s]
+      seconds have passed since the response ended: [s] is [min n 600]
+      minus 2, and at least 0. [None] when there is no such hint or a
+      request is in progress. *)
 
   val request :
      t

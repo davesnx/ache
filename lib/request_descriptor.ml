@@ -83,6 +83,7 @@ type t =
   ; mutable error_code : [ `Ok | error ]
   ; proxy : bool
   ; date : (unit -> string) option
+  ; keep_alive : string
   }
 
 let create
@@ -93,6 +94,7 @@ let create
       ~response_body_buffer
       ~proxy
       ~date
+      ~keep_alive
       request
       request_body
   =
@@ -108,6 +110,7 @@ let create
   ; error_code = `Ok
   ; proxy
   ; date
+  ; keep_alive
   }
 
 let request { request; _ } = request
@@ -144,21 +147,33 @@ let needs_date (response : Response.t) =
   (not (Status.is_informational response.status))
   && not (Headers.mem response.headers "date")
 
+let persists_after t (response : Response.t) =
+  t.persistent
+  && Response.persistent_connection response
+  && not (t.request.meth = `CONNECT && Status.is_successful response.status)
+
+let needs_keep_alive t (response : Response.t) =
+  t.keep_alive <> ""
+  && (not (Status.is_informational response.status))
+  && persists_after t response
+  && not (Headers.mem response.headers "keep-alive")
+
 let write_response t response =
   if Writer.is_closed t.writer
   then Serialize.check_response response
   else
-    match t.date with
-    | Some date when needs_date response ->
-      Writer.write_response_with_date t.writer response (date ())
-    | _ -> Writer.write_response t.writer response
+    let date =
+      match t.date with
+      | Some date when needs_date response -> date ()
+      | _ -> ""
+    in
+    let keep_alive = if needs_keep_alive t response then t.keep_alive else "" in
+    if date == "" && keep_alive == ""
+    then Writer.write_response t.writer response
+    else Writer.write_response_with t.writer response ~date ~keep_alive
 
 let commit_persistence t (response : Response.t) =
-  if t.persistent
-  then
-    t.persistent <-
-      Response.persistent_connection response
-      && not (t.request.meth = `CONNECT && Status.is_successful response.status);
+  t.persistent <- persists_after t response;
   if not t.persistent then Reader.pause t.reader
 
 let close_after t =

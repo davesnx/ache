@@ -229,6 +229,182 @@ let test_drain_before_101_written () =
     (Test_websocket.response_101 ^ Test_websocket.close_frame_out 1001)
     `Close
 
+let ok_ka hint =
+  "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nKeep-Alive: " ^ hint ^ "\r\n\r\nok"
+
+let test_keep_alive_hint () =
+  let conn = Server_connection.create ~keep_alive_timeout:5 respond in
+  ignore (feed conn get : int);
+  let out, _ = output conn in
+  check_string "hint" (ok_ka "timeout=5") out;
+  let conn = Server_connection.create respond in
+  ignore (feed conn get : int);
+  let out, _ = output conn in
+  check_string "no hint without keep_alive_timeout" ok out
+
+let test_keep_alive_max () =
+  let config = { Config.default with max_requests_per_connection = Some 3 } in
+  let conn = Server_connection.create ~config ~keep_alive_timeout:5 respond in
+  ignore (feed conn get : int);
+  let out, _ = output conn in
+  check_string "1st" (ok_ka "timeout=5, max=2") out;
+  ignore (feed conn get : int);
+  let out, _ = output conn in
+  check_string "2nd" (ok_ka "timeout=5, max=1") out;
+  ignore (feed conn get : int);
+  let out, state = output conn in
+  check_string "3rd closes, no hint" ok_close out;
+  check_state "closes" "Close" state
+
+let test_keep_alive_not_on_close () =
+  let conn = Server_connection.create ~keep_alive_timeout:5 respond in
+  ignore
+    (feed conn "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" : int);
+  let out, _ = output conn in
+  check_string "closing response has no hint" ok_close out;
+  let conn = Server_connection.create ~keep_alive_timeout:5 respond in
+  ignore (feed conn "GET / HTTP/1.0\r\n\r\n" : int);
+  let out, _ = output conn in
+  check_string "HTTP/1.0 response that closes has no hint" ok_close out;
+  let conn = Server_connection.create ~keep_alive_timeout:5 respond in
+  ignore (feed conn "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n" : int);
+  let out, _ = output conn in
+  check_string
+    "HTTP/1.0 keep-alive gets the hint"
+    "HTTP/1.1 200 OK\r\n\
+     content-length: 2\r\n\
+     connection: keep-alive\r\n\
+     Keep-Alive: timeout=5\r\n\
+     \r\n\
+     ok"
+    out;
+  let conn = Server_connection.create ~keep_alive_timeout:5 respond in
+  Server_connection.drain conn;
+  ignore (feed conn get : int);
+  let out, _ = output conn in
+  check_string "drained connection: nothing served" "" out
+
+let test_keep_alive_app_and_date () =
+  let conn =
+    Server_connection.create ~keep_alive_timeout:5 (fun reqd ->
+      Body.Reader.close (Request_descriptor.request_body reqd);
+      Request_descriptor.respond_with_string
+        reqd
+        (Response.create
+           ~headers:
+             (Headers.of_list
+                [ "content-length", "2"; "keep-alive", "timeout=1" ])
+           `OK)
+        "ok")
+  in
+  ignore (feed conn get : int);
+  let out, _ = output conn in
+  check_string
+    "the application's hint is kept"
+    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nkeep-alive: timeout=1\r\n\r\nok"
+    out;
+  let conn =
+    Server_connection.create
+      ~date:(fun () -> "Sun, 06 Nov 1994 08:49:37 GMT")
+      ~keep_alive_timeout:5
+      respond
+  in
+  ignore (feed conn get : int);
+  let out, _ = output conn in
+  check_string
+    "Date then Keep-Alive"
+    "HTTP/1.1 200 OK\r\n\
+     content-length: 2\r\n\
+     Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n\
+     Keep-Alive: timeout=5\r\n\
+     \r\n\
+     ok"
+    out;
+  match Server_connection.create ~keep_alive_timeout:0 respond with
+  | _ -> Alcotest.fail "expected Invalid_argument"
+  | exception Invalid_argument _ -> ()
+
+(* Client: the hint of the last response. *)
+
+let client_exchange ?(close = false) headers =
+  let client = Client_connection.create () in
+  let body =
+    Client_connection.request
+      client
+      (Request.create
+         ~headers:
+           (Headers.of_list
+              ((if close then [ "connection", "close" ] else [])
+              @ [ "host", "x" ]))
+         `GET
+         "/")
+      ~error_handler:(fun _ -> ())
+      ~response_handler:(fun _ body ->
+        Body.Reader.schedule_read
+          body
+          ~on_eof:ignore
+          ~on_error:ignore
+          ~on_read:(fun _ ~off:_ ~len:_ -> ()))
+  in
+  Body.Writer.close body;
+  let rec write () =
+    match Client_connection.next_write_operation client with
+    | `Write iovecs ->
+      Client_connection.report_write_result client (`Ok (IOVec.lengthv iovecs));
+      write ()
+    | `Yield | `Close _ -> ()
+  in
+  write ();
+  let during = Client_connection.reuse_timeout client in
+  let response =
+    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n" ^ headers ^ "\r\nok"
+  in
+  let len = String.length response in
+  let bs = Bigstring.of_string response ~off:0 ~len in
+  let rec read off =
+    if off < len
+    then
+      match Client_connection.next_read_operation client with
+      | `Read ->
+        read (off + Client_connection.read client bs ~off ~len:(len - off))
+      | `Yield | `Close -> ()
+  in
+  read 0;
+  ignore
+    (Client_connection.next_read_operation client : [ `Read | `Yield | `Close ]);
+  write ();
+  during, Client_connection.reuse_timeout client
+
+let check_reuse msg expected actual =
+  Alcotest.(check (option (float 1e-9))) msg expected actual
+
+let test_client_reuse_timeout () =
+  let during, after = client_exchange "Keep-Alive: timeout=5, max=99\r\n" in
+  check_reuse "none while the request is in progress" None during;
+  check_reuse "hint minus 2 s" (Some 3.) after;
+  check_reuse
+    "at least 0"
+    (Some 0.)
+    (snd (client_exchange "Keep-Alive: timeout=1\r\n"));
+  check_reuse
+    "capped at 600 s"
+    (Some 598.)
+    (snd (client_exchange "Keep-Alive: max=5, timeout=100000\r\n"));
+  check_reuse
+    "bad values ignored"
+    None
+    (snd (client_exchange "Keep-Alive: timeout=abc, timeout=-1\r\n"));
+  check_reuse
+    "a later valid timeout is used"
+    (Some 8.)
+    (snd
+       (client_exchange "Keep-Alive: timeout=x\r\nkeep-alive: TIMEOUT = 10\r\n"));
+  check_reuse "no hint" None (snd (client_exchange ""));
+  check_reuse
+    "closing response"
+    None
+    (snd (client_exchange "Connection: close\r\nKeep-Alive: timeout=5\r\n"))
+
 let tests =
   [ "drain: idle connection closes", `Quick, test_drain_idle
   ; "drain: before any request", `Quick, test_drain_before_any_request
@@ -240,6 +416,15 @@ let tests =
   ; "drain: WebSocket sends 1001", `Quick, test_drain_websocket
   ; "drain: before the 101 is written", `Quick, test_drain_before_101_written
   ; "max_requests_per_connection", `Quick, test_max_requests
+  ; "Keep-Alive hint", `Quick, test_keep_alive_hint
+  ; "Keep-Alive max counts down", `Quick, test_keep_alive_max
+  ; ( "no Keep-Alive hint on a closing response"
+    , `Quick
+    , test_keep_alive_not_on_close )
+  ; ( "Keep-Alive from the application, with Date"
+    , `Quick
+    , test_keep_alive_app_and_date )
+  ; "client: reuse_timeout from Keep-Alive", `Quick, test_client_reuse_timeout
   ; "max_requests_per_connection = 1", `Quick, test_max_requests_one
   ; "max_requests_per_connection < 1", `Quick, test_max_requests_invalid
   ]

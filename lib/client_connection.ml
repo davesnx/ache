@@ -50,6 +50,7 @@ type t =
   ; request_queue : Response_descriptor.t Queue.t
     (* invariant: If [request_queue] is not empty, then the head of the queue
        has already written the request headers to the wire. *)
+  ; mutable reuse_timeout : float option
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
@@ -74,6 +75,7 @@ let create ?(config = Config.default) () =
       Reader.response ~max_header_size:config.max_header_size request_queue
   ; writer = Writer.create ()
   ; request_queue
+  ; reuse_timeout = None
   }
 
 let create_request_body ~request t =
@@ -208,7 +210,39 @@ let maybe_pipeline_queued_requests t =
     with
     | _ -> ()
 
+let max_keep_alive_timeout = 600
+let keep_alive_margin = 2.
+let is_digits s = s <> "" && String.for_all (fun c -> c >= '0' && c <= '9') s
+
+let keep_alive_timeout headers =
+  Headers.get_multi headers "keep-alive"
+  |> List.concat_map (String.split_on_char ',')
+  |> List.find_map (fun param ->
+    match String.index_opt param '=' with
+    | None -> None
+    | Some i ->
+      let name = String.trim (String.sub param 0 i)
+      and value =
+        String.trim (String.sub param (i + 1) (String.length param - i - 1))
+      in
+      if
+        String.lowercase_ascii name = "timeout"
+        && is_digits value
+        && String.length value <= 9
+      then Some (min (int_of_string value) max_keep_alive_timeout)
+      else None)
+
+let reuse_timeout_after respd =
+  match respd.Response_descriptor.state with
+  | Received_response (response, _)
+    when Response_descriptor.persistent_connection respd ->
+    Option.map
+      (fun seconds -> Float.max 0. (float_of_int seconds -. keep_alive_margin))
+      (keep_alive_timeout response.Response.headers)
+  | _ -> None
+
 let advance_request_queue t =
+  t.reuse_timeout <- reuse_timeout_after (Queue.peek t.request_queue);
   ignore (Queue.take t.request_queue);
   if not (Queue.is_empty t.request_queue)
   then
@@ -329,3 +363,5 @@ let report_write_result t result =
   match result with
   | `Ok _ -> ()
   | `Closed -> Queue.iter Response_descriptor.flush_request_body t.request_queue
+
+let reuse_timeout t = if is_active t then None else t.reuse_timeout

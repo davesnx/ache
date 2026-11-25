@@ -41,6 +41,14 @@ module type Server = sig
         [Ache_miou.Websocket.upgrade], when no byte arrives for
         [idle_timeout], the connection sends a close frame with code 1001
         and closes when it is written.
+
+        With [idle_timeout] of at least 1 s, each response after which the
+        connection stays open gets [Keep-Alive: timeout=n] ([n] is
+        [idle_timeout] rounded down; see
+        {!Ache.Server_connection.create}), and the connection waits for the
+        next request [idle_timeout + 1] seconds, so that a client that trusts
+        the hint does not send a request into a connection that is closing.
+        The idle timeout of a WebSocket is not extended.
       - [head_timeout] (default [Some 30.]): when a request head is not
         complete [head_timeout] after its first byte was read,
         [error_handler] is called with [`Request_timeout] (408) and the
@@ -135,7 +143,15 @@ module type Client = sig
   val create_connection : ?config:Ache.Config.t -> socket -> t
   (** [create_connection socket] starts a task that runs the connection on the
       connected [socket]. The caller owns [socket] and closes it after
-      {!shutdown}. *)
+      {!shutdown}.
+
+      When a response keeps the connection open with [Keep-Alive: timeout=n],
+      the connection is reusable for [s] seconds after the response ends,
+      where [s] is {!Ache.Client_connection.reuse_timeout} ([n] at most 600,
+      minus 2). When [s] passes and no request was made, the connection
+      closes as with {!shutdown}, and {!is_closed} is [true]. A {!request}
+      made after [s] closes it first: the request gets
+      [`Connection_closed] and nothing is written. *)
 
   val request :
      t

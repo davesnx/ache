@@ -190,6 +190,17 @@ reaches the limit, the write is cancelled, a `flush` in progress gets
 While the request handler runs and the connection waits for nothing from
 the client, no limit applies: a slow handler is not timed out.
 
+With `idle_timeout` of 1 s or more, each response after which the
+connection stays open carries `Keep-Alive: timeout=n` (`n` is
+`idle_timeout` rounded down, with `, max=m` when
+`Config.max_requests_per_connection` is set), and the server waits
+`idle_timeout + 1` seconds for the next request, 1 s more than it
+announced. A WebSocket connection keeps `idle_timeout` itself. The client
+reads the hint: `Client` does not reuse a connection `n - 2` seconds after
+such a response. One fiber closes it then, and a `request` after that time
+gets `` `Connection_closed `` without writing anything. See
+[Keep-Alive](ache.md#keep-alive).
+
 Timeouts use the system clock. `?clock` replaces it, for example with a mock
 clock in tests. With TLS, the handshake must end within the smaller of
 `idle_timeout` and `head_timeout`.

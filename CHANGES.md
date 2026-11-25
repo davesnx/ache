@@ -106,6 +106,25 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   domain, `run` stops accepting, each connection drains in its own domain,
   `grace` seconds later the ones still open are cancelled with their
   WebSocket sessions, and `run` returns when every connection has ended.
+- `Server_connection.create ?keep_alive_timeout` adds `Keep-Alive:
+  timeout=n` (and `max=m` with `Config.max_requests_per_connection`) to
+  persistent responses, and `Client_connection.reuse_timeout` reads the
+  hint of the last response (at most 600 s, minus 2 s).
+- `ache-eio`, `ache-eio-tls`: with `idle_timeout` of 1 s or more the server
+  sends `Keep-Alive: timeout=n` on persistent responses and waits 1 s
+  longer than it announced; `Client` closes a connection `n - 2` seconds
+  after such a response, and a request after that gets
+  `` `Connection_closed `` without writing anything.
+- `ache-lwt`, `ache-lwt-tls`: with `?idle_timeout` of 1 s or more, the
+  server sends `Keep-Alive: timeout=n` and keeps its idle timer 1 s longer;
+  the client closes an idle connection `n - 2` s after a response with that
+  hint, and a request on it after that gets `` `Connection_closed ``.
+- `ache-miou`, `ache-miou-tls`: with `idle_timeout` of at least 1 s (the
+  default 60 s), the server sends `Keep-Alive: timeout=n` on persistent
+  responses and waits 1 s longer than it announces. The client closes an
+  idle connection `n - 2` seconds after a response with that hint, and a
+  request on it after then gets `` `Connection_closed `` before anything is
+  written.
 
 ### Changed
 

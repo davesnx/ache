@@ -1211,12 +1211,31 @@ let test_write_timeout () =
       at_end ()));
   check_no_handler_error ()
 
+let test_keep_alive_hint () =
+  with_server ~idle_timeout:3.5 (fun connect ->
+    with_raw_client connect (fun fd ->
+      let raw = raw_client fd in
+      raw_write raw "GET /hint HTTP/1.1\r\nhost: localhost\r\n\r\n";
+      let expected =
+        "HTTP/1.1 200 OK\r\n\
+         content-length: 5\r\n\
+         Keep-Alive: timeout=3\r\n\
+         \r\n\
+         /hint"
+      in
+      Alcotest.(check string)
+        "hint"
+        expected
+        (raw_take raw (String.length expected))));
+  check_no_handler_error ()
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
     "ache-miou-tls"
     [ ( "tls"
       , [ Alcotest.test_case "GET" `Quick test_get
+        ; Alcotest.test_case "Keep-Alive hint" `Quick test_keep_alive_hint
         ; Alcotest.test_case
             "write timeout: a client that stops reading"
             `Quick
