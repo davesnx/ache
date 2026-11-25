@@ -537,6 +537,24 @@ requests against Eio, Lwt and Miou echo servers. On 2026-11-16, h1spec at
 `f0a5650` (under Node 22 with `conformance/deno_shim.mjs`) passed 33 of 33
 checks on all three servers.
 
+`lib/test/fuzz` generates inputs with
+[QCheck](https://github.com/c-cube/qcheck): requests, responses, chunked
+bodies and WebSocket frames, from the grammar corpus, the oracle inputs and
+mutations of both. It checks properties, not fixed outputs: a server or
+client connection gives the same handler calls, body bytes, errors and output
+for every split of its input, and raises nothing; what ache writes, with
+partial writes, ache reads back the same; the chunk-size, Content-Length,
+field value and trailer parsers agree with their grammar; a WebSocket text
+message is delivered when it is valid UTF-8. `dune test` runs a fixed seed in
+about 2 seconds. For a longer run:
+
+```sh
+ACHE_FUZZ_SEED=7 ACHE_FUZZ_SCALE=10 dune exec lib/test/fuzz/fuzz.exe
+```
+
+`lib/test/fuzz/known_bugs.ml` lists the bugs it found that are not fixed
+(none now), and runs the minimal input of each fixed one.
+
 ## License
 
 BSD-3-Clause, with the copyright lines of httpaf and httpun. See
