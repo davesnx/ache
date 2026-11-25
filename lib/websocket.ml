@@ -165,12 +165,9 @@ type t =
   ; mutable mask_pos : int
   ; mutable fragmented : bool
   ; mutable text : bool
-    (* The message being read is text: its first frame had opcode 1. *)
   ; mutable utf8_need : int
   ; mutable utf8_lo : int
   ; mutable utf8_hi : int
-    (* Incremental UTF-8 check of the text message being read: the number of
-       continuation bytes still needed, and the range of the next one. *)
   ; message : Stdlib.Buffer.t
   ; control : Stdlib.Buffer.t
   ; pending : Stdlib.Buffer.t

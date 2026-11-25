@@ -267,8 +267,6 @@ module Websocket = struct
     | Some _ -> take_waiter waiters
     | None -> None
 
-  (* Drops the waiters whose promise was cancelled, so that a loop of cancelled
-     calls keeps the queue short. *)
   let prune waiters =
     let pending = Queue.of_seq (Queue.to_seq waiters) in
     Queue.clear waiters;

@@ -1101,7 +1101,6 @@ let test_websocket_echo () =
          sec-websocket-version: 13\r\n\
          \r\n";
       raw_read_head raw;
-      (* A masked text frame "hi", then a close frame with code 1000. *)
       raw_write raw "\x81\x82\x00\x00\x00\x00hi";
       Alcotest.(check string) "echo" "\x81\x02hi" (raw_take raw 4);
       raw_write raw "\x88\x82\x00\x00\x00\x00\x03\xe8";

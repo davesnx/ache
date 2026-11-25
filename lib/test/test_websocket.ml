@@ -678,7 +678,6 @@ let test_utf8_fails_inside_a_frame () =
   let frame =
     client_frame 0x1 (String.make 10 'a' ^ "\xff" ^ String.make 989 'a')
   in
-  (* Header (4 bytes), mask (4) and the first 20 payload bytes only. *)
   feed c (String.sub frame 0 28);
   check_reader_closed c;
   check_output c (close_frame_out 1007) `Close;

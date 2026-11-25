@@ -75,9 +75,6 @@ module Deadline = struct
   let stop t = Option.iter Miou.cancel t.timer
 end
 
-(* Sessions that a request handler starts, for example a WebSocket session. The
-   connection task starts each one in its own task, so that a session can wait
-   while the read loop runs, and awaits it before it returns. *)
 module Sessions = struct
   type t =
     { mutable pending : (unit -> unit) list
@@ -87,10 +84,6 @@ module Sessions = struct
 
   let create () = { pending = []; running = []; added = Signal.create () }
 
-  (* [Effect.perform Current] answers with the sessions of the request handler
-     that performs it. An effect handler, unlike a domain-local value, follows
-     the handler when it waits and another connection's handler runs: it is part
-     of the handler's stack. *)
   type _ Effect.t += Current : t Effect.t
 
   let with_current (t : t) f =
@@ -124,7 +117,6 @@ module Sessions = struct
       (List.rev t.pending);
     t.pending <- []
 
-  (* Starts the sessions that are added until [stopped] completes. *)
   let rec serve t ~stopped ~on_exn =
     Signal.wait_until t.added (fun () ->
       t.pending <> [] || not (Miou.Computation.is_running stopped));
@@ -133,8 +125,6 @@ module Sessions = struct
     then serve t ~stopped ~on_exn
     else await_or_raise stopped
 
-  (* Waits for the sessions to return. [shutdown] ends the connection first, so
-     that a session that waits for it sees the end. *)
   let finish t ~on_exn ~shutdown =
     start t ~on_exn;
     if t.running <> []
@@ -478,8 +468,6 @@ module Make (Io : IO) = struct
           write_task ();
           stop ())
       in
-      (* The session closed its WebSocket already (1011): keep the exception for
-         the end of the handler, without cutting the close frame. *)
       let session_failed exn bt =
         if Option.is_none !unreported then unreported := Some (exn, bt)
       in
@@ -888,9 +876,6 @@ module Websocket = struct
       waiters;
     Queue.clear waiters
 
-  (* Waits until [waiters] wakes this caller. A cancelled caller leaves a
-     completed waiter, which the next [wait] drops, so that a loop of cancelled
-     calls keeps the queue short. *)
   let wait waiters =
     let pending = Queue.of_seq (Queue.to_seq waiters) in
     Queue.clear waiters;
@@ -992,7 +977,6 @@ module Websocket = struct
       | () -> ()
       | exception exn ->
         let bt = Printexc.get_raw_backtrace () in
-        (* This caller may have been woken for a message: pass it on. *)
         if not (Queue.is_empty t.messages) then wake_one t.receivers;
         Printexc.raise_with_backtrace exn bt);
       receive t

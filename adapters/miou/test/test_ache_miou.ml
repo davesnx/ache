@@ -165,8 +165,6 @@ let ws_session = function
   | "/ws-raise" -> Some (fun (_ : Ws.t) -> raise Session_failed)
   | _ -> None
 
-(* Each /ws-wait handler waits on its own gate, in arrival order, before
-   [Ws.upgrade]. *)
 let ws_gates : unit Miou.Computation.t list ref = ref []
 
 let request_handler (_ : Unix.sockaddr) reqd =
@@ -881,8 +879,6 @@ let test_websocket_send_loop_peer_reset () =
       (elapsed < 1.0);
     wait_connection_done ())
 
-(* Runs [f] with a session that waits until [f] returns, and calls its functions
-   from the test task. *)
 let with_held_session f =
   let held = Miou.Computation.create ()
   and release = Miou.Computation.create () in
@@ -1054,9 +1050,6 @@ let test_websocket_ping_timeout () =
       (0x88, "\x03\xe8")
       (read_ws_frame socket))
 
-(* Serves one connection on a socket pair: runs [client] on the other end,
-   cancels the connection task when [cancel] is set, and returns how the server
-   handler ended. *)
 let on_socketpair ?(cancel = false) client_side =
   Miou_unix.run ~domains:0 (fun () ->
     let server, client = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
@@ -1096,8 +1089,6 @@ let test_websocket_session_exception () =
   | Ok () -> Alcotest.fail "the handler returned"
   | Error exn -> raise exn
 
-(* Two request handlers on one domain both wait before [Ws.upgrade]: each
-   session must belong to its own connection. *)
 let test_websocket_waiting_handlers () =
   ws_gates := [];
   Miou_unix.run ~domains:0 (fun () ->

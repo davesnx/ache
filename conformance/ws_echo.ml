@@ -1,14 +1,3 @@
-(* The server for autobahn.sh and wpt.sh. The same handler runs on Eio, Lwt and
-   Miou: ws_echo_{eio,lwt,miou}.ml only listen and accept.
-
-   Routes: - GET /ws: WebSocket echo, text as text and binary as binary. - GET
-   /ws/close: WebSocket that closes with code 4001 on the first message, the
-   message as reason. - GET /status: 200 with a JSON body. - /echo: 200 with the
-   request body, the request method in x-ache-method. - GET /redirect: 302 to
-   /status. - OPTIONS /cors: a CORS preflight, recorded under the query string.
-   - PUT /cors: the preflight recorded under the query string, as JSON. Every
-   response allows any origin, for the browser tests of wpt.sh. *)
-
 open Ache
 
 let max_message_size = 16 * 1024 * 1024
@@ -66,7 +55,6 @@ let upgrade reqd handler =
     respond reqd ~headers:[ "sec-websocket-version", "13" ] `Upgrade_required ""
   | Error (`Not_get | `Invalid_key) -> respond reqd `Bad_request ""
 
-(* Preflight request headers, by the query string of /cors. *)
 let preflights = Hashtbl.create 16
 
 let json_string s =

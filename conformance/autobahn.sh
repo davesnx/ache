@@ -70,7 +70,6 @@ while [ -z "$port" ]; do
   [ -n "$port" ] || sleep 0.1
 done
 
-# 12.* and 13.* test permessage-deflate, which ache does not negotiate.
 cat >"$work/fuzzingclient.json" <<EOF
 {
   "outdir": "/reports",

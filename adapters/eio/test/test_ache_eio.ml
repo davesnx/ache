@@ -2317,9 +2317,6 @@ let test_websocket_send_loop_peer_reset () =
       true
       (elapsed < 1.0))
 
-(* Serves one WebSocket connection on a socket pair: [session] runs in it,
-   [client] drives the other end. The result is how the connection handler
-   ended. *)
 let with_ws_session ?(on_upgrade = ignore) session client =
   Eio_main.run (fun env ->
     let clock = Eio.Stdenv.clock env in
@@ -2468,8 +2465,6 @@ let test_websocket_cancelled_receive () =
     | Error `Timeout -> say "timeout");
     Eio.Promise.resolve resolve_timed_out ();
     say (Option.value (receive_text ws) ~default:"None");
-    (* Two receives woken by one read: Fiber.first keeps the first result and
-       cancels the other, which must leave its message queued. *)
     let first =
       Eio.Fiber.first (fun () -> receive_text ws) (fun () -> receive_text ws)
     in

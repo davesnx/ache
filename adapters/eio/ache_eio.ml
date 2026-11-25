@@ -336,9 +336,6 @@ module IO_loop = struct
   let no_timeout _ = None
 end
 
-(* The connection that runs the current request handler:
-   create_connection_handler binds it, and Websocket.upgrade forks the session
-   on its switch. *)
 type connection_context =
   { sw : Switch.t
   ; session_failed : exn -> Printexc.raw_backtrace -> unit
@@ -426,8 +423,6 @@ module Websocket = struct
     Ache.Websocket.send_binary t.connection message;
     written t
 
-  (* A message is taken only by a fiber that is not cancelled, and returned
-     without a suspension, so a cancelled receive leaves it in the queue. *)
   let receive t =
     Eio.Condition.loop_no_mutex t.changed (fun () ->
       Fiber.check ();
@@ -576,7 +571,6 @@ module Server = struct
               Error `Timeout)
         | _ -> timeout phase
       in
-      (* WebSocket sessions are forked on [sw]: the handler waits for them. *)
       Switch.run (fun sw ->
         Fiber.with_binding
           connection_context
