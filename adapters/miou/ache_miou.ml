@@ -86,14 +86,17 @@ module Sessions = struct
 
   type _ Effect.t += Current : t Effect.t
 
-  let with_current (t : t) f =
+  (* [with_current t] runs request handlers with [t] as their sessions. The
+     handler record is made once for each connection, not for each request. *)
+  let with_current (t : t) : (unit -> unit) -> unit =
     let effc : type a.
-      a Effect.t -> ((a, _) Effect.Deep.continuation -> _) option
+      a Effect.t -> ((a, unit) Effect.Deep.continuation -> unit) option
       = function
       | Current -> Some (fun k -> Effect.Deep.continue k t)
       | _ -> None
     in
-    Effect.Deep.try_with f () { effc }
+    let handler = { Effect.Deep.retc = Fun.id; exnc = raise; effc } in
+    fun f -> Effect.Deep.match_with f () handler
 
   let current () =
     match Effect.perform Current with
@@ -528,6 +531,7 @@ module Make (Io : IO) = struct
         let head_deadline = ref None
         and error_handler_failure = ref None
         and sessions = Sessions.create () in
+        let with_sessions = Sessions.with_current sessions in
         let error_handler ?request error start_response =
           try error_handler client_addr ?request error start_response with
           | Miou.Cancelled as exn -> raise exn
@@ -540,8 +544,7 @@ module Make (Io : IO) = struct
         let connection =
           Ache.Server_connection.create ~config ~error_handler (fun reqd ->
             head_deadline := None;
-            Sessions.with_current sessions (fun () ->
-              request_handler client_addr reqd))
+            with_sessions (fun () -> request_handler client_addr reqd))
         in
         let observe () =
           match head_timeout with
