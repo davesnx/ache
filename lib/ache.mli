@@ -628,7 +628,8 @@ end
 
 (** {2 WebSocket Server} *)
 
-(** A WebSocket server connection (RFC 6455), for text messages, that runs
+(** A WebSocket server connection (RFC 6455), for text and binary messages,
+    that runs
     after a [101] response sent with {!Request_descriptor.respond_with_upgrade}. It needs no
     runtime code: every runtime drives it like {!Server_connection}.
 
@@ -638,20 +639,22 @@ end
 
     What the connection does on its own:
     - it answers a ping with a pong that has the same payload;
-    - it reassembles a fragmented text message and gives it whole to
+    - it reassembles a fragmented message and gives it whole to
       [on_message];
     - when the client sends a close frame, it sends a close frame with the
-      same code, then closes the connection;
+      same code (without the reason), then closes the connection;
     - it fails the connection, that is, it sends a close frame with a code
       and closes the connection, with code [1002] for a protocol error (an
       unmasked frame, an unknown opcode, a reserved bit set, a control frame
       that is fragmented or longer than 125 bytes, a continuation frame
       without a message to continue, a new data frame inside a fragmented
-      message, a payload length with the high bit set, a close frame with a
-      1-byte payload or an invalid code), [1007] for a text message or close
-      reason that is not valid UTF-8, [1009] for a message longer than
-      [max_message_size] (before it reads the payload), and [1003] for a
-      binary frame (RFC 6455 §7.4.1).
+      message, a payload length with the high bit set or not in its shortest
+      form, a close frame with a 1-byte payload or an invalid code), [1007]
+      for a text message or close reason that is not valid UTF-8, and [1009]
+      for a message longer than [max_message_size] (before it reads the
+      payload) (RFC 6455 §7.4.1). Text is checked as it arrives: the first
+      byte that cannot start or continue valid UTF-8 fails the connection,
+      without reading the rest of the message.
 
     After it sends a close frame, the connection reads no more messages and
     closes the TCP connection once the frame is written. It does not wait for
@@ -680,8 +683,8 @@ module Websocket : sig
           with [426 Upgrade Required] and [Sec-WebSocket-Version: 13]
           (RFC 6455 §4.4). *)
     | `Invalid_key
-      (** [Sec-WebSocket-Key] is not one field with the base64 encoding of 16
-          bytes. *)
+      (** [Sec-WebSocket-Key] is not one field with the canonical base64
+          encoding of 16 bytes (RFC 4648 §3.5: the padding bits are zero). *)
     ]
 
   val accept_key : string -> string
@@ -694,15 +697,29 @@ module Websocket : sig
       handshake (RFC 6455 §4.2.1) and returns the [Sec-WebSocket-Accept]
       value. *)
 
+  type message =
+    | Text of string  (** A text message: valid UTF-8. *)
+    | Binary of string  (** A binary message: any bytes. *)
+
+  type close =
+    { code : int
+    ; reason : string  (** Valid UTF-8, at most 123 bytes. *)
+    }
+  (** The client's close frame. *)
+
   type handler =
-    { on_message : string -> unit
-      (** Called with each whole text message, in order. *)
-    ; on_close : int option -> unit
+    { on_message : message -> unit
+      (** Called with each whole message, in order. *)
+    ; on_pong : string -> unit
+      (** Called with the payload of each pong from the client, for example
+          the answer to {!ping}. *)
+    ; on_close : close option -> unit
       (** Called once, when the connection is closed and no more messages
-          come. The argument is the code of the client's close frame, [1005]
-          for a close frame without a code, or [None] when the client sent no
-          valid close frame (end of input, a reset, a protocol error, or a
-          close that the server started). *)
+          come. The argument is the client's close frame: its code and
+          reason, [{ code = 1005; reason = "" }] for a close frame without a
+          code, or [None] when the client sent no valid close frame (end of
+          input, a reset, a protocol error, or a close that the server
+          started). *)
     }
 
   val default_max_message_size : int
@@ -734,19 +751,33 @@ module Websocket : sig
       mask. After the connection started to close, it does nothing. [message]
       must be valid UTF-8: [send_text] does not check it. *)
 
+  val send_binary : t -> string -> unit
+  (** [send_binary t message] queues [message] as one binary frame without a
+      mask. After the connection started to close, it does nothing. *)
+
+  val ping : t -> string -> unit
+  (** [ping t payload] queues a ping frame. The client answers with a pong,
+      reported to [on_pong]. A server that wants to find a client that is
+      gone can ping it and close the connection when no pong comes in time.
+      After the connection started to close, it does nothing.
+
+      @raise Invalid_argument if [payload] is longer than 125 bytes. *)
+
   val flush : t -> ([ `Written | `Closed ] -> unit) -> unit
   (** [flush t k] calls [k `Written] when all frames queued before it are
       written, and [k `Closed] when the connection closed first. After the
       connection started to close, it calls [k `Closed] at once. *)
 
-  val close : t -> code:int -> unit
-  (** [close t ~code] sends a close frame with [code], stops reading
-      messages, and closes the connection when the frame is written. It does
-      nothing when the connection already started to close.
+  val close : ?reason:string -> t -> code:int -> unit
+  (** [close ?reason t ~code] sends a close frame with [code] and [reason]
+      (default [""]), stops reading messages, and closes the connection when
+      the frame is written. It does nothing when the connection already
+      started to close.
 
       @raise Invalid_argument
         if [code] is not one that an endpoint may send: [1000] to [1003],
-        [1007] to [1014], or [3000] to [4999]. *)
+        [1007] to [1014], or [3000] to [4999]; or if [reason] is not valid
+        UTF-8 or longer than 123 bytes. *)
 
   val pause_reading : t -> unit
   (** [pause_reading t] stops reading from the client, so that no

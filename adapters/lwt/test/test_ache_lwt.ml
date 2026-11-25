@@ -95,10 +95,15 @@ let end_ws result =
   Option.iter (fun u -> Lwt.wakeup_later u result) !ws_ended;
   ws_ended := None
 
+let text_of = function Ache.Websocket.Text s -> s | Binary s -> "binary:" ^ s
+
+let receive_text ws =
+  Lwt.map (Option.map text_of) (Ache_lwt.Websocket.receive ws)
+
 let ws_echo ws =
   let rec loop () =
     Lwt.bind (Ache_lwt.Websocket.receive ws) (function
-      | Some "close-me" ->
+      | Some (Text "close-me") ->
         Lwt.bind (Ache_lwt.Websocket.close ws 1001) (fun () ->
           Lwt.map
             (fun next ->
@@ -106,11 +111,28 @@ let ws_echo ws =
                  (Ok
                     (match next with
                     | None -> "closed, receive None"
-                    | Some m -> "received " ^ m)))
+                    | Some m -> "received " ^ text_of m)))
             (Ache_lwt.Websocket.receive ws))
-      | Some message -> Lwt.bind (Ache_lwt.Websocket.send ws message) loop
+      | Some (Text "ping-me") ->
+        Lwt.bind (Ache_lwt.Websocket.ping ws "are you there") (fun () ->
+          Lwt.bind (Ache_lwt.Websocket.send_text ws "pong seen") loop)
+      | Some (Text "bye-reason") ->
+        Lwt.bind
+          (Ache_lwt.Websocket.close ~reason:"done here" ws 4000)
+          (fun () ->
+             end_ws (Ok "closed with a reason");
+             Lwt.return_unit)
+      | Some (Text message) ->
+        Lwt.bind (Ache_lwt.Websocket.send_text ws message) loop
+      | Some (Binary message) ->
+        Lwt.bind (Ache_lwt.Websocket.send_binary ws message) loop
       | None ->
-        end_ws (Ok "receive None");
+        end_ws
+          (Ok
+             (match Ache_lwt.Websocket.client_close ws with
+             | None -> "receive None"
+             | Some { code; reason } ->
+               Printf.sprintf "receive None, client close %d %S" code reason));
         Lwt.return_unit)
   in
   loop ()
@@ -119,7 +141,7 @@ let ws_flood ws =
   let chunk = String.make 4096 'x' in
   let rec loop () =
     incr ws_flood_sends;
-    Lwt.bind (Ache_lwt.Websocket.send ws chunk) loop
+    Lwt.bind (Ache_lwt.Websocket.send_text ws chunk) loop
   in
   Lwt.catch loop (fun exn ->
     Lwt.map
@@ -760,11 +782,13 @@ let test_websocket_echo () =
     >>= fun () ->
     read_ws_frame socket >>= fun second ->
     read_ws_frame socket >>= fun third ->
+    write_all socket (ws_frame 0x2 "\x00\xff") >>= fun () ->
+    read_ws_frame socket >>= fun fourth ->
     Alcotest.(check (list (pair int string)))
-      "echo, pong, echo of the fragmented message"
-      [ 0x81, "hello"; 0x8a, "ping"; 0x81, "w\xc3\xb6rld" ]
-      [ first; second; third ];
-    write_all socket (ws_frame 0x8 "\x03\xe8") >>= fun () ->
+      "echo, pong, echo of the fragmented message, binary echo"
+      [ 0x81, "hello"; 0x8a, "ping"; 0x81, "w\xc3\xb6rld"; 0x82, "\x00\xff" ]
+      [ first; second; third; fourth ];
+    write_all socket (ws_frame 0x8 "\x03\xe8bye") >>= fun () ->
     read_ws_frame socket >>= fun close ->
     Alcotest.(check (pair int string)) "close echoed" (0x88, "\x03\xe8") close;
     read_all socket >>= fun rest ->
@@ -772,7 +796,7 @@ let test_websocket_echo () =
     ended >>= fun result ->
     Alcotest.(check (result string reject))
       "server loop"
-      (Ok "receive None")
+      (Ok "receive None, client close 1000 \"bye\"")
       result;
     Lwt_unix.close socket);
   check_server_sockets_closed ()
@@ -793,6 +817,42 @@ let test_websocket_server_close () =
       (Ok "closed, receive None")
       result;
     write_all socket (ws_frame 0x8 "\x03\xe9") >>= fun () ->
+    read_all socket >>= fun rest ->
+    Alcotest.(check string) "then end of input" "" rest;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+let test_websocket_ping () =
+  let ended = wait_ws_end () in
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "ping-me") >>= fun () ->
+    read_ws_frame socket >>= fun ping ->
+    Alcotest.(check (pair int string))
+      "server ping"
+      (0x89, "are you there")
+      ping;
+    write_all socket (ws_frame 0xA "are you there") >>= fun () ->
+    read_ws_frame socket >>= fun after ->
+    Alcotest.(check (pair int string))
+      "ping resolved by the pong"
+      (0x81, "pong seen")
+      after;
+    write_all socket (ws_frame 0x1 "bye-reason") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string))
+      "close with a reason"
+      (0x88, "\x0f\xa0done here")
+      close;
+    write_all socket (ws_frame 0x8 "\x0f\xa0") >>= fun () ->
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "close resolved"
+      (Ok "closed with a reason")
+      result;
     read_all socket >>= fun rest ->
     Alcotest.(check string) "then end of input" "" rest;
     Lwt_unix.close socket);
@@ -847,7 +907,7 @@ let test_websocket_receive_backpressure () =
   Alcotest.(check int) "after 8 unconsumed messages" 8 !fed;
   let woken = ref false in
   Server_connection.yield_reader server (fun () -> woken := true);
-  let first = Lwt_main.run (Ache_lwt.Websocket.receive ws) in
+  let first = Lwt_main.run (receive_text ws) in
   Alcotest.(check (option string)) "first message" (Some "0") first;
   Alcotest.(check bool) "receive wakes the reader" true !woken;
   Alcotest.(check string) "reads again" "`Read" (read_operation ());
@@ -856,9 +916,7 @@ let test_websocket_receive_backpressure () =
     "the rest, in order"
     (List.init 8 (fun i -> Some (string_of_int (i + 1))))
     (Lwt_main.run
-       (Lwt_list.map_s
-          (fun () -> Ache_lwt.Websocket.receive ws)
-          (List.init 8 ignore)))
+       (Lwt_list.map_s (fun () -> receive_text ws) (List.init 8 ignore)))
 
 let ws_sans_io () =
   let ws = ref None in
@@ -894,9 +952,7 @@ let ws_sans_io () =
 
 let receive_within seconds ws =
   Lwt.pick
-    [ Ache_lwt.Websocket.receive ws
-    ; (Lwt_unix.sleep seconds >|= fun () -> Some "<timeout>")
-    ]
+    [ receive_text ws; (Lwt_unix.sleep seconds >|= fun () -> Some "<timeout>") ]
 
 let test_websocket_cancelled_receive () =
   let ws, feed, (_ : unit -> unit) = ws_sans_io () in
@@ -961,6 +1017,41 @@ let test_websocket_cancelled_receives_bounded () =
     "a receive still gets the next message"
     (Some "after")
     (Lwt_main.run (receive_within 0.5 ws))
+
+let test_websocket_ping_timeout () =
+  let ws, feed, drain = ws_sans_io () in
+  let timed_out =
+    Lwt_main.run
+      (Lwt.catch
+         (fun () ->
+            Lwt_unix.with_timeout 0.01 (fun () -> Ache_lwt.Websocket.ping ws "")
+            >|= fun () -> false)
+         (function Lwt_unix.Timeout -> Lwt.return true | exn -> Lwt.fail exn))
+  in
+  Alcotest.(check bool) "no pong: with_timeout fires" true timed_out;
+  let answered = Ache_lwt.Websocket.ping ws "x" in
+  feed (ws_frame 0xA "x");
+  Alcotest.(check bool)
+    "a pong resolves the ping"
+    true
+    (Lwt.state answered = Lwt.Return ());
+  let pending = Ache_lwt.Websocket.ping ws "y" in
+  feed (ws_frame 0x8 "\x03\xe8");
+  drain ();
+  Alcotest.(check bool)
+    "close fails the ping with Closed"
+    true
+    (Lwt.state pending = Lwt.Fail Ache_lwt.Websocket.Closed);
+  Alcotest.(check bool)
+    "client_close"
+    true
+    (Ache_lwt.Websocket.client_close ws
+    = Some { Ache.Websocket.code = 1000; reason = "" });
+  Alcotest.(check bool)
+    "ping after close fails"
+    true
+    (Lwt.state (Ache_lwt.Websocket.ping ws "")
+    = Lwt.Fail Ache_lwt.Websocket.Closed)
 
 let test_websocket_peer_reset () =
   let ended = wait_ws_end () in
@@ -1660,6 +1751,10 @@ let () =
           , test_upgrade_incomplete_token_reaches_new_protocol )
         ; "WebSocket echo and close", `Quick, test_websocket_echo
         ; "WebSocket server close", `Quick, test_websocket_server_close
+        ; "WebSocket ping, pong and close reason", `Quick, test_websocket_ping
+        ; ( "WebSocket ping timeout and Closed"
+          , `Quick
+          , test_websocket_ping_timeout )
         ; ( "WebSocket receive queue pauses reading"
           , `Quick
           , test_websocket_receive_backpressure )

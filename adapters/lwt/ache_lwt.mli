@@ -104,7 +104,8 @@ module Websocket : sig
   type t
 
   exception Closed
-  (** The connection closed before a message given to {!send} was written. *)
+  (** The connection closed before a message given to {!send_text} or
+      {!send_binary} was written, or before a pong answered {!ping}. *)
 
   val upgrade :
      ?max_message_size:int
@@ -119,23 +120,49 @@ module Websocket : sig
       Frames that a read already holds are still queued, so the queue can
       pass 8 by what one read buffer holds. *)
 
-  val send : t -> string -> unit Lwt.t
-  (** [send t message] sends [message] as one text frame. The promise
-      resolves when the frame is written. It fails with {!Closed} when the
-      connection closed before, also when it closed before [send] was called:
-      a loop of [send] ends when the client is gone. *)
+  val send_text : t -> string -> unit Lwt.t
+  (** [send_text t message] sends [message] as one text frame. [message] must
+      be valid UTF-8; it is not checked. The promise resolves when the frame
+      is written. It fails with {!Closed} when the connection closed before,
+      also when it closed before [send_text] was called: a loop of
+      [send_text] ends when the client is gone. *)
 
-  val receive : t -> string option Lwt.t
-  (** [receive t] is the next whole text message, or [None] after the
-      connection closed, whether the client sent a close frame, the
-      connection ended, or the server closed it.
+  val send_binary : t -> string -> unit Lwt.t
+  (** [send_binary t message] is {!send_text} for one binary frame. *)
+
+  val receive : t -> Ache.Websocket.message option Lwt.t
+  (** [receive t] is the next whole message, or [None] after the connection
+      closed, whether the client sent a close frame, the connection ended, or
+      the server closed it. {!client_close} then tells which.
 
       The promise can be cancelled, for example by [Lwt.pick] or
       [Lwt_unix.with_timeout]. No message is lost: the next [receive] gets
       it. *)
 
-  val close : t -> int -> unit Lwt.t
-  (** [close t code] sends a close frame with [code] (see
+  val ping : t -> string -> unit Lwt.t
+  (** [ping t payload] sends a ping. The promise resolves when the next pong
+      from the client arrives (any pong: RFC 6455 §5.5.3 lets a client answer
+      only the latest ping, or send pongs unasked), and fails with {!Closed}
+      when the connection closes first. To find a client that is gone:
+      [Lwt_unix.with_timeout 30. (fun () -> ping t "")], then {!close} on
+      [Lwt_unix.Timeout]. The promise can be cancelled.
+
+      The pong comes after the messages the client sent before it. While 8
+      messages wait for {!receive}, reading is paused, so the pong is not
+      seen until {!receive} takes messages: keep receiving while you wait
+      for a pong.
+
+      @raise Invalid_argument
+        at once if [payload] is longer than 125 bytes. *)
+
+  val client_close : t -> Ache.Websocket.close option
+  (** [client_close t] is the client's close frame (code and reason), once
+      {!receive} returned [None]: see the [on_close] of
+      {!Ache.Websocket.handler}. [None] before that, or when the client sent
+      no valid close frame. *)
+
+  val close : ?reason:string -> t -> int -> unit Lwt.t
+  (** [close ?reason t code] sends a close frame with [code] and [reason] (see
       {!Ache.Websocket.close}). The promise resolves when the connection is
       closed: the frame is written, or the connection ended. The socket
       closes when the read in progress also ends: when the client answers
@@ -147,7 +174,7 @@ module Websocket : sig
 
       @raise Invalid_argument
         at once, before it returns a promise, if [code] is not one an endpoint
-        may send. *)
+        may send, or [reason] is not valid UTF-8 or longer than 123 bytes. *)
 end
 
 module Make (Io : IO) : sig

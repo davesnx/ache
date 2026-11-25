@@ -89,11 +89,14 @@ let tokens headers name =
 let has_token headers name token =
   List.exists (Headers.ci_equal token) (tokens headers name)
 
-(* RFC 6455 §4.1: the key is the base64 encoding of 16 bytes. *)
+(* RFC 6455 §4.1: the key is the base64 encoding of 16 bytes. The last character
+   before the padding carries 2 bits of data and 4 padding bits, which RFC 4648
+   §3.5 requires to be zero: one of A, Q, g, w. *)
 let valid_key key =
   String.length key = 24
   && key.[22] = '='
   && key.[23] = '='
+  && String.contains "AQgw" key.[21]
   &&
   let ok = ref true in
   for i = 0 to 21 do
@@ -122,9 +125,19 @@ let check_handshake (request : Request.t) =
       | _ -> Error `Invalid_key)
     | _ -> Error `Unsupported_version
 
+type message =
+  | Text of string
+  | Binary of string
+
+type close =
+  { code : int
+  ; reason : string
+  }
+
 type handler =
-  { on_message : string -> unit
-  ; on_close : int option -> unit
+  { on_message : message -> unit
+  ; on_pong : string -> unit
+  ; on_close : close option -> unit
   }
 
 type reading =
@@ -143,7 +156,7 @@ type t =
   ; mutable reading : reading
   ; mutable paused : bool
   ; mutable writing : writing
-  ; mutable peer_code : int option
+  ; mutable peer_close : close option
   ; mutable closed_reported : bool
   ; mutable opcode : int
   ; mutable fin : bool
@@ -151,6 +164,13 @@ type t =
   ; mask : Bytes.t
   ; mutable mask_pos : int
   ; mutable fragmented : bool
+  ; mutable text : bool
+    (* The message being read is text: its first frame had opcode 1. *)
+  ; mutable utf8_need : int
+  ; mutable utf8_lo : int
+  ; mutable utf8_hi : int
+    (* Incremental UTF-8 check of the text message being read: the number of
+       continuation bytes still needed, and the range of the next one. *)
   ; message : Stdlib.Buffer.t
   ; control : Stdlib.Buffer.t
   ; pending : Stdlib.Buffer.t
@@ -190,28 +210,26 @@ let frame t ~opcode payload =
   t.queued <- t.queued + Stdlib.Buffer.length t.pending - before;
   wake_writer t
 
-let close_payload code =
-  let b = Bytes.create 2 in
+let close_payload ?(reason = "") code =
+  let b = Bytes.create (2 + String.length reason) in
   Bytes.set_uint16_be b 0 code;
+  Bytes.blit_string reason 0 b 2 (String.length reason);
   Bytes.unsafe_to_string b
 
 let stop_reading t =
   t.reading <- Stopped;
   wake_reader t
 
-let send_close t code =
+let send_close t payload =
   if t.writing = Open
   then (
-    frame
-      t
-      ~opcode:0x8
-      (match code with None -> "" | Some c -> close_payload c);
+    frame t ~opcode:0x8 payload;
     t.writing <- Closing;
     wake_writer t)
 
 let fail t code =
   stop_reading t;
-  send_close t (Some code)
+  send_close t (close_payload code)
 
 let finish t =
   t.writing <- Closed;
@@ -225,7 +243,7 @@ let finish t =
   if not t.closed_reported
   then (
     t.closed_reported <- true;
-    t.handler.on_close t.peer_code)
+    t.handler.on_close t.peer_close)
 
 (* RFC 6455 §7.4.1, §7.4.2: codes a peer may send in a close frame. *)
 let valid_close_code code =
@@ -237,18 +255,73 @@ let on_close_frame t payload =
   stop_reading t;
   match String.length payload with
   | 0 ->
-    t.peer_code <- Some 1005;
-    send_close t None
+    t.peer_close <- Some { code = 1005; reason = "" };
+    send_close t ""
   | 1 -> fail t 1002
   | n ->
     let code = String.get_uint16_be payload 0 in
+    let reason = String.sub payload 2 (n - 2) in
     if not (valid_close_code code)
     then fail t 1002
-    else if not (String.is_valid_utf_8 (String.sub payload 2 (n - 2)))
+    else if not (String.is_valid_utf_8 reason)
     then fail t 1007
     else (
-      t.peer_code <- Some code;
-      send_close t (Some code))
+      t.peer_close <- Some { code; reason };
+      send_close t (close_payload code))
+
+(* RFC 3629 §4: the next byte of a text message, given the bytes before it.
+   [false] when the message cannot be valid UTF-8 any more. *)
+let utf8_byte t c =
+  if t.utf8_need > 0
+  then
+    if c < t.utf8_lo || c > t.utf8_hi
+    then false
+    else (
+      t.utf8_need <- t.utf8_need - 1;
+      t.utf8_lo <- 0x80;
+      t.utf8_hi <- 0xbf;
+      true)
+  else if c < 0x80
+  then true
+  else if c >= 0xc2 && c <= 0xdf
+  then (
+    t.utf8_need <- 1;
+    true)
+  else if c = 0xe0
+  then (
+    t.utf8_need <- 2;
+    t.utf8_lo <- 0xa0;
+    true)
+  else if (c >= 0xe1 && c <= 0xec) || c = 0xee || c = 0xef
+  then (
+    t.utf8_need <- 2;
+    true)
+  else if c = 0xed
+  then (
+    t.utf8_need <- 2;
+    t.utf8_hi <- 0x9f;
+    true)
+  else if c = 0xf0
+  then (
+    t.utf8_need <- 3;
+    t.utf8_lo <- 0x90;
+    true)
+  else if c >= 0xf1 && c <= 0xf3
+  then (
+    t.utf8_need <- 3;
+    true)
+  else if c = 0xf4
+  then (
+    t.utf8_need <- 3;
+    t.utf8_hi <- 0x8f;
+    true)
+  else false
+
+let start_message t opcode =
+  t.text <- opcode = 0x1;
+  t.utf8_need <- 0;
+  t.utf8_lo <- 0x80;
+  t.utf8_hi <- 0xbf
 
 let end_frame t =
   match t.opcode with
@@ -257,18 +330,20 @@ let end_frame t =
     if t.writing = Open
     then frame t ~opcode:0xA (Stdlib.Buffer.contents t.control);
     t.reading <- Header
-  | 0xA -> t.reading <- Header
+  | 0xA ->
+    t.reading <- Header;
+    t.handler.on_pong (Stdlib.Buffer.contents t.control)
   | _ ->
     t.reading <- Header;
-    if t.fin
-    then (
+    if not t.fin
+    then t.fragmented <- true
+    else if t.text && t.utf8_need > 0
+    then fail t 1007
+    else
       let message = Stdlib.Buffer.contents t.message in
       Stdlib.Buffer.clear t.message;
       t.fragmented <- false;
-      if String.is_valid_utf_8 message
-      then t.handler.on_message message
-      else fail t 1007)
-    else t.fragmented <- true
+      t.handler.on_message (if t.text then Text message else Binary message)
 
 let read_header t bs ~off ~len =
   if len < 2
@@ -292,10 +367,6 @@ let read_header t bs ~off ~len =
     then (
       fail t 1002;
       len)
-    else if opcode = 0x2
-    then (
-      fail t 1003;
-      len)
     else if len < size
     then 0
     else
@@ -313,7 +384,12 @@ let read_header t bs ~off ~len =
           done;
           !v
       in
-      if Int64.compare payload_len 0L < 0
+      (* RFC 6455 §5.2: a payload length that has the high bit set, or that is
+         not in its shortest form. *)
+      if
+        Int64.compare payload_len 0L < 0
+        || (ext = 2 && Int64.compare payload_len 126L < 0)
+        || (ext = 8 && Int64.compare payload_len 0x10000L < 0)
       then (
         fail t 1002;
         len)
@@ -331,6 +407,7 @@ let read_header t bs ~off ~len =
         for i = 0 to 3 do
           Bytes.set t.mask i (Bigstring.unsafe_get bs (off + 2 + ext + i))
         done;
+        if opcode = 0x1 || opcode = 0x2 then start_message t opcode;
         t.opcode <- opcode;
         t.fin <- fin;
         t.remaining <- Int64.to_int payload_len;
@@ -342,18 +419,33 @@ let read_header t bs ~off ~len =
 
 let read_payload t bs ~off ~len =
   let n = min len t.remaining in
-  let dst = if t.opcode >= 0x8 then t.control else t.message in
-  for i = 0 to n - 1 do
+  let control = t.opcode >= 0x8 in
+  let dst = if control then t.control else t.message in
+  let check = (not control) && t.text in
+  let i = ref 0 in
+  let valid = ref true in
+  while !valid && !i < n do
     let c =
-      Char.code (Bigstring.unsafe_get bs (off + i))
-      lxor Char.code (Bytes.unsafe_get t.mask ((t.mask_pos + i) land 3))
+      Char.code (Bigstring.unsafe_get bs (off + !i))
+      lxor Char.code (Bytes.unsafe_get t.mask ((t.mask_pos + !i) land 3))
     in
-    Stdlib.Buffer.add_char dst (Char.unsafe_chr c)
+    if check && (c >= 0x80 || t.utf8_need > 0) && not (utf8_byte t c)
+    then valid := false
+    else (
+      Stdlib.Buffer.add_char dst (Char.unsafe_chr c);
+      incr i)
   done;
-  t.mask_pos <- (t.mask_pos + n) land 3;
-  t.remaining <- t.remaining - n;
-  if t.remaining = 0 then end_frame t;
-  n
+  if not !valid
+  then (
+    (* Invalid text fails at once, without reading the rest of the message (RFC
+       6455 §8.1). *)
+    fail t 1007;
+    len)
+  else (
+    t.mask_pos <- (t.mask_pos + n) land 3;
+    t.remaining <- t.remaining - n;
+    if t.remaining = 0 then end_frame t;
+    n)
 
 let read t bs ~off ~len =
   let rec go consumed =
@@ -446,11 +538,22 @@ let flush t k =
   then k `Written
   else Queue.push (t.queued, k) t.flushes
 
-let close t ~code =
+let send_binary t s = if t.writing = Open then frame t ~opcode:0x2 s
+
+let ping t payload =
+  if String.length payload > 125
+  then invalid_arg "Ache.Websocket.ping: payload longer than 125 bytes";
+  if t.writing = Open then frame t ~opcode:0x9 payload
+
+let close ?(reason = "") t ~code =
   if not (valid_close_code code)
   then invalid_arg "Ache.Websocket.close: invalid close code";
+  if String.length reason > 123
+  then invalid_arg "Ache.Websocket.close: reason longer than 123 bytes";
+  if not (String.is_valid_utf_8 reason)
+  then invalid_arg "Ache.Websocket.close: reason is not valid UTF-8";
   stop_reading t;
-  send_close t (Some code)
+  send_close t (close_payload ~reason code)
 
 let default_max_message_size = 1 lsl 20
 
@@ -462,11 +565,11 @@ let upgrade ?(max_message_size = default_max_message_size) reqd make_handler =
   | Ok accept ->
     let t =
       { max_message_size
-      ; handler = { on_message = ignore; on_close = ignore }
+      ; handler = { on_message = ignore; on_pong = ignore; on_close = ignore }
       ; reading = Header
       ; paused = false
       ; writing = Open
-      ; peer_code = None
+      ; peer_close = None
       ; closed_reported = false
       ; opcode = 0
       ; fin = false
@@ -474,6 +577,10 @@ let upgrade ?(max_message_size = default_max_message_size) reqd make_handler =
       ; mask = Bytes.create 4
       ; mask_pos = 0
       ; fragmented = false
+      ; text = false
+      ; utf8_need = 0
+      ; utf8_lo = 0x80
+      ; utf8_hi = 0xbf
       ; message = Stdlib.Buffer.create 256
       ; control = Stdlib.Buffer.create 128
       ; pending = Stdlib.Buffer.create 256

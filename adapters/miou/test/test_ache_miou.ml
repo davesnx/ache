@@ -144,7 +144,13 @@ let request_handler (_ : Unix.sockaddr) reqd =
            Websocket.flush ws (function `Written -> loop () | `Closed -> ())
          in
          loop ();
-         { on_message = ignore; on_close = (fun code -> !on_ws_closed code) })
+         { on_message = ignore
+         ; on_pong = ignore
+         ; on_close =
+             (fun close ->
+               !on_ws_closed
+                 (Option.map (fun { Websocket.code; _ } -> code) close))
+         })
      with
     | Ok () -> ()
     | Error _ -> Alcotest.fail "handshake rejected")

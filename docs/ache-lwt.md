@@ -119,9 +119,12 @@ let rec echo ws =
   let* message = Ache_lwt.Websocket.receive ws in
   match message with
   | None -> Lwt.return_unit
-  | Some "bye" -> Ache_lwt.Websocket.close ws 1000
-  | Some message ->
-    let* () = Ache_lwt.Websocket.send ws message in
+  | Some (Text "bye") -> Ache_lwt.Websocket.close ~reason:"bye" ws 1000
+  | Some (Text message) ->
+    let* () = Ache_lwt.Websocket.send_text ws message in
+    echo ws
+  | Some (Binary message) ->
+    let* () = Ache_lwt.Websocket.send_binary ws message in
     echo ws
 
 let request_handler _client_address reqd =
@@ -145,16 +148,24 @@ let request_handler _client_address reqd =
   `Ache.Websocket.upgrade` does. On `Error _` it responds nothing: send the
   response yourself, for example `426` with `Sec-WebSocket-Version: 13` for
   `` Error `Unsupported_version ``.
-- `receive` resolves with the next whole text message. Once the connection
-  has ended and no message waits, it resolves with `None`. The connection
-  ends after the client's close frame, the end of the input, a reset, a
-  protocol error, or your `close`.
-- `send` resolves when the frame is written. It fails with
-  `Ache_lwt.Websocket.Closed` when the connection is gone, also when it was
-  gone before the call, so a send loop ends when the client leaves.
-- `close ws code` sends a close frame and resolves when the frame is written
-  or the connection has ended. It raises `Invalid_argument` at once for a
-  code that an endpoint may not send. The socket closes when the read in
+- `receive` resolves with the next whole message, `Text s` or `Binary s`.
+  Once the connection has ended and no message waits, it resolves with
+  `None`. The connection ends after the client's close frame, the end of the
+  input, a reset, a protocol error, or your `close`. `client_close ws` then
+  gives the client's close code and reason, if it sent a valid close frame.
+- `send_text` and `send_binary` resolve when the frame is written. They fail
+  with `Ache_lwt.Websocket.Closed` when the connection is gone, also when it
+  was gone before the call, so a send loop ends when the client leaves.
+- `ping ws payload` sends a ping and resolves when the next pong arrives, or
+  fails with `Closed` when the connection ends first. To find a client that
+  is gone: `Lwt_unix.with_timeout 30. (fun () -> Ache_lwt.Websocket.ping ws
+  "")`, and `close` on `Lwt_unix.Timeout`. The pong comes after the
+  messages the client sent before it, so keep calling `receive` meanwhile:
+  while 8 messages wait, reading is paused and the pong is not seen.
+- `close ?reason ws code` sends a close frame and resolves when the frame is
+  written or the connection has ended. It raises `Invalid_argument` at once
+  for a code that an endpoint may not send, or a reason that is not UTF-8 or
+  longer than 123 bytes. The socket closes when the read in
   progress ends too: when the client answers with its close frame or closes
   the connection. There is no timeout for a client that does neither.
 - Messages that you have not received wait in a queue. When 8 messages wait,

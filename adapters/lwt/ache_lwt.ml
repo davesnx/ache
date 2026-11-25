@@ -246,9 +246,14 @@ end
 module Websocket = struct
   type t =
     { connection : Ache.Websocket.t
-    ; messages : string Queue.t
-    ; receivers : (string option Lwt.t * string option Lwt.u) Queue.t
+    ; messages : Ache.Websocket.message Queue.t
+    ; receivers :
+        (Ache.Websocket.message option Lwt.t
+        * Ache.Websocket.message option Lwt.u)
+          Queue.t
+    ; pingers : (unit Lwt.t * unit Lwt.u) Queue.t
     ; ended : bool ref
+    ; client_close : Ache.Websocket.close option ref
     ; closed : unit Lwt.t
     }
 
@@ -256,16 +261,28 @@ module Websocket = struct
 
   let max_queued_messages = 8
 
-  let rec take_receiver receivers =
-    match Queue.take_opt receivers with
+  let rec take_waiter waiters =
+    match Queue.take_opt waiters with
     | Some (p, u) when Lwt.is_sleeping p -> Some u
-    | Some _ -> take_receiver receivers
+    | Some _ -> take_waiter waiters
     | None -> None
+
+  (* Drops the waiters whose promise was cancelled, so that a loop of cancelled
+     calls keeps the queue short. *)
+  let prune waiters =
+    let pending = Queue.of_seq (Queue.to_seq waiters) in
+    Queue.clear waiters;
+    Queue.iter
+      (fun ((p, _) as waiter) ->
+         if Lwt.is_sleeping p then Queue.push waiter waiters)
+      pending
 
   let upgrade ?max_message_size reqd =
     let messages = Queue.create ()
     and receivers = Queue.create ()
-    and ended = ref false in
+    and pingers = Queue.create ()
+    and ended = ref false
+    and client_close = ref None in
     let closed, notify_closed = Lwt.wait () in
     let connection = ref None in
     match
@@ -273,23 +290,42 @@ module Websocket = struct
         connection := Some ws;
         { on_message =
             (fun message ->
-              match take_receiver receivers with
+              match take_waiter receivers with
               | Some u -> Lwt.wakeup_later u (Some message)
               | None ->
                 Queue.push message messages;
                 if Queue.length messages >= max_queued_messages
                 then Ache.Websocket.pause_reading ws)
-        ; on_close =
-            (fun (_ : int option) ->
-              ended := true;
+        ; on_pong =
+            (fun (_ : string) ->
               let rec wake_all () =
-                match take_receiver receivers with
+                match take_waiter pingers with
                 | Some u ->
-                  Lwt.wakeup_later u None;
+                  Lwt.wakeup_later u ();
                   wake_all ()
                 | None -> ()
               in
-              wake_all ();
+              wake_all ())
+        ; on_close =
+            (fun close ->
+              ended := true;
+              client_close := close;
+              let rec wake_receivers () =
+                match take_waiter receivers with
+                | Some u ->
+                  Lwt.wakeup_later u None;
+                  wake_receivers ()
+                | None -> ()
+              in
+              wake_receivers ();
+              let rec fail_pingers () =
+                match take_waiter pingers with
+                | Some u ->
+                  Lwt.wakeup_later_exn u Closed;
+                  fail_pingers ()
+                | None -> ()
+              in
+              fail_pingers ();
               Lwt.wakeup_later notify_closed ())
         })
     with
@@ -299,17 +335,26 @@ module Websocket = struct
         { connection = Option.get !connection
         ; messages
         ; receivers
+        ; pingers
         ; ended
+        ; client_close
         ; closed
         }
 
-  let send t message =
-    Ache.Websocket.send_text t.connection message;
+  let written t =
     let p, u = Lwt.wait () in
     Ache.Websocket.flush t.connection (function
       | `Written -> Lwt.wakeup_later u ()
       | `Closed -> Lwt.wakeup_later_exn u Closed);
     p
+
+  let send_text t message =
+    Ache.Websocket.send_text t.connection message;
+    written t
+
+  let send_binary t message =
+    Ache.Websocket.send_binary t.connection message;
+    written t
 
   let receive t =
     match Queue.take_opt t.messages with
@@ -319,19 +364,26 @@ module Websocket = struct
       Lwt.return_some message
     | None when !(t.ended) -> Lwt.return_none
     | None ->
-      let pending = Queue.of_seq (Queue.to_seq t.receivers) in
-      Queue.clear t.receivers;
-      Queue.iter
-        (fun ((p, _) as receiver) ->
-           if Lwt.is_sleeping p then Queue.push receiver t.receivers)
-        pending;
+      prune t.receivers;
       let p, u = Lwt.task () in
       Queue.push (p, u) t.receivers;
       Ache.Websocket.resume_reading t.connection;
       p
 
-  let close t code =
-    Ache.Websocket.close t.connection ~code;
+  let ping t payload =
+    Ache.Websocket.ping t.connection payload;
+    if !(t.ended)
+    then Lwt.fail Closed
+    else (
+      prune t.pingers;
+      let p, u = Lwt.task () in
+      Queue.push (p, u) t.pingers;
+      p)
+
+  let client_close t = !(t.client_close)
+
+  let close ?reason t code =
+    Ache.Websocket.close ?reason t.connection ~code;
     t.closed
 end
 
