@@ -884,7 +884,7 @@ module Client = struct
     ; runtime : Upgradable.t
     ; shutdown_reader : unit -> unit
     ; shutdown_complete : unit Promise.t
-    ; fd : Eio_unix.Fd.t option
+    ; input_waiting : unit -> bool
     ; unread : bool ref
     ; reuse_deadline : float ref
     }
@@ -898,7 +898,7 @@ module Client = struct
 
   (* Bytes other than empty lines, or the end of input, that wait on [fd]. Only
      for a non-blocking [fd], so that [recv] does not wait. *)
-  let input_waiting fd =
+  let socket_input_waiting fd =
     Eio_unix.Fd.use
       fd
       ~if_closed:(fun () -> false)
@@ -924,7 +924,12 @@ module Client = struct
     t.shutdown_reader ();
     Upgradable.shutdown t.runtime
 
-  let create_connection ?(config = Ache.Config.default) ~sw socket =
+  let create_connection
+        ?(config = Ache.Config.default)
+        ?input_waiting
+        ~sw
+        socket
+    =
     let connection = Ache.Client_connection.create ~config () in
     let runtime =
       Upgradable.create
@@ -948,10 +953,12 @@ module Client = struct
             if not (Promise.is_resolved cancel_reader)
             then Promise.resolve resolve_cancel_reader ())
       ; shutdown_complete = shutdown_p
-      ; fd =
-          (match Eio_unix.Resource.fd_opt socket with
-          | Some fd when non_blocking fd -> Some fd
-          | Some _ | None -> None)
+      ; input_waiting =
+          (match input_waiting, Eio_unix.Resource.fd_opt socket with
+          | Some input_waiting, _ -> input_waiting
+          | None, Some fd when non_blocking fd ->
+            fun () -> socket_input_waiting fd
+          | None, (Some _ | None) -> fun () -> false)
       ; unread
       ; reuse_deadline
       }
@@ -1053,11 +1060,7 @@ module Client = struct
     then (
       Fiber.yield ();
       Fiber.yield ();
-      if
-        waiting ()
-        && (!(t.unread)
-           || match t.fd with Some fd -> input_waiting fd | None -> false)
-      then close_now t);
+      if waiting () && (!(t.unread) || t.input_waiting ()) then close_now t);
     t.reuse_deadline := Float.infinity;
     Ache.Client_connection.request
       t.connection

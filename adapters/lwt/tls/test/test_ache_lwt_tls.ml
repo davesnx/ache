@@ -874,12 +874,88 @@ let test_write_timeout () =
     then Alcotest.failf "flush got `Closed after %.3f s" elapsed;
     Lwt_unix.close fd)
 
+let stray_outcome client =
+  let result, resolve = Lwt.wait () in
+  let finish r = if Lwt.is_sleeping result then Lwt.wakeup_later resolve r in
+  let writer =
+    Ache_lwt_tls.Client.request
+      client
+      (Ache.Request.create
+         ~headers:(Ache.Headers.of_list [ "host", "localhost" ])
+         `GET
+         "/")
+      ~error_handler:(function
+        | `Connection_closed -> finish "Connection_closed"
+        | `Malformed_response _ -> finish "Malformed_response"
+        | `Invalid_response_body_length _ ->
+          finish "Invalid_response_body_length"
+        | `Exn exn -> finish (Printexc.to_string exn))
+      ~response_handler:(fun response reader ->
+        let body = Stdlib.Buffer.create 16 in
+        let rec loop () =
+          Ache.Body.Reader.schedule_read
+            reader
+            ~on_error:(fun () -> finish "body error")
+            ~on_eof:(fun () ->
+              finish
+                (Printf.sprintf
+                   "%d %s"
+                   (Ache.Status.to_code response.status)
+                   (Stdlib.Buffer.contents body)))
+            ~on_read:(fun bs ~off ~len ->
+              Stdlib.Buffer.add_string
+                body
+                (Ache.Bigstring.substring bs ~off ~len);
+              loop ())
+        in
+        loop ())
+  in
+  Ache.Body.Writer.close writer;
+  result
+
+(* Client: TLS records that arrive on an idle connection (undici
+   GHSA-35p6-xmwp-9g52). Application data or a close_notify closes the
+   connection; a key update or an empty line does not. *)
+let test_stray_records_on_idle_connection () =
+  let port, server =
+    Ache_test_tls_stray.start server_config Ache_test_tls_stray.strays
+  in
+  List.iter
+    (fun (name, _, expected) ->
+       Lwt_main.run
+         (Lwt_unix.with_timeout 10.0 (fun () ->
+            let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+            Lwt_unix.connect fd (Unix.ADDR_INET (Unix.inet_addr_loopback, port))
+            >>= fun () ->
+            Ache_lwt_tls.Client.create_connection_with_fd
+              ~tls:client_config
+              ~peer:(`Host localhost)
+              fd
+            >>= fun client ->
+            stray_outcome client >>= fun first ->
+            Alcotest.(check string) (name ^ ": first") "200 ok" first;
+            (* The stray records arrive while this thread does not run the read
+               loop. *)
+            Unix.sleepf 0.2;
+            stray_outcome client >>= fun second ->
+            Alcotest.(check string) (name ^ ": second") expected second;
+            Ache_lwt_tls.Client.shutdown client)))
+    Ache_test_tls_stray.cases;
+  Alcotest.(check (list bool))
+    "second requests sent"
+    Ache_test_tls_stray.second_requests_sent
+    (List.map (fun second -> second <> "") (Domain.join server))
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
     "ache-lwt-tls"
     [ ( "tls"
       , [ Alcotest.test_case "GET" `Quick test_get
+        ; Alcotest.test_case
+            "client: TLS records on an idle connection"
+            `Quick
+            test_stray_records_on_idle_connection
         ; Alcotest.test_case
             "a streamed response: one TLS record for each 16 KiB"
             `Quick

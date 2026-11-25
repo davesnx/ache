@@ -38,6 +38,24 @@ module Make (Io : IO) : sig
   module Client : Client with type socket = Io.socket
 end
 
+(** [Make_with_idle_check (Io) (Idle)] is [Make (Io)], except that
+    [Client.request] on a connection where no request waits for a response
+    first calls [Idle.input_waiting socket]. When it returns [true], the
+    connection closes and the request gets [`Connection_closed] (undici
+    GHSA-35p6-xmwp-9g52). [input_waiting] must not block. It returns [true]
+    when bytes other than CR and LF, or the end of input, wait to be read;
+    bytes it takes from the socket must stay for the next [Io.read].
+    {!module-Client} looks at the socket this way; [ache-miou-tls] looks at the
+    TLS records that wait. *)
+module Make_with_idle_check
+    (Io : IO)
+    (_ : sig
+       val input_waiting : Io.socket -> bool
+     end) : sig
+  module Server : Server with type socket = Io.socket
+  module Client : Client with type socket = Io.socket
+end
+
 module Server : sig
   include Server with type socket = Miou_unix.file_descr
 

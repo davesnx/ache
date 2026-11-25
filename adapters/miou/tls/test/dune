@@ -5,6 +5,7 @@
   ache
   ache-miou-tls
   ache_test_certs
+  ache_test_tls_stray
   alcotest
   domain-name
   ipaddr

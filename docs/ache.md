@@ -298,8 +298,13 @@ let () =
   response (undici GHSA-35p6-xmwp-9g52). `Ache_eio.Client.request` yields
   twice first, so that a read that io_uring completed returns. The socket is
   looked at by `ache-lwt` and `ache-miou`, and by `ache-eio` on a
-  non-blocking descriptor (`eio_posix`), not over TLS; `ache-miou-tls`
-  makes neither check.
+  non-blocking descriptor (`eio_posix`). The TLS clients of
+  `ache-lwt-tls`, `ache-eio-tls` and `ache-miou-tls` read the TLS records
+  that wait on the socket, without blocking, and decrypt them: application
+  data other than empty lines, a `close_notify` or the end of TCP closes
+  the connection; a session ticket or a key update does not, and decrypted
+  bytes are kept for the next read. On a blocking descriptor (Lwt) or with
+  io_uring (Eio) they look only at the records that reads returned.
 - Interim 1xx responses other than 101 are dropped. After a 101, or a 2xx
   response to `CONNECT`, the client stops reading HTTP and `upgrade` gives
   the bytes after the head to the new protocol.

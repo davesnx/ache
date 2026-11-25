@@ -70,11 +70,17 @@ module Client : sig
     -> [> Eio.Flow.two_way_ty | Eio.Resource.close_ty ] Eio.Resource.t
     -> t
   (** [create_connection ~sw ~tls ~peer flow] does the client side of the TLS
-      handshake on [flow] and runs {!Ache_eio.Client} on the TLS flow. When the
-      handshake fails, for example because the certificate is not valid for
-      [peer], it raises the exception of [Tls_eio.client_of_flow]
-      ([Tls_eio.Tls_failure (`Error (`AuthenticationFailure _))] for a
-      rejected certificate). The caller closes [flow]. *)
+      handshake on [flow] and runs {!Ache_eio.Client} on the TLS flow, which
+      it drives with [Tls.Engine]. When the handshake fails, for example
+      because the certificate is not valid for [peer], it raises the
+      exceptions of [tls-eio] ([Tls_eio.Tls_failure
+      (`Error (`AuthenticationFailure _))] for a rejected certificate,
+      [Tls_eio.Tls_alert], or [End_of_file] when the server closes). The
+      caller closes [flow].
+
+      On an idle connection, {!request} first reads the TLS records that wait
+      on a non-blocking [flow] ([eio_posix]) and decrypts them; see
+      {!Ache_eio.Client.create_connection} for what closes the connection. *)
 
   val request :
      t
