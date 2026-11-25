@@ -413,6 +413,7 @@ let with_server
       ?head_timeout
       ?body_timeout
       ?write_timeout
+      ?close_timeout
       ?(date = false)
       ?stop
       ?grace
@@ -446,6 +447,7 @@ let with_server
                       ~head_timeout
                       ~body_timeout
                       ~write_timeout
+                      ~close_timeout
                       ?stop
                       ?grace
                       ~request_handler
@@ -990,6 +992,94 @@ let test_websocket_server_close () =
       (Ok "closed, client close 4000 \"done\"")
       (await ended);
     Alcotest.(check string) "then end of input" "" (read_all socket);
+    Miou_unix.close socket;
+    wait_connection_done ())
+
+(* The client never answers the server's close frame, and keeps sending messages
+   for 3 s: they do not extend the close timeout. *)
+let test_websocket_close_timeout () =
+  let ended = wait_ws_end () in
+  with_server ~close_timeout:0.2 (fun addr ->
+    let socket = ws_connect addr "/ws-echo" in
+    send socket (ws_frame 0x1 "close-me");
+    Alcotest.(check (pair int string))
+      "close 1001"
+      (0x88, "\x03\xe9")
+      (read_ws_frame socket);
+    let from = Unix.gettimeofday () in
+    let sender =
+      Miou.async (fun () ->
+        let rec loop n =
+          if n > 0
+          then (
+            (try send socket (ws_frame 0x1 "dropped") with
+            | Unix.Unix_error ((EPIPE | ECONNRESET), _, _) -> ());
+            Miou_unix.sleep 0.05;
+            loop (n - 1))
+        in
+        loop 60)
+    in
+    Alcotest.(check string) "then end of input" "" (read_all socket);
+    check_elapsed "closed" ~from ~min:0. ~max:2.0;
+    Miou.cancel sender;
+    Alcotest.(check (result string reject))
+      "close returned without the client's close frame"
+      (Ok "closed, no client close")
+      (await ended);
+    Miou_unix.close socket;
+    wait_connection_done ())
+
+(* The read that waits when the session closes has the idle limit, or none: the
+   close frame must give it the close deadline. The client sends nothing after
+   the server's close frame. *)
+(* After the close timeout, the connection does not linger for [idle_timeout]
+   on a client that keeps sending and never closes its socket. *)
+let test_websocket_close_timeout_no_linger () =
+  let ended = wait_ws_end () in
+  with_server ~idle_timeout:30. ~close_timeout:0.2 (fun addr ->
+    let socket = ws_connect addr "/ws-echo" in
+    send socket (ws_frame 0x1 "close-me");
+    Alcotest.(check (pair int string))
+      "close 1001"
+      (0x88, "\x03\xe9")
+      (read_ws_frame socket);
+    let from = Unix.gettimeofday () in
+    let sender =
+      Miou.async (fun () ->
+        let rec loop () =
+          match send socket (ws_frame 0x1 "dropped") with
+          | () ->
+            Miou_unix.sleep 0.05;
+            loop ()
+          | exception Unix.Unix_error ((EPIPE | ECONNRESET), _, _) -> ()
+        in
+        loop ())
+    in
+    wait_connection_done ();
+    check_elapsed "handler returned" ~from ~min:0. ~max:2.5;
+    Miou.cancel sender;
+    Alcotest.(check (result string reject))
+      "close returned without the client's close frame"
+      (Ok "closed, no client close")
+      (await ended);
+    Miou_unix.close socket)
+
+let test_websocket_close_timeout_silent ?idle_timeout () =
+  let ended = wait_ws_end () in
+  with_server ?idle_timeout ~close_timeout:0.2 (fun addr ->
+    let socket = ws_connect addr "/ws-echo" in
+    send socket (ws_frame 0x1 "close-me");
+    Alcotest.(check (pair int string))
+      "close 1001"
+      (0x88, "\x03\xe9")
+      (read_ws_frame socket);
+    let from = Unix.gettimeofday () in
+    Alcotest.(check string) "then end of input" "" (read_all socket);
+    check_elapsed "closed" ~from ~min:0. ~max:2.5;
+    Alcotest.(check (result string reject))
+      "close returned without the client's close frame"
+      (Ok "closed, no client close")
+      (await ended);
     Miou_unix.close socket;
     wait_connection_done ())
 
@@ -2157,6 +2247,7 @@ let test_timeout_check_timing () =
               ~head_timeout:(Some 1.)
               ~body_timeout:(Some 1.)
               ~write_timeout:(Some 1.)
+              ~close_timeout:(Some 1.)
               ~stop:(Miou.Computation.create ())
               ~grace:1.
               ~request_handler
@@ -2178,6 +2269,15 @@ let test_timeout_check_timing () =
             Ache_miou.Server.create_connection_handler
               ~date:false
               ~write_timeout:(Some (-1.))
+              ~request_handler
+              ~error_handler
+              socket
+              addr )
+      ; ( "zero close_timeout raises"
+        , fun () ->
+            Ache_miou.Server.create_connection_handler
+              ~date:false
+              ~close_timeout:(Some 0.)
               ~request_handler
               ~error_handler
               socket
@@ -3347,6 +3447,18 @@ let () =
           , test_websocket_peer_reset )
         ; "WebSocket echo", `Quick, test_websocket_echo
         ; "WebSocket server close", `Quick, test_websocket_server_close
+        ; ( "WebSocket close timeout: the client never answers"
+          , `Quick
+          , test_websocket_close_timeout )
+        ; ( "WebSocket close timeout: silent client, no idle timeout"
+          , `Quick
+          , test_websocket_close_timeout_silent ?idle_timeout:None )
+        ; ( "WebSocket close timeout: silent client, idle timeout 30 s"
+          , `Quick
+          , test_websocket_close_timeout_silent ~idle_timeout:30. )
+        ; ( "WebSocket close timeout: no linger after it"
+          , `Quick
+          , test_websocket_close_timeout_no_linger )
         ; "WebSocket ping", `Quick, test_websocket_ping
         ; ( "WebSocket send loop to a reset peer ends"
           , `Quick

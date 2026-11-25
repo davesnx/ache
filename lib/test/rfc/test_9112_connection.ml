@@ -818,7 +818,7 @@ let timeout_tests =
          ignore (Server.take_output s);
          (match timeout_action s with
          | Some (`Idle, close) -> close ()
-         | Some ((`Head | `Body), _) ->
+         | Some ((`Head | `Body | `Close), _) ->
            Alcotest.fail "head timeout between requests"
          | None -> Alcotest.fail "no timeout between requests");
          Server.pump s;
@@ -831,7 +831,7 @@ let timeout_tests =
          let s = Server.run "GET / HTTP/1.1\r\nHo" in
          (match timeout_action s with
          | Some (`Head, reject) -> reject ()
-         | Some ((`Idle | `Body), _) ->
+         | Some ((`Idle | `Body | `Close), _) ->
            Alcotest.fail "idle timeout inside a head"
          | None -> Alcotest.fail "no timeout inside a head");
          Server.pump s;
@@ -847,7 +847,7 @@ let timeout_tests =
          in
          (match timeout_action s with
          | Some (`Body, expire) -> expire ()
-         | Some ((`Idle | `Head), _) ->
+         | Some ((`Idle | `Head | `Close), _) ->
            Alcotest.fail "idle or head timeout inside a body"
          | None -> Alcotest.fail "no timeout while a body is read");
          Server.pump s;

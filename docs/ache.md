@@ -442,14 +442,14 @@ when the connection closed first.
   client's: it keeps reading, drops the messages that arrive meanwhile, and
   closes the connection at the client's close frame or the end of input.
   `on_close` gets the client's code and reason. Paused reading starts again,
-  so the client's close frame is seen. There is no timeout for a client that
-  neither answers nor closes. The reason must be valid UTF-8 and at most 123
+  so the client's close frame is seen. The runtimes wait at most
+  `close_timeout` (10 s by default) for it, then close the connection and
+  `on_close` gets `None`. The reason must be valid UTF-8 and at most 123
   bytes.
 - `Websocket.ping ws payload` sends a ping; the client's pong reaches
   `on_pong`. To find a client that is gone, ping it on a timer and close the
   connection when no pong comes in time. A client that is gone does not
-  answer the close frame either: the socket stays open until you close it
-  ([Limits](#limits)).
+  answer the close frame either: the close timeout ends the connection.
 - It closes the connection with a code when the client breaks the protocol.
   `on_close` then gets `None`:
 
@@ -594,6 +594,9 @@ The core decides which limit applies to the next read
 - the head timeout, while a request head is only partly received;
 - the idle timeout, on a keep-alive connection that waits for its next
   request, and on a WebSocket connection that reads frames;
+- the close timeout, on a WebSocket connection that sent its close frame
+  and waits for the client's. It is a deadline: the messages that still
+  arrive do not restart it;
 - the body timeout, while the connection waits for request body bytes: the
   application has scheduled a read on the body, or the response is complete
   and the rest of the body has not arrived;
@@ -605,7 +608,8 @@ The runtime owns the clock and starts the timer, and asks again before each
 read. When the timer fires first, it calls the action that the core gave
 for the state at that time: `408` for a head; for a body, `on_error` and
 then `408` if no response has started, or a close; a close for an idle
-connection, with close code 1001 on a WebSocket.
+connection, with close code 1001 on a WebSocket; for a WebSocket close, a
+close without the client's answer.
 
 The runtimes count the body and write limits as progress, after warp and
 Cowboy: the body clock runs only while the connection waits for body bytes,
@@ -615,8 +619,8 @@ connection open, and a handler that is slow to answer is never timed out.
 A write that makes no progress closes the connection; the core sees it as
 a failed write (`` `Closed ``).
 
-All four timeouts are on by default in every runtime: head 30 s, idle,
-body and write 60 s. Passing `None` turns one off.
+All five timeouts are on by default in every runtime: head 30 s, idle,
+body and write 60 s, close 10 s. Passing `None` turns one off.
 
 ### Keep-Alive
 
@@ -712,8 +716,9 @@ runtimes.
 - WebSocket: server only. There are no extensions. The application chooses
   a subprotocol and answers it with `?headers` of `upgrade`. A WebSocket
   connection that receives nothing for the idle timeout is closed with
-  code 1001, and one whose writes make no progress for the write timeout
-  is closed.
+  code 1001, one whose writes make no progress for the write timeout is
+  closed, and one whose client does not answer the server's close frame
+  within the close timeout is closed.
 - The API is not stable before 1.0.
 
 ## Test a handler

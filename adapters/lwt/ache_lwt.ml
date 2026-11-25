@@ -467,6 +467,7 @@ struct
           ?(head_timeout = Some 30.)
           ?(body_timeout = Some 60.)
           ?(write_timeout = Some 60.)
+          ?(close_timeout = Some 10.)
           ?(date = true)
           ?stop
           ?grace
@@ -479,6 +480,7 @@ struct
       check_timeout "head_timeout" head_timeout;
       check_timeout "body_timeout" body_timeout;
       check_timeout "write_timeout" write_timeout;
+      check_timeout "close_timeout" close_timeout;
       check_timeout "grace" grace;
       let close = IO_loop.close_once Io.close socket in
       match stop with
@@ -486,6 +488,11 @@ struct
       | _ ->
         let head_timer = Option.map Timeout.create head_timeout
         and head_armed = ref false
+        (* Close timer of a WebSocket: a fixed deadline from the moment the
+           server's close frame is queued. The messages that still arrive do not
+           restart it, and it is not stopped: a connection closes only once. *)
+        and close_timer = Option.map Timeout.create close_timeout
+        and close_armed = ref false
         and idle_timer = Option.map Timeout.create idle_timeout
         and keep_alive_timeout =
           match idle_timeout with
@@ -520,6 +527,33 @@ struct
           | Some { Ache.Response.status = `Switching_protocols; _ } -> true
           | Some _ | None -> false
         in
+        (* [true] once the connection is upgraded with [Ache.Websocket.upgrade],
+           whose [101] carries [Upgrade: websocket]. The answer is cached once
+           there is a [101]: other protocols never reach the [`Close] phase. *)
+        let websocket = ref false
+        and checked_reqd = ref None in
+        let is_websocket () =
+          !websocket
+          ||
+          match !last_reqd with
+          | Some reqd
+            when match !checked_reqd with
+                 | Some checked -> checked != reqd
+                 | None -> true ->
+            (* Each request's response is checked once it is known. *)
+            (match Ache.Request_descriptor.response reqd with
+            | Some { Ache.Response.status; headers; _ } ->
+              checked_reqd := Some reqd;
+              (websocket :=
+                 status = `Switching_protocols
+                 &&
+                 match Ache.Headers.get headers "upgrade" with
+                 | Some value -> String.lowercase_ascii value = "websocket"
+                 | None -> false);
+              !websocket
+            | None -> false)
+          | Some _ | None -> false
+        in
         let stop_head_timer () =
           head_armed := false;
           Option.iter Timeout.stop head_timer
@@ -536,8 +570,30 @@ struct
                restart_body_clock ();
                request_handler client_addr reqd)
         in
+        (* The WebSocket read that waits in the [`Idle] phase. When the server
+           queues its close frame meanwhile, that read stays (the socket read
+           cannot be cancelled), and its limit becomes the close timeout. *)
+        let closing_wait = ref None in
+        (* Arms the close timer when the server's close frame is queued. The
+           frame wakes the writer, whoever queued it: [Ache_lwt.Websocket] or
+           the callback API. *)
+        let observe_close () =
+          match close_timer with
+          | Some timer when (not !close_armed) && is_websocket () ->
+            (match Ache.Server_connection.read_timeout connection with
+            | Some (`Close, _) ->
+              close_armed := true;
+              Timeout.set timer;
+              (match !closing_wait with
+              | Some u ->
+                closing_wait := None;
+                Lwt.wakeup_later u ()
+              | None -> ())
+            | Some ((`Idle | `Head | `Body), _) | None -> ())
+          | Some _ | None -> ()
+        in
         let observe () =
-          match head_timer with
+          (match head_timer with
           | None -> ()
           | Some timer ->
             (match Ache.Server_connection.read_timeout connection with
@@ -546,10 +602,16 @@ struct
               then (
                 head_armed := true;
                 Timeout.set timer)
-            | Some ((`Idle | `Body), _) | None -> stop_head_timer ())
+            | Some ((`Idle | `Body | `Close), _) | None -> stop_head_timer ()));
+          observe_close ()
         in
         let module Observed = struct
           include Ache.Server_connection
+
+          let next_write_operation t =
+            let operation = next_write_operation t in
+            observe_close ();
+            operation
 
           let read t bs ~off ~len =
             let n = read t bs ~off ~len in
@@ -597,7 +659,15 @@ struct
           (* The action depends on the state when the clock runs out. *)
           (match Ache.Server_connection.read_timeout connection with
           | Some (`Body, expire) -> expire ()
-          | Some ((`Idle | `Head), _) | None -> ());
+          | Some ((`Idle | `Head | `Close), _) | None -> ());
+          Error `Timeout
+        in
+        let close_limit timer =
+          Timeout.expired timer >|= fun () ->
+          (* The client may have answered since the read started. *)
+          (match Ache.Server_connection.read_timeout connection with
+          | Some (`Close, abort) -> abort ()
+          | Some ((`Idle | `Head | `Body), _) | None -> ());
           Error `Timeout
         in
         (* The idle read in progress, which [drain] ends: a drained idle
@@ -607,6 +677,13 @@ struct
           let p, u = Lwt.wait () in
           idle_read := Some (p, u);
           p
+        in
+        let closing_limit timer =
+          let p, u = Lwt.wait () in
+          closing_wait := Some u;
+          p >>= fun () ->
+          Option.iter Timeout.stop idle_timer;
+          close_limit timer
         in
         let timed_read read =
           observe ();
@@ -622,7 +699,7 @@ struct
                 if !body_progress >= progress_bytes then restart_body_clock ()
               | Error `Timeout -> ());
               result
-            | _ -> reading
+            | (Some ((`Idle | `Head | `Body | `Close), _) | None), _ -> reading
           in
           let limits =
             if not (Lwt.is_sleeping reading)
@@ -643,23 +720,40 @@ struct
               | Some (`Head, _) -> []
               | Some (`Body, _) ->
                 Option.to_list (Option.map body_limit tick_timer)
-              | None -> []
+              | Some (`Close, _) when !close_armed ->
+                Option.to_list (Option.map close_limit close_timer)
+              | Some (`Close, _) | None -> []
+          in
+          let limits =
+            match phase, close_timer with
+            | Some (`Idle, _), Some timer
+              when Lwt.is_sleeping reading && is_websocket () ->
+              closing_limit timer :: limits
+            | (Some _ | None), (Some _ | None) -> limits
           in
           let limits =
             match stop, phase with
             | Some _, Some (`Idle, _) when Lwt.is_sleeping reading ->
               drainable () :: limits
-            | _ -> limits
+            (* A drain ends the reads of a WebSocket at once (it sends 1001 and
+               stops reading): only an idle read needs waking. *)
+            | ( (Some _ | None)
+              , (Some ((`Idle | `Head | `Body | `Close), _) | None) ) ->
+              limits
           in
           match limits with
           | [] -> counted
           | limits ->
-            let waiting = !body_wait in
+            let waiting = !body_wait
+            and closing_waiting = !closing_wait in
             let result = Lwt.pick (counted :: limits) in
             (* The next read can start before this callback runs. *)
             Lwt.on_termination result (fun () ->
-              match !body_wait, waiting with
+              (match !body_wait, waiting with
               | Some u, Some mine when u == mine -> body_wait := None
+              | _ -> ());
+              match !closing_wait, closing_waiting with
+              | Some u, Some mine when u == mine -> closing_wait := None
               | _ -> ());
             result
         in
@@ -733,6 +827,7 @@ struct
             (fun () -> Lwt.choose [ serving; cancelled ])
             (fun () ->
                Option.iter Timeout.stop head_timer;
+               Option.iter Timeout.stop close_timer;
                Option.iter Timeout.stop idle_timer;
                Option.iter Timeout.stop between_requests_timer;
                Option.iter Timeout.stop tick_timer;

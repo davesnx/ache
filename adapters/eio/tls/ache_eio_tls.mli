@@ -98,6 +98,7 @@ module Server : sig
     -> ?clock:_ Eio.Time.clock
     -> ?idle_timeout:float option
     -> ?head_timeout:float option
+    -> ?close_timeout:float option
     -> ?body_timeout:float option
     -> ?write_timeout:float option
     -> ?date:bool
@@ -134,7 +135,7 @@ module Server : sig
 
       @raise Invalid_argument
         in the cases of {!Ache_eio.Server.create_connection_handler}: when
-        [~error_handler] is applied if all nine optional arguments are given
+        [~error_handler] is applied if all ten optional arguments are given
         too, and otherwise when the handler is applied to a flow, before the
         handshake. *)
 end

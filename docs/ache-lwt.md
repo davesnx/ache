@@ -178,16 +178,18 @@ let request_handler _client_address reqd =
 - `ping ws payload` sends a ping and resolves when the next pong arrives, or
   fails with `Closed` when the connection ends first. To find a client that
   is gone: `Lwt_unix.with_timeout 30. (fun () -> Ache_lwt.Websocket.ping ws
-  "")`, and `close` on `Lwt_unix.Timeout`, with a timeout too, since a
-  client that is gone does not answer. The pong comes after the
+  "")`, and `close` on `Lwt_unix.Timeout`. A client that is gone does not
+  answer the close frame: the connection waits for it at most
+  `close_timeout` (10 s by default). The pong comes after the
   messages the client sent before it, so keep calling `receive` meanwhile:
   while 8 messages wait, reading is paused and the pong is not seen.
 - `close ?reason ws code` sends a close frame and resolves when the
   connection has ended: the client answered with its close frame (then in
   `client_close`), closed the connection, or the connection failed.
-  Messages that arrive meanwhile are dropped. There is no timeout for a
-  client that neither answers nor closes: wrap `close` in
-  `Lwt_unix.with_timeout`. It raises `Invalid_argument` at once for a code
+  Messages that arrive meanwhile are dropped. The connection waits at most
+  `close_timeout` (10 s by default) for the client's close frame, then
+  closes without it, and `client_close` is `None`. Messages that arrive
+  meanwhile do not extend the wait. It raises `Invalid_argument` at once for a code
   that an endpoint may not send, or a reason that is not UTF-8 or longer
   than 123 bytes.
 - Messages that you have not received wait in a queue. When 8 messages wait,
@@ -282,6 +284,13 @@ turns one off. The TLS handler takes the same arguments.
 | `?head_timeout` | `Some 30.` | a request head is partly read (408) |
 | `?body_timeout` | `Some 60.` | the connection waits for request body bytes (408 if no response started, else close) |
 | `?write_timeout` | `Some 60.` | output waits to be written, for example to a client that stopped reading (close) |
+| `?close_timeout` | `Some 10.` | a WebSocket queued its close frame and waits for the client's (close without it) |
+
+The close clock starts when the server's close frame is queued, by
+`Ache_lwt.Websocket.close`, the end of a session or `Ache.Websocket.close`.
+Messages from the client do not restart it. The close frames of
+`idle_timeout` and of a drain end the connection at once, without waiting
+for the client's close frame.
 
 With `?idle_timeout:(Some x)` and `x >= 1.`, a response after which the
 connection stays open gets `Keep-Alive: timeout=n`, with `n` the whole
@@ -351,7 +360,8 @@ connection calls `Ache.Server_connection.drain`:
 2. A connection with a request in progress serves it, with
    `Connection: close` if its head is not written yet, and then closes.
    Requests pipelined after it are not served.
-3. A WebSocket connection sends a close frame with code 1001.
+3. A WebSocket connection sends a close frame with code 1001 and closes at
+   once.
 4. `grace` seconds after `stop`, a connection that is still open is
    cancelled: its socket closes, and the promise of the connection
    resolves without waiting for the request handler. Without `grace` there

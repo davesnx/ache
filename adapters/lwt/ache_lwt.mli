@@ -81,8 +81,8 @@ module type Client = Ache_lwt_intf.Client
     do not start or cancel a sleep.
 
     The servers of [ache-lwt] and [ache-lwt-tls] use [Timeout] for
-    [idle_timeout], [head_timeout] and the TLS handshake. Use it only from the
-    thread that runs Lwt. *)
+    [idle_timeout], [head_timeout], [close_timeout] and the TLS handshake.
+    Use it only from the thread that runs Lwt. *)
 module Timeout : sig
   type t
 
@@ -173,8 +173,9 @@ module Websocket : sig
       only the latest ping, or send pongs unasked), and fails with {!Closed}
       when the connection closes first. To find a client that is gone:
       [Lwt_unix.with_timeout 30. (fun () -> ping t "")], then {!close} on
-      [Lwt_unix.Timeout], with a timeout too: a client that is gone does not
-      answer the close frame. The promise can be cancelled.
+      [Lwt_unix.Timeout]. A client that is gone does not answer the close
+      frame: the connection waits for it at most [close_timeout] (10 s by
+      default). The promise can be cancelled.
 
       The pong comes after the messages the client sent before it. While 8
       messages wait for {!receive}, reading is paused, so the pong is not
@@ -200,9 +201,11 @@ module Websocket : sig
       {!client_close}), closed the connection, or the connection failed.
       Messages that arrive meanwhile are dropped.
 
-      There is no timeout: when the client neither answers nor closes, the
-      socket stays open until the caller closes the socket it gave to
-      [create_connection_handler], for example with its own timer.
+      The connection waits at most [close_timeout] of
+      [create_connection_handler] (10 s by default) for the client's close
+      frame, then closes without it: {!client_close} is [None]. Messages
+      that arrive meanwhile do not extend the wait. With
+      [~close_timeout:None] it waits until the client answers or closes.
 
       @raise Invalid_argument
         at once, before it returns a promise, if [code] is not one an endpoint
@@ -223,7 +226,8 @@ end
       no byte arrives for [idle_timeout], the connection closes without a
       response. On a connection upgraded with {!Websocket.upgrade}: when no
       frame arrives for [idle_timeout], the connection sends a close frame
-      with code [1001] and closes.
+      with code [1001] and closes at once, without waiting for the client's
+      close frame.
     - [head_timeout] (default [Some 30.]): when a request head is not
       complete [head_timeout] after its first bytes were read,
       [error_handler] is called with [`Request_timeout] (408) and the
@@ -243,6 +247,14 @@ end
       because the client stopped reading. The connection closes its socket
       and ends; pending [Body.Writer.flush] callbacks get [`Closed]. The
       clock restarts when all output is written and after each 2048 bytes.
+    - [close_timeout] (default [Some 10.]): on a connection upgraded with
+      {!Websocket.upgrade}, the server sent its close frame and the client
+      does not answer with its own within [close_timeout]. The connection
+      closes without it. The clock starts when the server's close frame is
+      queued, by {!Websocket.close}, the end of a session or
+      {!Ache.Websocket.close}. Messages that arrive meanwhile do not restart
+      it. The close frames of [idle_timeout] and of a drain end the
+      connection at once and do not use it.
 
     Keep-Alive hint: when [idle_timeout] is [Some x] with [x >= 1.], each
     response after which the connection stays open gets
@@ -268,7 +280,7 @@ end
       connection closes at once. A connection with a request in progress
       serves it, with [Connection: close] if its head is not written yet, and
       then closes; requests pipelined after it are not served. A WebSocket
-      connection sends a close frame with code [1001].
+      connection sends a close frame with code [1001] and closes at once.
     + [grace] seconds later, a connection that is still open is cancelled:
       it stops, and its socket is closed without waiting for the handler or
       for pending output, and the promise of the connection resolves.

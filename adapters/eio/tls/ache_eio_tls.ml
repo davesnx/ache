@@ -172,6 +172,7 @@ module Server = struct
         ?clock
         ?(idle_timeout = Some 60.)
         ?(head_timeout = Some 30.)
+        ?close_timeout
         ?body_timeout
         ?write_timeout
         ?date
@@ -187,6 +188,7 @@ module Server = struct
         ?clock
         ~idle_timeout
         ~head_timeout
+        ?close_timeout
         ?body_timeout
         ?write_timeout
         ?date

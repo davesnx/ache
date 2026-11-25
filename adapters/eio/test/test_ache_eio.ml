@@ -87,6 +87,7 @@ exception Respond_later
 
 let late_error_response : (unit -> unit) option ref = ref None
 let ws_reports : string Eio.Stream.t = Eio.Stream.create max_int
+let callbacks_ws : Ache.Websocket.t option ref = ref None
 let text_of = function Ache.Websocket.Text s -> s | Binary s -> "binary:" ^ s
 
 let ws_echo ws =
@@ -195,6 +196,27 @@ let request_handler (_ : Eio.Net.Sockaddr.stream) reqd =
              (fun close ->
                !on_ws_closed
                  (Option.map (fun { Websocket.code; _ } -> code) close))
+         })
+     with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
+  | `GET, "/ws-callbacks" ->
+    (* The callback API of the core. *)
+    (match
+       Ache.Websocket.upgrade reqd (fun ws ->
+         callbacks_ws := Some ws;
+         { on_message =
+             (function
+               | Text "close-me" -> Ache.Websocket.close ws ~code:1000
+               | Text _ | Binary _ -> ())
+         ; on_pong = ignore
+         ; on_close =
+             (fun close ->
+               Eio.Stream.add
+                 ws_reports
+                 (match close with
+                 | None -> "on_close None"
+                 | Some { code; _ } -> Printf.sprintf "on_close %d" code))
          })
      with
     | Ok () -> ()
@@ -315,6 +337,7 @@ let with_server
       ?clock
       ?idle_timeout
       ?head_timeout
+      ?close_timeout
       ?body_timeout
       ?write_timeout
       ?(date = false)
@@ -352,6 +375,7 @@ let with_server
                    ?clock
                    ~idle_timeout
                    ~head_timeout
+                   ~close_timeout
                    ~body_timeout
                    ~write_timeout
                    ~request_handler
@@ -1444,13 +1468,25 @@ let test_timeout_check_timing () =
               ~clock:(Eio_mock.Clock.make ())
               ~idle_timeout:(Some (-1.))
               ~head_timeout:(Some 1.)
+              ~close_timeout:(Some 1.)
               ~body_timeout:None
               ~write_timeout:None
               ~stop:(Eio.Promise.create_resolved ())
               ~grace:1.
               ~request_handler
               ~error_handler
-            : _ -> _ -> unit))))
+            : _ -> _ -> unit)));
+    Alcotest.(check bool)
+      "close_timeout not positive: raises"
+      true
+      (raises (fun () ->
+         Ache_eio.Server.create_connection_handler
+           ~date:false
+           ~close_timeout:(Some 0.)
+           ~request_handler
+           ~error_handler
+           flow
+           addr)))
 
 let test_cancel_is_not_an_error () =
   server_errors := [];
@@ -2448,6 +2484,125 @@ let test_websocket_server_close () =
       "then end of input"
       ""
       (Eio.Buf_read.take_all reader);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
+let test_websocket_close_timeout () =
+  with_server ~close_timeout:0.2 (fun ~sw ~net addr ->
+    let socket, reader = ws_connect ~sw ~net addr "/ws-echo" in
+    Eio.Flow.copy_string (ws_frame 0x1 "close-me") socket;
+    Alcotest.check frame "close 1001" (0x88, "\x03\xe9") (read_ws_frame reader);
+    let closed_at = Unix.gettimeofday () in
+    (* The client never answers, and sends a message every 50 ms: the messages
+       are dropped and do not extend the close timeout. *)
+    let rec send () =
+      match Eio.Flow.copy_string (ws_frame 0x1 "dropped") socket with
+      | () ->
+        !real_sleep 0.05;
+        send ()
+      | exception (Eio.Io _ | End_of_file) -> Eio.Fiber.await_cancel ()
+    in
+    Eio.Fiber.first
+      (fun () ->
+         Alcotest.(check string)
+           "then end of input"
+           ""
+           (Eio.Buf_read.take_all reader))
+      send;
+    let elapsed = Unix.gettimeofday () -. closed_at in
+    Alcotest.(check bool)
+      (Printf.sprintf "closed within 2.5 s (%.3f s)" elapsed)
+      true
+      (elapsed < 2.5);
+    Alcotest.(check string)
+      "close returned without the client's close frame"
+      "closed, no client close"
+      (Eio.Stream.take ws_reports);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
+(* A client that sends nothing after the server's close: the read that waits
+   when the session closes starts again with the close timeout, with or without
+   an idle timeout. *)
+let close_timeout_silent ?idle_timeout () =
+  with_server ?idle_timeout ~close_timeout:0.2 (fun ~sw ~net addr ->
+    let socket, reader = ws_connect ~sw ~net addr "/ws-echo" in
+    Eio.Flow.copy_string (ws_frame 0x1 "close-me") socket;
+    Alcotest.check frame "close 1001" (0x88, "\x03\xe9") (read_ws_frame reader);
+    let closed_at = Unix.gettimeofday () in
+    Alcotest.(check string)
+      "then end of input"
+      ""
+      (Eio.Buf_read.take_all reader);
+    let elapsed = Unix.gettimeofday () -. closed_at in
+    Alcotest.(check bool)
+      (Printf.sprintf "closed within 2.5 s (%.3f s)" elapsed)
+      true
+      (elapsed < 2.5);
+    Alcotest.(check string)
+      "close returned without the client's close frame"
+      "closed, no client close"
+      (Eio.Stream.take ws_reports);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
+(* The core's [close], called from another fiber while the read waits (a close
+   from [on_message] runs inside a read). The read gets the close timeout,
+   without an idle timeout. *)
+let test_websocket_close_timeout_silent () = close_timeout_silent ()
+
+let test_websocket_close_timeout_silent_idle () =
+  close_timeout_silent ~idle_timeout:30. ()
+
+(* After the close timeout, the connection does not linger: a client that keeps
+   sending and never closes its socket does not keep it open. *)
+let test_websocket_close_timeout_no_linger () =
+  with_server ~idle_timeout:30. ~close_timeout:0.2 (fun ~sw ~net addr ->
+    let socket, reader = ws_connect ~sw ~net addr "/ws-echo" in
+    Eio.Flow.copy_string (ws_frame 0x1 "close-me") socket;
+    Alcotest.check frame "close 1001" (0x88, "\x03\xe9") (read_ws_frame reader);
+    let closed_at = Unix.gettimeofday () in
+    let rec send () =
+      (try Eio.Flow.copy_string (ws_frame 0x1 "dropped") socket with
+      | Eio.Io _ | End_of_file -> ());
+      !real_sleep 0.05;
+      send ()
+    in
+    Eio.Fiber.first (fun () -> Eio.Stream.take connections_done) send;
+    let elapsed = Unix.gettimeofday () -. closed_at in
+    Alcotest.(check bool)
+      (Printf.sprintf "handler returned within 2.5 s (%.3f s)" elapsed)
+      true
+      (elapsed < 2.5);
+    Alcotest.(check string)
+      "close returned without the client's close frame"
+      "closed, no client close"
+      (Eio.Stream.take ws_reports);
+    Eio.Flow.close socket)
+
+let test_websocket_close_timeout_callbacks () =
+  with_server ~close_timeout:0.2 (fun ~sw ~net addr ->
+    callbacks_ws := None;
+    let socket, reader = ws_connect ~sw ~net addr "/ws-callbacks" in
+    Eio.Flow.copy_string (ws_frame 0x1 "hello") socket;
+    (* The read loop has read the message and waits again. *)
+    !real_sleep 0.1;
+    Ache.Websocket.close (Option.get !callbacks_ws) ~code:1000;
+    Alcotest.check frame "close 1000" (0x88, "\x03\xe8") (read_ws_frame reader);
+    let closed_at = Unix.gettimeofday () in
+    Alcotest.(check string)
+      "then end of input"
+      ""
+      (Eio.Buf_read.take_all reader);
+    let elapsed = Unix.gettimeofday () -. closed_at in
+    Alcotest.(check bool)
+      (Printf.sprintf "closed within 2.5 s (%.3f s)" elapsed)
+      true
+      (elapsed < 2.5);
+    Alcotest.(check string)
+      "on_close without the client's close frame"
+      "on_close None"
+      (Eio.Stream.take ws_reports);
     Eio.Flow.close socket;
     Eio.Stream.take connections_done)
 
@@ -3792,6 +3947,19 @@ let () =
     ; ( "websocket"
       , [ "echo through Ache_eio.Websocket", `Quick, test_websocket_echo
         ; "server close", `Quick, test_websocket_server_close
+        ; "close timeout", `Quick, test_websocket_close_timeout
+        ; ( "close timeout, silent client"
+          , `Quick
+          , test_websocket_close_timeout_silent )
+        ; ( "close timeout, silent client, idle timeout"
+          , `Quick
+          , test_websocket_close_timeout_silent_idle )
+        ; ( "close timeout, no linger"
+          , `Quick
+          , test_websocket_close_timeout_no_linger )
+        ; ( "close timeout, callback API"
+          , `Quick
+          , test_websocket_close_timeout_callbacks )
         ; ( "ping returns on the pong, close with a reason"
           , `Quick
           , test_websocket_ping )

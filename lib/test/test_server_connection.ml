@@ -3821,7 +3821,7 @@ let test_head_timeout_is_408 () =
        Raw.feed ~chunk t "GET / HTTP/1.1\r\nHo";
        (match Server_connection.read_timeout t.conn with
        | Some (`Head, reject) -> reject ()
-       | Some ((`Idle | `Body), _) | None ->
+       | Some ((`Idle | `Body | `Close), _) | None ->
          Alcotest.fail "expected a head timeout");
        Alcotest.(check (list request_error))
          (split ^ ": error")
@@ -4594,6 +4594,7 @@ let read_timeout_kind conn =
   | Some (`Idle, _) -> "idle"
   | Some (`Head, _) -> "head"
   | Some (`Body, _) -> "body"
+  | Some (`Close, _) -> "close"
 
 let test_body_delivered_after_closing_response () =
   List.iter

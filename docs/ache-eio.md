@@ -170,13 +170,14 @@ let () =
 ## Timeouts
 
 The server entry points (`Server.create_connection_handler`, `Server.run`
-and the TLS handler) take four timeouts, in seconds, of type
+and the TLS handler) take five timeouts, in seconds, of type
 `float option`. Each is on by default; `None` turns it off:
 
 | Argument | Default | What it limits |
 | --- | --- | --- |
 | `?idle_timeout` | `Some 60.` | A connection that waits for its next request, or a WebSocket that receives nothing. |
 | `?head_timeout` | `Some 30.` | A request head, from its first byte. The client gets 408. |
+| `?close_timeout` | `Some 10.` | A WebSocket that waits for the client's close frame after the server's `close`, from when the close frame is queued. Messages that still arrive do not extend it. |
 | `?body_timeout` | `Some 60.` | A request body that makes no progress while the connection waits for it. |
 | `?write_timeout` | `Some 60.` | A write that makes no progress, for example to a client that stopped reading. |
 
@@ -351,16 +352,17 @@ let request_handler _client_address reqd =
 - `ping ws payload` sends a ping and returns when the next pong arrives, or
   raises `Closed` when the connection ends first. To find a client that is
   gone: `Eio.Time.with_timeout_exn clock 30. (fun () ->
-  Ache_eio.Websocket.ping ws "")`, and `close` on `Eio.Time.Timeout`, with a
-  timeout too, since a client that is gone does not answer. The
-  pong comes after the messages the client sent before it, so keep calling
+  Ache_eio.Websocket.ping ws "")`, and `close` on `Eio.Time.Timeout`. The
+  connection waits at most `close_timeout` (10 s by default) for the
+  client's close frame, then closes without it. The pong comes after the messages the client sent before it, so keep calling
   `receive` in another fiber meanwhile: while 8 messages wait, reading is
   paused and the pong is not seen.
 - `close ?reason ws code` sends a close frame and returns when the
   connection has ended: the client answered with its close frame (then in
   `client_close`), closed the connection, or the connection failed.
-  Messages that arrive meanwhile are dropped. A client that does neither
-  for `close_timeout` (10 s by default) is cut off. It raises
+  Messages that arrive meanwhile are dropped and do not extend the wait. A
+  client that does neither for `close_timeout` (10 s by default) is cut
+  off: `close` returns and `client_close` is `None`. It raises
   `Invalid_argument` at once for a code that an endpoint may not send, or a
   reason that is not UTF-8 or longer than 123 bytes.
 - A WebSocket that receives nothing for `idle_timeout` gets a close frame
@@ -452,8 +454,16 @@ read loop asks it to, and keeps the result until the read loop takes it.
 - With `?stop`, a read that waits for a new request goes through the
   reader fiber, also without `idle_timeout`, so that the drain at `stop`
   can end the wait.
+- With `close_timeout`, a read on a WebSocket goes through the reader
+  fiber, also without `idle_timeout`. The close clock starts when the
+  server's close frame is queued, from any source: `Websocket.close`, the
+  end of a session, or `Ache.Websocket.close` from a callback. The writer
+  sees the frame first, and the read that waits starts again with the
+  close timeout. When it passes, the connection closes at once, without
+  the [linger](#linger). The idle close and a drain stop
+  reading, so they close at once and do not use the close timeout.
 - Every other read is direct: the read loop calls `single_read` itself, for
-  example with all four timeouts off, in a tunnel after `CONNECT`, or after
+  example with all timeouts off, in a tunnel after `CONNECT`, or after
   an error response.
 
 A direct read saves two fiber switches and an `Eio.Condition` handoff for
@@ -473,7 +483,7 @@ When a read deadline passes, the watchdog wakes the read loop, which calls
 the core's timeout action. When a write deadline passes, it cancels the
 write (`Eio.Cancel`), and the connection closes. On one core, a hello-world
 server with the default timeouts serves about 25 % fewer requests per
-second than with all four off, mostly for the reader fiber.
+second than with all timeouts off, mostly for the reader fiber.
 
 A write that tls-eio was in the middle of leaves the TLS session in an
 error state. The connection then sends no `close_notify`, and later reads

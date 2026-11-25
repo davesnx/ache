@@ -723,7 +723,9 @@ module Server_connection : sig
 
   (**/**)
 
-  val read_timeout : t -> ([ `Idle | `Head | `Body ] * (unit -> unit)) option
+  val read_timeout :
+     t
+    -> ([ `Idle | `Head | `Body | `Close ] * (unit -> unit)) option
   (** [read_timeout t] tells a runtime which read timeout applies while it
       waits for input on [t], and the action to run when that timeout expires.
       - [Some (`Idle, close)]: no request is in progress. [close] closes the
@@ -741,8 +743,8 @@ module Server_connection : sig
         [`Request_timeout] (408) and closes the connection after the error
         response, and otherwise it closes the connection after its pending
         output.
-      - [Some (`Idle, close)] on a connection upgraded with
-        {!Websocket.upgrade}: see {!Websocket.read_timeout}.
+      - [Some (`Idle, close)] or [Some (`Close, abort)] on a connection
+        upgraded with {!Websocket.upgrade}: see {!Websocket.read_timeout}.
       - [None]: no read is waiting for the peer (the application runs, a
         response is being written, the connection is closing), or the
         connection was upgraded to another protocol. No timeout applies.
@@ -789,8 +791,8 @@ end
     The runtimes close a connection that receives nothing for their idle
     timeout, with close code [1001] (see {!read_timeout}), and one whose
     writes make no progress for their write timeout. A client that never
-    answers a close frame does not keep the connection: it closes when the
-    close frame is written.
+    answers the server's close frame is cut off after their close timeout
+    (10 s by default), counted from the moment the close frame is queued.
 
     Reading stops while more than 64 KiB of frames (messages, pongs and close
     frames) are queued and not yet written, and starts again when the writes
@@ -918,8 +920,9 @@ module Websocket : sig
       until the client's close frame or the end of input, then closes the
       connection (RFC 6455 §7.1.1). Messages that arrive meanwhile are
       dropped, and reading is no longer paused. [on_close] gets the client's
-      close frame. There is no timeout for a client that neither answers nor
-      closes. [close] does nothing when the connection already started to
+      close frame. The runtimes wait at most their close timeout for it (see
+      {!read_timeout}); then the connection closes and [on_close] gets
+      [None]. [close] does nothing when the connection already started to
       close.
 
       @raise Invalid_argument
@@ -942,15 +945,23 @@ module Websocket : sig
   (** [is_closed t] is [true] once the connection is closed: [on_close] was
       called and nothing more is written. *)
 
-  val read_timeout : t -> ([ `Idle ] * (unit -> unit)) option
+  val read_timeout : t -> ([ `Idle | `Close ] * (unit -> unit)) option
   (** [read_timeout t] tells a runtime which read timeout applies while it
       waits for input on [t], as {!Server_connection.read_timeout} does (and
       that function answers with it once the connection is upgraded).
       - [Some (`Idle, close)]: the connection reads frames. When nothing
         arrives for the runtime's idle timeout, [close] sends a close frame
-        with code [1001] (going away) and closes as {!close} does.
-      - [None]: reading is paused, waits for the writes, or the connection
-        is closing. No timeout applies. *)
+        with code [1001] (going away) and closes the connection.
+      - [Some (`Close, abort)]: the server sent its close frame ({!close})
+        and waits for the client's. The runtimes give the client their close
+        timeout, counted from the moment the close frame is queued and not
+        restarted by the messages that still arrive. A close after a
+        protocol error, an idle timeout or a drain stops reading at once and
+        never enters this phase. [abort] closes the
+        connection without the client's close frame: [on_close] gets
+        [None].
+      - [None]: reading is paused or waits for the writes, or the
+        connection has closed. No timeout applies. *)
 end
 
 (** {2 Client Connection} *)

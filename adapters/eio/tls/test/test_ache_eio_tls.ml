@@ -778,6 +778,7 @@ let test_timeout_check_timing () =
                 ~clock:(Eio.Stdenv.clock env)
                 ~idle_timeout:(Some 1.)
                 ~head_timeout:(Some (-1.))
+                ~close_timeout:(Some 1.)
                 ~body_timeout:None
                 ~write_timeout:None
                 ~stop:(Eio.Promise.create_resolved ())

@@ -58,8 +58,13 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   waits for request body bytes, also before the response is complete, and
   its action sends 408 when no response has started (otherwise it closes).
   On a connection upgraded with `Websocket.upgrade` it answers `` `Idle ``,
-  whose action closes with code 1001 (new `Websocket.read_timeout`). It
+  whose action closes with code 1001 (new `Websocket.read_timeout`), or
+  `` `Close `` while the server waits for the client's close frame. It
   answers `None` only while no read waits for the peer.
+- `Websocket.close` waits for the client's close frame and drops the
+  messages that arrive meanwhile. Every runtime takes `?close_timeout`
+  (default 10 s) to bound that wait. A WebSocket session that returns
+  closes the connection with 1000.
 - `Server_connection.error` has `` `Bad_request of string `` instead of
   `` `Bad_request ``: the reason the request was rejected, for logs. The
   default error handler does not send it. An error handler that matches

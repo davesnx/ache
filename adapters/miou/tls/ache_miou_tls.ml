@@ -247,6 +247,7 @@ module Server = struct
         ?(head_timeout = default_head_timeout)
         ?body_timeout
         ?write_timeout
+        ?close_timeout
         ?date
         ?stop
         ?grace
@@ -261,6 +262,7 @@ module Server = struct
         ~head_timeout
         ?body_timeout
         ?write_timeout
+        ?close_timeout
         ?date
         ?stop
         ?grace

@@ -486,10 +486,13 @@ let next_read_operation t =
   | Header | Payload -> `Read
 
 let read_timeout t =
-  match t.reading with
-  | (Header | Payload) when t.writing = Open && not (read_blocked t) ->
+  match t.reading, t.writing with
+  | (Header | Payload), Open when not (read_blocked t) ->
     Some (`Idle, fun () -> fail t 1001)
-  | Header | Payload | Stopped -> None
+  | (Header | Payload), Closing ->
+    (* RFC 6455 §7.1.1: the client did not answer our close frame in time. *)
+    Some (`Close, fun () -> finish t)
+  | (Header | Payload), (Open | Closed) | Stopped, _ -> None
 
 let yield_reader t k =
   if t.reading = Stopped then k () else t.reader_k <- Some k

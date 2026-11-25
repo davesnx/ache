@@ -786,6 +786,7 @@ let test_timeout_check_timing () =
               ~config:Ache.Config.default
               ~idle_timeout:(Some 1.)
               ~head_timeout:(Some (-1.))
+              ~close_timeout:(Some 1.)
               ~body_timeout:(Some 1.)
               ~write_timeout:(Some 1.)
               ~stop:(Miou.Computation.create ())

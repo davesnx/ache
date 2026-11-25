@@ -37,6 +37,7 @@ module Server : sig
     -> ?clock:_ Eio.Time.clock
     -> ?idle_timeout:float option
     -> ?head_timeout:float option
+    -> ?close_timeout:float option
     -> ?body_timeout:float option
     -> ?write_timeout:float option
     -> ?date:bool
@@ -72,6 +73,14 @@ module Server : sig
         [error_handler] is called with [`Request_timeout] (408) and the
         connection closes after the error response. Each request head,
         pipelined or not, has its own limit.
+      - [close_timeout] (default [Some 10.]): on a WebSocket connection
+        ({!Websocket.upgrade} or {!Ache.Websocket.upgrade}), after the
+        server queued its close frame with a close or at the end of a
+        session, the connection waits at most [close_timeout] for the
+        client's close frame, then closes at once, without it. The time
+        counts from when the close frame is queued. The messages that still
+        arrive are dropped and do not extend it. The idle close and a drain
+        stop reading and close at once: they do not wait for the client.
       - [body_timeout] (default [Some 60.]): while the connection waits for
         request body bytes (the application has scheduled a read on the
         body, or the response is complete and the rest of the body has not
@@ -147,7 +156,7 @@ module Server : sig
 
       @raise Invalid_argument
         if a timeout or [grace] is not positive. It is raised when
-        [~error_handler] is applied if all nine optional arguments are
+        [~error_handler] is applied if all ten optional arguments are
         given too, and otherwise when the handler is applied
         to a flow: with [Eio.Net.run_server], in each connection fiber. *)
 
@@ -156,6 +165,7 @@ module Server : sig
     -> ?clock:_ Eio.Time.clock
     -> ?idle_timeout:float option
     -> ?head_timeout:float option
+    -> ?close_timeout:float option
     -> ?body_timeout:float option
     -> ?write_timeout:float option
     -> ?date:bool
@@ -187,7 +197,7 @@ module Server : sig
       Each loop accepts connections with [Eio.Net.accept_fork] and [on_error],
       and serves them with the handler from {!create_connection_handler},
       which takes [config], [clock], [idle_timeout], [head_timeout],
-      [body_timeout], [write_timeout], [date], [stop], [grace],
+      [close_timeout], [body_timeout], [write_timeout], [date], [stop], [grace],
       [request_handler] and [error_handler].
       [request_handler] and [error_handler] run in several domains at the
       same time.
@@ -348,8 +358,9 @@ module Websocket : sig
       client arrives (any pong: RFC 6455 §5.5.3 lets a client answer only the
       latest ping, or send pongs unasked). To find a client that is gone:
       [Eio.Time.with_timeout_exn clock 30. (fun () -> ping t "")], then
-      {!close} on [Eio.Time.Timeout], with a timeout too: a client that is
-      gone does not answer the close frame. [ping] can be cancelled.
+      {!close} on [Eio.Time.Timeout]. The connection waits at most
+      [close_timeout] (10 s by default) for the client's close frame, then
+      closes without it. [ping] can be cancelled.
 
       The pong comes after the messages the client sent before it. While 8
       messages wait for {!receive}, reading is paused, so the pong is not
@@ -375,8 +386,9 @@ module Websocket : sig
       client answered with its close frame (then in {!client_close}), closed
       the connection, or the connection failed. Messages that arrive
       meanwhile are dropped. When the client does neither for [close_timeout]
-      (see {!Server.create_connection_handler}), the connection closes
-      without its answer.
+      (10 s by default, see {!Server.create_connection_handler}), the
+      connection closes without its answer: [close] returns and
+      {!client_close} is [None]. Messages do not extend this time.
 
       @raise Invalid_argument
         at once if [code] is not one an endpoint may send, or [reason] is not

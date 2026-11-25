@@ -211,14 +211,15 @@ struct
       (module Ache.Runtime.ENGINE with type t = t)
       -> read_buffer_size:int
       -> read_closed:Read_closed.t
-      -> interruptible:bool
+      -> interruptible:(unit -> bool)
+      -> ?retimed:bool ref
       -> timeout:
            ([ `Read | `Linger ]
-            -> ([ `Idle | `Head | `Body of float -> int -> unit ]
+            -> ([ `Idle | `Head | `Body of float -> int -> unit | `Close ]
                * float
                * (unit -> unit))
                  option)
-      -> linger:bool
+      -> linger:(unit -> bool)
       -> ?write_timeout:float
       -> ?sessions:Sessions.t
       -> ?graceful:graceful
@@ -231,6 +232,7 @@ struct
        ~read_buffer_size
        ~read_closed
        ~interruptible
+       ?(retimed = ref false)
        ~timeout
        ~linger:lingers
        ?write_timeout
@@ -294,7 +296,8 @@ struct
       in
       let read_buffer = Buffer.create read_buffer_size in
       let idle_deadline = Deadline.create ()
-      and head_deadline = Deadline.create () in
+      and head_deadline = Deadline.create ()
+      and close_deadline = Deadline.create () in
       let pending_read = ref false
       and read_requested = ref false
       and read_result = ref None
@@ -319,60 +322,82 @@ struct
                  in
                  loop ()))
       in
-      let timed_read limit =
-        if (not interruptible) && Option.is_none limit && not !pending_read
+      (* [timed_read get_limit] reads with the limit that [get_limit] gives.
+         When [retimed] is set while the read waits, the limit may have changed
+         (a WebSocket started its closing handshake): the wait asks again. *)
+      let timed_read get_limit =
+        let limit = get_limit () in
+        retimed := false;
+        if (not (interruptible ())) && Option.is_none limit && not !pending_read
         then Ok (read socket read_buffer)
         else
           let started = Unix.gettimeofday () in
-          let waited n =
+          let waited limit n =
             match limit with
             | Some (`Body progress, _, _) ->
               progress (Unix.gettimeofday () -. started) n
-            | Some ((`Idle | `Head), _, _) | None -> ()
+            | Some ((`Idle | `Head | `Close), _, _) | None -> ()
           in
-          if Option.is_none !read_result
-          then (
-            if read_closed.closed then raise End_of_file;
-            if not !pending_read
-            then (
-              pending_read := true;
-              read_requested := true;
-              start_reader ();
-              Signal.wake request_read);
+          let rec wait limit =
             let deadline =
-              Option.bind limit (fun (kind, at, _) ->
-                let deadline =
-                  match kind with
-                  | `Idle | `Body _ -> Some idle_deadline
-                  | `Head -> Some head_deadline
-                in
-                Option.iter
-                  (fun deadline ->
-                     Deadline.set deadline at ~expired:read_closed.ready)
-                  deadline;
-                deadline)
+              Option.map
+                (fun (kind, at, _) ->
+                   let deadline =
+                     match kind with
+                     | `Idle | `Body _ -> idle_deadline
+                     | `Head -> head_deadline
+                     | `Close -> close_deadline
+                   in
+                   Deadline.set deadline at ~expired:read_closed.ready;
+                   deadline)
+                limit
             in
             Signal.wait_until read_closed.ready (fun () ->
               Option.is_some !read_result
               || read_closed.closed
-              || Option.fold ~none:false ~some:Deadline.passed deadline));
+              || !retimed
+              || Option.fold ~none:false ~some:Deadline.passed deadline);
+            if
+              !retimed
+              && Option.is_none !read_result
+              && (not read_closed.closed)
+              && not (Option.fold ~none:false ~some:Deadline.passed deadline)
+            then (
+              let limit = get_limit () in
+              retimed := false;
+              wait limit)
+            else limit
+          in
+          let limit =
+            if Option.is_none !read_result
+            then (
+              if read_closed.closed then raise End_of_file;
+              if not !pending_read
+              then (
+                pending_read := true;
+                read_requested := true;
+                start_reader ();
+                Signal.wake request_read);
+              wait limit)
+            else limit
+          in
           match !read_result with
           | Some result ->
             read_result := None;
             pending_read := false;
             (match result with
             | Ok n ->
-              waited n;
+              waited limit n;
               Ok n
             | Error exn -> raise exn)
           | None when read_closed.closed -> raise End_of_file
           | None ->
-            waited 0;
+            waited limit 0;
             Option.iter (fun (_, _, on_timeout) -> on_timeout ()) limit;
             Error `Timeout
       in
       let rec linger limit =
-        match timed_read limit with
+        match timed_read (fun () -> limit) with
         | Ok (_ : int) ->
           let (_ : int) =
             Buffer.get read_buffer ~f:(fun _ ~off:_ ~len -> len)
@@ -387,7 +412,7 @@ struct
           (match
              if Buffer.unread read_buffer
              then Ok 0
-             else timed_read (timeout `Read)
+             else timed_read (fun () -> timeout `Read)
            with
           | Ok (_ : int) ->
             let (_ : int) = Buffer.get read_buffer ~f:(Runtime.read t) in
@@ -407,7 +432,7 @@ struct
         | `Close ->
           if not read_closed.closed
           then (
-            if lingers then linger (timeout `Linger);
+            if lingers () then linger (timeout `Linger);
             shutdown_once SHUTDOWN_RECEIVE;
             Read_closed.close read_closed)
       in
@@ -479,7 +504,8 @@ struct
             Read_closed.close read_closed));
         Option.iter Miou.cancel !reader;
         Deadline.stop idle_deadline;
-        Deadline.stop head_deadline
+        Deadline.stop head_deadline;
+        Deadline.stop close_deadline
       and write_task () =
         match write_loop () with () -> () | exception exn -> fail exn
       in
@@ -569,6 +595,7 @@ struct
     let default_head_timeout = Some 30.
     let default_body_timeout = Some 60.
     let default_write_timeout = Some 60.
+    let default_close_timeout = Some 10.
     let current_date = Ache.Ache_private.Http_date.now
 
     let check_timeout name = function
@@ -585,6 +612,7 @@ struct
           ?(head_timeout = default_head_timeout)
           ?(body_timeout = default_body_timeout)
           ?(write_timeout = default_write_timeout)
+          ?(close_timeout = default_close_timeout)
           ?(date = true)
           ?stop
           ?grace
@@ -595,6 +623,7 @@ struct
       check_timeout "head_timeout" head_timeout;
       check_timeout "body_timeout" body_timeout;
       check_timeout "write_timeout" write_timeout;
+      check_timeout "close_timeout" close_timeout;
       check_timeout "grace" grace;
       let untimed =
         Option.is_none idle_timeout && Option.is_none head_timeout
@@ -610,6 +639,11 @@ struct
       in
       let serve socket client_addr =
         let head_deadline = ref None
+        and close_deadline = ref None
+        and retimed = ref false
+        and close_aborted = ref false
+        and websocket = ref None
+        and read_closed = Read_closed.create ()
         and last_request = ref None
         and body_spent = ref 0.
         and body_received = ref 0
@@ -634,19 +668,83 @@ struct
             (fun reqd ->
                head_deadline := None;
                last_request := Some reqd;
+               websocket := None;
                body_spent := 0.;
                body_received := 0;
                with_sessions (fun () -> request_handler client_addr reqd))
         in
+        (* [`Idle] after a [101] is the idle timeout of a WebSocket. *)
+        let upgraded () =
+          match Option.bind !last_request Ache.Request_descriptor.response with
+          | Some { status = `Switching_protocols; _ } -> true
+          | Some _ | None -> false
+        in
+        (* [is_websocket ()] is [true] after the [101] of
+           [Ache.Websocket.upgrade]. The answer is kept once the response of the
+           request is known, so plain HTTP and other upgrades check it once. *)
+        let is_websocket () =
+          match !websocket with
+          | Some answer -> answer
+          | None ->
+            (match
+               Option.bind !last_request Ache.Request_descriptor.response
+             with
+            | None -> false
+            | Some { status = `Switching_protocols; headers; _ } ->
+              let answer =
+                match Ache.Headers.get headers "upgrade" with
+                | Some value -> String.lowercase_ascii value = "websocket"
+                | None -> false
+              in
+              websocket := Some answer;
+              answer
+            | Some _ ->
+              websocket := Some false;
+              false)
+        in
+        (* The close deadline is set the first time the connection is seen
+           waiting for the client's close frame, and never moves after. *)
+        let watch_close =
+          match close_timeout with
+          | None -> fun () -> false
+          | Some _ ->
+            fun () -> Option.is_none !close_deadline && is_websocket ()
+        in
+        let start_close () =
+          match close_timeout, !close_deadline with
+          | Some seconds, None ->
+            close_deadline := Some (Unix.gettimeofday () +. seconds);
+            retimed := true;
+            Signal.wake read_closed.ready
+          | Some _, Some _ | None, _ -> ()
+        in
         let observe () =
-          match head_timeout with
-          | None -> ()
-          | Some seconds ->
-            (match Ache.Server_connection.read_timeout connection with
+          if Option.is_some head_timeout || watch_close ()
+          then
+            match Ache.Server_connection.read_timeout connection with
             | Some (`Head, _) ->
-              if Option.is_none !head_deadline
-              then head_deadline := Some (Unix.gettimeofday () +. seconds)
-            | Some ((`Idle | `Body), _) | None -> head_deadline := None)
+              (match head_timeout with
+              | Some seconds when Option.is_none !head_deadline ->
+                head_deadline := Some (Unix.gettimeofday () +. seconds)
+              | Some _ | None -> ())
+            | Some (`Close, _) ->
+              head_deadline := None;
+              start_close ()
+            | Some ((`Idle | `Body), _) | None -> head_deadline := None
+        in
+        (* The close clock starts when the server's close frame is queued,
+           whatever queued it ({!Ache.Websocket.close} from the session, or the
+           close at the end of the session). The read task may wait with the
+           idle limit then, so the write task, which the frame wakes, sets the
+           deadline and wakes the read. Drain and the idle timeout close through
+           the core's [fail], which stops reading: the connection ends at once,
+           without a close deadline. *)
+        let observe_write () =
+          if watch_close ()
+          then
+            match Ache.Server_connection.read_timeout connection with
+            | Some (`Close, _) -> start_close ()
+            | Some ((`Idle | `Head | `Body), _) | None -> ()
         in
         let module Observed = struct
           include Ache.Server_connection
@@ -660,6 +758,11 @@ struct
             let n = read_eof t bs ~off ~len in
             observe ();
             n
+
+          let next_write_operation t =
+            let operation = next_write_operation t in
+            observe_write ();
+            operation
         end
         in
         let timeout = function
@@ -675,15 +778,8 @@ struct
             observe ();
             (match Ache.Server_connection.read_timeout connection with
             | Some (`Idle, on_timeout) ->
-              (* [`Idle] after a [101] is the idle timeout of a WebSocket, which
-                 announces nothing. *)
-              let upgraded =
-                match
-                  Option.bind !last_request Ache.Request_descriptor.response
-                with
-                | Some { status = `Switching_protocols; _ } -> true
-                | Some _ | None -> false
-              in
+              (* The idle timeout of a WebSocket announces nothing. *)
+              let upgraded = upgraded () in
               Option.map
                 (fun seconds ->
                    let seconds =
@@ -714,21 +810,33 @@ struct
                      body_received := 0;
                      match Ache.Server_connection.read_timeout connection with
                      | Some (`Body, expire) -> expire ()
-                     | Some ((`Idle | `Head), _) | None -> ()
+                     | Some ((`Idle | `Head | `Close), _) | None -> ()
                    in
                    ( `Body progress
                    , Unix.gettimeofday () +. limit -. !body_spent
                    , expire ))
                 body_timeout
+            | Some (`Close, _) ->
+              let expire () =
+                match Ache.Server_connection.read_timeout connection with
+                | Some (`Close, abort) ->
+                  (* Our close frame is written: close without lingering. *)
+                  close_aborted := true;
+                  abort ()
+                | Some ((`Idle | `Head | `Body), _) | None -> ()
+              in
+              Option.map (fun at -> `Close, at, expire) !close_deadline
             | None -> None)
         in
         IO_loop.start
           (module Observed)
           ~read_buffer_size:config.read_buffer_size
-          ~read_closed:(Read_closed.create ())
-          ~interruptible:false
+          ~read_closed
+          ~interruptible:(fun () ->
+            Option.is_some close_timeout && is_websocket ())
+          ~retimed
           ~timeout
-          ~linger:(not untimed)
+          ~linger:(fun () -> (not untimed) && not !close_aborted)
           ?write_timeout
           ~sessions
           ?graceful:
@@ -822,9 +930,9 @@ struct
             (module Upgradable)
             ~read_buffer_size:config.read_buffer_size
             ~read_closed
-            ~interruptible:true
+            ~interruptible:(fun () -> true)
             ~timeout
-            ~linger:true
+            ~linger:(fun () -> true)
             ~stopped
             runtime
             socket)
@@ -1021,6 +1129,7 @@ module Server = struct
         ?head_timeout
         ?body_timeout
         ?write_timeout
+        ?close_timeout
         ?date
         ?domains
         ?(backlog = 128)
@@ -1062,6 +1171,7 @@ module Server = struct
         ?head_timeout
         ?body_timeout
         ?write_timeout
+        ?close_timeout
         ?date
         ?stop
         ?grace

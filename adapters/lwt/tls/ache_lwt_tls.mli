@@ -93,6 +93,7 @@ module Server : sig
     -> ?head_timeout:float option
     -> ?body_timeout:float option
     -> ?write_timeout:float option
+    -> ?close_timeout:float option
     -> ?date:bool
     -> ?stop:unit Lwt.t
     -> ?grace:float

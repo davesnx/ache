@@ -920,6 +920,43 @@ let test_pause_reading () =
   feed c hello_masked;
   check_messages c [ "Hello" ]
 
+let timeout_kind c =
+  match Server_connection.read_timeout c.server with
+  | Some (`Idle, _) -> "idle"
+  | Some (`Close, _) -> "close"
+  | Some ((`Head | `Body), _) -> "other"
+  | None -> "none"
+
+let test_close_timeout () =
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1000;
+  check_output c (close_frame_out 1000) `Yield;
+  Alcotest.(check string)
+    "waits for the client's close"
+    "close"
+    (timeout_kind c);
+  feed c (client_frame 0x1 "dropped");
+  Alcotest.(check string)
+    "a message does not change the phase"
+    "close"
+    (timeout_kind c);
+  (match Server_connection.read_timeout c.server with
+  | Some (`Close, abort) -> abort ()
+  | _ -> Alcotest.fail "expected a close timeout");
+  check_reader_closed c;
+  check_output ~msg:"nothing more written" c "" `Close;
+  check_closed c [ None ];
+  Alcotest.(check string) "no timeout once closed" "none" (timeout_kind c)
+
+let test_close_answered_no_timeout () =
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1000;
+  check_output c (close_frame_out 1000) `Yield;
+  feed c (client_frame 0x8 (close_payload 1000));
+  Alcotest.(check string) "no timeout after the answer" "none" (timeout_kind c);
+  check_output c "" `Close;
+  check_closed c [ Some 1000 ]
+
 let test_idle_timeout () =
   let c = upgraded () in
   (match
@@ -948,6 +985,10 @@ let test_idle_timeout () =
 let tests =
   [ "accept key", `Quick, test_accept_key
   ; "idle timeout closes with 1001", `Quick, test_idle_timeout
+  ; "close timeout aborts the closing handshake", `Quick, test_close_timeout
+  ; ( "no close timeout after the client's answer"
+    , `Quick
+    , test_close_answered_no_timeout )
   ; "handshake accepted", `Quick, test_handshake_accept
   ; "handshake rejected", `Quick, test_handshake_reject
   ; "canonical keys only", `Quick, test_canonical_keys

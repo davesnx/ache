@@ -219,6 +219,22 @@ let request_handler (_ : Unix.sockaddr) reqd =
      with
     | Ok () -> ()
     | Error _ -> Alcotest.fail "handshake rejected")
+  | `GET, "/ws-callback-close" ->
+    (* The callback API: the first message closes the connection with 1000. *)
+    (match
+       Ache.Websocket.upgrade reqd (fun ws ->
+         { Ache.Websocket.on_message =
+             (fun _ -> Ache.Websocket.close ws ~code:1000)
+         ; on_pong = ignore
+         ; on_close =
+             (function
+               | None -> end_ws (Ok "on_close None")
+               | Some { code; _ } ->
+                 end_ws (Ok (Printf.sprintf "on_close %d" code)))
+         })
+     with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
   | `GET, ("/ws-echo" | "/ws-flood") ->
     (match
        Ache_lwt.Websocket.upgrade
@@ -338,6 +354,7 @@ let with_server
       ?head_timeout
       ?body_timeout
       ?write_timeout
+      ?close_timeout
       ?(date = false)
       ?stop
       ?grace
@@ -350,6 +367,7 @@ let with_server
             ~head_timeout
             ~body_timeout
             ~write_timeout
+            ~close_timeout
             ?stop
             ?grace
             ~request_handler
@@ -964,6 +982,183 @@ let test_websocket_server_close () =
       result;
     read_all socket >>= fun rest ->
     Alcotest.(check string) "then end of input" "" rest;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+(* A client that never answers the server's close frame, and keeps sending
+   messages, which do not extend the close timeout. *)
+let test_websocket_close_timeout () =
+  let ended = wait_ws_end () in
+  with_server ~close_timeout:0.2 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    let started = Unix.gettimeofday () in
+    let sending = ref true in
+    (* A message every 50 ms for up to 3 s, much longer than the timeout. *)
+    let rec send () =
+      if !sending && Unix.gettimeofday () -. started < 3.
+      then
+        Lwt.catch
+          (fun () ->
+             write_all socket (ws_frame 0x1 "dropped") >>= fun () ->
+             Lwt_unix.sleep 0.05 >>= send)
+          (function
+            | Unix.Unix_error ((ECONNRESET | EPIPE), _, _) -> Lwt.return_unit
+            | exn -> Lwt.fail exn)
+      else Lwt.return_unit
+    in
+    let sender = send () in
+    Lwt.catch
+      (fun () -> read_all socket)
+      (function
+        | Unix.Unix_error (ECONNRESET, _, _) -> Lwt.return ""
+        | exn -> Lwt.fail exn)
+    >>= fun rest ->
+    let elapsed = Unix.gettimeofday () -. started in
+    sending := false;
+    Alcotest.(check string) "then end of input" "" rest;
+    if elapsed > 2.
+    then
+      Alcotest.failf "end of input after %.2f s, expected about 0.2 s" elapsed;
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "close resolved without the client's close frame"
+      (Ok "closed, no client close")
+      result;
+    sender >>= fun () -> Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+(* The read that waits when the session closes has no idle limit: the close
+   timeout must still apply to a client that then sends nothing. *)
+let test_websocket_close_timeout_silent_client ?idle_timeout () =
+  let ended = wait_ws_end () in
+  with_server ?idle_timeout ~close_timeout:0.2 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    let started = Unix.gettimeofday () in
+    Lwt.pick
+      [ (read_all socket >|= fun rest -> Some rest)
+      ; (Lwt_unix.sleep 2.5 >|= fun () -> None)
+      ]
+    >>= fun rest ->
+    Alcotest.(check (option string))
+      (Printf.sprintf
+         "end of input within 2.5 s (after %.2f s)"
+         (Unix.gettimeofday () -. started))
+      (Some "")
+      rest;
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "close resolved without the client's close frame"
+      (Ok "closed, no client close")
+      result;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+(* A client that never answers, keeps sending and never closes its socket: after
+   the close timeout the server closes its socket and the connection promise
+   resolves. *)
+let test_websocket_close_timeout_server_closes () =
+  let ended = wait_ws_end () in
+  let served = ref [] in
+  let connection_handler ~request_handler ~error_handler addr socket =
+    let p =
+      Ache_lwt.Server.create_connection_handler
+        ~idle_timeout:None
+        ~close_timeout:(Some 0.2)
+        ~request_handler
+        ~error_handler
+        addr
+        socket
+    in
+    served := p :: !served;
+    p
+  in
+  with_server ~connection_handler (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    let started = Unix.gettimeofday () in
+    let sending = ref true in
+    let rec send () =
+      if !sending
+      then
+        Lwt.catch
+          (fun () ->
+             write_all socket (ws_frame 0x1 "dropped") >>= fun () ->
+             Lwt_unix.sleep 0.05 >>= send)
+          (function
+            | Unix.Unix_error ((ECONNRESET | EPIPE), _, _) -> Lwt.return_unit
+            | exn -> Lwt.fail exn)
+      else Lwt.return_unit
+    in
+    let sender = send () in
+    Lwt.pick
+      [ (Lwt.join !served >|= fun () -> true)
+      ; (Lwt_unix.sleep 2.5 >|= fun () -> false)
+      ]
+    >>= fun resolved ->
+    let elapsed = Unix.gettimeofday () -. started in
+    Alcotest.(check bool)
+      (Printf.sprintf
+         "connection promise resolved within 2.5 s (%.2f s)"
+         elapsed)
+      true
+      resolved;
+    check_server_sockets_closed ();
+    sending := false;
+    sender >>= fun () ->
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "close resolved without the client's close frame"
+      (Ok "closed, no client close")
+      result;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+(* As above, with the callback API of the core: the close frame of
+   [Ache.Websocket.close] starts the close timeout. *)
+let test_websocket_close_timeout_callback_api () =
+  let ended = wait_ws_end () in
+  with_server ~close_timeout:0.2 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-callback-close") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "close") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1000" (0x88, "\x03\xe8") close;
+    let started = Unix.gettimeofday () in
+    Lwt.pick
+      [ (read_all socket >|= fun rest -> Some rest)
+      ; (Lwt_unix.sleep 2.5 >|= fun () -> None)
+      ]
+    >>= fun rest ->
+    Alcotest.(check (option string))
+      (Printf.sprintf
+         "end of input within 2.5 s (after %.2f s)"
+         (Unix.gettimeofday () -. started))
+      (Some "")
+      rest;
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "on_close without the client's close frame"
+      (Ok "on_close None")
+      result;
     Lwt_unix.close socket);
   check_server_sockets_closed ()
 
@@ -2690,6 +2885,22 @@ let () =
           , test_upgrade_incomplete_token_reaches_new_protocol )
         ; "WebSocket echo and close", `Quick, test_websocket_echo
         ; "WebSocket server close", `Quick, test_websocket_server_close
+        ; ( "WebSocket close timeout for a client that does not answer"
+          , `Quick
+          , test_websocket_close_timeout )
+        ; ( "WebSocket close timeout for a silent client and no idle timeout"
+          , `Quick
+          , test_websocket_close_timeout_silent_client ?idle_timeout:None )
+        ; ( "WebSocket close timeout for a silent client and an idle timeout"
+          , `Quick
+          , test_websocket_close_timeout_silent_client ~idle_timeout:30. )
+        ; ( "WebSocket close timeout closes the server socket of a client that \
+             keeps sending"
+          , `Quick
+          , test_websocket_close_timeout_server_closes )
+        ; ( "WebSocket close timeout with the callback API"
+          , `Quick
+          , test_websocket_close_timeout_callback_api )
         ; "WebSocket ping, pong and close reason", `Quick, test_websocket_ping
         ; ( "WebSocket session that returns closes 1000"
           , `Quick

@@ -47,6 +47,7 @@ module Server : sig
     -> ?head_timeout:float option
     -> ?body_timeout:float option
     -> ?write_timeout:float option
+    -> ?close_timeout:float option
     -> ?date:bool
     -> ?domains:int
     -> ?backlog:int
@@ -71,7 +72,7 @@ module Server : sig
 
       Call it inside [Miou_unix.run]. Each accepted socket is served in its
       own task, in the domain that accepted it, by the handler from
-      {!create_connection_handler}, which takes [config], the four timeouts
+      {!create_connection_handler}, which takes [config], the five timeouts
       (on by default), [date], [stop], [grace], [request_handler] and
       [error_handler].
       [request_handler] and [error_handler] run in several domains at the
@@ -224,9 +225,9 @@ module Websocket : sig
       client (any pong: RFC 6455 §5.5.3 lets a client answer only the latest
       ping, or send pongs unasked). To find a client that is gone, race
       [ping] with a task that sleeps, with [Miou.await_first], and {!close}
-      when the sleep wins, raced with a sleep too: a client that is gone does
-      not answer the close frame. The task that waits in [ping] can be
-      cancelled.
+      when the sleep wins. The connection waits at most [close_timeout] (10 s
+      by default) for the client's close frame, then closes without it. The
+      task that waits in [ping] can be cancelled.
 
       The pong comes after the messages the client sent before it. While 8
       messages wait for {!receive}, reading is paused, so the pong is not
@@ -251,9 +252,10 @@ module Websocket : sig
       {!Ache.Websocket.close}). It returns when the connection has ended: the
       client answered with its close frame (then in {!client_close}), closed
       the connection, or the connection failed. Messages that arrive
-      meanwhile are dropped. When the client does neither for
-      [close_timeout] (10 s by default, see {!Server.create_connection_handler}),
-      the connection closes without its answer.
+      meanwhile are dropped and do not extend the wait. When the client does
+      neither for [close_timeout] (10 s by default, see
+      {!Server.create_connection_handler}), the connection closes without its
+      answer: {!client_close} is [None].
 
       A session whose client sends nothing for [idle_timeout] is closed with
       code 1001: {!receive} returns [None].

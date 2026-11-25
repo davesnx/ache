@@ -293,15 +293,20 @@ let request_handler _client_address reqd =
 - `ping ws payload` sends a ping and returns when the next pong arrives, or
   raises `Closed` when the connection ends first. To find a client that is
   gone, race it with a task that sleeps, with `Miou.await_first`, and
-  `close` when the sleep wins, raced with a sleep too, since a client that
-  is gone does not answer. The pong comes after the messages the
+  `close` when the sleep wins. The connection waits at most
+  `close_timeout` (10 s by default) for the client's close frame, then
+  closes without it. The pong comes after the messages the
   client sent before it, so keep calling `receive` meanwhile: while 8
   messages wait, reading is paused and the pong is not seen.
 - `close ?reason ws code` sends a close frame and returns when the
   connection has ended: the client answered with its close frame (then in
   `client_close`), closed the connection, or the connection failed.
-  Messages that arrive meanwhile are dropped. A client that does neither
-  for `close_timeout` (10 s by default) is cut off. It raises
+  Messages that arrive meanwhile are dropped and do not extend the wait. A
+  client that does neither for `close_timeout` (10 s by default) is cut
+  off, and `client_close` is `None`. The clock starts when the close frame
+  is queued, by `close` or by the end of the session. The close frame of
+  the idle timeout or of a graceful stop stops reading at once, so the
+  connection ends without waiting for the client's. It raises
   `Invalid_argument` at once for a code that an endpoint may not send, or a
   reason that is not UTF-8 or longer than 123 bytes.
 - A session whose client sends nothing for `idle_timeout` (60 s by
@@ -371,7 +376,13 @@ core connection and starts the two loops as two child tasks:
   a separate reader task, and only the wait is stopped when the timeout
   fires. The client always reads through it, so `Client.shutdown` can stop
   the wait. Every other read is direct: with the default timeouts, only
-  reads in a tunnel, or with every timeout set to `None`. The reader task
+  reads in a tunnel, or with every timeout set to `None`. With
+  `close_timeout`, the reads of a connection after the `101` of a
+  WebSocket (`upgrade: websocket`) also go through it: when the session
+  queues its close frame, the write task sets the close deadline and wakes
+  the waiting read, which then waits at most until that deadline. When the
+  deadline passes, the connection closes without lingering. The
+  reader task
   starts only on the first read that needs it.
 - **Body clock.** Before each read, the read task asks the core which
   timeout applies (`Server_connection.read_timeout`). For `` `Body ``,
@@ -439,7 +450,7 @@ socket. For another socket type, implement `Ache_miou.IO` and apply
 `Ache_miou.Make`. Run the server handler in
 its own task for each accepted socket, and close the socket when it
 returns. The server timeouts are on by default (idle 60 s, head 30 s,
-body 60 s, write 60 s); `~idle_timeout:None` and the others turn one off.
+body 60 s, write 60 s, WebSocket close 10 s); `~idle_timeout:None` and the others turn one off.
 With an idle timeout of at least 1 s, persistent responses carry
 `Keep-Alive: timeout=n` (the idle timeout rounded down, with `max=` when
 `Config.max_requests_per_connection` is set), and the server waits 1 s

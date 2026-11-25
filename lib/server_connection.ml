@@ -650,7 +650,7 @@ let read_timeout t =
     | _ -> None)
   | Some impl, _ ->
     (Runtime.read_timeout impl
-      :> ([ `Idle | `Head | `Body ] * (unit -> unit)) option)
+      :> ([ `Idle | `Head | `Body | `Close ] * (unit -> unit)) option)
   | None, Error _ -> None
 
 let drain t =

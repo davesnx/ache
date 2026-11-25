@@ -20,6 +20,7 @@ module type Server = sig
     -> ?head_timeout:float option
     -> ?body_timeout:float option
     -> ?write_timeout:float option
+    -> ?close_timeout:float option
     -> ?date:bool
     -> ?stop:unit Miou.Computation.t
     -> ?grace:float
@@ -70,6 +71,15 @@ module type Server = sig
         [write_timeout], for example because the peer stopped reading, the
         write is dropped, the flushes that wait get [`Closed], and the
         connection closes at once.
+      - [close_timeout] (default [Some 10.]): after a WebSocket of
+        [Ache_miou.Websocket.upgrade] queues its close frame (from
+        [Ache_miou.Websocket.close], or when the session ends), the
+        connection keeps reading until the client's close frame. The clock
+        starts when the frame is queued. When the client's close frame has
+        not arrived [close_timeout] later, the connection closes at once,
+        without it. Messages that arrive meanwhile are dropped and do not
+        extend the limit. The close of the idle timeout and of [stop] stops
+        reading at once, so the close timeout does not apply to it.
 
       While the request handler runs and waits for nothing from the peer, no
       timeout applies.
@@ -128,7 +138,7 @@ module type Server = sig
 
       @raise Invalid_argument
         if a timeout or [grace] is not positive. It is raised when
-        [~error_handler] is applied if all eight optional arguments are given
+        [~error_handler] is applied if all nine optional arguments are given
         too, and otherwise when the handler is applied to a socket. *)
 
   val linger_without_idle_timeout : float

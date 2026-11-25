@@ -118,7 +118,7 @@ module IO_loop = struct
     -> ?read_closed:unit Promise.t * unit Promise.u
     -> ?time:Time.t
     -> timeout:([ `Read | `Linger ] -> limit option)
-    -> linger:bool
+    -> linger:(unit -> bool)
     -> ?write_timeout:float
     -> ?interrupt:(unit -> unit) ref
     -> ?on_read:(Ache.Bigstring.t -> off:int -> len:int -> unit)
@@ -425,7 +425,7 @@ module IO_loop = struct
           | `Close ->
             if not (Promise.is_resolved read_closed)
             then (
-              if lingers then linger (timeout `Linger);
+              if lingers () then linger (timeout `Linger);
               shutdown_once `Receive;
               ignore (Promise.try_resolve resolve_read_closed () : bool))
         in
@@ -611,6 +611,7 @@ module Server = struct
         ?clock
         ?(idle_timeout = Some 60.)
         ?(head_timeout = Some 30.)
+        ?(close_timeout = Some 10.)
         ?(body_timeout = Some 60.)
         ?(write_timeout = Some 60.)
         ?(date = true)
@@ -621,6 +622,7 @@ module Server = struct
     =
     check_timeout "idle_timeout" idle_timeout;
     check_timeout "head_timeout" head_timeout;
+    check_timeout "close_timeout" close_timeout;
     check_timeout "body_timeout" body_timeout;
     check_timeout "write_timeout" write_timeout;
     check_timeout "grace" grace;
@@ -642,7 +644,35 @@ module Server = struct
           | Some _ | None -> false)
         | None -> false
       in
+      (* Only a WebSocket ([Ache.Websocket.upgrade]) reaches [`Close]: plain
+         HTTP and other protocols skip the close timeout. *)
+      let websocket = ref false
+      and checked_reqd = ref None in
+      let is_websocket () =
+        !websocket
+        ||
+        match !last_reqd with
+        | Some reqd
+          when match !checked_reqd with
+               | Some checked -> checked != reqd
+               | None -> true ->
+          (match Ache.Request_descriptor.response reqd with
+          | Some { Ache.Response.status; headers; _ } ->
+            checked_reqd := Some reqd;
+            (websocket :=
+               status = `Switching_protocols
+               &&
+               match Ache.Headers.get headers "upgrade" with
+               | Some value ->
+                 String.lowercase_ascii (String.trim value) = "websocket"
+               | None -> false);
+            !websocket
+          | None -> false)
+        | Some _ | None -> false
+      in
       let head_deadline = ref None
+      and close_deadline = ref None
+      and close_expired = ref false
       and body_spent = ref 0.
       and body_progress = ref 0
       and failure = ref None in
@@ -670,16 +700,40 @@ module Server = struct
              body_progress := 0;
              request_handler client_addr reqd)
       in
-      let observe () =
-        match head_timeout with
-        | Some seconds ->
-          (match Ache.Server_connection.read_timeout connection with
-          | Some (`Head, _) ->
-            if Option.is_none !head_deadline
-            then head_deadline := Some (time.now () +. seconds)
-          | Some ((`Idle | `Body), _) | None -> head_deadline := None)
-        | None -> ()
+      let interrupt = ref ignore in
+      (* A fixed deadline: the messages that the client still sends do not
+         extend it, and a connection closes only once. A read that waits starts
+         again, to take it. *)
+      let start_close () =
+        match close_timeout, !close_deadline with
+        | Some seconds, None ->
+          close_deadline := Some (time.now () +. seconds);
+          !interrupt ()
+        | Some _, Some _ | None, _ -> ()
       in
+      let watch_close () = Option.is_some close_timeout && is_websocket () in
+      let observe_close () =
+        match Ache.Server_connection.read_timeout connection with
+        | Some (`Close, _) -> start_close ()
+        | Some ((`Idle | `Head | `Body), _) | None -> ()
+      in
+      (* An upgraded connection has no request head. *)
+      let observe () =
+        if watch_close ()
+        then observe_close ()
+        else
+          match head_timeout with
+          | Some seconds ->
+            (match Ache.Server_connection.read_timeout connection with
+            | Some (`Head, _) ->
+              if Option.is_none !head_deadline
+              then head_deadline := Some (time.now () +. seconds)
+            | Some ((`Idle | `Body | `Close), _) | None -> head_deadline := None)
+          | None -> ()
+      in
+      (* The server's close frame is queued from any fiber (a session, a
+         callback) while a read may wait: the writer sees it first. *)
+      let observe_write () = if watch_close () then observe_close () in
       let module Observed = struct
         include Ache.Server_connection
 
@@ -692,12 +746,20 @@ module Server = struct
           let n = read_eof t bs ~off ~len in
           observe ();
           n
+
+        let next_write_operation t =
+          let operation = next_write_operation t in
+          observe_write ();
+          operation
       end
       in
       (* The action of a timeout depends on the state when it fires. *)
       let expire phase () =
         match Ache.Server_connection.read_timeout connection with
-        | Some (phase', action) when phase' = phase -> action ()
+        | Some (phase', action) when phase' = phase ->
+          (* Our close frame is written: close at once, without the linger. *)
+          if phase = `Close then close_expired := true;
+          action ()
         | Some _ | None -> ()
       in
       let limit deadline phase =
@@ -719,7 +781,6 @@ module Server = struct
                 body_progress := 0))
         }
       in
-      let interrupt = ref ignore in
       let drained = ref false in
       let drain () =
         if not !drained
@@ -751,13 +812,17 @@ module Server = struct
                 else seconds
               in
               Some (limit (time.now () +. seconds) `Idle)
-            | None when Option.is_some stop && not !drained ->
-              (* Only so that a drain can stop the wait. *)
+            | None when (Option.is_some stop && not !drained) || watch_close ()
+              ->
+              (* Only so that a drain, or the server's close frame that starts
+                 the close timeout, can stop the wait. *)
               Some (limit Float.infinity `Idle)
             | None -> None)
           | Some (`Head, _) ->
             Option.map (fun deadline -> limit deadline `Head) !head_deadline
           | Some (`Body, _) -> Option.map body_limit body_timeout
+          | Some (`Close, _) ->
+            Option.map (fun deadline -> limit deadline `Close) !close_deadline
           | None -> None)
       in
       let serve () =
@@ -771,7 +836,7 @@ module Server = struct
                  ~read_buffer_size:config.read_buffer_size
                  ~time
                  ~timeout
-                 ~linger:true
+                 ~linger:(fun () -> not !close_expired)
                  ?write_timeout
                  ~interrupt
                  connection
@@ -807,6 +872,7 @@ module Server = struct
         ?clock
         ?idle_timeout
         ?head_timeout
+        ?close_timeout
         ?body_timeout
         ?write_timeout
         ?date
@@ -830,6 +896,7 @@ module Server = struct
         ?clock
         ?idle_timeout
         ?head_timeout
+        ?close_timeout
         ?body_timeout
         ?write_timeout
         ?date
@@ -1023,7 +1090,7 @@ module Client = struct
             ~read_buffer_size:config.read_buffer_size
             ~read_closed
             ~timeout:IO_loop.no_timeout
-            ~linger:true
+            ~linger:(fun () -> true)
             ~on_read:(fun buf ~off ~len ->
               if has_response_byte buf off (off + len) then unread := true)
             runtime

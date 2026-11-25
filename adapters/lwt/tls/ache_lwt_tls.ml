@@ -181,6 +181,7 @@ module Server = struct
         ?(head_timeout = Some 30.)
         ?body_timeout
         ?write_timeout
+        ?close_timeout
         ?date
         ?stop
         ?grace
@@ -206,7 +207,7 @@ module Server = struct
               invalid_arg
                 "Ache_lwt_tls.Server.create_connection_handler_with_fd: a \
                  timeout must be positive")))
-      [ body_timeout; write_timeout ];
+      [ body_timeout; write_timeout; close_timeout ];
     match stop with
     | Some stop when not (Lwt.is_sleeping stop) -> close_fd fd
     | _ ->
@@ -246,6 +247,7 @@ module Server = struct
              ~head_timeout
              ?body_timeout
              ?write_timeout
+             ?close_timeout
              ?date
              ?stop
              ?grace

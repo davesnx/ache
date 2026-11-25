@@ -51,7 +51,7 @@ end
 
 type 't hooks =
   { drain : 't -> unit
-  ; read_timeout : 't -> ([ `Idle ] * (unit -> unit)) option
+  ; read_timeout : 't -> ([ `Idle | `Close ] * (unit -> unit)) option
   }
 
 type impl = Impl : (module ENGINE with type t = 't) * 't * 't hooks -> impl
