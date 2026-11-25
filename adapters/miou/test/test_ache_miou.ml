@@ -1081,9 +1081,10 @@ let test_websocket_session_exception () =
         "close 1011"
         (0x88, "\x03\xf3")
         (read_ws_frame client);
-      send client (ws_frame 0x8 "\x03\xf3");
-      Alcotest.(check string) "then end of input" "" (read_all client);
-      shutdown_send client)
+      (* The server does not wait for a close frame: sending one could meet a
+         closed socket and a reset. *)
+      shutdown_send client;
+      Alcotest.(check string) "then end of input" "" (read_all client))
   with
   | Error Session_failed -> ()
   | Ok () -> Alcotest.fail "the handler returned"

@@ -857,7 +857,7 @@ let test_websocket_ping () =
       "close with a reason"
       (0x88, "\x0f\xa0done here")
       close;
-    write_all socket (ws_frame 0x8 "\x0f\xa0") >>= fun () ->
+    Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
     ended >>= fun result ->
     Alcotest.(check (result string reject))
       "close resolved"
@@ -885,7 +885,9 @@ let test_websocket_session_exception () =
            "close 1011"
            (0x88, "\x03\xf3")
            close;
-         write_all socket (ws_frame 0x8 "\x03\xf3") >>= fun () ->
+         (* The server does not wait for a close frame: sending one could meet a
+            closed socket and a reset. *)
+         Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
          read_all socket >>= fun rest ->
          Alcotest.(check string) "then end of input" "" rest;
          Lwt_unix.close socket);

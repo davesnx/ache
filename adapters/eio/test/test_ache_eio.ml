@@ -2584,7 +2584,9 @@ let test_websocket_session_exception () =
          "close 1011"
          (0x88, "\x03\xf3")
          (read_ws_frame reader);
-       Eio.Flow.copy_string (ws_frame 0x8 "\x03\xf3") socket;
+       (* The server does not wait for a close frame: sending one could meet a
+          closed socket and a reset. *)
+       Eio.Flow.shutdown socket `Send;
        Alcotest.(check string)
          "then end of input"
          ""
