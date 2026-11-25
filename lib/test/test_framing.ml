@@ -1,5 +1,14 @@
 open Ache
 
+let ignore_error ?request:_ _ _ = ()
+
+let serve ?config ?(error_handler = ignore_error) handler input =
+  let t = Testing.create ?config ~error_handler handler in
+  Testing.feed t input;
+  t
+
+(* Tests that check the next read and write operations drive Server_connection
+   directly: Testing does not expose them. *)
 type server =
   { conn : Server_connection.t
   ; out : Buffer.t
@@ -51,7 +60,7 @@ let feed s input =
   s.pending <- s.pending ^ input;
   pump s
 
-let server ?config ?(error_handler = fun ?request:_ _ _ -> ()) handler input =
+let server ?config ?(error_handler = ignore_error) handler input =
   let s =
     { conn = Server_connection.create ?config ~error_handler handler
     ; out = Buffer.create 256
@@ -369,9 +378,9 @@ let test_length_mismatch () =
     | () -> ()
     | exception Invalid_argument msg -> raised := Some msg
   in
-  let s = server handler (req "GET") in
+  let t = serve handler (req "GET") in
   Alcotest.(check bool) "Invalid_argument" true (Option.is_some !raised);
-  Alcotest.(check string) "nothing written" "" (Buffer.contents s.out)
+  Alcotest.(check string) "nothing written" "" (Testing.output t)
 
 let test_head_error_response () =
   let error_handler ?request:_ _ respond =
@@ -379,8 +388,8 @@ let test_head_error_response () =
     Body.Writer.write_string body "error";
     Body.Writer.close body
   in
-  let s =
-    server
+  let t =
+    serve
       ~error_handler
       (fun _ -> Alcotest.fail "handler called")
       (req ~headers:[ "Content-Length", "abc" ] "HEAD")
@@ -388,11 +397,11 @@ let test_head_error_response () =
   Alcotest.(check string)
     "head only"
     "HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n"
-    (Buffer.contents s.out)
+    (Testing.output t)
 
 let test_pipelined_head_get () =
-  let s =
-    server
+  let t =
+    serve
       (with_string ~headers:[ "content-length", "5" ] `OK "hello")
       (req "HEAD" ^ req "GET")
   in
@@ -405,7 +414,7 @@ let test_pipelined_head_get () =
      content-length: 5\r\n\
      \r\n\
      hello"
-    (Buffer.contents s.out)
+    (Testing.output t)
 
 let tests =
   [ "server framing table", `Quick, test_table
@@ -598,19 +607,19 @@ let test_continue () =
   Alcotest.(check string) "connection open" "open" (state s)
 
 let test_continue_http_1_0 () =
-  let s =
-    server
+  let t =
+    serve
       (informational_then_final [ `Continue ])
       (expect_continue ~version:"HTTP/1.0" () ^ "hello")
   in
   Alcotest.(check string)
     "only the final response"
     "HTTP/1.1 200 OK\r\ncontent-length: 9\r\nconnection: close\r\n\r\ngot hello"
-    (Buffer.contents s.out)
+    (Testing.output t)
 
 let test_several_informational () =
-  let s =
-    server
+  let t =
+    serve
       (informational_then_final [ `Early_hints; `Continue ])
       (expect_continue () ^ "hello")
   in
@@ -624,13 +633,13 @@ let test_several_informational () =
      content-length: 9\r\n\
      \r\n\
      got hello"
-    (Buffer.contents s.out)
+    (Testing.output t)
 
 let test_informational_misuse () =
   let only_raises label f =
     let outcome = ref "no exception" in
-    let s =
-      server
+    let t =
+      serve
         (fun reqd ->
            match f reqd with
            | () -> ()
@@ -638,10 +647,7 @@ let test_informational_misuse () =
         (req "GET")
     in
     Alcotest.(check string) (label ^ " raises") "Invalid_argument" !outcome;
-    Alcotest.(check string)
-      (label ^ " writes nothing")
-      ""
-      (Buffer.contents s.out)
+    Alcotest.(check string) (label ^ " writes nothing") "" (Testing.output t)
   in
   only_raises "respond_with_string 100" (with_string `Continue "");
   only_raises "respond_with_bigstring 103" (with_bigstring `Early_hints "");
@@ -672,18 +678,18 @@ let got_hello = "HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\ngot hello"
 let test_auto_continue () =
   List.iter
     (fun (label, request, body) ->
-       let s =
-         server ~config:auto_continue (informational_then_final []) request
+       let t =
+         serve ~config:auto_continue (informational_then_final []) request
        in
        Alcotest.(check string)
          (label ^ ": 100 at the first read")
          continue_head
-         (Buffer.contents s.out);
-       feed s body;
+         (Testing.output t);
+       Testing.feed t body;
        Alcotest.(check string)
          (label ^ ": final response after the body")
-         (continue_head ^ got_hello)
-         (Buffer.contents s.out))
+         got_hello
+         (Testing.output t))
     [ "Content-Length", expect_continue (), "hello"
     ; ( "chunked, mixed case"
       , req
@@ -693,8 +699,8 @@ let test_auto_continue () =
     ]
 
 let test_auto_continue_body_arrived () =
-  let s =
-    server
+  let t =
+    serve
       ~config:auto_continue
       (informational_then_final [])
       (expect_continue () ^ "hello")
@@ -702,11 +708,11 @@ let test_auto_continue_body_arrived () =
   Alcotest.(check string)
     "100, then the final response"
     (continue_head ^ got_hello)
-    (Buffer.contents s.out)
+    (Testing.output t)
 
 let test_auto_continue_response_first () =
-  let s =
-    server
+  let t =
+    serve
       ~config:auto_continue
       (fun reqd ->
          with_string `Content_too_large "" reqd;
@@ -720,15 +726,15 @@ let test_auto_continue_response_first () =
   Alcotest.(check string)
     "only the final response"
     "HTTP/1.1 413 Content Too Large\r\ncontent-length: 0\r\n\r\n"
-    (Buffer.contents s.out)
+    (Testing.output t)
 
 let test_auto_continue_not_sent () =
   List.iter
     (fun (label, request, final) ->
-       let s =
-         server ~config:auto_continue (informational_then_final []) request
+       let t =
+         serve ~config:auto_continue (informational_then_final []) request
        in
-       Alcotest.(check string) label final (Buffer.contents s.out))
+       Alcotest.(check string) label final (Testing.output t))
     [ ( "HTTP/1.0"
       , expect_continue ~version:"HTTP/1.0" () ^ "hello"
       , "HTTP/1.1 200 OK\r\n\
@@ -750,13 +756,13 @@ let test_auto_continue_not_sent () =
 let test_auto_continue_not_doubled () =
   List.iter
     (fun (label, interim, expected) ->
-       let s =
-         server
+       let t =
+         serve
            ~config:auto_continue
            (informational_then_final interim)
            (expect_continue () ^ "hello")
        in
-       Alcotest.(check string) label expected (Buffer.contents s.out))
+       Alcotest.(check string) label expected (Testing.output t))
     [ "explicit 100", [ `Continue ], continue_head ^ got_hello
     ; ( "explicit 103"
       , [ `Early_hints ]
@@ -764,13 +770,10 @@ let test_auto_continue_not_doubled () =
     ]
 
 let test_auto_continue_off_by_default () =
-  let s = server (informational_then_final []) (expect_continue ()) in
-  Alcotest.(check string) "nothing before the body" "" (Buffer.contents s.out);
-  feed s "hello";
-  Alcotest.(check string)
-    "only the final response"
-    got_hello
-    (Buffer.contents s.out)
+  let t = serve (informational_then_final []) (expect_continue ()) in
+  Alcotest.(check string) "nothing before the body" "" (Testing.output t);
+  Testing.feed t "hello";
+  Alcotest.(check string) "only the final response" got_hello (Testing.output t)
 
 let tests =
   tests
@@ -1035,8 +1038,8 @@ let rejected =
 let test_rejected () =
   each rejected (fun (label, input, handler) ->
     let outcome = ref "no exception" in
-    let s =
-      server
+    let t =
+      serve
         (fun reqd ->
            match handler reqd with
            | () -> ()
@@ -1046,8 +1049,9 @@ let test_rejected () =
              then ok_after reqd)
         input
     in
+    let output = Testing.output t in
     Alcotest.(check string)
-      (Printf.sprintf "%s: raises (wrote %S)" label (Buffer.contents s.out))
+      (Printf.sprintf "%s: raises (wrote %S)" label output)
       "Invalid_argument"
       !outcome;
     if not (String.starts_with ~prefix:"CONNECT" input)
@@ -1057,17 +1061,13 @@ let test_rejected () =
         (if String.starts_with ~prefix:"HEAD" input
          then "HTTP/1.1 200 OK\r\n\r\n"
          else "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-        (Buffer.contents s.out)
-    else
-      Alcotest.(check string)
-        (label ^ ": nothing written")
-        ""
-        (Buffer.contents s.out))
+        output
+    else Alcotest.(check string) (label ^ ": nothing written") "" output)
 
 let test_invalid_content_length_message () =
   let raised = ref "" in
-  let (_ : server) =
-    server
+  let (_ : Testing.t) =
+    serve
       (fun reqd ->
          match
            Request_descriptor.respond_with_string
@@ -1119,8 +1119,8 @@ let test_streaming_overflow () =
   Alcotest.(check string) "connection" "open" (state s)
 
 let test_streaming_short () =
-  let s =
-    server
+  let t =
+    serve
       (fun reqd ->
          match (Request_descriptor.request reqd).meth with
          | `POST ->
@@ -1131,8 +1131,8 @@ let test_streaming_short () =
   Alcotest.(check string)
     "5 of 9 bytes, then close"
     "HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\nhello"
-    (Buffer.contents s.out);
-  Alcotest.(check string) "connection" "closed" (state s)
+    (Testing.output t);
+  Alcotest.(check bool) "connection closed" true (Testing.is_closed t)
 
 let tests =
   tests
