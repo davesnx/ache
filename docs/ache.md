@@ -537,6 +537,16 @@ requests against Eio, Lwt and Miou echo servers. On 2026-11-16, h1spec at
 `f0a5650` (under Node 22 with `conformance/deno_shim.mjs`) passed 33 of 33
 checks on all three servers.
 
+`lib/test/llhttp` runs the request and response cases of the
+[llhttp](https://github.com/nodejs/llhttp) test corpus (`5aa5ac1`, MIT)
+through `Server_connection` and `Client_connection`, at every split of the
+input, and compares accept or reject, complete messages and body bytes with
+llhttp's log. An HTTP/1.1 request without `Host` gets `Host: a`; a
+`*-lenient-*` case must be rejected; pause and finish cases are not run. On
+2026-11-25, 162 of 192 strict and 35 of 40 lenient cases agreed.
+`lib/test/llhttp/expected-differences.txt` gives each difference its reason,
+and the test fails on a difference not listed there.
+
 `lib/test/fuzz` generates inputs with
 [QCheck](https://github.com/c-cube/qcheck): requests, responses, chunked
 bodies and WebSocket frames, from the grammar corpus, the oracle inputs and
