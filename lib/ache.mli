@@ -459,6 +459,13 @@ module Config : sig
           switch protocols, is never written while another response is
           pending. Default is [1]: a request is written after the previous
           response is complete. *)
+    ; max_requests_per_connection : int option
+      (** Server: with [Some n], the [n]-th request on a connection is the
+          last one. Its response gets [Connection: close], and the connection
+          closes after it (as after {!Server_connection.drain}). Default is
+          [None]: no limit.
+          {!Server_connection.create} raises [Invalid_argument] when [n] is
+          less than 1. *)
     }
 
   val default : t
@@ -479,10 +486,30 @@ module Server_connection : sig
   val create :
      ?config:Config.t
     -> ?error_handler:error_handler
+    -> ?date:(unit -> string)
+    -> ?keep_alive_timeout:int
     -> request_handler
     -> t
-  (** [create ?config ?error_handler ~request_handler] creates a connection
-      handler that will service individual requests with [request_handler].
+  (** [create ?config ?error_handler ?date ?keep_alive_timeout
+       request_handler] creates a connection handler that will service
+      individual requests with [request_handler].
+
+      With [keep_alive_timeout], every response after which the connection
+      stays open (not 1xx, not a tunnel, no [Connection: close]) and that
+      has no [Keep-Alive] field gets [Keep-Alive: timeout=n], with
+      [, max=m] when [Config.max_requests_per_connection] is set ([m] is
+      the number of requests the connection still serves after this one).
+      [n] is the idle timeout that the runtime announces; the runtime keeps
+      its own idle timer 1 s longer, so that a client that trusts the hint
+      never writes into a connection that is closing. Raises
+      [Invalid_argument] when [n] is less than 1.
+
+      With [date], every response that is not 1xx and has no [Date] field
+      (in any case) gets [Date: (date ())] after its other fields (RFC 9110
+      §6.6.1: an origin server with a clock sends [Date]). [date] returns an
+      IMF-fixdate such as [Sun, 06 Nov 1994 08:49:37 GMT]; the runtimes pass
+      a function that formats the time once per second. Without [date] the
+      connection adds no [Date] field.
 
       The connection rejects a request before [request_handler] runs, calls
       [error_handler] and closes after the error response:
@@ -617,6 +644,28 @@ module Server_connection : sig
   (** [error_code t] returns the [error_code] that caused the connection to
       close, if one exists. *)
 
+  val drain : t -> unit
+  (** [drain t] makes the request in progress the last one on [t], for a
+      graceful stop of a server:
+      - When no request is in progress and no byte of a next request has
+        been read, the connection closes at once: {!next_read_operation}
+        returns [`Close], and output that is not written yet is still
+        written. A runtime that waits for input stops waiting, as when its
+        idle timeout fires.
+      - When a request is in progress, or its head is partly read, the
+        connection serves it and reads no other request. Its response gets
+        [Connection: close] if its head is not written yet; otherwise the
+        response is sent as it was framed and the connection closes after
+        it. Requests that were pipelined after it are not served.
+      - On a connection upgraded with {!Websocket.upgrade}, the WebSocket
+        connection sends a close frame with code [1001] (going away) and
+        closes as {!Websocket.close} does. Another upgraded protocol is not
+        told; the runtime stops it when its grace period ends.
+
+      A runtime calls [drain] on each of its connections when it stops, and
+      closes the ones that are still open after a grace period. Calling
+      [drain] again does nothing. *)
+
   (**/**)
 
   val shutdown : t -> unit
@@ -631,17 +680,22 @@ module Server_connection : sig
       - [Some (`Head, reject)]: a request head is partly read. [reject] calls
         [error_handler] with [`Request_timeout] (408) and closes the connection
         after the error response. The request handler is not called.
-      - [Some (`Body, close)]: the response is complete, and the rest of the
-        request body has not arrived. The application reads it, or the
-        connection drops it to find the next request. A runtime waits for it
-        at most its idle timeout; a runtime without an idle timeout calls
-        [close] instead of waiting. [close] calls the body's [on_error] and
-        closes the connection after its pending output.
-      - [None]: a request is in progress and its response is not complete,
-        or the connection is closing or upgraded. No timeout applies. The
-        answer can change to [Some (`Body, _)] while the runtime waits for
-        input, when the response completes. A runtime asks again each time
-        its write loop waits or ends. *)
+      - [Some (`Body, expire)]: the connection waits for request body bytes:
+        the application has scheduled a read on the request body, or the
+        response is complete and the rest of the body has not arrived (the
+        connection drops it to find the next request). The peer must make
+        progress; the runtimes give it their body timeout and restart it
+        only after enough bytes. [expire] calls the body's [on_error]; then,
+        when no response has started, it calls [error_handler] with
+        [`Request_timeout] (408) and closes the connection after the error
+        response, and otherwise it closes the connection after its pending
+        output.
+      - [Some (`Idle, close)] on a connection upgraded with
+        {!Websocket.upgrade}: see {!Websocket.read_timeout}.
+      - [None]: no read is waiting for the peer (the application runs, a
+        response is being written, the connection is closing), or the
+        connection was upgraded to another protocol. No timeout applies.
+        A runtime asks again before each read. *)
 end
 
 (** {2 WebSocket Server} *)
@@ -678,9 +732,11 @@ end
     closes the TCP connection once the frame is written. It does not wait for
     the client's close frame.
 
-    ache has no timeout on an upgraded connection. A client that stops
-    reading, or never answers a close frame, keeps the connection open until
-    the caller closes the socket, for example with its own timer.
+    The runtimes close a connection that receives nothing for their idle
+    timeout, with close code [1001] (see {!read_timeout}), and one whose
+    writes make no progress for their write timeout. A client that never
+    answers a close frame does not keep the connection: it closes when the
+    close frame is written.
 
     Reading stops while more than 64 KiB of frames (messages, pongs and close
     frames) are queued and not yet written, and starts again when the writes
@@ -811,6 +867,16 @@ module Websocket : sig
   val is_closed : t -> bool
   (** [is_closed t] is [true] once the connection is closed: [on_close] was
       called and nothing more is written. *)
+
+  val read_timeout : t -> ([ `Idle ] * (unit -> unit)) option
+  (** [read_timeout t] tells a runtime which read timeout applies while it
+      waits for input on [t], as {!Server_connection.read_timeout} does (and
+      that function answers with it once the connection is upgraded).
+      - [Some (`Idle, close)]: the connection reads frames. When nothing
+        arrives for the runtime's idle timeout, [close] sends a close frame
+        with code [1001] (going away) and closes as {!close} does.
+      - [None]: reading is paused, waits for the writes, or the connection
+        is closing. No timeout applies. *)
 end
 
 (** {2 Client Connection} *)
@@ -847,6 +913,16 @@ module Client_connection : sig
   type error_handler = error -> unit
 
   val create : ?config:Config.t -> unit -> t
+
+  val reuse_timeout : t -> float option
+  (** [reuse_timeout t] is [Some s] when no request is in progress on [t]
+      and the last response kept the connection open with a [Keep-Alive]
+      field that has [timeout=n] ([n] is digits; other parameters and
+      invalid values are ignored). The server may close the connection [n]
+      seconds after that response, so a runtime does not reuse it once [s]
+      seconds have passed since the response ended: [s] is [min n 600]
+      minus 2, and at least 0. [None] when there is no such hint or a
+      request is in progress. *)
 
   val request :
      t
@@ -991,6 +1067,22 @@ module Ache_private : sig
         -> (int -> unit)
         -> unit
     end
+  end
+
+  module Http_date : sig
+    val imf_fixdate : int -> string
+    (** [imf_fixdate seconds] is the IMF-fixdate (RFC 9110 §5.6.7) of
+        [seconds] since the Unix epoch, such as
+        [Sun, 06 Nov 1994 08:49:37 GMT]. *)
+
+    val cached : int -> string
+    (** [cached seconds] is [imf_fixdate seconds], kept per domain: it
+        allocates only when [seconds] differs from the previous call in the
+        same domain. *)
+
+    val now : unit -> string
+    (** [now ()] is [cached] of the current second ([time(2)]): the [Date]
+        function that the runtimes give to {!Server_connection.create}. *)
   end
 
   module Response_descriptor : sig

@@ -31,6 +31,35 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   1: a request is written after the previous response is complete. A
   non-idempotent request, or one that may switch protocols, is never
   written while another response is pending. Set the limit to pipeline.
+- `ache-miou`, `ache-miou-tls`: the server timeouts are on by default and
+  take a `float option`: `?idle_timeout` (60 s), `?head_timeout` (30 s),
+  and the new `?body_timeout` (60 s, request body progress) and
+  `?write_timeout` (60 s, write progress); `None` turns one off. An idle
+  WebSocket is closed with code 1001 after `idle_timeout`. A request body
+  left unread after its response is no longer dropped at once without
+  `idle_timeout`: `body_timeout` bounds it.
+- `ache-lwt`, `ache-lwt-tls`: the server timeouts are on by default and
+  take a `float option`: `?idle_timeout` (60 s), `?head_timeout` (30 s),
+  and the new `?body_timeout` (60 s, request body progress, counted in
+  shared ticks of a tenth) and `?write_timeout` (60 s, write progress);
+  `None` turns one off. An idle WebSocket is closed with code 1001 after
+  `idle_timeout`. A request body left unread after its response is bounded
+  by `body_timeout`, no longer by `idle_timeout` (or dropped at once).
+- `ache-eio`, `ache-eio-tls`: the server timeouts are on by default and
+  take a `float option`: `?idle_timeout` (60 s), `?head_timeout` (30 s),
+  and the new `?body_timeout` (60 s, request body progress) and
+  `?write_timeout` (60 s, write progress); `None` turns one off. They no
+  longer need `?clock`: without it the server uses the system clock, and
+  it always lingers after a closing response. An idle WebSocket is closed
+  with code 1001 after `idle_timeout`. A request body left unread after its
+  response is bounded by `body_timeout`, no longer by `idle_timeout` (or
+  dropped at once).
+- `Server_connection.read_timeout` answers `` `Body `` whenever a read
+  waits for request body bytes, also before the response is complete, and
+  its action sends 408 when no response has started (otherwise it closes).
+  On a connection upgraded with `Websocket.upgrade` it answers `` `Idle ``,
+  whose action closes with code 1001 (new `Websocket.read_timeout`). It
+  answers `None` only while no read waits for the peer.
 
 ### New
 
@@ -39,6 +68,10 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `103 Early Hints`.
 - Server timeouts `?idle_timeout` and `?head_timeout`, and
   `Config.max_header_size`.
+- `Server_connection.create ?date` adds a `Date` field to each final
+  response that has none. The servers of `ache-eio`, `ache-lwt` and
+  `ache-miou` now send `Date` by default (RFC 9110 §6.6.1); `~date:false`
+  turns it off.
 - `Config.max_pending_output` (64 KiB): while more response bytes wait to
   be written, the server reads no new request.
 - `Server.run` in `ache-eio` and `ache-miou`: one accept loop for each
@@ -57,6 +90,45 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   style, with the session in a fiber (Eio) or task (Miou) of the connection.
   A write to a client that reset the connection ends the connection
   (camlworks/dream#467).
+- `Server_connection.drain` makes the request in progress the last one on
+  a connection (an idle connection closes at once, a WebSocket sends close
+  1001), and `Config.max_requests_per_connection` (default `None`) makes
+  the n-th request the last one.
+- `ache-lwt`, `ache-lwt-tls`: graceful stop with `?stop:unit Lwt.t` and
+  `?grace:float` on `create_connection_handler` (and
+  `create_connection_handler_with_fd`). When `stop` resolves, each
+  connection drains; `grace` seconds later the ones still open are closed.
+- `ache-eio`, `ache-eio-tls`: graceful stop with `?stop:unit Eio.Promise.t`
+  and `?grace:float` on `Server.create_connection_handler` and
+  `Server.run`. When `stop` is resolved, `run` stops accepting, each
+  connection drains, `grace` seconds later the ones still open are
+  cancelled, and `run` returns when every connection has ended.
+- `ache-miou`, `ache-miou-tls`: graceful stop with
+  `?stop:unit Miou.Computation.t` and `?grace:float` on
+  `Server.create_connection_handler`, `Server.run` and
+  `create_connection_handler_with_fd`. When `stop` is resolved, from any
+  domain, `run` stops accepting, each connection drains in its own domain,
+  `grace` seconds later the ones still open are cancelled with their
+  WebSocket sessions, and `run` returns when every connection has ended.
+- `Server_connection.create ?keep_alive_timeout` adds `Keep-Alive:
+  timeout=n` (and `max=m` with `Config.max_requests_per_connection`) to
+  persistent responses, and `Client_connection.reuse_timeout` reads the
+  hint of the last response (at most 600 s, minus 2 s).
+- `ache-eio`, `ache-eio-tls`: with `idle_timeout` of 1 s or more the server
+  sends `Keep-Alive: timeout=n` on persistent responses and waits 1 s
+  longer than it announced; `Client` closes a connection `n - 2` seconds
+  after such a response, and a request after that gets
+  `` `Connection_closed `` without writing anything.
+- `ache-lwt`, `ache-lwt-tls`: with `?idle_timeout` of 1 s or more, the
+  server sends `Keep-Alive: timeout=n` and keeps its idle timer 1 s longer;
+  the client closes an idle connection `n - 2` s after a response with that
+  hint, and a request on it after that gets `` `Connection_closed ``.
+- `ache-miou`, `ache-miou-tls`: with `idle_timeout` of at least 1 s (the
+  default 60 s), the server sends `Keep-Alive: timeout=n` on persistent
+  responses and waits 1 s longer than it announces. The client closes an
+  idle connection `n - 2` seconds after a response with that hint, and a
+  request on it after then gets `` `Connection_closed `` before anything is
+  written.
 
 ### Changed
 

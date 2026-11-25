@@ -84,6 +84,8 @@ type t =
   ; mutable response_state : Response_state.t
   ; mutable error_code : [ `Ok | error ]
   ; proxy : bool
+  ; date : (unit -> string) option
+  ; keep_alive : string
   }
 
 let create
@@ -94,6 +96,8 @@ let create
       ~response_body_buffer
       ~proxy
       ~max_discard_body
+      ~date
+      ~keep_alive
       request
       request_body
   =
@@ -110,6 +114,8 @@ let create
   ; response_state = Waiting
   ; error_code = `Ok
   ; proxy
+  ; date
+  ; keep_alive
   }
 
 let request { request; _ } = request
@@ -155,17 +161,48 @@ let frame ~fn ~length t (response : Response.t) =
     ~length
     response
 
+let needs_date (response : Response.t) =
+  (not (Status.is_informational response.status))
+  && not (Headers.mem response.headers "date")
+
+let persists_after t (response : Response.t) =
+  keeps_connection t && Response.persistent_connection response
+
+let needs_keep_alive t (response : Response.t) =
+  t.keep_alive <> ""
+  && (not (Status.is_informational response.status))
+  && persists_after t response
+  && not (Headers.mem response.headers "keep-alive")
+
 let write_response t response =
   if Writer.is_closed t.writer
   then Serialize.check_response response
-  else Writer.write_response t.writer response
+  else
+    match t.date, t.keep_alive with
+    | None, "" -> Writer.write_response t.writer response
+    | _ ->
+      let date =
+        match t.date with
+        | Some date when needs_date response -> date ()
+        | _ -> ""
+      in
+      let keep_alive =
+        if needs_keep_alive t response then t.keep_alive else ""
+      in
+      if date == "" && keep_alive == ""
+      then Writer.write_response t.writer response
+      else Writer.write_response_with t.writer response ~date ~keep_alive
 
 let commit_persistence t (response : Response.t) =
-  if t.persistent
-  then
-    t.persistent <-
-      keeps_connection t && Response.persistent_connection response;
+  t.persistent <- persists_after t response;
   if not t.persistent then Reader.pause t.reader
+
+let close_after t =
+  match t.response_state with
+  | Upgrade _ -> ()
+  | Waiting | Fixed _ | Streaming _ ->
+    t.persistent <- false;
+    Reader.pause t.reader
 
 let has_body t encoding =
   encoding <> `No_body && not (Writer.is_closed t.writer)
@@ -319,7 +356,7 @@ let unsafe_respond_with_upgrade ?status t headers impl =
     Writer.flush t.writer (function
       | `Written when not closed -> t.upgrade impl
       | `Written | `Closed ->
-        let (Runtime.Impl ((module Engine), engine)) = impl in
+        let (Runtime.Impl ((module Engine), engine, _)) = impl in
         Engine.shutdown engine;
         Reader.force_close t.reader;
         Reader.wakeup t.reader);

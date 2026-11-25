@@ -162,6 +162,35 @@ let write_response t ({ Response.version; status; reason; headers } as response)
   write_crlf t;
   write_headers t headers
 
+let check_date date =
+  if has_cr_lf_nul date 0 then invalid_argf "ache: invalid date %S" date
+
+let write_response_with
+      t
+      ({ Response.version; status; reason; headers } as response)
+      ~date
+      ~keep_alive
+  =
+  check_response response;
+  write_version t version;
+  write_space t;
+  write_status t status;
+  write_space t;
+  write_string t reason;
+  write_crlf t;
+  write_fields t (Headers.to_list headers);
+  if date <> ""
+  then (
+    write_string t "Date: ";
+    write_string t date;
+    write_crlf t);
+  if keep_alive <> ""
+  then (
+    write_string t "Keep-Alive: ";
+    write_string t keep_alive;
+    write_crlf t);
+  write_crlf t
+
 let rec write_hex_digits t len shift =
   if shift >= 0
   then (
@@ -226,6 +255,10 @@ module Writer = struct
   let encoder t = t.encoder
   let write_request t request = write_request t.encoder request
   let write_response t response = write_response t.encoder response
+
+  let write_response_with t response ~date ~keep_alive =
+    write_response_with t.encoder response ~date ~keep_alive
+
   let write_string t ?off ?len string = write_string t.encoder ?off ?len string
 
   let write_bigstring t ?off ?len bigstring =

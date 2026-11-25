@@ -477,6 +477,12 @@ let next_read_operation t =
   | (Header | Payload) when read_blocked t -> `Yield
   | Header | Payload -> `Read
 
+let read_timeout t =
+  match t.reading with
+  | (Header | Payload) when t.writing = Open && not (read_blocked t) ->
+    Some (`Idle, fun () -> fail t 1001)
+  | Header | Payload | Stopped -> None
+
 let yield_reader t k =
   if t.reading = Stopped then k () else t.reader_k <- Some k
 
@@ -613,5 +619,8 @@ let upgrade ?(max_message_size = default_max_message_size) reqd make_handler =
          ; "connection", "Upgrade"
          ; "sec-websocket-accept", accept
          ])
-      (Runtime.make (module Engine) t);
+      (Runtime.make_with_hooks
+         (module Engine)
+         t
+         { drain = (fun t -> fail t 1001); read_timeout });
     Ok ()

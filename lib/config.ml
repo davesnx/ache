@@ -8,6 +8,7 @@ type t =
   ; max_pending_output : int
   ; max_discard_body : int
   ; max_pipelined_requests : int
+  ; max_requests_per_connection : int option
   }
 
 let default =
@@ -20,4 +21,5 @@ let default =
   ; max_pending_output = 0x10000
   ; max_discard_body = 0x40000
   ; max_pipelined_requests = 1
+  ; max_requests_per_connection = None
   }

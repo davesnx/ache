@@ -1,4 +1,4 @@
 (library
  (name ache_eio_tls)
  (public_name ache-eio-tls)
- (libraries ache ache-eio domain-name eio ipaddr tls tls-eio))
+ (libraries ache ache-eio domain-name eio eio.unix ipaddr tls tls-eio))

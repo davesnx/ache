@@ -57,7 +57,18 @@ module type Server = Ache_lwt_intf.Server
 
 module type Client = Ache_lwt_intf.Client
 (** [Client.upgrade t impl] shuts down the HTTP state of [t] and hands reading
-    and writing on its socket to [impl]. *)
+    and writing on its socket to [impl].
+
+    Reuse deadline: when a response keeps the connection open and has
+    [Keep-Alive: timeout=n], the connection is not reused after [s] seconds,
+    from when its reader sees the end of that response ([s] is
+    {!Ache.Client_connection.reuse_timeout}: [min n 600] minus 2). When [s]
+    passes and no request was made, the connection shuts down as with
+    [shutdown]: [is_closed] becomes [true] and the socket closes. A
+    [request] made after [s] passed shuts the connection down first, so its
+    [error_handler] gets [`Connection_closed] and nothing is written. A new
+    [request] before [s] clears the deadline. Without the hint nothing
+    changes. *)
 
 (** Timeouts that share one Lwt timer for each length.
 
@@ -195,17 +206,69 @@ end
 (** The function that results from [create_connection_handler] can be passed to
     [Lwt_io.establish_server_with_client_socket].
 
-    Timeouts of [create_connection_handler] are in seconds and are off by
-    default:
-    - [idle_timeout]: when no request is in progress and no byte arrives for
-      [idle_timeout], the connection closes without a response.
-    - [head_timeout]: when a request head is not complete [head_timeout] after
-      its first bytes were read, [error_handler] is called with
-      [`Request_timeout] (408) and the connection closes after the error
-      response.
+    Timeouts of [create_connection_handler] are in seconds. Each is on by
+    default; [~idle_timeout:None] (and so on) turns one off.
+    - [idle_timeout] (default [Some 60.]): when no request is in progress and
+      no byte arrives for [idle_timeout], the connection closes without a
+      response. On a connection upgraded with {!Websocket.upgrade}: when no
+      frame arrives for [idle_timeout], the connection sends a close frame
+      with code [1001] and closes.
+    - [head_timeout] (default [Some 30.]): when a request head is not
+      complete [head_timeout] after its first bytes were read,
+      [error_handler] is called with [`Request_timeout] (408) and the
+      connection closes after the error response. Each request head,
+      pipelined or not, has its own limit.
+    - [body_timeout] (default [Some 60.]): the connection waits for request
+      body bytes (a read is scheduled on the body, or the response is
+      complete and the rest of the body has not arrived) and the client
+      sends less than 2048 bytes in [body_timeout] of waiting. The body gets
+      [on_error]; then the client gets 408 if no response started, and
+      otherwise the connection closes after its pending output. The clock
+      counts only while the connection waits for body bytes, restarts at
+      each request and after each 2048 bytes, and counts in tenths of
+      [body_timeout], so it can run out up to a tenth late.
+    - [write_timeout] (default [Some 60.]): output waits to be written and
+      less than 2048 bytes of it are written in [write_timeout], for example
+      because the client stopped reading. The connection closes its socket
+      and ends; pending [Body.Writer.flush] callbacks get [`Closed]. The
+      clock restarts when all output is written and after each 2048 bytes.
 
-    A request body or a response in progress is never timed out. Each request
-    head, pipelined or not, has its own limit.
+    Keep-Alive hint: when [idle_timeout] is [Some x] with [x >= 1.], each
+    response after which the connection stays open gets
+    [Keep-Alive: timeout=n] ([n] is [x] rounded down), with [, max=m] when
+    [Config.max_requests_per_connection] is set, unless the application set
+    a [Keep-Alive] field (see {!Ache.Server_connection.create}). The timer
+    between requests then runs [x +. 1.] seconds, so that a client that
+    trusts the hint does not write into a connection that is closing. The
+    WebSocket idle timer stays [x]. With [x < 1.] or [None] no hint is
+    sent.
+
+    While the request handler runs and the connection waits for nothing
+    from the client, no timeout applies.
+
+    [date] defaults to [true]: each response that is not 1xx and has no [Date]
+    field gets [Date] with the current time (RFC 9110 §6.6.1), as
+    {!Ache.Server_connection.create} describes. The text is built at most once
+    per second in each domain. With [~date:false] no [Date] is added.
+
+    Graceful stop: give the same [stop] promise to each connection. When
+    [stop] resolves (or is rejected):
+    + the connection calls {!Ache.Server_connection.drain}. An idle
+      connection closes at once. A connection with a request in progress
+      serves it, with [Connection: close] if its head is not written yet, and
+      then closes; requests pipelined after it are not served. A WebSocket
+      connection sends a close frame with code [1001].
+    + [grace] seconds later, a connection that is still open is cancelled:
+      it stops, and its socket is closed without waiting for the handler or
+      for pending output, and the promise of the connection resolves.
+      Without [grace] the connection has no time limit.
+
+    A handler applied to a socket after [stop] resolved closes the socket
+    and does not read a request. [create_connection_handler] does not stop
+    the accept loop: stop it yourself, for example with
+    [Lwt_io.shutdown_server], and wait for the promises of the connections.
+    A [stop] that is never resolved holds no memory for connections that
+    ended.
 
     Closing: when the connection stops reading it calls [shutdown_receive]
     and does not wait for the peer to close; it closes the socket once the
@@ -214,7 +277,7 @@ end
     instead reads and discards input for a bounded time first.
 
     [create_connection_handler] raises [Invalid_argument] when applied to a
-    socket if a timeout is not positive.
+    socket if a timeout or [grace] is not positive.
 
     The application must ignore [SIGPIPE], for example with
     [Sys.set_signal Sys.sigpipe Sys.Signal_ignore], before it serves

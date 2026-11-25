@@ -35,8 +35,13 @@ module Server : sig
   val create_connection_handler :
      ?config:Ache.Config.t
     -> ?clock:_ Eio.Time.clock
-    -> ?idle_timeout:float
-    -> ?head_timeout:float
+    -> ?idle_timeout:float option
+    -> ?head_timeout:float option
+    -> ?body_timeout:float option
+    -> ?write_timeout:float option
+    -> ?date:bool
+    -> ?stop:unit Eio.Promise.t
+    -> ?grace:float
     -> request_handler:
          (Eio.Net.Sockaddr.stream -> Ache.Request_descriptor.t -> unit)
     -> error_handler:
@@ -50,45 +55,87 @@ module Server : sig
       can be passed to [Eio.Net.run_server] or [Eio.Net.accept_fork]. The
       caller owns [flow] and closes it after the handler returns.
 
-      Timeouts are in seconds and are off by default:
-      - [idle_timeout]: when no request is in progress and no byte arrives
-        for [idle_timeout], the connection closes without a response.
-      - [head_timeout]: when a request head is not complete [head_timeout]
-        after its first byte was read, [error_handler] is called with
-        [`Request_timeout] (408) and the connection closes after the error
-        response. Each request head, pipelined or not, has its own limit.
+      Timeouts are in seconds. Each is on by default; [None] turns it off.
+      - [idle_timeout] (default [Some 60.]): when no request is in progress
+        and no byte arrives for [idle_timeout], the connection closes
+        without a response. When [idle_timeout] is at least 1 s, each
+        response after which the connection stays open gets
+        [Keep-Alive: timeout=n], [n] being [idle_timeout] rounded down
+        (see [keep_alive_timeout] in {!Ache.Server_connection.create}), and
+        the connection then waits [idle_timeout + 1.] seconds for the next
+        request, so that a client that trusts the hint does not send a
+        request into a connection that is closing. On a connection upgraded
+        with {!Websocket.upgrade}, when no byte arrives for [idle_timeout],
+        the connection sends a close frame with code [1001] and closes.
+      - [head_timeout] (default [Some 30.]): when a request head is not
+        complete [head_timeout] after its first byte was read,
+        [error_handler] is called with [`Request_timeout] (408) and the
+        connection closes after the error response. Each request head,
+        pipelined or not, has its own limit.
+      - [body_timeout] (default [Some 60.]): while the connection waits for
+        request body bytes (the application has scheduled a read on the
+        body, or the response is complete and the rest of the body has not
+        arrived), a clock runs. It stops while the connection does not
+        wait for body bytes, and starts again from zero with each request
+        and after each 2048 bytes of input. When it reaches
+        [body_timeout], the body's [on_error] runs; then, if no response
+        has started, [error_handler] gets [`Request_timeout] (408),
+        otherwise the connection closes after its pending output. A body
+        that trickles in, a few bytes at a time, times out.
+      - [write_timeout] (default [Some 60.]): while a write to [flow]
+        waits, a clock runs. It starts again from zero when the write is
+        complete and after each 2048 bytes written. When it reaches
+        [write_timeout], the write is cancelled and the connection closes:
+        a flush in progress gets [`Closed], and nothing more is read or
+        written. A client that stops reading a response is closed this way.
 
-      A request body or a response in progress is never timed out.
+      While the request handler runs and the connection waits for nothing
+      from the peer, no timeout applies: a slow handler is not timed out.
+
+      Timeouts use [clock] when it is given, and the system clock of the
+      Eio backend otherwise.
+
+      [date] defaults to [true]: each response that is not 1xx and has no
+      [Date] field gets [Date] with the current time (RFC 9110 §6.6.1), as
+      {!Ache.Server_connection.create} describes. The text is built at most
+      once per second in each domain. With [~date:false] no [Date] is added.
 
       Closing: when the connection stops reading (after a response with
       [Connection: close], an error response, or a timeout), it reads and
       discards input until the peer closes, so that unread input does not
       make the kernel reset the connection before the peer has read the
-      response (RFC 9112 §9.6). With [clock], it waits at most
-      [idle_timeout], or {!linger_without_idle_timeout} without
-      [idle_timeout], after its last write; input from the peer does not
-      extend this time. A peer that closes its sending side (a half-close)
-      ends the wait; it is not an error, and the response is sent in full.
-      Without [clock] it does not wait: it shuts down the flow at once, and
-      the handler returns.
-
-      A [shutdown] of [flow] that raises is ignored, so a flow without
-      half-close (for example some TLS flows) ends the connection normally.
-
-      When a response completes while a read of its request body waits, the
-      request body fails ([on_error] runs) at once without [idle_timeout], or
-      after [idle_timeout] with it when no byte arrives first. The connection
-      then closes as described above: with [clock] it waits at most
-      [idle_timeout], or {!linger_without_idle_timeout}, for the peer, and
-      then ends the pending read with [Eio.Flow.shutdown flow `Receive];
-      without [clock] it ends the read at once. A body read that starts
-      after the response is complete has the same limits. A flow whose
+      response (RFC 9112 §9.6). It waits at most [idle_timeout], or
+      {!linger_without_idle_timeout} without [idle_timeout], after its last
+      write; input from the peer does not extend this time. A peer that
+      closes its sending side (a half-close) ends the wait; it is not an
+      error, and the response is sent in full. It then ends a read that
+      still waits with [Eio.Flow.shutdown flow `Receive]. A flow whose
       [`Receive] shutdown does not end a pending read, such as a plain
       [Tls_eio] flow, keeps that read until input arrives;
       [Ache_eio_tls.Server] passes this shutdown to the TCP flow.
 
+      A [shutdown] of [flow] that raises is ignored, so a flow without
+      half-close (for example some TLS flows) ends the connection normally.
+
       The handler returns when the connection has ended and the sessions
       that {!Websocket.upgrade} started have returned.
+
+      Graceful stop: when [stop] is resolved, the handler calls
+      {!Ache.Server_connection.drain} on the connection, in a fiber of the
+      connection:
+      - An idle connection (no request in progress, no byte of a next
+        request read) closes at once: a read that waits stops, and the
+        connection closes as described below.
+      - A request in progress, or one whose head is partly read, is served;
+        its response gets [Connection: close] if its head is not written
+        yet. No other request is read; pipelined requests are not served.
+      - A WebSocket connection sends a close frame with code [1001].
+      When [stop] is already resolved when the handler is applied, the
+      connection closes without reading a request. [grace] is in seconds:
+      [grace] seconds after [stop] is resolved, the
+      handler cancels what is left of the connection (its reads, writes and
+      WebSocket sessions) and returns. Without [grace] it waits for the
+      connection to end. The handler does not close [flow].
 
       When [error_handler] or a WebSocket session raises, the connection
       closes, and after the connection ends the handler raises the first
@@ -99,16 +146,21 @@ module Server : sig
       error, and the handler returns normally.
 
       @raise Invalid_argument
-        if a timeout is given without [clock] or a timeout is not positive.
-        It is raised when [~error_handler] is applied if all four optional
-        arguments are given too, and otherwise when the handler is applied
+        if a timeout or [grace] is not positive. It is raised when
+        [~error_handler] is applied if all nine optional arguments are
+        given too, and otherwise when the handler is applied
         to a flow: with [Eio.Net.run_server], in each connection fiber. *)
 
   val run :
      ?config:Ache.Config.t
     -> ?clock:_ Eio.Time.clock
-    -> ?idle_timeout:float
-    -> ?head_timeout:float
+    -> ?idle_timeout:float option
+    -> ?head_timeout:float option
+    -> ?body_timeout:float option
+    -> ?write_timeout:float option
+    -> ?date:bool
+    -> ?stop:unit Eio.Promise.t
+    -> ?grace:float
     -> ?domains:int
     -> ?backlog:int
     -> ?tcp_nodelay:bool
@@ -135,6 +187,7 @@ module Server : sig
       Each loop accepts connections with [Eio.Net.accept_fork] and [on_error],
       and serves them with the handler from {!create_connection_handler},
       which takes [config], [clock], [idle_timeout], [head_timeout],
+      [body_timeout], [write_timeout], [date], [stop], [grace],
       [request_handler] and [error_handler].
       [request_handler] and [error_handler] run in several domains at the
       same time.
@@ -155,7 +208,14 @@ module Server : sig
       [on_error], waits 50 ms and accepts again. The connections in progress
       continue.
 
-      [run] does not return. Cancel its fiber to stop all domains. If
+      Without [stop], [run] does not return: cancel its fiber to stop all
+      domains at once. When [stop] is resolved, each domain stops accepting
+      and closes its listening socket, so connections that the kernel
+      queued and [run] did not accept are reset. Each connection then
+      drains, as {!create_connection_handler} describes: a connection
+      accepted just before [stop] closes without reading a request, and
+      what is left [grace] seconds after [stop] is cancelled. [run] returns
+      when every connection in every domain has ended. If
       [on_error] raises, a listen fails, or an accept fails because the
       listening socket is not usable ([EBADF], [EINVAL], [ENOTSOCK],
       [EFAULT], or an operation that is not available) in one domain, [run]
@@ -166,8 +226,8 @@ module Server : sig
         {!create_connection_handler} gives. *)
 
   val linger_without_idle_timeout : float
-  (** Seconds a connection with [clock] and no [idle_timeout] waits for the
-      peer to close after its last write: 2.0. *)
+  (** Seconds a connection without [idle_timeout] waits for the peer to
+      close after its last write: 2.0. *)
 end
 
 module Client : sig
@@ -178,6 +238,16 @@ module Client : sig
     -> sw:Eio.Switch.t
     -> _ Eio.Flow.two_way
     -> t
+  (** [create_connection ~sw flow] runs an HTTP/1.1 client on [flow].
+
+      When a response keeps the connection open with
+      [Keep-Alive: timeout=n], the connection is not reused once the time
+      that {!Ache.Client_connection.reuse_timeout} gives ([n] minus 2 s)
+      has passed since the response ended: one fiber of [sw] then shuts it
+      down as {!shutdown} does, if no request has started. A {!request}
+      after that time, also before that fiber has run, shuts the connection
+      down first, and gets [`Connection_closed] without writing anything.
+      Without the hint, the connection stays open. *)
 
   val request :
      t
@@ -295,8 +365,9 @@ module Websocket : sig
       {!Ache.Websocket.close}) and returns when the connection is closed: the
       frame is written, or the connection ended. The socket closes when the
       read in progress also ends: when the client answers with its close
-      frame or closes the connection. There is no timeout for a client that
-      does neither.
+      frame or closes the connection, or at most [idle_timeout] later, as
+      after any closing response (see
+      {!Server.create_connection_handler}).
 
       @raise Invalid_argument
         at once if [code] is not one an endpoint may send, or [reason] is not

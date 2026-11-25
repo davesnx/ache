@@ -836,16 +836,23 @@ let timeout_tests =
          | None -> Alcotest.fail "no timeout inside a head");
          Server.pump s;
          check_rejected ~allowed:[ 408 ] s)
-  ; test "§9.5 server SHOULD: no read timeout while a body is read" (fun () ->
-      let s =
-        Server.run
-          ~handler:(fun ex -> Server.read_body ex ~on_complete:ignore)
-          "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nab"
-      in
-      Alcotest.(check bool)
-        "no timeout"
-        true
-        (Option.is_none (timeout_action s)))
+  ; test
+      "§9.5 server SHOULD: body timeout while a body is read answers 408 and \
+       closes"
+      (fun () ->
+         let s =
+           Server.run
+             ~handler:(fun ex -> Server.read_body ex ~on_complete:ignore)
+             "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nab"
+         in
+         (match timeout_action s with
+         | Some (`Body, expire) -> expire ()
+         | Some ((`Idle | `Head), _) ->
+           Alcotest.fail "idle or head timeout inside a body"
+         | None -> Alcotest.fail "no timeout while a body is read");
+         Server.pump s;
+         check_status "408 after the handler" [ 408 ] s;
+         check_closed "connection closed" s)
   ]
 
 let tests =

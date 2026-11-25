@@ -2839,8 +2839,8 @@ module Raw = struct
     ; out : Buffer.t
     }
 
-  let create ?config ?(error_handler = error_handler) handler =
-    { conn = Server_connection.create ?config ~error_handler handler
+  let create ?config ?(error_handler = error_handler) ?date handler =
+    { conn = Server_connection.create ?config ~error_handler ?date handler
     ; pending = ""
     ; out = Buffer.create 256
     }
@@ -4558,16 +4558,97 @@ let test_unread_body_after_response_is_timed () =
          ])
     splits
 
-let test_body_timeout_only_after_response () =
+let test_body_timeout_before_response () =
+  let events = ref [] in
   let t =
     Raw.create (fun reqd ->
-      record_body (ref []) (Request_descriptor.request_body reqd))
+      record_body events (Request_descriptor.request_body reqd))
   in
   Raw.feed ~chunk:max_int t (post_head 10 ^ "01234");
+  (match Server_connection.read_timeout t.conn with
+  | Some (`Body, expire) -> expire ()
+  | _ ->
+    Alcotest.failf
+      "expected a body timeout while a body read waits, got %s"
+      (read_timeout_kind t.conn));
+  check_one_ending "body read" "error" events;
+  let output = ref "" in
+  let rec write () =
+    match Server_connection.next_write_operation t.conn with
+    | `Write iovecs ->
+      let s = Write_operation.iovecs_to_string iovecs in
+      output := !output ^ s;
+      Server_connection.report_write_result t.conn (`Ok (String.length s));
+      write ()
+    | `Yield | `Close _ -> ()
+  in
+  write ();
   Alcotest.(check string)
-    "no timeout while the response is pending"
+    "408 response"
+    "HTTP/1.1 408"
+    (String.sub !output 0 (min 12 (String.length !output)));
+  Alcotest.check read_operation "reader closed" `Close (Raw.read_op t);
+  Alcotest.(check bool)
+    "connection closed"
+    true
+    (Server_connection.is_closed t.conn)
+
+let test_eof_in_unread_body_after_response_closes () =
+  let t =
+    Raw.create (fun reqd ->
+      Request_descriptor.respond_with_string
+        reqd
+        (Response.create `Content_too_large)
+        "no")
+  in
+  Raw.feed ~chunk:max_int t (post_head 100000 ^ "abc");
+  Alcotest.(check bool) "writer waits" true (Raw.write_all t = `Yield);
+  let woken = ref false in
+  Server_connection.yield_writer t.conn (fun () -> woken := true);
+  Alcotest.check read_operation "reads the rest" `Read (Raw.read_op t);
+  Raw.feed ~eof:true ~chunk:max_int t "";
+  Alcotest.check read_operation "reader closed" `Close (Raw.read_op t);
+  Alcotest.(check bool) "writer woken" true !woken;
+  Alcotest.(check bool) "writer closed" true (Raw.write_all t = `Close);
+  Alcotest.(check bool)
+    "connection closed"
+    true
+    (Server_connection.is_closed t.conn)
+
+let test_no_body_timeout_while_the_handler_runs () =
+  let t = Raw.create (fun (_ : Request_descriptor.t) -> ()) in
+  Raw.feed ~chunk:max_int t (post_head 10 ^ "01234");
+  Alcotest.(check string)
+    "no timeout while no body read waits"
+    "none"
+    (read_timeout_kind t.conn);
+  let t = Raw.create (fun (_ : Request_descriptor.t) -> ()) in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  Alcotest.(check string)
+    "no timeout while a GET is handled"
     "none"
     (read_timeout_kind t.conn)
+
+let test_body_timeout_after_response_started () =
+  let events = ref [] in
+  let t =
+    Raw.create (fun reqd ->
+      record_body events (Request_descriptor.request_body reqd);
+      let body =
+        Request_descriptor.respond_with_streaming
+          ~flush_headers_immediately:true
+          reqd
+          (Response.create `OK)
+      in
+      Body.Writer.write_string body "x")
+  in
+  Raw.feed ~chunk:max_int t (post_head 10 ^ "01234");
+  (match Server_connection.read_timeout t.conn with
+  | Some (`Body, expire) -> expire ()
+  | _ ->
+    Alcotest.failf "expected a body timeout, got %s" (read_timeout_kind t.conn));
+  check_one_ending "body read" "error" events;
+  Alcotest.check read_operation "reader closed" `Close (Raw.read_op t)
 
 let test_connect_upgrade_status () =
   let impl () =
@@ -4619,9 +4700,155 @@ let test_connect_upgrade_status () =
     ]
     (List.rev !raised)
 
+let fixed_date = "Sun, 06 Nov 1994 08:49:37 GMT"
+
+let date_lines output =
+  String.split_on_char '\n' output
+  |> List.filter (fun line ->
+    String.length line >= 5
+    && String.lowercase_ascii (String.sub line 0 5) = "date:")
+
+let test_date_added () =
+  let t =
+    Raw.create
+      ~date:(fun () -> fixed_date)
+      (fun reqd ->
+         Request_descriptor.respond_with_string reqd (Response.create `OK) "")
+  in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  ignore (Raw.write_all t);
+  Alcotest.(check string)
+    "Date after the other fields"
+    ("HTTP/1.1 200 OK\r\ncontent-length: 0\r\nDate: " ^ fixed_date ^ "\r\n\r\n")
+    (Raw.take_output t)
+
+let test_date_kept_from_application () =
+  let calls = ref 0 in
+  let t =
+    Raw.create
+      ~date:(fun () ->
+        incr calls;
+        fixed_date)
+      (fun reqd ->
+         Request_descriptor.respond_with_string
+           reqd
+           (Response.create
+              ~headers:
+                (Headers.of_list [ "date", "Mon, 07 Nov 1994 00:00:00 GMT" ])
+              `OK)
+           "")
+  in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  ignore (Raw.write_all t);
+  Alcotest.(check (list string))
+    "only the application's date"
+    [ "date: Mon, 07 Nov 1994 00:00:00 GMT\r" ]
+    (date_lines (Raw.take_output t));
+  Alcotest.(check int) "date function not called" 0 !calls
+
+let test_date_not_on_informational () =
+  let t =
+    Raw.create
+      ~date:(fun () -> fixed_date)
+      (fun reqd ->
+         match (Request_descriptor.request reqd).target with
+         | "/upgrade" ->
+           Request_descriptor.respond_with_upgrade
+             reqd
+             (Headers.of_list [ "upgrade", "test" ])
+             (Ache.Runtime.make
+                (module Recorder)
+                { Recorder.got = ""; eof = false })
+         | _ ->
+           Request_descriptor.respond_with_informational
+             reqd
+             (Response.create `Continue);
+           Request_descriptor.respond_with_string reqd (Response.create `OK) "")
+  in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  ignore (Raw.write_all t);
+  Alcotest.(check string)
+    "100 without Date, 200 with Date"
+    ("HTTP/1.1 100 Continue\r\n\
+      \r\n\
+      HTTP/1.1 200 OK\r\n\
+      content-length: 0\r\n\
+      Date: "
+    ^ fixed_date
+    ^ "\r\n\r\n")
+    (Raw.take_output t);
+  Raw.feed
+    ~chunk:max_int
+    t
+    "GET /upgrade HTTP/1.1\r\n\
+     Host: a\r\n\
+     Connection: upgrade\r\n\
+     Upgrade: test\r\n\
+     \r\n";
+  ignore (Raw.write_all t);
+  Alcotest.(check string)
+    "101 without Date"
+    "HTTP/1.1 101 Switching Protocols\r\nupgrade: test\r\n\r\n"
+    (Raw.take_output t)
+
+let test_date_on_error_response () =
+  let t = Raw.create ~date:(fun () -> fixed_date) default_request_handler in
+  Raw.feed
+    ~chunk:max_int
+    t
+    "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n";
+  ignore (Raw.write_all t);
+  let output = Raw.take_output t in
+  Alcotest.(check bool)
+    "a 400"
+    true
+    (String.starts_with ~prefix:"HTTP/1.1 400" output);
+  Alcotest.(check (list string))
+    "one Date"
+    [ "Date: " ^ fixed_date ^ "\r" ]
+    (date_lines output)
+
+let test_no_date_by_default () =
+  let t =
+    Raw.create (fun reqd ->
+      Request_descriptor.respond_with_string reqd (Response.create `OK) "")
+  in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  Raw.feed
+    ~chunk:max_int
+    t
+    "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n";
+  ignore (Raw.write_all t);
+  Alcotest.(check (list string)) "no Date" [] (date_lines (Raw.take_output t))
+
+let test_imf_fixdate () =
+  List.iter
+    (fun (seconds, expected) ->
+       Alcotest.(check string)
+         (string_of_int seconds)
+         expected
+         (Ache.Ache_private.Http_date.imf_fixdate seconds);
+       Alcotest.(check string)
+         (string_of_int seconds ^ " cached")
+         expected
+         (Ache.Ache_private.Http_date.cached seconds))
+    [ 784111777, "Sun, 06 Nov 1994 08:49:37 GMT"
+    ; 0, "Thu, 01 Jan 1970 00:00:00 GMT"
+    ; 951782400, "Tue, 29 Feb 2000 00:00:00 GMT"
+    ; 951868799, "Tue, 29 Feb 2000 23:59:59 GMT"
+    ; 2147483648, "Tue, 19 Jan 2038 03:14:08 GMT"
+    ; 4102444800, "Fri, 01 Jan 2100 00:00:00 GMT"
+    ]
+
 let tests =
   [ "initial reader state", `Quick, test_initial_reader_state
   ; "shutdown reader closed", `Quick, test_reader_is_closed_after_eof
+  ; "Date added with ?date", `Quick, test_date_added
+  ; "Date from the application kept", `Quick, test_date_kept_from_application
+  ; "no Date on 1xx", `Quick, test_date_not_on_informational
+  ; "Date on an error response", `Quick, test_date_on_error_response
+  ; "no Date without ?date", `Quick, test_no_date_by_default
+  ; "Http_date.imf_fixdate", `Quick, test_imf_fixdate
   ; ( "commit parse after every header line"
     , `Quick
     , test_commit_parse_after_every_header )
@@ -4906,9 +5133,18 @@ let tests =
   ; ( "unread body after the response has a timeout"
     , `Quick
     , test_unread_body_after_response_is_timed )
-  ; ( "no body timeout before the response"
+  ; ( "body timeout before the response: on_error, then 408"
     , `Quick
-    , test_body_timeout_only_after_response )
+    , test_body_timeout_before_response )
+  ; ( "end of input in an unread body after the response closes"
+    , `Quick
+    , test_eof_in_unread_body_after_response_closes )
+  ; ( "no body timeout while the handler runs"
+    , `Quick
+    , test_no_body_timeout_while_the_handler_runs )
+  ; ( "body timeout after the response started closes"
+    , `Quick
+    , test_body_timeout_after_response_started )
   ]
 
 (* https://httpwg.org/specs/rfc9110.html For example, a CONNECT request (Section

@@ -184,6 +184,33 @@ let () =
     Unix.(ADDR_INET (inet_addr_loopback, port))
 ```
 
+## Graceful stop
+
+`Server.run`, `Server.create_connection_handler` and the TLS
+`create_connection_handler_with_fd` take `?stop:unit Miou.Computation.t`
+and `?grace:float`. Resolve `stop` with `Miou.Computation.try_return`
+(or cancel it) from any task of any domain. Then:
+
+1. `run` stops accepting in each domain and closes its listening sockets.
+   A connection accepted at the same moment is closed without a response,
+   and so is a socket given to a handler after `stop`.
+2. Each connection is drained (see [Graceful stop](ache.md#graceful-stop)
+   in ache.md). An idle connection closes at once: the runtime shuts down
+   reading on the socket to end the read that waits. A request in progress
+   finishes and its response gets `Connection: close`. A WebSocket gets a
+   close frame with code 1001. A TLS handshake in progress stops.
+3. `grace` seconds after `stop`, each connection that is still open is
+   cancelled with its tasks, its request handler and its WebSocket
+   sessions, and the socket is shut down. Without `grace` there is no
+   limit.
+4. `run` returns when every connection of every domain has ended.
+
+Each connection waits for `stop` in a task of its own, in the domain that
+accepted it, so `Server_connection.drain` runs where the connection runs.
+`grace` must be positive, or the handler raises `Invalid_argument`.
+Without `stop`, `run` does not return; cancelling its task still stops
+everything at once.
+
 ## WebSocket
 
 `Ache_miou.Websocket` gives the WebSocket server of
@@ -249,10 +276,12 @@ let request_handler _client_address reqd =
 - `close ?reason ws code` sends a close frame and returns when the frame is
   written or the connection has ended. It raises `Invalid_argument` at
   once for a code that an endpoint may not send, or a reason that is not
-  UTF-8 or longer than 123 bytes. The socket closes when the read in
-  progress ends too: when the client answers with its close frame or
-  closes the connection. There is no timeout for a client that does
-  neither.
+  UTF-8 or longer than 123 bytes. The connection then stops reading and
+  closes as any closing connection does: it waits for the client to close
+  at most `idle_timeout` (60 s by default), and at once without timeouts.
+- A session whose client sends nothing for `idle_timeout` (60 s by
+  default) gets a close frame with code 1001, and `receive` returns
+  `None`.
 - Messages that you have not received wait in a queue. When 8 messages
   wait, the connection stops reading from the client until `receive` takes
   one. Frames that one read already holds still join the queue.
@@ -314,11 +343,24 @@ core connection and starts the two loops as two child tasks:
 - **The reader task.** As in `ache-eio`, a read with a timeout goes through
   a separate reader task, and only the wait is stopped when the timeout
   fires. The client always reads through it, so `Client.shutdown` can stop
-  the wait. A server read of a request body before its response is
-  complete also goes through it, so that the write task can stop the wait
-  when the response completes (see [Timeouts](ache.md#timeouts)). Every
-  other read is direct. The reader task starts only on the first read that
-  needs it.
+  the wait. Every other read is direct: with the default timeouts, only
+  reads in a tunnel, or with every timeout set to `None`. The reader task
+  starts only on the first read that needs it.
+- **Body clock.** Before each read, the read task asks the core which
+  timeout applies (`Server_connection.read_timeout`). For `` `Body ``,
+  the read waits at most `body_timeout` minus the time already spent in
+  body waits of this request. After the read, the time waited and the
+  bytes read are added up; both start again from zero at each request and
+  once 2048 bytes have arrived. When the wait runs out, the read task asks
+  the core again and calls the action it gives (`on_error`, then 408 or a
+  close).
+- **Write clock.** Before a write, the write task starts the clock if it
+  is not running; it stops it when the core has nothing more to write, and
+  starts it again after each 2048 bytes written. A watchdog task sleeps
+  until the clock's deadline, at most 0.5 s at a time. If the clock is
+  still running then, it stops the connection as an error does: it cancels
+  the read and write tasks, tells the core that the write was `Closed`,
+  and shuts the socket down.
 - **Timers.** A timer sleeps at most 0.5 s at a time and then checks its
   deadline again. A cancelled sleep stays in Miou's timer heap until it
   ends, so a short sleep keeps that heap small.
@@ -344,6 +386,14 @@ core connection and starts the two loops as two child tasks:
   leaves the message for the next one. A cancelled wait completes its
   computation, and the next wait drops the completed ones, so many
   cancelled calls do not pile up.
+- **Graceful stop.** With `stop`, the connection task starts one more
+  child task that waits for `stop`. It calls `Server_connection.drain`,
+  shuts down reading on the socket when the connection is then closed, and
+  sleeps `grace`. Then it marks the sessions to be cancelled and stops the
+  connection as an error does: the connection task cancels the read and
+  write tasks and the sessions. With `stop`, the accept loop of `run`
+  waits for the listening socket or `stop`, whichever comes first, and
+  accepts with a non-blocking `accept`.
 
 ### Several domains
 
@@ -361,7 +411,16 @@ The application must ignore `SIGPIPE`. `Ache_miou.Server` and
 socket. For another socket type, implement `Ache_miou.IO` and apply
 `Ache_miou.Make`. Run the server handler in
 its own task for each accepted socket, and close the socket when it
-returns. Timeouts use `Miou_unix.sleep` and need no clock. With
+returns. The server timeouts are on by default (idle 60 s, head 30 s,
+body 60 s, write 60 s); `~idle_timeout:None` and the others turn one off.
+With an idle timeout of at least 1 s, persistent responses carry
+`Keep-Alive: timeout=n` (the idle timeout rounded down, with `max=` when
+`Config.max_requests_per_connection` is set), and the server waits 1 s
+longer than it announces. The client honours the hint: `n - 2` seconds
+(at most 598) after a response with `Keep-Alive: timeout=n`, an idle
+client connection closes, and `Client.request` on it after that time gets
+`` `Connection_closed `` before anything is written.
+Timeouts use `Miou_unix.sleep` and need no clock. With
 `?idle_timeout` or `?head_timeout`, when the server stops reading it reads
 and drops input until the peer stops sending. It waits at most
 `idle_timeout` (2 s without one) after it stops reading or after its last
@@ -371,6 +430,11 @@ timeout it closes at once. Handlers and body
 callbacks run in the connection tasks and must not leave a child task that
 they do not await. `Client.shutdown` must be called by the task that
 created the connection.
+
+The server adds a `Date` field with the current time to each response that
+is not 1xx and has none (RFC 9110 §6.6.1). The text is formatted once per
+second in each domain. `~date:false` on `create_connection_handler`, `run`
+or the TLS handler turns it off.
 
 ## TLS
 

@@ -225,11 +225,9 @@ It creates the core connection and starts the two loops:
   for each record. With the default 4 KiB buffer, each record takes 4
   writes.
 - **Timeouts.** A timed read is `Lwt.pick` of the socket read and
-  `Ache_lwt.Timeout.expired`. See [Timeouts](#timeouts) for why the timers
-  are shared. A read of a request body before its response is complete is
-  `Lwt.pick` of the socket read and a wait for the write loop, which
-  then gives the limit for the rest of the body (see
-  [Timeouts](ache.md#timeouts)).
+  `Ache_lwt.Timeout.expired`; a timed write is `Lwt.pick` of the `writev`
+  and the write timer. See [Timeouts](#timeouts) for which timer applies
+  and why the timers are shared.
 - **Errors.** If a write fails, or the core raises in `report_exn`, the
   connection resolves `failed`, and `Lwt.choose` closes the socket.
 
@@ -244,7 +242,50 @@ and `writev` returns `` `Closed `` when the peer is gone. The `Ache_lwt.IO`
 documentation has the full contract. The Lwt server does not wait for the
 peer to close after the last response.
 
+The server adds a `Date` field with the current time to each response that
+is not 1xx and has none (RFC 9110 §6.6.1). The text is formatted once per
+second in each domain. `~date:false` on `create_connection_handler` or the
+TLS handler turns it off.
+
 ### Timeouts
+
+The server timeouts are on by default; `~idle_timeout:None` (and so on)
+turns one off. The TLS handler takes the same arguments.
+
+| Argument | Default | Applies while |
+|---|---|---|
+| `?idle_timeout` | `Some 60.` | no request is in progress, or a WebSocket waits for a frame (it closes with 1001) |
+| `?head_timeout` | `Some 30.` | a request head is partly read (408) |
+| `?body_timeout` | `Some 60.` | the connection waits for request body bytes (408 if no response started, else close) |
+| `?write_timeout` | `Some 60.` | output waits to be written, for example to a client that stopped reading (close) |
+
+With `?idle_timeout:(Some x)` and `x >= 1.`, a response after which the
+connection stays open gets `Keep-Alive: timeout=n`, with `n` the whole
+seconds of `x` (and `, max=m` when `Config.max_requests_per_connection` is
+set), unless the application set `Keep-Alive`. The timer between requests
+then runs `x + 1` seconds, so that a client that trusts the hint never
+writes into a connection that is closing. A WebSocket keeps `x`.
+
+The client reads the hint: `Client_connection.reuse_timeout` gives `s`,
+`timeout` (at most 600) minus 2 seconds. `s` seconds after it sees the end
+of the response, an idle `Ache_lwt.Client` connection shuts down, and a
+`request` made after that time gets `` `Connection_closed `` without
+writing anything, also when the timer has not run yet. The TLS client does
+the same.
+
+Before each read, the server asks the core which timeout applies
+(`Server_connection.read_timeout`). While the request handler runs and the
+connection waits for nothing from the client, no timeout applies.
+
+The body and write timeouts measure progress, not single reads or writes:
+their clock restarts only after 2048 bytes, so a client that sends or reads
+one byte at a time cannot keep a connection. The body clock counts only
+while a read waits for body bytes. It counts ticks of a tenth of
+`body_timeout`, so all connections with the same `body_timeout` share one
+timer queue, and the timeout can end up to a tenth late. The write clock
+runs while output is pending and restarts when all of it is written. When
+it runs out, the server closes the socket and ends the connection, and
+pending `Body.Writer.flush` callbacks get `` `Closed ``.
 
 With Lwt's `select` and `poll` engines, a cancelled `Lwt_unix.sleep` stays in
 memory until no other sleep ends before it. A server that starts one sleep
@@ -255,8 +296,8 @@ frees a cancelled sleep at once.
 `Ache_lwt.Timeout` avoids this. All timeouts of one length share one queue,
 in deadline order, and one sleep for the front of the queue that is never
 cancelled. `set` and `stop` only move an entry in the queue. The servers of
-`ache-lwt` and `ache-lwt-tls` use it for `?idle_timeout`, `?head_timeout` and
-the TLS handshake. An application can use it for its own timeouts:
+`ache-lwt` and `ache-lwt-tls` use it for each server timeout and the TLS
+handshake. An application can use it for its own timeouts:
 
 ```ocaml
 let read_with_timeout timeout read =
@@ -275,6 +316,68 @@ let read_with_timeout timeout read =
 Create the timeout once, for example with `Ache_lwt.Timeout.create 30.`, and
 reuse it for each read. Cancelling the `expired` promise, as `Lwt.pick` does,
 does not change the timeout.
+
+### Graceful stop
+
+`create_connection_handler` takes `?stop:unit Lwt.t` and `?grace:float`.
+Give the same `stop` promise to every connection. When it resolves, each
+connection calls `Ache.Server_connection.drain`:
+
+1. An idle connection closes at once.
+2. A connection with a request in progress serves it, with
+   `Connection: close` if its head is not written yet, and then closes.
+   Requests pipelined after it are not served.
+3. A WebSocket connection sends a close frame with code 1001.
+4. `grace` seconds after `stop`, a connection that is still open is
+   cancelled: its socket closes, and the promise of the connection
+   resolves without waiting for the request handler. Without `grace` there
+   is no limit.
+
+A connection handler applied after `stop` resolved closes the socket
+without reading a request. With `ache-lwt-tls`, a handshake in progress at
+`stop` is closed. The handler does not stop the accept loop; the server
+does that and waits for its connections:
+
+```ocaml
+let serve listen_address =
+  let open Lwt.Syntax in
+  let stop, stop_now = Lwt.wait () in
+  let (_ : Lwt_unix.signal_handler_id) =
+    Lwt_unix.on_signal Sys.sigterm (fun _ ->
+      if Lwt.is_sleeping stop then Lwt.wakeup_later stop_now ())
+  in
+  let open_connections = ref 0
+  and closed = Lwt_condition.create () in
+  let* server =
+    Lwt_io.establish_server_with_client_socket listen_address (fun addr fd ->
+      incr open_connections;
+      Lwt.finalize
+        (fun () ->
+          Ache_lwt.Server.create_connection_handler
+            ~stop
+            ~grace:10.
+            ~request_handler
+            ~error_handler
+            addr
+            fd)
+        (fun () ->
+          decr open_connections;
+          Lwt_condition.broadcast closed ();
+          Lwt.return_unit))
+  in
+  let* () = stop in
+  let* () = Lwt_io.shutdown_server server in
+  let rec all_closed () =
+    if !open_connections = 0
+    then Lwt.return_unit
+    else Lwt.bind (Lwt_condition.wait closed) all_closed
+  in
+  all_closed ()
+```
+
+The callback that each connection puts on `stop` is removed when the
+connection ends, so a `stop` that stays pending for the life of the server
+does not grow with the number of connections served.
 
 ## TLS
 

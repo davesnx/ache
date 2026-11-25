@@ -43,11 +43,16 @@ module Server : sig
 
   val run :
      ?config:Ache.Config.t
-    -> ?idle_timeout:float
-    -> ?head_timeout:float
+    -> ?idle_timeout:float option
+    -> ?head_timeout:float option
+    -> ?body_timeout:float option
+    -> ?write_timeout:float option
+    -> ?date:bool
     -> ?domains:int
     -> ?backlog:int
     -> ?tcp_nodelay:bool
+    -> ?stop:unit Miou.Computation.t
+    -> ?grace:float
     -> on_error:(exn -> unit)
     -> request_handler:(Unix.sockaddr -> Ache.Request_descriptor.t -> unit)
     -> error_handler:(Unix.sockaddr -> Ache.Server_connection.error_handler)
@@ -66,8 +71,9 @@ module Server : sig
 
       Call it inside [Miou_unix.run]. Each accepted socket is served in its
       own task, in the domain that accepted it, by the handler from
-      {!create_connection_handler}, which takes [config], [idle_timeout],
-      [head_timeout], [request_handler] and [error_handler].
+      {!create_connection_handler}, which takes [config], the four timeouts
+      (on by default), [date], [stop], [grace], [request_handler] and
+      [error_handler].
       [request_handler] and [error_handler] run in several domains at the
       same time. When the handler of a connection raises (see
       {!create_connection_handler}), [on_error] is called with the exception
@@ -88,9 +94,21 @@ module Server : sig
       [domains] defaults to all domains: [Miou_unix.run ~domains:n] gives
       [n + 1]. [backlog] defaults to 128, [tcp_nodelay] to [false].
 
-      [run] does not return. Cancel its task to stop all domains. If
-      [on_error] raises, or a listen or another accept error occurs in one
-      domain, [run] cancels all domains and raises the exception.
+      Graceful stop: when [stop] is resolved (returned or cancelled, from any
+      domain), each domain stops accepting and closes its listening socket.
+      A connection that the kernel queued but that was not accepted yet is
+      reset when the socket closes; one accepted at the same time as [stop]
+      is closed without a response. Each connection is drained as
+      {!create_connection_handler} describes for [stop] and [grace]: idle
+      connections close at once, requests in progress finish with
+      [Connection: close], and [grace] seconds after [stop] what is left is
+      cancelled. [run] returns when every connection of every domain has
+      ended.
+
+      Without [stop], [run] does not return. Cancelling its task stops all
+      domains at once, with their connections. If [on_error] raises, or a
+      listen or another accept error occurs in one domain, [run] cancels all
+      domains and raises the exception.
 
       @raise Invalid_argument
         if [domains] is less than 1 or more than the domains available, if
@@ -218,12 +236,14 @@ module Websocket : sig
   val close : ?reason:string -> t -> int -> unit
   (** [close ?reason t code] sends a close frame with [code] and [reason] (see
       {!Ache.Websocket.close}). It returns when the connection is closed: the
-      frame is written, or the connection ended. The socket closes when the
-      read in progress also ends: when the client answers with its close
-      frame or closes the connection.
+      frame is written, or the connection ended. The connection stops
+      reading, and closes as any closing connection of
+      {!Server.create_connection_handler} does: it reads and drops input
+      until the client closes, at most [idle_timeout] (the default), and at
+      once without timeouts.
 
-      There is no timeout: when the client neither answers nor closes, the
-      connection stays open until its task is cancelled.
+      A session whose client sends nothing for [idle_timeout] is closed with
+      code 1001: {!receive} returns [None].
 
       @raise Invalid_argument
         at once if [code] is not one an endpoint may send, or [reason] is not

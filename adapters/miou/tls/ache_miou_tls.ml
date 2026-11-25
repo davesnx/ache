@@ -182,13 +182,33 @@ module Io = struct
 
   let shutdown t command =
     (match command with
-    | Unix.SHUTDOWN_SEND | SHUTDOWN_ALL ->
+    | Unix.SHUTDOWN_SEND ->
       if not t.close_notify_sent
       then (
         t.close_notify_sent <- true;
         let state, data = Tls.Engine.send_close_notify t.state in
         t.state <- state;
         send_ignoring_errors t data)
+    | SHUTDOWN_ALL ->
+      (* The connection is stopped at once, maybe because a write is stuck: send
+         close_notify only if it does not wait. *)
+      if not t.close_notify_sent
+      then (
+        t.close_notify_sent <- true;
+        if (not t.writing) && Queue.is_empty t.output
+        then (
+          let state, data = Tls.Engine.send_close_notify t.state in
+          t.state <- state;
+          try
+            ignore
+              (Unix.single_write_substring
+                 (Miou_unix.to_file_descr t.fd)
+                 data
+                 0
+                 (String.length data)
+               : int)
+          with
+          | Unix.Unix_error _ -> ()))
     | SHUTDOWN_RECEIVE -> ());
     shutdown_tcp t command
 end
@@ -216,10 +236,20 @@ let sleep_until at =
 module Server = struct
   include Server
 
+  (* The defaults of [Ache_miou.Server.create_connection_handler], which the
+     handshake limit needs. *)
+  let default_idle_timeout = Some 60.
+  let default_head_timeout = Some 30.
+
   let create_connection_handler_with_fd
         ?config
-        ?idle_timeout
-        ?head_timeout
+        ?(idle_timeout = default_idle_timeout)
+        ?(head_timeout = default_head_timeout)
+        ?body_timeout
+        ?write_timeout
+        ?date
+        ?stop
+        ?grace
         ~tls
         ~request_handler
         ~error_handler
@@ -227,12 +257,29 @@ module Server = struct
     let handler =
       create_connection_handler
         ?config
-        ?idle_timeout
-        ?head_timeout
+        ~idle_timeout
+        ~head_timeout
+        ?body_timeout
+        ?write_timeout
+        ?date
+        ?stop
+        ?grace
         ~request_handler
         ~error_handler
     in
     fun fd client_addr ->
+      let stopped =
+        match stop with
+        | None -> []
+        | Some stop ->
+          [ Miou.async (fun () ->
+              (match Miou.Computation.await stop with
+              | Error (exn, bt) when Miou.Computation.is_running stop ->
+                Printexc.raise_with_backtrace exn bt
+              | Ok () | Error _ -> ());
+              None)
+          ]
+      in
       let timer =
         match handshake_limit idle_timeout head_timeout with
         | None -> []
@@ -245,7 +292,8 @@ module Server = struct
       in
       match
         Miou.await_first
-          (Miou.async (fun () -> Some (server_of_fd tls fd)) :: timer)
+          ((Miou.async (fun () -> Some (server_of_fd tls fd)) :: timer)
+          @ stopped)
       with
       | Ok (Some socket) -> handler socket client_addr
       | Ok None | Error _ -> ()

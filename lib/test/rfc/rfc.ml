@@ -384,6 +384,7 @@ module Server = struct
         ?config
         ?(handler = echo)
         ?(error_handler = default_error_handler)
+        ?date
         ()
     =
     let state = ref None in
@@ -407,14 +408,14 @@ module Server = struct
       error_handler ?request error respond
     in
     let conn =
-      Server_connection.create ?config ~error_handler request_handler
+      Server_connection.create ?config ~error_handler ?date request_handler
     in
     let s = { driver = Driver.make conn; exchanges = []; errors = [] } in
     state := Some s;
     s
 
-  let run ?config ?handler ?error_handler ?(eof = false) input =
-    let s = create ?config ?handler ?error_handler () in
+  let run ?config ?handler ?error_handler ?date ?(eof = false) input =
+    let s = create ?config ?handler ?error_handler ?date () in
     Driver.feed s.driver input;
     if eof then Driver.close_input s.driver;
     s
