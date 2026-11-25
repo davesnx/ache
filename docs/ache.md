@@ -118,6 +118,10 @@ ache accepts HTTP/1.x with x > 1 as HTTP/1.1, one empty line before the
 request line, chunk extensions (ignored) and trailer fields (see
 [Trailers](#trailers)). httpun rejected chunk extensions and trailers.
 
+A `CONNECT` request has no body (RFC 9110 §9.3.6): the server ignores its
+`Content-Length` and `Transfer-Encoding` fields, as llhttp does, and does
+not check them. The bytes after the head belong to the tunnel.
+
 ### Responses
 
 - ache adds `Content-Length` to a string or bigstring response, and
@@ -151,7 +155,8 @@ request line, chunk extensions (ignored) and trailer fields (see
   reading the body sends no `100 Continue`.
 - `Request_descriptor.respond_with_upgrade` on a `CONNECT` request sends a
   2xx (`200` unless `?status` says otherwise) and gives the connection to
-  the tunnel, with the bytes that came after the `CONNECT` head. Any other
+  the tunnel, with the bytes that came after the `CONNECT` head, also when
+  the request has `Content-Length` or `Transfer-Encoding`. Any other
   response to `CONNECT` closes the connection, and the bytes after the
   request are not read: they may be tunnel data. A 2xx is sent as it is,
   another status gets `connection: close`.

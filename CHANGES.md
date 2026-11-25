@@ -201,6 +201,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 - Every response to `CONNECT` other than `respond_with_upgrade` closes the
   connection, and the bytes after the request are not read. A non-2xx
   response let the connection read them as the next request.
+- A `CONNECT` request has no body: the server ignores its `Content-Length`
+  and `Transfer-Encoding` (RFC 9110 §9.3.6). It read a body framed by them.
 - The client accepts a status-line with CRLF right after the status code
   (`HTTP/1.1 301\r\n`) and gives `` `Malformed_response `` for a response
   whose `Transfer-Encoding` lists no coding.

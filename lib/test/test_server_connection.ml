@@ -3479,6 +3479,17 @@ let switching_requests =
        Upgrade: echo\r\n\
        \r\n" )
   ; "CONNECT", "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n\r\n"
+    (* Decision 0016: a CONNECT request has no body, whatever its framing fields
+       say. *)
+  ; ( "CONNECT with Content-Length"
+    , "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\nContent-Length: 5\r\n\r\n" )
+  ; ( "CONNECT with Transfer-Encoding"
+    , "CONNECT a:443 HTTP/1.1\r\n\
+       Host: a:443\r\n\
+       Transfer-Encoding: chunked\r\n\
+       \r\n" )
+  ; ( "CONNECT with an invalid Content-Length"
+    , "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\nContent-Length: x\r\n\r\n" )
   ]
 
 let upgrade_response_for request =

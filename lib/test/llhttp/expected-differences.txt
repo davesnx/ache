@@ -43,5 +43,4 @@ request/content-length.md:447 | harness | skipBody: llhttp skips the body of a r
 request/invalid.md:493 | harness | input ends inside the request line; llhttp fails at the version, ache at the line end
 
 # gaps
-request/method.md:99 | ticket: task 26 | CONNECT with Content-Length: ache reads a body (RFC 9110 §9.3.6: no content)
 request/connection.md:159 | ticket: task 27 | two CRLFs between pipelined requests: ache allows one

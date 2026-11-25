@@ -239,6 +239,9 @@ let received_body_length ({ meth; target; version; headers } as t) =
       Error (`Bad_request "userinfo or an empty host in the request-target")
     | _ when not (target_fits_method meth target) ->
       Error (`Bad_request "request-target does not fit the method")
+    (* RFC 9110 §9.3.6: a CONNECT request has no content; its framing fields are
+       ignored (decision 0016). *)
+    | _ when meth = `CONNECT -> Ok (`Fixed 0L)
     | _ ->
       (match transfer_coding_error t with
       | Some error -> Error error

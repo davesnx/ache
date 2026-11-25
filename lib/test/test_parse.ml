@@ -1358,6 +1358,28 @@ let test_connect_refused_closes () =
          && Server_connection.is_closed conn))
     (all_splits input)
 
+(* Decision 0016: a CONNECT request has no body; its framing fields are
+   ignored. *)
+let test_connect_no_body () =
+  List.iter
+    (fun field ->
+       check_server
+         ~expect:
+           [ ( Printf.sprintf
+                 {|"CONNECT" "a:443" HTTP/1.1 ["Host":"a:443";%s]|}
+                 (match String.split_on_char ':' field with
+                 | [ name; value ] ->
+                   Printf.sprintf "%S:%S" name (String.trim value)
+                 | _ -> assert false)
+             , "" )
+           ]
+         ("CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n" ^ field ^ "\r\n\r\n"))
+    [ "Content-Length: 5"
+    ; "Content-Length: x"
+    ; "Transfer-Encoding: chunked"
+    ; "Transfer-Encoding: gzip"
+    ]
+
 let test_status_line_without_reason () =
   check_client
     ~expect:[ {|HTTP/1.1 301 "" ["Content-Length":"2"]|}, "ok" ]
@@ -1446,6 +1468,7 @@ let tests =
   ; ( "CONNECT refused: closes, next bytes not served"
     , `Quick
     , test_connect_refused_closes )
+  ; "CONNECT: framing fields ignored, no body", `Quick, test_connect_no_body
   ; ( "status-line without reason (client)"
     , `Quick
     , test_status_line_without_reason )
