@@ -215,7 +215,8 @@ let close_payload ?(reason = "") code =
 
 let stop_reading t =
   t.reading <- Stopped;
-  wake_reader t
+  wake_reader t;
+  wake_writer t
 
 let send_close t payload =
   if t.writing = Open
@@ -248,11 +249,13 @@ let valid_close_code code =
   || (code >= 1007 && code <= 1014)
   || (code >= 3000 && code <= 4999)
 
+(* [peer_close] is set before [stop_reading]: that wakes the writer, which
+   finishes the connection when our close frame is already written. *)
 let on_close_frame t payload =
-  stop_reading t;
   match String.length payload with
   | 0 ->
     t.peer_close <- Some { code = 1005; reason = "" };
+    stop_reading t;
     send_close t ""
   | 1 -> fail t 1002
   | n ->
@@ -264,6 +267,7 @@ let on_close_frame t payload =
     then fail t 1007
     else (
       t.peer_close <- Some { code; reason };
+      stop_reading t;
       send_close t (close_payload code))
 
 (* RFC 3629 §4: the next byte of a text message, given the bytes before it.
@@ -340,7 +344,11 @@ let end_frame t =
       let message = Stdlib.Buffer.contents t.message in
       Stdlib.Buffer.clear t.message;
       t.fragmented <- false;
-      t.handler.on_message (if t.text then Text message else Binary message)
+      (* After our close frame, messages are dropped while we wait for the
+         peer's (RFC 6455 §1.4). *)
+      if t.writing = Open
+      then
+        t.handler.on_message (if t.text then Text message else Binary message)
 
 let read_header t bs ~off ~len =
   if len < 2
@@ -496,6 +504,9 @@ let next_write_operation t =
   | (Open | Closing) when len > 0 ->
     `Write [ { IOVec.buffer = t.inflight; off = t.inflight_off; len } ]
   | Open -> `Yield
+  | Closing when t.reading <> Stopped ->
+    (* Our close frame is written: wait for the peer's (RFC 6455 §7.1.1). *)
+    `Yield
   | Closing ->
     finish t;
     `Close 0
@@ -549,8 +560,13 @@ let close ?(reason = "") t ~code =
   then invalid_arg "Ache.Websocket.close: reason longer than 123 bytes";
   if not (String.is_valid_utf_8 reason)
   then invalid_arg "Ache.Websocket.close: reason is not valid UTF-8";
-  stop_reading t;
-  send_close t (close_payload ~reason code)
+  if t.writing = Open
+  then (
+    (* Keep reading until the peer's close frame or the end of input; the
+       messages before it are dropped, so the queue no longer pauses. *)
+    send_close t (close_payload ~reason code);
+    t.paused <- false;
+    wake_reader_unless_blocked t)
 
 let default_max_message_size = 1 lsl 20
 

@@ -403,7 +403,10 @@ module Websocket = struct
         (* The fork runs at once: wait until [upgrade] has returned. *)
         Fiber.yield ();
         match session t with
-        | () | (exception Closed) -> ()
+        | () | (exception Closed) ->
+          (* Nothing reads the messages any more: close, unless the connection
+             already ended. *)
+          Ache.Websocket.close t.connection ~code:1000
         | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
         | exception exn ->
           context.session_failed exn (Printexc.get_raw_backtrace ());

@@ -116,11 +116,13 @@ module Websocket : sig
       it responds with [101] when the request is a valid opening handshake,
       starts [session] with the new connection, and returns [Ok ()]. When it
       returns [Error _], it responded nothing and [session] does not run:
-      respond, for example with [400].
+      respond, for example with [426] and [Sec-WebSocket-Version: 13] for
+      [`Unsupported_version], [400] otherwise.
 
       [session] runs like [Lwt.async]: the request handler does not wait for
-      it. {!Closed} raised by [session] is ignored, so a session can end on a
-      failed send. Another exception sends a close frame with code [1011],
+      it. When the promise of [session] resolves, or fails with {!Closed},
+      the connection closes with code [1000], unless it has already ended:
+      a session can end on a failed send. Another exception sends a close frame with code [1011],
       then goes to [Lwt.async_exception_hook]. The default hook exits the
       program: a server sets its own.
 
@@ -155,7 +157,8 @@ module Websocket : sig
       only the latest ping, or send pongs unasked), and fails with {!Closed}
       when the connection closes first. To find a client that is gone:
       [Lwt_unix.with_timeout 30. (fun () -> ping t "")], then {!close} on
-      [Lwt_unix.Timeout]. The promise can be cancelled.
+      [Lwt_unix.Timeout], with a timeout too: a client that is gone does not
+      answer the close frame. The promise can be cancelled.
 
       The pong comes after the messages the client sent before it. While 8
       messages wait for {!receive}, reading is paused, so the pong is not
@@ -167,16 +170,19 @@ module Websocket : sig
 
   val client_close : t -> Ache.Websocket.close option
   (** [client_close t] is the client's close frame (code and reason), once
-      {!receive} returned [None]: see the [on_close] of
-      {!Ache.Websocket.handler}. [None] before that, or when the client sent
-      no valid close frame. *)
+      the connection has ended: see the [on_close] of
+      {!Ache.Websocket.handler}. It is set when the connection ends, also
+      while {!receive} still returns queued messages. [None] before that, or
+      when the connection ended without a valid close frame from the client:
+      an end of input, a reset, a protocol error, or the server's own close
+      that the client did not answer. *)
 
   val close : ?reason:string -> t -> int -> unit Lwt.t
   (** [close ?reason t code] sends a close frame with [code] and [reason] (see
-      {!Ache.Websocket.close}). The promise resolves when the connection is
-      closed: the frame is written, or the connection ended. The socket
-      closes when the read in progress also ends: when the client answers
-      with its close frame or closes the connection.
+      {!Ache.Websocket.close}). The promise resolves when the connection has
+      ended: the client answered with its close frame (then in
+      {!client_close}), closed the connection, or the connection failed.
+      Messages that arrive meanwhile are dropped.
 
       There is no timeout: when the client neither answers nor closes, the
       socket stays open until the caller closes the socket it gave to

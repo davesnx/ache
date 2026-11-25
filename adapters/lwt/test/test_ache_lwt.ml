@@ -111,9 +111,11 @@ let ws_echo ws =
             (fun next ->
                end_ws
                  (Ok
-                    (match next with
-                    | None -> "closed, receive None"
-                    | Some m -> "received " ^ text_of m)))
+                    (match next, Ache_lwt.Websocket.client_close ws with
+                    | None, None -> "closed, no client close"
+                    | None, Some { code; reason } ->
+                      Printf.sprintf "closed, client close %d %S" code reason
+                    | Some m, _ -> "received " ^ text_of m)))
             (Ache_lwt.Websocket.receive ws))
       | Some (Text "ping-me") ->
         Lwt.bind (Ache_lwt.Websocket.ping ws "are you there") (fun () ->
@@ -202,6 +204,13 @@ let request_handler (_ : Unix.sockaddr) reqd =
       reqd
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (echo_server ())
+  | `GET, "/ws-return" ->
+    (match
+       Ache_lwt.Websocket.upgrade reqd (fun ws ->
+         Ache_lwt.Websocket.send_text ws "hi")
+     with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
   | `GET, "/ws-raise" ->
     (match
        Ache_lwt.Websocket.upgrade reqd (fun _ -> Lwt.fail Ws_session_failed)
@@ -821,12 +830,15 @@ let test_websocket_server_close () =
     write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
     read_ws_frame socket >>= fun close ->
     Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    (* The server waits for the client's close frame and drops the message
+       before it. *)
+    write_all socket (ws_frame 0x1 "dropped" ^ ws_frame 0x8 "\x0f\xa0done")
+    >>= fun () ->
     ended >>= fun result ->
     Alcotest.(check (result string reject))
-      "close resolved"
-      (Ok "closed, receive None")
+      "close resolved with the client's close frame"
+      (Ok "closed, client close 4000 \"done\"")
       result;
-    write_all socket (ws_frame 0x8 "\x03\xe9") >>= fun () ->
     read_all socket >>= fun rest ->
     Alcotest.(check string) "then end of input" "" rest;
     Lwt_unix.close socket);
@@ -857,7 +869,7 @@ let test_websocket_ping () =
       "close with a reason"
       (0x88, "\x0f\xa0done here")
       close;
-    Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
+    write_all socket (ws_frame 0x8 "\x0f\xa0") >>= fun () ->
     ended >>= fun result ->
     Alcotest.(check (result string reject))
       "close resolved"
@@ -885,9 +897,7 @@ let test_websocket_session_exception () =
            "close 1011"
            (0x88, "\x03\xf3")
            close;
-         (* The server does not wait for a close frame: sending one could meet a
-            closed socket and a reset. *)
-         Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
+         write_all socket (ws_frame 0x8 "\x03\xf3") >>= fun () ->
          read_all socket >>= fun rest ->
          Alcotest.(check string) "then end of input" "" rest;
          Lwt_unix.close socket);
@@ -895,6 +905,26 @@ let test_websocket_session_exception () =
          "the hook got the exception"
          true
          (!hooked = [ Ws_session_failed ]));
+  check_server_sockets_closed ()
+
+let test_websocket_session_return_closes () =
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-return") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    read_ws_frame socket >>= fun hi ->
+    Alcotest.(check (pair int string)) "hi" (0x81, "hi") hi;
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string))
+      "close 1000 when the session returns"
+      (0x88, "\x03\xe8")
+      close;
+    write_all socket (ws_frame 0x1 "unread" ^ ws_frame 0x8 "\x03\xe8")
+    >>= fun () ->
+    read_all socket >>= fun rest ->
+    Alcotest.(check string) "then end of input" "" rest;
+    Lwt_unix.close socket);
   check_server_sockets_closed ()
 
 let test_websocket_receive_backpressure () =
@@ -1799,6 +1829,9 @@ let () =
         ; "WebSocket echo and close", `Quick, test_websocket_echo
         ; "WebSocket server close", `Quick, test_websocket_server_close
         ; "WebSocket ping, pong and close reason", `Quick, test_websocket_ping
+        ; ( "WebSocket session that returns closes 1000"
+          , `Quick
+          , test_websocket_session_return_closes )
         ; ( "WebSocket session exception closes 1011"
           , `Quick
           , test_websocket_session_exception )

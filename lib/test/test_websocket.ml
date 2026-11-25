@@ -581,7 +581,7 @@ let test_ping () =
   check_output ~msg:"nothing written by the raise" c "" `Yield;
   Websocket.close (ws c) ~code:1000;
   Websocket.ping (ws c) "late";
-  check_output ~msg:"no ping after close" c (close_frame_out 1000) `Close
+  check_output ~msg:"no ping after close" c (close_frame_out 1000) `Yield
 
 let test_close_reason () =
   let c = upgraded () in
@@ -595,11 +595,11 @@ let test_close_reason () =
     (fun () -> Websocket.close ~reason:(String.make 124 'r') (ws c) ~code:1000);
   check_output ~msg:"nothing written by the raises" c "" `Yield;
   Websocket.close ~reason:"bye" (ws c) ~code:1000;
-  check_output c "\x88\x05\x03\xe8bye" `Close;
+  check_output c "\x88\x05\x03\xe8bye" `Yield;
   let c = upgraded () in
   let reason = String.make 123 'r' in
   Websocket.close ~reason (ws c) ~code:4000;
-  check_output c ("\x88\x7d\x0f\xa0" ^ reason) `Close
+  check_output c ("\x88\x7d\x0f\xa0" ^ reason) `Yield
 
 let test_length_boundaries () =
   let c = upgraded () in
@@ -718,17 +718,65 @@ let test_write_closed_no_spin () =
   Alcotest.(check bool) "is_closed" true (Websocket.is_closed (ws c));
   check_closed c [ None ]
 
+let read_operation c =
+  match Server_connection.next_read_operation c.server with
+  | `Read -> "`Read"
+  | `Yield -> "`Yield"
+  | `Close -> "`Close"
+
 let test_server_close () =
   let c = upgraded () in
   Websocket.close (ws c) ~code:1001;
-  check_reader_closed c;
   Websocket.send_text (ws c) "dropped";
-  check_output c (close_frame_out 1001) `Close;
-  check_closed c [ None ];
+  Websocket.close (ws c) ~code:1000;
+  check_output
+    ~msg:"one close frame, then wait for the client's"
+    c
+    (close_frame_out 1001)
+    `Yield;
+  Alcotest.(check string) "still reading" "`Read" (read_operation c);
+  feed
+    c
+    (client_frame 0x1 "dropped"
+    ^ client_frame 0x9 "no pong"
+    ^ client_frame 0x8 (close_payload 4000 ^ "done"));
+  check_messages c [];
+  check_reader_closed c;
+  check_output ~msg:"no pong, no second close frame" c "" `Close;
+  check_close_reasons c [ Some (4000, "done") ];
   Alcotest.check_raises
     "reserved code"
     (Invalid_argument "Ache.Websocket.close: invalid close code")
     (fun () -> Websocket.close (ws c) ~code:1006)
+
+let test_server_close_eof () =
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1001;
+  check_output c (close_frame_out 1001) `Yield;
+  feed_eof c;
+  check_reader_closed c;
+  check_output ~msg:"closes at the end of input" c "" `Close;
+  check_closed c [ None ]
+
+let test_server_close_resumes_reading () =
+  let c = upgraded () in
+  Websocket.pause_reading (ws c);
+  Alcotest.(check string) "paused" "`Yield" (read_operation c);
+  Websocket.close (ws c) ~code:1000;
+  check_output c (close_frame_out 1000) `Yield;
+  Alcotest.(check string) "reads the client's close" "`Read" (read_operation c);
+  feed c (client_frame 0x8 (close_payload 1000));
+  check_output c "" `Close;
+  check_closed c [ Some 1000 ]
+
+let test_server_close_protocol_error () =
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1000;
+  check_output c (close_frame_out 1000) `Yield;
+  feed c (client_frame ~rsv:1 0x1 "x");
+  check_reader_closed c;
+  check_output ~msg:"no second close frame" c "" `Close;
+  check_closed c [ None ]
 
 let test_101_not_written () =
   let c = connect () in
@@ -738,12 +786,6 @@ let test_101_not_written () =
   | _ -> Alcotest.fail "expected the 101");
   check_closed c [ None ];
   Alcotest.(check bool) "is_closed" true (Websocket.is_closed (ws c))
-
-let read_operation c =
-  match Server_connection.next_read_operation c.server with
-  | `Read -> "`Read"
-  | `Yield -> "`Yield"
-  | `Close -> "`Close"
 
 let test_pong_backpressure () =
   let c = upgraded () in
@@ -836,6 +878,11 @@ let tests =
     , `Quick
     , test_write_closed_no_spin )
   ; "server close", `Quick, test_server_close
+  ; "server close, then end of input", `Quick, test_server_close_eof
+  ; "server close resumes reading", `Quick, test_server_close_resumes_reading
+  ; ( "server close, then a protocol error"
+    , `Quick
+    , test_server_close_protocol_error )
   ; "101 not written shuts the connection down", `Quick, test_101_not_written
   ; "pongs to a client that does not read", `Quick, test_pong_backpressure
   ; "pause and resume reading", `Quick, test_pause_reading

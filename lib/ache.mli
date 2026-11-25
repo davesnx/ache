@@ -656,9 +656,10 @@ end
       byte that cannot start or continue valid UTF-8 fails the connection,
       without reading the rest of the message.
 
-    After it sends a close frame, the connection reads no more messages and
-    closes the TCP connection once the frame is written. It does not wait for
-    the client's close frame.
+    After it sends a close frame, the connection drops the messages that
+    still arrive and closes the TCP connection at the client's close frame or
+    the end of input (RFC 6455 §7.1.1). After a protocol error it reads
+    nothing more.
 
     ache has no timeout on an upgraded connection. A client that stops
     reading, or never answers a close frame, keeps the connection open until
@@ -770,9 +771,13 @@ module Websocket : sig
 
   val close : ?reason:string -> t -> code:int -> unit
   (** [close ?reason t ~code] sends a close frame with [code] and [reason]
-      (default [""]), stops reading messages, and closes the connection when
-      the frame is written. It does nothing when the connection already
-      started to close.
+      (default [""]) and completes the closing handshake: it keeps reading
+      until the client's close frame or the end of input, then closes the
+      connection (RFC 6455 §7.1.1). Messages that arrive meanwhile are
+      dropped, and reading is no longer paused. [on_close] gets the client's
+      close frame. There is no timeout for a client that neither answers nor
+      closes. [close] does nothing when the connection already started to
+      close.
 
       @raise Invalid_argument
         if [code] is not one that an endpoint may send: [1000] to [1003],
