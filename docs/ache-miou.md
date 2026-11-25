@@ -186,10 +186,86 @@ let () =
 
 ## WebSocket
 
-`ache-miou` has no promise API for WebSocket. Use the callbacks of
-`Ache.Websocket` in the request handler, as in [WebSocket in
-ache.md](ache.md#websocket). The callbacks run in the read and write loops of
-the connection. The connection has no lock: call `send_text`, `flush`,
+`Ache_miou.Websocket` gives the WebSocket server of
+[ache.md](ache.md#websocket) a direct-style API. Call `upgrade` in the
+request handler with a session function. The session runs in its own task
+and blocks in `receive`, `send_text` and the others:
+
+```ocaml
+open Ache
+
+let rec echo ws =
+  match Ache_miou.Websocket.receive ws with
+  | None -> ()
+  | Some (Text "bye") -> Ache_miou.Websocket.close ~reason:"bye" ws 1000
+  | Some (Text message) ->
+    Ache_miou.Websocket.send_text ws message;
+    echo ws
+  | Some (Binary message) ->
+    Ache_miou.Websocket.send_binary ws message;
+    echo ws
+
+let request_handler _client_address reqd =
+  match Ache_miou.Websocket.upgrade reqd echo with
+  | Ok () -> ()
+  | Error _ ->
+    let headers = Headers.of_list [ "content-length", "0" ] in
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers `Bad_request)
+      ""
+```
+
+- `upgrade` checks the handshake and responds with `101`, as
+  `Ache.Websocket.upgrade` does. On `Error _` it responds nothing: send the
+  response yourself, for example `426` with `Sec-WebSocket-Version: 13` for
+  `` Error `Unsupported_version ``. Call it from the request handler of
+  `Server.create_connection_handler`, `Server.run`, `Make` or
+  `ache-miou-tls`, while the handler runs. Elsewhere it raises
+  `Invalid_argument`.
+- The session runs in a task that the connection task starts with
+  `Miou.async`, in the domain of the connection. The server handler
+  returns when the session returns. The connection does not cancel the
+  session when the socket closes: the session sees the end, because
+  `receive` returns `None` and the other functions raise `Closed` or
+  return. The session is cancelled only when the connection task is.
+- `Closed` raised by the session is ignored. Another exception closes the
+  connection, and the server handler raises it: with `Server.run`, it goes
+  to `on_error`.
+- `receive` returns the next whole message, `Text s` or `Binary s`. Once
+  the connection has ended and no message waits, it returns `None`. The
+  connection ends after the client's close frame, the end of the input, a
+  reset, a protocol error, or your `close`. `client_close ws` then gives
+  the client's close code and reason, if it sent a valid close frame.
+- `send_text` and `send_binary` return when the frame is written. They
+  raise `Ache_miou.Websocket.Closed` when the connection is gone, also when
+  it was gone before the call, so a send loop ends when the client leaves.
+- `ping ws payload` sends a ping and returns when the next pong arrives, or
+  raises `Closed` when the connection ends first. To find a client that is
+  gone, race it with a task that sleeps, with `Miou.await_first`, and
+  `close` when the sleep wins. The pong comes after the messages the
+  client sent before it, so keep calling `receive` meanwhile: while 8
+  messages wait, reading is paused and the pong is not seen.
+- `close ?reason ws code` sends a close frame and returns when the frame is
+  written or the connection has ended. It raises `Invalid_argument` at
+  once for a code that an endpoint may not send, or a reason that is not
+  UTF-8 or longer than 123 bytes. The socket closes when the read in
+  progress ends too: when the client answers with its close frame or
+  closes the connection. There is no timeout for a client that does
+  neither.
+- Messages that you have not received wait in a queue. When 8 messages
+  wait, the connection stops reading from the client until `receive` takes
+  one. Frames that one read already holds still join the queue.
+- You can cancel a task that waits in `receive` or `ping`, for example with
+  `Miou.cancel` or `Miou.await_first`. No message is lost: the next
+  `receive` gets it.
+- Call these functions from the session task, or from tasks that it starts
+  with `Miou.async`. The connection has no lock, so they must run in its
+  domain; do not call them from a task of `Miou.call`.
+
+To use the callbacks of `Ache.Websocket` directly, as in [WebSocket in
+ache.md](ache.md#websocket): the callbacks run in the read and write loops
+of the connection. The connection has no lock: call `send_text`, `flush`,
 `close`, `pause_reading` and `resume_reading` from the domain that runs the
 connection. `adapters/miou/test/test_ache_miou.ml` has a server that sends in
 a loop on `flush` and stops at `` `Closed ``.
@@ -221,7 +297,9 @@ core connection and starts the two loops as two child tasks:
   ├─ read task  ── Miou_unix.read into the read buffer
   │     └─ timed read ─► reader task (started on first use)
   ├─ write task ── one sendmsg for all buffers
-  └─ waits until both tasks end, or one fails ─► close the socket
+  ├─ WebSocket session tasks (started on upgrade)
+  └─ waits until both loops end, or one fails, then for the sessions
+     ─► close the socket
 ```
 
 - **Waiting.** On `Yield`, a loop gives the core a callback that wakes it
@@ -253,6 +331,19 @@ core connection and starts the two loops as two child tasks:
 - **Client shutdown.** `Client.shutdown` cancels both tasks at once, so a
   write that waits for a peer that does not read does not hold it. Output
   that is not yet written is dropped.
+- **Sessions.** While the request handler runs, the connection sets a
+  domain-local value that `Websocket.upgrade` reads. `upgrade` adds the
+  session there and wakes the connection task, which starts it with
+  `Miou.async`. So the session is a child of the connection task, not of
+  the read task, and can wait while the read loop runs. When both loops
+  end, the connection shuts the core down, so that a waiting session sees
+  the end, and awaits the sessions.
+- **WebSocket waits.** Each `receive` or `ping` that waits has its own
+  `Miou.Computation`. A message is queued first and then wakes one
+  `receive`, which takes it from the queue: a `receive` that is cancelled
+  leaves the message for the next one. A cancelled wait completes its
+  computation, and the next wait drops the completed ones, so many
+  cancelled calls do not pile up.
 
 ### Several domains
 

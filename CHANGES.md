@@ -48,7 +48,9 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   every runtime. It checks text as UTF-8 while it arrives, sends and reports
   close reasons, and sends pings (`on_pong` gets the answers).
   `Ache_lwt.Websocket` gives it a promise API: `upgrade`, `send_text`,
-  `send_binary`, `receive`, `ping`, `client_close` and `close`. A write to a
+  `send_binary`, `receive`, `ping`, `client_close` and `close`, and
+  `Ache_miou.Websocket` the same in direct style, with the session in its own
+  task of the connection. A write to a
   client that reset the connection ends the connection (camlworks/dream#467).
 
 ### Changed

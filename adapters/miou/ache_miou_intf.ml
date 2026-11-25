@@ -66,6 +66,9 @@ module type Server = sig
 
       A [shutdown] of [socket] that fails is ignored.
 
+      The handler starts the sessions of [Ache_miou.Websocket.upgrade] in
+      tasks of its own, and returns when they return.
+
       @raise Invalid_argument
         if a timeout is not positive. It is raised when [~error_handler] is
         applied if all three optional arguments are given too, and otherwise

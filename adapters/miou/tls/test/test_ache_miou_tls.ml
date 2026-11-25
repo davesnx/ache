@@ -83,6 +83,17 @@ let request_handler (_ : Unix.sockaddr) reqd =
   let request = Request_descriptor.request reqd in
   let body = Request_descriptor.request_body reqd in
   match request.meth, request.target with
+  | `GET, "/ws-echo" ->
+    let rec echo ws =
+      match Ache_miou.Websocket.receive ws with
+      | Some (Text message) ->
+        Ache_miou.Websocket.send_text ws message;
+        echo ws
+      | Some (Binary _) | None -> ()
+    in
+    (match Ache_miou.Websocket.upgrade reqd echo with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
   | `POST, "/echo" ->
     let headers =
       Headers.of_list
@@ -1076,12 +1087,36 @@ let test_cut_handshake_timers_bounded () =
     ~connections:1000
     (fun (_ : Miou_unix.file_descr) -> Miou_unix.sleep 0.001)
 
+let test_websocket_echo () =
+  with_server (fun connect ->
+    with_raw_client connect (fun fd ->
+      let raw = raw_client fd in
+      raw_write
+        raw
+        "GET /ws-echo HTTP/1.1\r\n\
+         host: localhost\r\n\
+         upgrade: websocket\r\n\
+         connection: Upgrade\r\n\
+         sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         sec-websocket-version: 13\r\n\
+         \r\n";
+      raw_read_head raw;
+      (* A masked text frame "hi", then a close frame with code 1000. *)
+      raw_write raw "\x81\x82\x00\x00\x00\x00hi";
+      Alcotest.(check string) "echo" "\x81\x02hi" (raw_take raw 4);
+      raw_write raw "\x88\x82\x00\x00\x00\x00\x03\xe8";
+      Alcotest.(check string) "close echoed" "\x88\x02\x03\xe8" (raw_take raw 4);
+      let rest, (_ : [ `Tcp_eof | `Close_notify ]) = raw_read_until_eof raw in
+      Alcotest.(check string) "then the end" "" rest));
+  check_no_handler_error ()
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
     "ache-miou-tls"
     [ ( "tls"
       , [ Alcotest.test_case "GET" `Quick test_get
+        ; Alcotest.test_case "WebSocket echo" `Quick test_websocket_echo
         ; Alcotest.test_case
             "client_of_fd, epoch and create_connection"
             `Quick
