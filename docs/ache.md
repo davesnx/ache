@@ -515,6 +515,44 @@ requests against Eio, Lwt and Miou echo servers. On 2026-11-16, h1spec at
 `f0a5650` (under Node 22 with `conformance/deno_shim.mjs`) passed 33 of 33
 checks on all three servers.
 
+`conformance/autobahn.sh` runs the
+[Autobahn test suite](https://github.com/crossbario/autobahn-testsuite)
+(fuzzingclient, Docker image pinned by digest, `--network host`, so Linux
+only) against the WebSocket echo of `conformance/ws_echo.ml` with a
+`max_message_size` of 16 MiB. It skips cases 12 and 13, which test
+permessage-deflate: ache negotiates no extension. Run it from an opam
+environment with Docker and Node:
+
+```sh
+RUNTIME=lwt sh conformance/autobahn.sh   # RUNTIME=eio (default), lwt or miou
+```
+
+The report goes to `_build/autobahn/<runtime>/index.html`. The script fails
+when a case does worse than `conformance/autobahn-expected.txt` allows. On
+2026-11-25 all three servers passed 298 of the 301 cases, and 3 were
+informational (7.1.6, 7.13.1, 7.13.2), which Autobahn does not grade.
+
+`conformance/wpt.sh` runs `conformance/wpt/ache.any.js` in a browser with
+[web-platform-tests](https://github.com/web-platform-tests/wpt). It is not
+run in CI. The test uses `fetch` for a GET with a JSON body, a UTF-8 POST
+body, HEAD, a redirect, a simple and a preflighted CORS request and 20
+concurrent requests, and a browser `WebSocket` for a text and a binary echo
+and a close that the server starts. The script copies the test into the WPT
+checkout, starts the server on `ACHE_PORT` (default 8090), runs `wpt run`,
+then stops the server and removes the copy. With `WPT_BROWSER=chromium`, the
+default, it runs the Chromium on `PATH` as wpt's `chrome` product, which
+needs no WPT hosts in `/etc/hosts`; give it a ChromeDriver of the same major
+version:
+
+```sh
+git clone --depth 1 https://github.com/web-platform-tests/wpt /tmp/wpt
+WPT_ROOT=/tmp/wpt RUNTIME=eio sh conformance/wpt.sh \
+  --webdriver-binary /path/to/chromedriver --headless
+```
+
+Other arguments go to `wpt run`. On 2026-11-25, with Chromium 156, the 10
+subtests passed on the three servers.
+
 ## License
 
 BSD-3-Clause, with the copyright lines of httpaf and httpun. See
