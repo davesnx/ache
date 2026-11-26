@@ -458,13 +458,15 @@ longer than it announces. The client honours the hint: `n - 2` seconds
 (at most 598) after a response with `Keep-Alive: timeout=n`, an idle
 client connection closes, and `Client.request` on it after that time gets
 `` `Connection_closed `` before anything is written.
-Timeouts use `Miou_unix.sleep` and need no clock. With
-`?idle_timeout` or `?head_timeout`, when the server stops reading it reads
-and drops input until the peer stops sending. It waits at most
+Timeouts use `Miou_unix.sleep` and need no clock. When the server stops
+reading while the client may still be sending (`Server_connection.lingers`:
+a request partly read, or input left after the last one), it reads and
+drops input until the peer stops sending. It waits at most
 `idle_timeout` (2 s without one) after it stops reading or after its last
 write, whichever is later; input that arrives does not extend this limit.
-A peer that stops sending still gets the rest of the response. Without a
-timeout it closes at once. Handlers and body
+A peer that stops sending still gets the rest of the response. When every
+request was read whole, or after a completed WebSocket close handshake, it
+closes at once. Handlers and body
 callbacks run in the connection tasks and must not leave a child task that
 they do not await. `Client.shutdown` must be called by the task that
 created the connection.

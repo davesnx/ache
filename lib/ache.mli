@@ -750,6 +750,26 @@ module Server_connection : sig
         connection was upgraded to another protocol. No timeout applies.
         A runtime asks again before each read. *)
 
+  val lingers : t -> bool
+  (** [lingers t] tells a runtime whose read side reached [`Close] whether
+      the client may still be sending. When [true], the runtime shuts down its
+      send side and reads until end of input (with a time limit) before it
+      closes the socket, so that unread input does not reset the connection
+      under the response (RFC 9112 §9.6). When [false], it closes at once. It
+      is [true] when:
+      - a request is partly read: its body was not read to its end (the
+        connection drops it, or the application closed it), its head is
+        incomplete, or it could not be parsed;
+      - input is left after the last request, or requests were pipelined
+        after the one that closes the connection;
+      - after an upgrade, the protocol says so: on a WebSocket, [false] once
+        the client's close frame was read (the close handshake is complete),
+        [true] after a close without it (a protocol error, an idle timeout or
+        a drain); [true] for other protocols.
+
+      It is [false] after the end of input, and when every request was read
+      whole. *)
+
   val upgrade_state : t -> [ `None | `Websocket | `Other ]
   (** [upgrade_state t] tells a runtime which protocol runs on [t].
       - [`None]: HTTP/1.1. This includes a request whose

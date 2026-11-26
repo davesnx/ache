@@ -1134,7 +1134,10 @@ let test_idle_timeout_then_request () =
       let output, ending = raw_read_until_eof raw in
       Alcotest.(check string) "no response" "" output;
       Alcotest.(check bool) "close_notify" true (ending = `Close_notify);
-      raw_close_notify raw));
+      (* The idle close does not linger (decision 0023): the socket may be
+         closed, and our request reset it. *)
+      try raw_close_notify raw with
+      | Unix.Unix_error ((EPIPE | ECONNRESET), _, _) -> ()));
   Alcotest.(check int) "no error" 0 (List.length !server_errors);
   check_no_handler_error ()
 

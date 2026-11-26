@@ -917,6 +917,25 @@ let read_all socket =
   Eio.Buf_read.parse_exn Eio.Buf_read.take_all ~max_size:65536 socket
 
 let get_hello = "GET /hello HTTP/1.1\r\nhost: localhost\r\n\r\n"
+
+(* A connection handler returns within [seconds] of [from]. *)
+let check_done_within seconds ~from =
+  match
+    Eio.Fiber.first
+      (fun () ->
+         Eio.Stream.take connections_done;
+         Some (Unix.gettimeofday () -. from))
+      (fun () ->
+         !real_sleep 2.0;
+         None)
+  with
+  | Some elapsed ->
+    Alcotest.(check bool)
+      (Printf.sprintf "connection ended within %.3f s (%.3f s)" seconds elapsed)
+      true
+      (elapsed < seconds)
+  | None -> Alcotest.fail "the connection did not end"
+
 let hello_response = "HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nhello world"
 
 let hello_response_close =
@@ -939,12 +958,10 @@ let test_idle_timeout () =
       0.1
       (Eio.Time.now clock);
     Alcotest.(check string) "nothing written" "" (read_all socket);
-    advance clock;
-    Alcotest.(check (float 0.))
-      "stops waiting for the peer to close"
-      0.2
-      (Eio.Time.now clock);
+    (* No request is in flight: the connection does not linger (decision
+       0023). *)
     Eio.Stream.take connections_done;
+    Alcotest.(check (float 0.)) "no linger" 0.1 (Eio.Time.now clock);
     Eio.Flow.close socket);
   Alcotest.(check int) "no error" 0 (List.length !server_errors);
   check_shutdowns ()
@@ -1668,12 +1685,18 @@ let test_pipelined_head_deadline () =
     Eio.Flow.close socket;
     Eio.Stream.take connections_done)
 
+(* The bytes after the closing request may be followed by more: the server
+   lingers (decision 0023). *)
 let close_without_reading_eof ?clock ?idle_timeout ?head_timeout () =
   with_server ?clock ?idle_timeout ?head_timeout (fun ~sw ~net addr ->
     let socket = Eio.Net.connect ~sw net addr in
     let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
     Eio.Flow.copy_string
-      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+      "GET /hello HTTP/1.1\r\n\
+       host: localhost\r\n\
+       connection: close\r\n\
+       \r\n\
+       GET /next"
       socket;
     Alcotest.(check string)
       "response"
@@ -1691,6 +1714,27 @@ let close_without_reading_eof ?clock ?idle_timeout ?head_timeout () =
     Eio.Flow.close socket)
 
 let test_linger_system_clock () = close_without_reading_eof ~idle_timeout:0.2 ()
+
+(* A request read whole leaves nothing in flight: the server closes at once,
+   although the client keeps its socket open (decision 0023). *)
+let test_close_request_read_whole () =
+  with_server ~idle_timeout:30. (fun ~sw ~net addr ->
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    let from = Unix.gettimeofday () in
+    Eio.Flow.copy_string
+      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+      socket;
+    Alcotest.(check string)
+      "response"
+      hello_response_close
+      (Eio.Buf_read.take (String.length hello_response_close) reader);
+    Alcotest.(check bool)
+      "end of input"
+      true
+      (Eio.Buf_read.at_end_of_input reader);
+    check_done_within 0.1 ~from;
+    Eio.Flow.close socket)
 
 let test_linger_bounded_without_idle_timeout () =
   close_without_reading_eof ~clock:(Eio_mock.Clock.make ()) ~head_timeout:5. ()
@@ -1896,7 +1940,9 @@ let test_idle_timeout_then_request () =
        Eio.Flow.close socket);
   Alcotest.(check int) "no request handled" 0 !requests_seen;
   Alcotest.(check int) "no error" 0 (List.length !server_errors);
-  Poison_flow.check ~bytes_sent:(String.length get_hello)
+  (* The idle close does not linger (decision 0023): the receive shutdown ends
+     the pending read before the request arrives, so nothing is read. *)
+  Poison_flow.check ~bytes_sent:0
 
 let test_client_shutdown_with_pending_read () =
   Poison_flow.reset ();
@@ -2237,8 +2283,9 @@ let test_linger_deadline_not_renewed () =
   let clock = Eio_mock.Clock.make () in
   with_server ~clock ~idle_timeout:0.5 (fun ~sw ~net addr ->
     let socket = Eio.Net.connect ~sw net addr in
+    (* A byte after the request makes it linger (decision 0023). *)
     Eio.Flow.copy_string
-      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\nx"
       socket;
     Alcotest.(check string) "response" hello_response_close (read_all socket);
     let rec trickle i =
@@ -2682,21 +2729,10 @@ let test_websocket_close_handshake_fin ~server_first () =
       (Printf.sprintf "end of input within 100 ms (%.3f s)" elapsed)
       true
       (elapsed < 0.1);
-    (* Known linger (runtime-cost F9, task 48): after its FIN the server reads
-       and drops input until the client's FIN or [idle_timeout], although
-       nothing may follow the client's close frame. When the server closes at
-       once, assert that the handler returns here instead. *)
-    if
-      Eio.Fiber.first
-        (fun () ->
-           Eio.Stream.take connections_done;
-           true)
-        (fun () ->
-           !real_sleep 0.5;
-           false)
-    then Alcotest.fail "the connection no longer lingers: assert that instead";
+    (* Nothing may follow the client's close frame (decision 0024): the
+       connection ends without waiting for the client's FIN. *)
+    check_done_within 0.1 ~from;
     Eio.Flow.close socket;
-    Eio.Stream.take connections_done;
     Alcotest.(check string)
       "session"
       (if server_first
@@ -4044,6 +4080,9 @@ let () =
         ; ( "without a clock lingering is bounded by the system clock"
           , `Quick
           , test_linger_system_clock )
+        ; ( "a Connection: close request read whole closes at once"
+          , `Quick
+          , test_close_request_read_whole )
         ; ( "without idle_timeout lingering is bounded"
           , `Quick
           , test_linger_bounded_without_idle_timeout )
@@ -4240,7 +4279,7 @@ let () =
         ; ( "input after a head timeout is read once, no read cancelled"
           , `Quick
           , test_head_timeout_then_data )
-        ; ( "a request after the idle timeout is read once, no read cancelled"
+        ; ( "a request after the idle timeout is not read, no read cancelled"
           , `Quick
           , test_idle_timeout_then_request )
         ; ( "Client.shutdown cancels no read before its Send shutdown"

@@ -5008,8 +5008,92 @@ let test_imf_fixdate () =
     ; 4102444800, "Fri, 01 Jan 2100 00:00:00 GMT"
     ]
 
+(* Decision 0023: the connection lingers only when the client may still be
+   sending. *)
+let test_lingers () =
+  let close_headers = Headers.of_list [ "connection", "close" ] in
+  let respond ?(headers = close_headers) ?(status = `OK) reqd =
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers status)
+      "ok"
+  in
+  let get_close = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n" in
+  let check label expected t =
+    ignore (Raw.write_all t);
+    Alcotest.check
+      read_operation
+      (label ^ ": reader closed")
+      `Close
+      (Raw.read_op t);
+    Alcotest.(check bool) label expected (Server_connection.lingers t.conn)
+  in
+  List.iter
+    (fun (split, chunk) ->
+       let label case = case ^ ", " ^ split in
+       let t = Raw.create respond in
+       Raw.feed ~chunk t get_close;
+       check (label "request read whole") false t;
+       let pending = ref [] in
+       let t = Raw.create (fun reqd -> pending := reqd :: !pending) in
+       Raw.feed ~chunk t get_close;
+       List.iter respond !pending;
+       check (label "response after the request") false t;
+       (* A runtime offers all the input it holds in each read. *)
+       let t = Raw.create respond in
+       Raw.feed ~chunk:max_int t (get_close ^ "GET /next");
+       check (label "input after the request") true t;
+       let pending = ref [] in
+       let t = Raw.create (fun reqd -> pending := reqd :: !pending) in
+       Raw.feed
+         ~chunk:max_int
+         t
+         (get_close ^ "GET /next HTTP/1.1\r\nHost: a\r\n\r\n");
+       List.iter respond !pending;
+       check (label "a request pipelined after it") true t;
+       let events = ref [] in
+       let t =
+         Raw.create (fun reqd ->
+           record_body events (Request_descriptor.request_body reqd);
+           respond reqd)
+       in
+       Raw.feed ~chunk t (post_head 5 ^ "abcde");
+       check (label "body read whole") false t;
+       let t =
+         Raw.create (respond ~headers:Headers.empty ~status:`Content_too_large)
+       in
+       Raw.feed ~chunk t (post_head 100000 ^ "abc");
+       ignore (Raw.write_all t);
+       (match Server_connection.read_timeout t.conn with
+       | Some (`Body, expire) -> expire ()
+       | _ -> Alcotest.fail "expected a body timeout");
+       check (label "unread body") true t;
+       let t = Raw.create respond in
+       Raw.feed ~chunk t "GET / HTTP/1.1\r\nHost a\r\n\r\n";
+       check (label "parse error") true t;
+       let t = Raw.create respond in
+       Raw.feed ~chunk t "GET / HTTP/1.1\r\nHo";
+       (match Server_connection.read_timeout t.conn with
+       | Some (`Head, reject) -> reject ()
+       | _ -> Alcotest.fail "expected a head timeout");
+       check (label "head timeout") true t;
+       let t =
+         Raw.create (respond ~headers:Headers.empty ~status:`Content_too_large)
+       in
+       Raw.feed ~chunk t (post_head 100000 ^ "abc");
+       ignore (Raw.write_all t);
+       Raw.feed ~eof:true ~chunk t "";
+       check (label "end of input in an unread body") false t)
+    splits;
+  let t = Raw.create respond in
+  (match Server_connection.read_timeout t.conn with
+  | Some (`Idle, close) -> close ()
+  | _ -> Alcotest.fail "expected an idle timeout");
+  check "idle timeout" false t
+
 let tests =
   [ "initial reader state", `Quick, test_initial_reader_state
+  ; "lingers", `Quick, test_lingers
   ; "shutdown reader closed", `Quick, test_reader_is_closed_after_eof
   ; "Date added with ?date", `Quick, test_date_added
   ; "Date from the application kept", `Quick, test_date_kept_from_application

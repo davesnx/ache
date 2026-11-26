@@ -503,6 +503,12 @@ let read_timeout t =
     Some (`Close, fun () -> finish t)
   | (Header | Payload), (Open | Closed) | Stopped, _ -> None
 
+(* Decision 0024: once the peer's close frame is read, our close frame answered
+   it or was sent before it, so nothing may follow (RFC 6455 §5.5.1). A close
+   without it (a protocol error, an idle timeout, a drain) may leave the peer
+   still sending. *)
+let lingers t = Option.is_none t.peer_close
+
 let yield_reader t k =
   if t.reading = Stopped then k () else t.reader_k <- Some k
 
@@ -675,5 +681,9 @@ let upgrade
       (Runtime.make_with_hooks
          (module Engine)
          t
-         { protocol = `Websocket; drain = (fun t -> fail t 1001); read_timeout });
+         { protocol = `Websocket
+         ; drain = (fun t -> fail t 1001)
+         ; read_timeout
+         ; lingers
+         });
     Ok ()

@@ -924,9 +924,6 @@ struct
       check_timeout "write_timeout" write_timeout;
       check_timeout "close_timeout" close_timeout;
       check_timeout "grace" grace;
-      let untimed =
-        Option.is_none idle_timeout && Option.is_none head_timeout
-      in
       (* With an idle timeout of at least 1 s, persistent responses announce it
          in [Keep-Alive: timeout=n], and the idle timer between requests runs 1
          s longer, so that a client that trusts the hint does not write into a
@@ -1112,7 +1109,8 @@ struct
           ~read_closed
           ~interruptible:false
           ~timeout:{ IO_loop.timed; deadline; ended; expire }
-          ~linger:(fun () -> (not untimed) && not !close_aborted)
+          ~linger:(fun () ->
+            (not !close_aborted) && Ache.Server_connection.lingers connection)
           ?write_timeout
           ~interrupt
           ~sessions

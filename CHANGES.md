@@ -56,7 +56,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   and the new `?body_timeout` (60 s, request body progress) and
   `?write_timeout` (60 s, write progress); `None` turns one off. They no
   longer need `?clock`: without it the server uses the system clock, and
-  it always lingers after a closing response. An idle WebSocket is closed
+  it lingers after a closing response while the client may still be
+  sending. An idle WebSocket is closed
   with code 1001 after `idle_timeout`. A request body left unread after its
   response is bounded by `body_timeout`, no longer by `idle_timeout` (or
   dropped at once).
@@ -170,6 +171,13 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 
 ### Changed
 
+- `Server_connection.lingers` tells a runtime whether the client may still
+  be sending when the connection closes: a request partly read (an unread
+  or dropped body, a parse error), input left after the last request, or a
+  WebSocket closed without the client's close frame. ache-eio and ache-miou
+  linger only then: a request read whole and answered with
+  `Connection: close`, and a completed WebSocket close handshake, close the
+  socket at once. ache-miou no longer skips the linger without timeouts.
 - Strict parsing and framing after RFC 9110 and RFC 9112. `docs/ache.md` lists
   what the server rejects.
 - Bodies are delivered in linear time.

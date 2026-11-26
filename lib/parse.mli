@@ -77,6 +77,11 @@ module Reader : sig
   (** [in_body t body] is [true] while [t] reads [body], and after [t] failed
       inside [body]. *)
 
+  val between_messages : (_, _) t -> bool
+  (** [between_messages t] is [true] when [t] read every message it started
+      to the end. It is [false] while a head or body is partly read, after a
+      failure, and after a {!force_close} inside a message. *)
+
   val force_close : (_, _) t -> unit
   (** Closes the reader. After a partial head, chunk-size line or trailer
       section, the reader drops the buffered bytes and the bytes of later

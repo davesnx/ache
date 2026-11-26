@@ -1071,7 +1071,9 @@ module Server = struct
                    ; ended
                    ; expire
                    }
-                 ~linger:(fun () -> not !close_expired)
+                 ~linger:(fun () ->
+                   (not !close_expired)
+                   && Ache.Server_connection.lingers connection)
                  ?write_timeout
                  ~interrupt
                  connection

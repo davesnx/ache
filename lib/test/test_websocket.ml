@@ -449,7 +449,11 @@ let test_upgrade_state_other_websocket () =
   let c = bare_conn server in
   feed c (request_string handshake_headers);
   let (_ : string * [ `Yield | `Close ]) = drain c in
-  check_upgrade_state "another protocol" `Other c
+  check_upgrade_state "another protocol" `Other c;
+  Alcotest.(check bool)
+    "another protocol lingers"
+    true
+    (Server_connection.lingers c.server)
 
 let test_upgrade_adds_headers () =
   let offered = ref [] in
@@ -1070,8 +1074,52 @@ let test_idle_timeout () =
     true
     (Option.is_some (Server_connection.read_timeout c.server))
 
+(* Decision 0024: no linger once the close handshake is complete; a close
+   without the client's close frame lingers (decision 0023). *)
+let test_lingers () =
+  let check msg expected c =
+    Alcotest.(check bool) msg expected (Server_connection.lingers c.server)
+  in
+  let c = upgraded () in
+  check "open" true c;
+  feed c (client_frame 0x8 (close_payload 1000));
+  check_output c (close_frame_out 1000) `Close;
+  check "client closed first, answered" false c;
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1000;
+  check_output c (close_frame_out 1000) `Yield;
+  check "waiting for the client's close frame" true c;
+  feed c (client_frame 0x8 (close_payload 1000));
+  check_output c "" `Close;
+  check "server closed first, answered" false c;
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1000;
+  check_output c (close_frame_out 1000) `Yield;
+  (match Server_connection.read_timeout c.server with
+  | Some (`Close, abort) -> abort ()
+  | _ -> Alcotest.fail "expected a close timeout");
+  check "close timeout" true c;
+  let c = upgraded () in
+  feed c (client_frame ~masked:false 0x1 "x");
+  check_output c (close_frame_out 1002) `Close;
+  check "protocol error" true c;
+  let c = upgraded () in
+  (match Server_connection.read_timeout c.server with
+  | Some (`Idle, close) -> close ()
+  | _ -> Alcotest.fail "expected an idle timeout");
+  check_output c (close_frame_out 1001) `Close;
+  check "idle timeout" true c;
+  let c = upgraded () in
+  Server_connection.drain c.server;
+  check_output c (close_frame_out 1001) `Close;
+  check "drain" true c;
+  let c = upgraded () in
+  feed_eof c;
+  check "end of input" false c
+
 let tests =
   [ "accept key", `Quick, test_accept_key
+  ; "lingers", `Quick, test_lingers
   ; "upgrade state", `Quick, test_upgrade_state
   ; "a failed handshake does not upgrade", `Quick, test_upgrade_state_rejected
   ; ( "a 101 from respond_with_upgrade is another protocol"
