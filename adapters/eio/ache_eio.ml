@@ -783,41 +783,6 @@ module Server = struct
       | Some _ | None -> None
     in
     fun socket client_addr ->
-      let last_reqd = ref None in
-      let upgraded () =
-        match !last_reqd with
-        | Some reqd ->
-          (* [response_exn], which does not allocate: this runs per request. *)
-          (match Ache.Request_descriptor.response_exn reqd with
-          | { Ache.Response.status = `Switching_protocols; _ } -> true
-          | _ -> false
-          | exception Failure _ -> false)
-        | None -> false
-      in
-      (* Only a WebSocket ([Ache.Websocket.upgrade]) reaches [`Close]: plain
-         HTTP and other protocols skip the close timeout. [checked_reqd] is the
-         last request whose response was looked at. *)
-      let websocket = ref false
-      and checked_reqd = ref None in
-      let is_websocket () =
-        !websocket
-        ||
-        match !last_reqd with
-        | Some reqd as last when last != !checked_reqd ->
-          (match Ache.Request_descriptor.response_exn reqd with
-          | { Ache.Response.status; headers; _ } ->
-            checked_reqd := last;
-            (websocket :=
-               status = `Switching_protocols
-               &&
-               match Ache.Headers.get headers "upgrade" with
-               | Some value ->
-                 String.lowercase_ascii (String.trim value) = "websocket"
-               | None -> false);
-            !websocket
-          | exception Failure _ -> false)
-        | Some _ | None -> false
-      in
       let head_deadline = ref None
       and close_deadline = ref None
       and close_expired = ref false
@@ -842,11 +807,21 @@ module Server = struct
           ?date:(if date then Some current_date else None)
           ?keep_alive_timeout
           (fun reqd ->
-             last_reqd := Some reqd;
              head_deadline := None;
              body_spent := 0.;
              body_progress := 0;
              request_handler client_addr reqd)
+      in
+      let upgraded () =
+        match Ache.Server_connection.upgrade_state connection with
+        | `Websocket | `Other -> true
+        | `None -> false
+      (* Only a WebSocket ([Ache.Websocket.upgrade]) reaches [`Close]: plain
+         HTTP and other protocols skip the close timeout. *)
+      and is_websocket () =
+        match Ache.Server_connection.upgrade_state connection with
+        | `Websocket -> true
+        | `None | `Other -> false
       in
       (* The head clock starts when a read starts in the [`Head] phase, right
          after the read that brought the first bytes of a head. *)
