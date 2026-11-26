@@ -27,6 +27,31 @@ module type HTTP = sig
   val writer_is_closed : writer -> bool
 end
 
+(* Requests the handler has started, for [cost.sh]. *)
+let requests = ref 0
+
+(* On [SIGUSR1], one line on stderr with the request count and the GC counters
+   of this domain. [cost.sh] reads two such lines around its window and divides
+   by the requests between them. *)
+let print_counters () =
+  let s = Gc.quick_stat () in
+  Printf.eprintf
+    "vs-counters requests=%d minor_words=%.0f promoted_words=%.0f \
+     minor_collections=%d major_collections=%d\n\
+     %!"
+    !requests
+    (Gc.minor_words ())
+    s.promoted_words
+    s.minor_collections
+    s.major_collections
+
+let () =
+  match
+    Sys.set_signal Sys.sigusr1 (Sys.Signal_handle (fun _ -> print_counters ()))
+  with
+  | () -> ()
+  | exception Invalid_argument _ -> ()
+
 type settings =
   { port : int
   ; read_buffer_size : int
@@ -55,7 +80,7 @@ let settings () =
       , " (4096)" )
     ; ( "--timeouts"
       , Arg.Symbol ([ "on"; "off" ], fun mode -> timeouts := mode = "on")
-      , " Timeouts of the ache-eio server: the defaults (on), or all off" )
+      , " Timeouts of the ache servers: the defaults (on), or all off" )
     ]
     (fun arg -> raise (Arg.Bad arg))
     "Benchmark server. Routes: GET /fixed/<bytes>, GET /close/<bytes>, GET \
@@ -184,6 +209,7 @@ module Make (Http : HTTP) = struct
     Http.schedule_read body ~on_eof ~on_read
 
   let handle reqd =
+    incr requests;
     match action (Http.target reqd) with
     | Fixed (response, body) -> Http.respond_with_bigstring reqd response body
     | Stream (response, chunk, count) ->
