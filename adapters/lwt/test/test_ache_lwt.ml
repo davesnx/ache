@@ -1203,6 +1203,78 @@ let test_websocket_close_timeout_callback_api () =
     Lwt_unix.close socket);
   check_server_sockets_closed ()
 
+(* After a completed close handshake the server ends the TCP connection first
+   (RFC 6455 7.1.1, decision 0019): the client, which keeps its socket open
+   without sending FIN, sees the end of input within 100 ms. [~server_first]:
+   the server sends the first close frame; otherwise the client does. *)
+let test_websocket_close_handshake_fin ~server_first () =
+  let ended = wait_ws_end () in
+  let served = ref [] in
+  let connection_handler ~request_handler ~error_handler addr socket =
+    let p =
+      Ache_lwt.Server.create_connection_handler
+        ~idle_timeout:(Some 30.)
+        ~close_timeout:(Some 30.)
+        ~request_handler
+        ~error_handler
+        addr
+        socket
+    in
+    served := p :: !served;
+    p
+  in
+  with_server ~connection_handler (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    (if server_first
+     then (
+       write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
+       read_ws_frame socket >>= fun close ->
+       Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+       let from = Unix.gettimeofday () in
+       write_all socket (ws_frame 0x8 "\x03\xe8") >|= fun () -> from)
+     else
+       let from = Unix.gettimeofday () in
+       write_all socket (ws_frame 0x8 "\x03\xe8bye") >>= fun () ->
+       read_ws_frame socket >|= fun close ->
+       Alcotest.(check (pair int string))
+         "close echoed"
+         (0x88, "\x03\xe8")
+         close;
+       from)
+    >>= fun from ->
+    read_all socket >>= fun rest ->
+    Alcotest.(check string) "end of input" "" rest;
+    let elapsed = Unix.gettimeofday () -. from in
+    Alcotest.(check bool)
+      (Printf.sprintf "end of input within 100 ms (%.3f s)" elapsed)
+      true
+      (elapsed < 0.1);
+    (* Known linger (runtime-cost F9, task 48): after its FIN the server reads
+       and drops input until the client's FIN or [idle_timeout], although
+       nothing may follow the client's close frame. When the server closes at
+       once, assert that the connection promise resolves here instead. *)
+    Lwt.pick
+      [ (Lwt.join !served >|= fun () -> true)
+      ; (Lwt_unix.sleep 0.5 >|= fun () -> false)
+      ]
+    >>= fun resolved ->
+    if resolved
+    then Alcotest.fail "the connection no longer lingers: assert that instead";
+    Lwt_unix.close socket >>= fun () ->
+    Lwt.join !served >>= fun () ->
+    ended >|= fun result ->
+    Alcotest.(check (result string reject))
+      "session"
+      (Ok
+         (if server_first
+          then "closed, client close 1000 \"\""
+          else "receive None, client close 1000 \"bye\""))
+      result);
+  check_server_sockets_closed ()
+
 let test_websocket_ping () =
   let ended = wait_ws_end () in
   with_server (fun connect ->
@@ -2990,6 +3062,12 @@ let () =
              keeps sending"
           , `Quick
           , test_websocket_close_timeout_server_closes )
+        ; ( "WebSocket close handshake from the client: FIN at once"
+          , `Quick
+          , test_websocket_close_handshake_fin ~server_first:false )
+        ; ( "WebSocket close handshake from the server: FIN at once"
+          , `Quick
+          , test_websocket_close_handshake_fin ~server_first:true )
         ; ( "WebSocket close timeout with the callback API"
           , `Quick
           , test_websocket_close_timeout_callback_api )
