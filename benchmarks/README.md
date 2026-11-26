@@ -206,6 +206,33 @@ shows the quick check and the report up to its detail tables.
 - The core table: ns per message (median and min), the ratio (ache ns over
   library ns) and minor words per message.
 
+## Cost per request
+
+`vs/cost.sh` measures one ache server in CPU instructions and GC words per
+request, which vary much less than req/s on a shared host.
+
+```sh
+SERVER_CPU=386 WRK_CPUS=404,407,431,496 \
+  opam exec -- benchmarks/vs/cost.sh lwt --timeouts off /fixed/5 keep-alive
+```
+
+- `SERVER` is `lwt`, `eio` or `miou`; `--timeouts off` turns every server
+  timeout off (`None`), `on` (the default) keeps the defaults.
+- `PATH` is a route above; `CONN` is `keep-alive` or `close` (each request
+  sends `Connection: close`).
+- It builds the server with `--profile=release`, pins it to `SERVER_CPU`,
+  warms up with wrk for 2 s, then runs `wrk -t4 -c64` for `DURATION` (10 s)
+  pinned to `WRK_CPUS`. Over `DURATION - 2` seconds of that run it reads
+  `perf stat -e instructions:u,instructions:k -p` and two `SIGUSR1`
+  snapshots: on `SIGUSR1` every server prints its request count and GC
+  counters to stderr (`vs.ml`).
+- It prints one line: `req_s`, `user_instr` and `kernel_instr` per request,
+  `minor_words` and `promoted_words` per request, and the requests and
+  collections in the window.
+- `PORT` (18300), `NO_BUILD=1` and `DUNE` are optional.
+  `benchmarks/vs/cost.sh idle 384-511 5` prints the 5 idlest CPUs of a
+  range, sampled over 5 s.
+
 ## Limits
 
 - Only p50 and p90 latency are reported. wrk 4.1 adds synthetic samples
