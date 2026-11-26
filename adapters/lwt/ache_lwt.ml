@@ -146,11 +146,11 @@ module IO_loop = struct
     -> ?timing:timing
     -> close:(unit -> unit Lwt.t)
     -> ?writer_waits:(unit -> unit)
-    -> ?linger:(unit -> (unit -> unit Lwt.t) option)
+    -> ?linger:(unit -> ((unit -> unit) -> unit) option)
     -> ?writev:
          (Ache.Bigstring.t Ache.IOVec.t list -> [ `Closed | `Ok of int ] Lwt.t)
     -> fd
-    -> unit Lwt.t
+    -> unit
     =
    fun (module Io)
      (module Runtime)
@@ -165,18 +165,38 @@ module IO_loop = struct
     let read_buffer = Buffer.create read_buffer_size in
     (* [eof]: a read saw the end of input, so a linger would read nothing. *)
     let eof = ref false
-    and send_shut, notify_send_shut = Lwt.wait ()
+    (* [send_shut]: the write loop shut the send side. [on_send_shut]: the
+       linger waits for it to arm its deadline. *)
+    and send_shut = ref false
+    and on_send_shut = ref ignore
     and reader = timing.reader in
-    let failed, notify_failed = Lwt.wait () in
+    (* The socket closes when both loops have exited, or at once when one fails.
+       [close] does not fail. *)
+    let closing = ref false
+    and running = ref 2 in
+    let close_socket () =
+      if not !closing
+      then (
+        closing := true;
+        let (_ : unit Lwt.t) = close () in
+        ())
+    in
+    (* Called once by each loop. *)
+    let loop_exited () =
+      decr running;
+      if !running = 0 then close_socket ()
+    in
     let fail exn =
       (try Runtime.report_exn t exn with _ -> ());
-      if Lwt.is_sleeping failed then Lwt.wakeup_later notify_failed ();
+      close_socket ();
       Lwt.return_unit
     in
-    let read_loop_exited, notify_read_loop_exited = Lwt.wait () in
+    let read_loop_exited = ref false in
     let read_loop_done () =
-      if Lwt.is_sleeping read_loop_exited
-      then Lwt.wakeup_later notify_read_loop_exited ();
+      if not !read_loop_exited
+      then (
+        read_loop_exited := true;
+        loop_exited ());
       (try Io.shutdown_receive socket with _ -> ());
       Lwt.return_unit
     in
@@ -184,7 +204,7 @@ module IO_loop = struct
       match Runtime.report_exn t exn with
       | () -> read_loop_done ()
       | exception _ ->
-        if Lwt.is_sleeping failed then Lwt.wakeup_later notify_failed ();
+        close_socket ();
         Lwt.return_unit
     in
     let rec read_loop () =
@@ -233,46 +253,75 @@ module IO_loop = struct
           (match linger with
           | Some lingers when not !eof ->
             (match lingers () with
-            | Some deadline -> lingering deadline >>= read_loop_done
+            | Some arm -> lingering arm
             | None -> read_loop_done ())
           | Some _ | None -> read_loop_done ())
       (* Lingering close (RFC 9112 9.6): reads and drops input until the end of
-         input, or until the send side is shut and [deadline ()] resolves, so
-         that the close does not reset the connection under unread input and the
-         peer can read the last response. *)
-      and lingering deadline =
+         input, or until the send side is shut and the deadline that [arm] sets
+         passes, so that the close does not reset the connection under unread
+         input and the peer can read the last response. The drain runs on
+         callbacks; at the deadline the read loop ends at once, and the socket
+         read in progress is left to the close. *)
+      and lingering arm =
         let drop () =
           let (_ : int) =
             Buffer.get read_buffer ~f:(fun _ ~off:_ ~len -> len)
           in
           ()
         in
+        let read () =
+          match read (module Io) socket read_buffer with
+          | reading -> reading
+          | exception exn -> Lwt.fail exn
+        in
+        let ended = ref false in
+        let finish () =
+          if not !ended
+          then (
+            ended := true;
+            drop ();
+            let (_ : unit Lwt.t) = read_loop_done () in
+            ())
+        in
         let rec drain reading =
-          (if Lwt.is_sleeping reading
-           then reading >|= ignore
-           else reading >>= fun (_ : int) -> Lwt.pause ())
-          >>= fun () ->
-          drop ();
-          drain (read (module Io) socket read_buffer)
+          match Lwt.state reading with
+          | Lwt.Sleep ->
+            Lwt.on_any
+              reading
+              (fun (_ : int) ->
+                 if not !ended
+                 then (
+                   drop ();
+                   drain (read ())))
+              (fun (_ : exn) -> finish ())
+          | Lwt.Return (_ : int) ->
+            (* Input was ready at once: let other connections and the timers run
+               before the next read, or a client that always has input ready
+               would keep the drain from returning to [Lwt_main], and its
+               deadline from passing. *)
+            drop ();
+            Lwt.on_success (Lwt.pause ()) (fun () ->
+              if not !ended then drain (read ()))
+          | Lwt.Fail (_ : exn) -> finish ()
         in
         drop ();
         let reading =
-          match pending_left reader with
-          | Some left -> left
-          | None -> read (module Io) socket read_buffer
+          match pending_left reader with Some left -> left | None -> read ()
         in
-        Lwt.pick
-          [ Lwt.catch
-              (fun () -> drain reading)
-              (fun (_ : exn) -> Lwt.return_unit)
-          ; send_shut >>= deadline
-          ]
-        >|= drop
+        (match Lwt.state reading with
+        | Lwt.Fail (_ : exn) ->
+          (* The end of input, or an error: no deadline. *)
+          finish ()
+        | Lwt.Sleep | Lwt.Return (_ : int) ->
+          let arm () = if not !ended then arm finish in
+          if !send_shut then arm () else on_send_shut := arm;
+          drain reading);
+        Lwt.return_unit
       in
       Lwt.async (fun () -> Lwt.catch read_loop_step read_failed)
     in
     let writev = Option.value writev ~default:(Io.writev socket) in
-    let write_loop_exited, notify_write_loop_exited = Lwt.wait () in
+    let write_loop_exited = ref false in
     let rec write_loop () =
       let rec write_loop_step () =
         match Runtime.next_write_operation t with
@@ -289,16 +338,20 @@ module IO_loop = struct
           if Option.is_some linger
           then (
             (try Io.shutdown_send socket with _ -> ());
-            Lwt.wakeup_later notify_send_shut ());
-          Lwt.wakeup_later notify_write_loop_exited ();
+            send_shut := true;
+            let on_send_shut' = !on_send_shut in
+            on_send_shut := ignore;
+            on_send_shut' ());
+          if not !write_loop_exited
+          then (
+            write_loop_exited := true;
+            loop_exited ());
           Lwt.return_unit
       in
       Lwt.async (fun () -> Lwt.catch write_loop_step fail)
     in
     read_loop ();
-    write_loop ();
-    Lwt.choose [ Lwt.join [ read_loop_exited; write_loop_exited ]; failed ]
-    >>= close
+    write_loop ()
 end
 
 module Timeout = struct
@@ -718,7 +771,6 @@ struct
        stays: the next read, or the linger, takes its bytes. *)
     type timers =
       { socket : socket
-      ; close : unit -> unit Lwt.t
       ; idle_timeout : float option
       ; head_timeout : float option
       ; (* The length of a body clock tick. *)
@@ -751,8 +803,10 @@ struct
            does not pay for it. *)
         mutable linger_timer : Timeout.t option
       ; mutable websocket : websocket option
-      ; cancelled : unit Lwt.t
-      ; notify_cancelled : unit Lwt.u
+      ; (* Resolves when the socket is closed and the timers are stopped. *)
+        ended : unit Lwt.t
+      ; notify_ended : unit Lwt.u
+      ; mutable closing : bool
       }
 
     type connection =
@@ -783,6 +837,20 @@ struct
       Option.iter Timeout.stop t.tick_timer;
       Option.iter Timeout.stop t.write_timer;
       Option.iter Timeout.stop t.linger_timer
+
+    (* Closes the socket once, then stops the timers and resolves [ended]. *)
+    let close t () =
+      if not t.closing
+      then (
+        t.closing <- true;
+        let closed () =
+          stop_timers t;
+          Lwt.wakeup_later t.notify_ended ()
+        in
+        match Io.close t.socket with
+        | closing -> Lwt.on_termination closing closed
+        | exception (_ : exn) -> closed ());
+      t.ended
 
     let restart_body_clock t =
       t.ticks <- 0;
@@ -1036,22 +1104,21 @@ struct
       | Some { close_expired = true; _ } -> None
       | Some { close_expired = false; _ } | None ->
         Some
-          (fun () ->
+          (fun on_expire ->
             let timer =
-              Timeout.create
+              Timeout.create_with
                 (Option.value
                    t.idle_timeout
                    ~default:linger_without_idle_timeout)
+                (fun (_ : Timeout.t) -> on_expire ())
             in
             t.linger_timer <- Some timer;
-            Timeout.set timer;
-            Timeout.expired timer)
+            Timeout.set timer)
 
     let cancel c =
       (try Ache.Server_connection.shutdown c.connection with _ -> ());
-      Lwt.on_termination (c.timers.close ()) (fun () ->
-        if Lwt.is_sleeping c.timers.cancelled
-        then Lwt.wakeup_later c.timers.notify_cancelled ())
+      let (_ : unit Lwt.t) = close c.timers () in
+      ()
 
     let stop_write_clock t () =
       if t.write_clock
@@ -1141,19 +1208,18 @@ struct
       check_timeout "write_timeout" write_timeout;
       check_timeout "close_timeout" close_timeout;
       check_timeout "grace" grace;
-      let close = IO_loop.close_once Io.close socket in
       match stop with
-      | Some stop when not (Lwt.is_sleeping stop) -> close ()
+      | Some stop when not (Lwt.is_sleeping stop) ->
+        IO_loop.close_once Io.close socket ()
       | _ ->
         let keep_alive_timeout =
           match idle_timeout with
           | Some seconds when seconds >= 1. -> Some (int_of_float seconds)
           | Some _ | None -> None
         in
-        let cancelled, notify_cancelled = Lwt.wait () in
+        let ended, notify_ended = Lwt.wait () in
         let timers =
           { socket
-          ; close
           ; idle_timeout
           ; head_timeout
           ; tick_timeout =
@@ -1178,8 +1244,9 @@ struct
           ; write_clock = false
           ; linger_timer = None
           ; websocket = None
-          ; cancelled
-          ; notify_cancelled
+          ; ended
+          ; notify_ended
+          ; closing = false
           }
         in
         let restart_body_clock () = restart_body_clock timers in
@@ -1205,26 +1272,17 @@ struct
           | `None | `Other -> false
         in
         let c = { connection; timers; upgraded; is_websocket } in
-        let serving =
-          IO_loop.start
-            (module Io)
-            (module Observed)
-            c
-            ~read_buffer_size:config.read_buffer_size
-            ~timing:(timing c)
-            ~close
-            ~writer_waits:(stop_write_clock timers)
-            ~linger:(linger timers)
-            ?writev:(Option.map (writev c) write_timeout)
-            socket
-        in
-        let ended =
-          Lwt.finalize
-            (fun () -> Lwt.choose [ serving; cancelled ])
-            (fun () ->
-               stop_timers timers;
-               Lwt.return_unit)
-        in
+        IO_loop.start
+          (module Io)
+          (module Observed)
+          c
+          ~read_buffer_size:config.read_buffer_size
+          ~timing:(timing c)
+          ~close:(close timers)
+          ~writer_waits:(stop_write_clock timers)
+          ~linger:(linger timers)
+          ?writev:(Option.map (writev c) write_timeout)
+          socket;
         (* [Lwt.choose] removes its callback from [stop] when [ended] resolves
            first, so a long-lived [stop] does not keep one callback for each
            connection that ended. *)
@@ -1325,20 +1383,18 @@ struct
           n
       end
       in
-      Lwt.async (fun () ->
-        Lwt.finalize
-          (fun () ->
-             IO_loop.start
-               (module Io)
-               (module Observed)
-               runtime
-               ~read_buffer_size:config.read_buffer_size
-               ~close
-               socket)
-          (fun () ->
-             Option.iter Timeout.stop reuse.timer;
-             reuse.timer <- None;
-             Lwt.return_unit));
+      IO_loop.start
+        (module Io)
+        (module Observed)
+        runtime
+        ~read_buffer_size:config.read_buffer_size
+        ~close:(fun () ->
+          let closing = close () in
+          Lwt.on_termination closing (fun () ->
+            Option.iter Timeout.stop reuse.timer;
+            reuse.timer <- None);
+          closing)
+        socket;
       Lwt.return { connection; runtime; close; socket; unread; reuse }
 
     let request

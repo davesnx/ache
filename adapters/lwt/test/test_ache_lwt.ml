@@ -2688,6 +2688,49 @@ let test_body_timeout_linger () =
     Lwt_unix.close socket);
   Alcotest.(check bool) "on_error" true !body_cut
 
+(* With [idle_timeout], the linger ends [idle_timeout] after the server's output
+   ends, though the client still sends. *)
+let test_linger_ends_at_idle_timeout () =
+  with_server ~idle_timeout:0.5 ~body_timeout:0.3 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (count_request 100_000_000) >>= fun () ->
+    let rec send n =
+      let chunk = if n < 10 then "b" else String.make 1024 'b' in
+      Lwt_unix.sleep (if n < 10 then 0.05 else 0.01) >>= fun () ->
+      write_all socket chunk >>= fun () -> send (n + 1)
+    in
+    let writer =
+      Lwt.catch (fun () -> send 0) (fun (_ : exn) -> Lwt.return_unit)
+    in
+    read_all socket >>= fun output ->
+    Alcotest.(check string) "408, then the end of input" response_408 output;
+    let since = Unix.gettimeofday () in
+    writer >>= fun () ->
+    check_within "server closes after the linger" ~since ~min:0.3 ~max:1.5;
+    check_server_sockets_closed ();
+    Lwt_unix.close socket)
+
+(* A client that reads a closing response and then ends its output ends the
+   linger at once, long before [idle_timeout]. *)
+let test_linger_ends_at_end_of_input () =
+  let since = ref 0. in
+  with_server ~idle_timeout:30. (fun connect ->
+    connect () >>= fun socket ->
+    write_all
+      socket
+      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+    >>= fun () ->
+    read_all socket >>= fun output ->
+    Alcotest.(check bool)
+      "200"
+      true
+      (String.starts_with ~prefix:"HTTP/1.1 200 OK\r\n" output);
+    since := Unix.gettimeofday ();
+    Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
+    Lwt_unix.close socket);
+  check_within "server closes at the end of input" ~since:!since ~min:0. ~max:1.;
+  check_server_sockets_closed ()
+
 let test_body_progress_not_timed_out () =
   body_cut := false;
   with_server ~body_timeout:0.3 (fun connect ->
@@ -3161,6 +3204,12 @@ let () =
         ; ( "a client that sends after a 408 reads it, then the end of input"
           , `Quick
           , test_body_timeout_linger )
+        ; ( "the linger ends at idle_timeout though the client sends"
+          , `Quick
+          , test_linger_ends_at_idle_timeout )
+        ; ( "the linger ends at the client's end of input"
+          , `Quick
+          , test_linger_ends_at_end_of_input )
         ; ( "a body that makes progress is not timed out"
           , `Quick
           , test_body_progress_not_timed_out )

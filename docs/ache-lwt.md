@@ -227,7 +227,7 @@ It creates the core connection and starts the two loops:
   ├─ read loop  (Lwt.async) ── Lwt_bytes.read into the read buffer
   │                            (a timer ends a read that waits too long)
   ├─ write loop (Lwt.async) ── Lwt_unix.writev, one call for all buffers
-  └─ Lwt.choose [ both loops ended ; failed ] ─► close the socket once
+  └─ both loops ended, or one failed ─► close the socket once
      (a server read loop lingers first; the write loop shuts the send side)
 ```
 
@@ -265,11 +265,16 @@ It creates the core connection and starts the two loops:
   end of input, or until the write loop has shut the send side and
   `idle_timeout` (2 s when it is `None`) has passed (RFC 9112 §9.6). Closing
   with unread input would make the kernel send a reset, and the client could
-  lose the response. The timer is made only then, and stops with the
-  connection. After the end of input, and when a WebSocket closes at
-  `close_timeout`, there is no linger.
+  lose the response. The drain runs on callbacks of its reads. Its deadline
+  is a timer of the connection, made and set when the send side is shut
+  while the drain waits, and stopped with the connection. At the deadline
+  the read loop ends and the socket closes; the read in progress is left to
+  the close. When the first drain read finds the end of input, the
+  connection closes without a timer. After the end of input, and when a
+  WebSocket closes at `close_timeout`, there is no linger.
 - **Errors.** If a write fails, or the core raises in `report_exn`, the
-  connection resolves `failed`, and `Lwt.choose` closes the socket.
+  connection closes the socket at once, without waiting for the other
+  loop.
 
 ## Runtime notes
 
