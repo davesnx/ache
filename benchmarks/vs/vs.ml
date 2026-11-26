@@ -33,6 +33,7 @@ type settings =
   ; request_body_buffer_size : int
   ; response_buffer_size : int
   ; response_body_buffer_size : int
+  ; timeouts : bool
   }
 
 let settings () =
@@ -40,7 +41,8 @@ let settings () =
   and read_buffer_size = ref 4096
   and request_body_buffer_size = ref 4096
   and response_buffer_size = ref 1024
-  and response_body_buffer_size = ref 4096 in
+  and response_body_buffer_size = ref 4096
+  and timeouts = ref true in
   Arg.parse
     [ "--port", Arg.Set_int port, " Port on 127.0.0.1 (8080)"
     ; "--read-buffer-size", Arg.Set_int read_buffer_size, " (4096)"
@@ -51,6 +53,9 @@ let settings () =
     ; ( "--response-body-buffer-size"
       , Arg.Set_int response_body_buffer_size
       , " (4096)" )
+    ; ( "--timeouts"
+      , Arg.Symbol ([ "on"; "off" ], fun mode -> timeouts := mode = "on")
+      , " Timeouts of the ache-eio server: the defaults (on), or all four off" )
     ]
     (fun arg -> raise (Arg.Bad arg))
     "Benchmark server. Routes: GET /fixed/<bytes>, GET /close/<bytes>, GET \
@@ -61,6 +66,7 @@ let settings () =
   ; request_body_buffer_size = !request_body_buffer_size
   ; response_buffer_size = !response_buffer_size
   ; response_body_buffer_size = !response_body_buffer_size
+  ; timeouts = !timeouts
   }
 
 let bigstrings : (int, bigstring) Hashtbl.t = Hashtbl.create 16
