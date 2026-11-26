@@ -176,16 +176,28 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   or dropped body, a parse error), input left after the last request, or a
   WebSocket closed without the client's close frame. ache-eio and ache-miou
   linger only then: a request read whole and answered with
-  `Connection: close`, and a completed WebSocket close handshake, close the
-  socket at once. ache-miou no longer skips the linger without timeouts.
+  `Connection: close` closes the socket at once. ache-miou no longer skips
+  the linger without timeouts. ache-lwt still lingers after every close.
+- ache-eio and ache-miou close the socket at once after a completed
+  WebSocket close handshake. They kept reading until the client's end of
+  input or `idle_timeout`.
+- ache-eio and ache-miou cost less per request. User-space instructions per
+  request on `/fixed/5` (`benchmarks/vs/cost.sh`, one core): ache-eio with
+  timeouts, keep-alive 20.2k to 16.1k, `Connection: close` 155.9k to
+  72.4k; ache-miou with timeouts, keep-alive 90.0k to 23.0k,
+  `Connection: close` 220.1k to 70.4k. ache-eio forks its watchdog fiber
+  with the first deadline and runs the write loop in the connection's
+  fiber, and the ache-miou server reads without a reader task.
 - Strict parsing and framing after RFC 9110 and RFC 9112. `docs/ache.md` lists
   what the server rejects.
 - Bodies are delivered in linear time.
 - An obs-folded response field is joined once, in linear time.
-- `ache-lwt` shares one timer for each timeout value among all connections,
-  and `ache-miou` keeps one timer for each timeout on a connection that
-  sleeps at most 0.5 s at a time, so cancelled timers do not pile up in the
-  heap. The TLS handshake timeout does the same: `ache-lwt-tls` uses
+- `ache-lwt` shares one timer for each timeout value among all connections.
+  `ache-miou` keeps the deadlines of the connections of a domain in one
+  heap, with one task that sleeps until the earliest, at most 0.5 s at a
+  time, so cancelled timers do not pile up in Miou's heap. Each connection
+  runs its own timeout actions, so an `error_handler` that waits delays
+  only its connection. The TLS handshake timeout does the same: `ache-lwt-tls` uses
   `Ache_lwt.Timeout`, and `ache-miou-tls` sleeps at most 0.5 s at a time.
 - The responses to all pipelined requests in one read go out in one write.
   `ache-miou` sends all buffers with one `sendmsg`, not one write per buffer.

@@ -440,9 +440,10 @@ when the connection closed first.
 - It answers a ping with a pong that has the same payload.
 - It gives a fragmented message to `on_message` in one piece.
 - When the client sends a close frame, it sends a close frame with the same
-  code, then closes the connection. `on_close` gets the client's code and
-  reason, or `Some { code = 1005; reason = "" }` for a close frame without a
-  code.
+  code, then closes the connection (see
+  [Lingering close](#lingering-close)). `on_close` gets the client's code
+  and reason, or `Some { code = 1005; reason = "" }` for a close frame
+  without a code.
 - `Websocket.close ?reason ws ~code` sends a close frame and waits for the
   client's: it keeps reading, drops the messages that arrive meanwhile, and
   closes the connection at the client's close frame or the end of input.
@@ -626,6 +627,30 @@ a failed write (`` `Closed ``).
 
 All five timeouts are on by default in every runtime: head 30 s, idle,
 body and write 60 s, close 10 s. Passing `None` turns one off.
+
+### Lingering close
+
+A server that closes a socket with unread input makes the kernel send a
+reset, and the client can lose the response it has not read yet. So when
+the client may still be sending, the runtime shuts down its send side,
+reads and drops input until the end of input, and only then closes (RFC
+9112 §9.6). The linger ends at most `idle_timeout` (2 s without one) after
+the response is written.
+
+`Server_connection.lingers` tells the runtime whether the client may still
+be sending. It is `true` when a request is partly read (a body not read to
+its end, an incomplete head, a request that could not be parsed), when
+input is left after the last request, and on a WebSocket closed without
+the client's close frame (a protocol error, an idle timeout, a drain). It
+is `false` when every request was read whole, after the end of input, and
+after a completed WebSocket close handshake: nothing may follow the
+client's close frame (RFC 6455 §5.5.1). Go's `net/http` and nginx's
+`lingering_close on` linger on the same condition.
+
+ache-eio and ache-miou linger only when `lingers` is `true`; a request
+read whole and answered with `Connection: close` closes the socket at
+once. ache-lwt lingers after every close, except after the end of input
+and when a WebSocket closes at `close_timeout`.
 
 ### Keep-Alive
 

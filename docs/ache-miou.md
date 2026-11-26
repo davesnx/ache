@@ -347,20 +347,23 @@ scheduler, and a task stays on its domain.
 
 ### One connection
 
-The server handler runs in a task for each accepted socket. It creates the
-core connection and starts the two loops as two child tasks:
+The server handler runs in a task for each accepted socket, the
+connection task. It creates the core connection and starts the two loops
+as two child tasks:
 
 ```
  accept loop ── Miou.async: one task per accepted socket
         │
         ▼
- connection task
+ connection task: starts sessions, runs timeout actions, may lead the ticker
   ├─ read task  ── Miou_unix.read into the read buffer
-  │     └─ timed read ─► reader task (started on first use)
   ├─ write task ── one sendmsg for all buffers
+  ├─ timeout action task (while the action of a deadline runs)
+  ├─ ticker task (while this connection leads the timers of its domain)
+  ├─ stop task (with ?stop)
   ├─ WebSocket session tasks (started on upgrade)
   └─ waits until both loops end, or one fails, then for the sessions
-     ─► close the socket
+     ─► the handler returns, and the caller closes the socket
 ```
 
 - **Waiting.** On `Yield`, a loop gives the core a callback that wakes it
@@ -370,38 +373,51 @@ core connection and starts the two loops as two child tasks:
   `sendmsg` (a C stub in `adapters/miou/ache_miou_stubs.c`). When the socket
   buffer is full, it waits until the socket can be written. On a file
   descriptor that is not a socket, it writes each buffer in turn.
-- **Reads.** The read task reads with `Miou_unix.read` into free space in the
-  read buffer, then gives the new bytes to the core.
-- **The reader task.** As in `ache-eio`, a read with a timeout goes through
-  a separate reader task, and only the wait is stopped when the timeout
-  fires. The client always reads through it, so `Client.shutdown` can stop
-  the wait. Every other read is direct: with the default timeouts, only
-  reads in a tunnel, or with every timeout set to `None`. With
-  `close_timeout`, the reads of a connection after the `101` of a
-  WebSocket (`upgrade: websocket`) also go through it: when the session
-  queues its close frame, the write task sets the close deadline and wakes
-  the waiting read, which then waits at most until that deadline. When the
-  deadline passes, the connection closes without lingering. The
-  reader task
-  starts only on the first read that needs it.
-- **Body clock.** Before each read, the read task asks the core which
-  timeout applies (`Server_connection.read_timeout`). For `` `Body ``,
-  the read waits at most `body_timeout` minus the time already spent in
-  body waits of this request. After the read, the time waited and the
-  bytes read are added up; both start again from zero at each request and
-  once 2048 bytes have arrived. When the wait runs out, the read task asks
-  the core again and calls the action it gives (`on_error`, then 408 or a
-  close).
+- **Reads.** The server's read task reads with `Miou_unix.read` into free
+  space in the read buffer, then gives the new bytes to the core. It has
+  no reader task: a timeout does not cancel the read that waits. Before
+  each read, the read task asks the core which timeout applies
+  (`Server_connection.read_timeout`) and sets the read deadline of that
+  phase. When the action of a deadline ends reading, the read in progress
+  and the reads after it drop their input, and the connection lingers
+  (see [Runtime notes](#runtime-notes)). When it does not linger, it shuts
+  down the receive side at once, which ends the read.
+- **Client reads.** The client reads through a reader task, so that
+  `Client.shutdown` can end the wait without cancelling the read. The
+  reader task starts with the first read.
+- **Close timeout.** With `close_timeout`, the close clock of a WebSocket
+  starts when the server's close frame is queued. The write task sees the
+  frame first and sets the close deadline, which the read that waits takes
+  at once. When the deadline passes, the connection closes without
+  lingering.
+- **Body clock.** For `` `Body ``, the read waits at most `body_timeout`
+  minus the time already spent in body waits of this request. After the
+  read, the time waited and the bytes read are added up; both start again
+  from zero at each request and once 2048 bytes have arrived. When the
+  deadline passes, the connection task runs the action that the core gives
+  then (`on_error`, then 408 or a close), if the phase is still
+  `` `Body ``.
 - **Write clock.** Before a write, the write task starts the clock if it
   is not running; it stops it when the core has nothing more to write, and
-  starts it again after each 2048 bytes written. A watchdog task sleeps
-  until the clock's deadline, at most 0.5 s at a time. If the clock is
-  still running then, it stops the connection as an error does: it cancels
-  the read and write tasks, tells the core that the write was `Closed`,
-  and shuts the socket down.
-- **Timers.** A timer sleeps at most 0.5 s at a time and then checks its
-  deadline again. A cancelled sleep stays in Miou's timer heap until it
-  ends, so a short sleep keeps that heap small.
+  starts it again after each 2048 bytes written. If the clock is still
+  running at its deadline, the connection stops as an error does: it
+  cancels the read and write tasks, tells the core that the write was
+  `Closed`, and shuts the socket down.
+- **Timers.** The read and write deadlines of a connection are two floats.
+  Each domain has one heap of the connections that have a deadline, and
+  one ticker task that sleeps until the earliest, at most 0.5 s at a time.
+  A domain thus has one sleep in Miou's timer heap, whatever its number of
+  connections. A deadline that moves later does not touch the heap. When a
+  connection's time comes, the ticker wakes its connection task, which runs
+  the action of the deadlines that passed in a task of its own, one at a
+  time, and then takes its place in the heap again at its next deadline.
+  The ticker runs no action, so an action that waits, such as an
+  `error_handler` that answers 408, delays only its own connection. A task
+  must be awaited by the task that started it, so the ticker is a child of
+  one connection task, the leader. When the leader ends, it cancels the
+  ticker, and another connection that has a deadline starts one. A
+  cancelled sleep stays in Miou's timer heap until it ends, so the ticker
+  never sleeps longer than 0.5 s.
 - **Errors.** The core gets an exception from a read, a write or a
   handler, and gives it to `error_handler` as `` `Exn ``. If
   `error_handler` raises, or the core raises when it gets the exception,
