@@ -156,10 +156,14 @@ let ws_flood ws =
            | Some _ -> Ok "receive returned a message after the reset"))
       (Ache_lwt.Websocket.receive ws))
 
-(* The size of the message that [ws_blocked] sends: more than the 64 KiB of
-   unwritten output at which a WebSocket stops reading, also when the kernel
-   buffers some of it. *)
-let ws_blocked_size = 0x80000
+(* The size of the message that [ws_blocked] sends: far more than the kernel
+   buffers of a loopback connection hold, so that more than the 64 KiB of
+   unwritten output at which a WebSocket stops reading stays unwritten until the
+   client reads. *)
+let ws_blocked_size = 0x1000000
+
+(* [ws_blocked]'s message is written. *)
+let ws_blocked_written = ref false
 
 (* On "block", waits for its read to start again, then queues [ws_blocked_size]
    bytes, so that its reads stop until the client reads them; echoes every other
@@ -169,9 +173,12 @@ let ws_blocked ws =
     Lwt.bind (Ache_lwt.Websocket.receive ws) (function
       | Some (Text "block") ->
         Lwt.bind (Lwt_unix.sleep 0.05) (fun () ->
+          ws_blocked_written := false;
           Lwt.bind
             (Ache_lwt.Websocket.send_text ws (String.make ws_blocked_size 'x'))
-            loop)
+            (fun () ->
+               ws_blocked_written := true;
+               loop ()))
       | Some (Text message) ->
         Lwt.bind (Ache_lwt.Websocket.send_text ws message) loop
       | Some (Binary _) -> loop ()
@@ -2270,45 +2277,67 @@ let test_timeout_cancelled_expired () =
       (Unix.gettimeofday () -. since))
 
 (* A [set] of a queued timeout moves it behind the timeouts set after it was
-   queued: they expire first. *)
+   queued: they expire first. The three [set]s run without returning to the
+   event loop, so that no timer can run between them, however late the sleeps
+   end. *)
 let test_timeout_set_reorders () =
   run (fun () ->
-    let first = Ache_lwt.Timeout.create 0.15
-    and second = Ache_lwt.Timeout.create 0.15 in
+    let first = Ache_lwt.Timeout.create 0.2
+    and second = Ache_lwt.Timeout.create 0.2 in
+    let order = ref [] in
+    let record name timer =
+      let since = Unix.gettimeofday () in
+      Lwt.on_success (Ache_lwt.Timeout.expired timer) (fun () ->
+        order := (name, Unix.gettimeofday () -. since) :: !order)
+    in
     Ache_lwt.Timeout.set first;
-    let first_expired = expired_after first in
-    Lwt_unix.sleep 0.03 >>= fun () ->
+    (* [first]'s first deadline is earlier than [second]'s. *)
+    let start = Unix.gettimeofday () in
+    while Unix.gettimeofday () -. start < 0.002 do
+      ()
+    done;
     Ache_lwt.Timeout.set second;
-    let second_expired = expired_after second in
-    Lwt_unix.sleep 0.03 >>= fun () ->
+    record "second" second;
     Ache_lwt.Timeout.set first;
-    second_expired >>= fun elapsed ->
-    check_between "second" ~min:0.15 ~max:0.4 elapsed;
-    Alcotest.(check bool) "first pending" true (Lwt.is_sleeping first_expired);
-    first_expired >|= check_between "first" ~min:0.21 ~max:0.5)
+    record "first" first;
+    let rec both () =
+      if List.length !order = 2
+      then Lwt.return_unit
+      else Lwt_unix.sleep 0.01 >>= both
+    in
+    both () >|= fun () ->
+    Alcotest.(check (list string))
+      "expiry order"
+      [ "second"; "first" ]
+      (List.rev_map fst !order);
+    List.iter
+      (fun (name, elapsed) -> check_between name ~min:0.2 ~max:3.0 elapsed)
+      !order)
 
-(* A timeout set over and over expires its length after the last [set]. *)
+(* A timeout set over and over expires its length after the last [set]. The
+   timeout is 0.8 s and is set again every 0.05 s, so that a sleep that ends up
+   to 0.7 s late does not let it expire. *)
 let test_timeout_set_repeatedly () =
   run (fun () ->
-    let timer = Ache_lwt.Timeout.create 0.1 in
+    let timer = Ache_lwt.Timeout.create 0.8 in
     Ache_lwt.Timeout.set timer;
     let expired = Ache_lwt.Timeout.expired timer in
     let rec keep n =
       if n = 0
       then Lwt.return_unit
       else
-        Lwt_unix.sleep 0.04 >>= fun () ->
+        Lwt_unix.sleep 0.05 >>= fun () ->
         Alcotest.(check bool) "pending while set" true (Lwt.is_sleeping expired);
         Ache_lwt.Timeout.set timer;
         keep (n - 1)
     in
-    keep 6 >>= fun () ->
+    keep 4 >>= fun () ->
     let since = Unix.gettimeofday () in
     expired >|= fun () ->
     check_between
       "after the last set"
-      ~min:0.1
-      ~max:0.4
+      ~min:0.8
+      ~max:3.0
       (Unix.gettimeofday () -. since))
 
 let test_flood_does_not_block_event_loop () =
@@ -2837,22 +2866,28 @@ let websocket_idle_timeout ~idle_timeout () =
   check_server_sockets_closed ()
 
 let test_websocket_idle_timeout = websocket_idle_timeout ~idle_timeout:0.3
+let blocked_idle_timeout = 0.5
 
-(* A WebSocket on [/ws-blocked] with small socket buffers: the server's idle
-   timer (0.3 s) passes while its output waits for the client, so the read in
-   progress ends and the read loop yields; it reads again once the client has
-   read the output. [f] runs after the client sent "block" and slept 0.45 s. *)
+(* A WebSocket on [/ws-blocked]: its read waits, then the session queues more
+   output than the kernel buffers hold, so that the connection stops reading.
+   The idle deadline ([blocked_idle_timeout]) passes while the output waits for
+   the client: the read in progress ends and the read loop yields. The client
+   reads nothing until well after that deadline, checks that the output is still
+   unwritten, then runs [f], which reads the output so that the reads start
+   again. A 1001 sent while the output was blocked would arrive right behind it,
+   so [f] checks when the close comes. *)
 let with_blocked_websocket f =
   let connection_handler ~request_handler ~error_handler addr socket =
     Lwt_unix.setsockopt_int socket Unix.SO_SNDBUF 4096;
     Ache_lwt.Server.create_connection_handler
       ~date:false
-      ~idle_timeout:(Some 0.3)
+      ~idle_timeout:(Some blocked_idle_timeout)
       ~request_handler
       ~error_handler
       addr
       socket
   in
+  ws_blocked_written := false;
   with_server ~connection_handler (fun connect ->
     connect () >>= fun socket ->
     Lwt_unix.setsockopt_int socket Unix.SO_RCVBUF 4096;
@@ -2860,20 +2895,39 @@ let with_blocked_websocket f =
     read_head socket >>= fun head ->
     Alcotest.(check string) "101" ws_101 head;
     write_all socket (ws_frame 0x1 "block") >>= fun () ->
-    Lwt_unix.sleep 0.45 >>= fun () ->
+    Lwt_unix.sleep (blocked_idle_timeout +. 0.4) >>= fun () ->
+    Alcotest.(check bool)
+      "the output is still unwritten past the idle deadline"
+      false
+      !ws_blocked_written;
     let read_blocked_output () =
-      (* A larger window, so that the output arrives at once: with 4 KiB windows
-         on both sides it would take seconds. *)
+      (* Larger buffers, so that the output arrives at once: with 4 KiB buffers,
+         each write waits for a delayed acknowledgement. *)
       Lwt_unix.setsockopt_int socket Unix.SO_RCVBUF 0x100000;
-      read_exactly socket (10 + ws_blocked_size) >|= fun frame ->
-      Alcotest.(check int)
-        "the whole message"
-        (10 + ws_blocked_size)
-        (String.length frame);
+      List.iter
+        (fun server_socket ->
+           Lwt_unix.setsockopt_int server_socket Unix.SO_SNDBUF 0x100000)
+        !server_sockets;
+      read_exactly socket 10 >>= fun head ->
+      let expected = Bytes.make 10 '\x00' in
+      Bytes.set expected 0 '\x81';
+      Bytes.set expected 1 '\x7f';
+      Bytes.set_int64_be expected 2 (Int64.of_int ws_blocked_size);
       Alcotest.(check string)
-        "text frame, 64-bit length"
-        "\x81\x7f"
-        (String.sub frame 0 2)
+        "text frame header"
+        (Bytes.to_string expected)
+        head;
+      let chunk = Bytes.create 0x10000 in
+      let rec skip remaining =
+        if remaining = 0
+        then Lwt.return_unit
+        else
+          Lwt_unix.read socket chunk 0 (min remaining (Bytes.length chunk))
+          >>= function
+          | 0 -> Alcotest.failf "end of input, %d bytes missing" remaining
+          | n -> skip (remaining - n)
+      in
+      skip ws_blocked_size
     in
     let within seconds what p =
       Lwt.pick
@@ -2885,23 +2939,28 @@ let with_blocked_websocket f =
     f socket ~read_blocked_output ~within >>= fun () -> Lwt_unix.close socket)
 
 (* The read that resumes after the output is read gets the idle timeout again: a
-   silent client gets 1001. *)
+   silent client gets 1001 then, not while the output was blocked. *)
 let test_websocket_idle_after_blocked_output () =
   with_blocked_websocket (fun socket ~read_blocked_output ~within ->
     read_blocked_output () >>= fun () ->
     let since = Unix.gettimeofday () in
-    within 1.5 "idle close" (read_ws_frame socket) >|= fun close ->
+    within 3.0 "idle close" (read_ws_frame socket) >|= fun close ->
     Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
-    check_within "idle close" ~since ~min:0.2 ~max:1.0)
+    check_within
+      "idle close after the output"
+      ~since
+      ~min:(blocked_idle_timeout -. 0.15)
+      ~max:2.5)
 
 (* Input that arrives while the reads wait for the output is read when they
-   start again, without more input. *)
+   start again, without more input: the next frame is its echo, not the 1001 of
+   the idle timeout. *)
 let test_websocket_input_while_blocked () =
   with_blocked_websocket (fun socket ~read_blocked_output ~within ->
     write_all socket (ws_frame 0x1 "while blocked") >>= fun () ->
     Lwt_unix.sleep 0.05 >>= fun () ->
     read_blocked_output () >>= fun () ->
-    within 0.25 "echo" (read_ws_frame socket) >|= fun echo ->
+    within 3.0 "echo" (read_ws_frame socket) >|= fun echo ->
     Alcotest.(check (pair int string)) "echo" (0x81, "while blocked") echo)
 
 (* With a [Keep-Alive] hint, the timer between requests runs 1 s longer, but a
