@@ -157,9 +157,12 @@ let ws_flood ws =
       (Ache_lwt.Websocket.receive ws))
 
 (* The size of the message that [ws_blocked] sends: far more than the kernel
-   buffers of a loopback connection hold, so that more than the 64 KiB of
-   unwritten output at which a WebSocket stops reading stays unwritten until the
-   client reads. *)
+   buffers of a loopback connection hold (the send buffer grows to a few MiB,
+   the receive buffer of a client that does not read stays small), so that more
+   than the 64 KiB of unwritten output at which a WebSocket stops reading stays
+   unwritten until the client reads. The socket buffers keep their default
+   sizes: with small ones, each write waits for a delayed acknowledgement and
+   the message takes minutes. *)
 let ws_blocked_size = 0x1000000
 
 (* [ws_blocked]'s message is written. *)
@@ -2878,7 +2881,6 @@ let blocked_idle_timeout = 0.5
    so [f] checks when the close comes. *)
 let with_blocked_websocket f =
   let connection_handler ~request_handler ~error_handler addr socket =
-    Lwt_unix.setsockopt_int socket Unix.SO_SNDBUF 4096;
     Ache_lwt.Server.create_connection_handler
       ~date:false
       ~idle_timeout:(Some blocked_idle_timeout)
@@ -2890,7 +2892,6 @@ let with_blocked_websocket f =
   ws_blocked_written := false;
   with_server ~connection_handler (fun connect ->
     connect () >>= fun socket ->
-    Lwt_unix.setsockopt_int socket Unix.SO_RCVBUF 4096;
     write_all socket (ws_handshake "/ws-blocked") >>= fun () ->
     read_head socket >>= fun head ->
     Alcotest.(check string) "101" ws_101 head;
@@ -2901,22 +2902,11 @@ let with_blocked_websocket f =
       false
       !ws_blocked_written;
     let read_blocked_output () =
-      (* Larger buffers, so that the output arrives at once: with 4 KiB buffers,
-         each write waits for a delayed acknowledgement. *)
-      Lwt_unix.setsockopt_int socket Unix.SO_RCVBUF 0x100000;
-      List.iter
-        (fun server_socket ->
-           Lwt_unix.setsockopt_int server_socket Unix.SO_SNDBUF 0x100000)
-        !server_sockets;
-      read_exactly socket 10 >>= fun head ->
       let expected = Bytes.make 10 '\x00' in
       Bytes.set expected 0 '\x81';
       Bytes.set expected 1 '\x7f';
       Bytes.set_int64_be expected 2 (Int64.of_int ws_blocked_size);
-      Alcotest.(check string)
-        "text frame header"
-        (Bytes.to_string expected)
-        head;
+      let received = ref 0 in
       let chunk = Bytes.create 0x10000 in
       let rec skip remaining =
         if remaining = 0
@@ -2925,9 +2915,23 @@ let with_blocked_websocket f =
           Lwt_unix.read socket chunk 0 (min remaining (Bytes.length chunk))
           >>= function
           | 0 -> Alcotest.failf "end of input, %d bytes missing" remaining
-          | n -> skip (remaining - n)
+          | n ->
+            received := !received + n;
+            skip (remaining - n)
       in
-      skip ws_blocked_size
+      Lwt.pick
+        [ ( read_exactly socket 10 >>= fun head ->
+            Alcotest.(check string)
+              "text frame header"
+              (Bytes.to_string expected)
+              head;
+            skip ws_blocked_size )
+        ; ( Lwt_unix.sleep 5.0 >>= fun () ->
+            Alcotest.failf
+              "the output: %d of %d bytes after 5 s"
+              !received
+              ws_blocked_size )
+        ]
     in
     let within seconds what p =
       Lwt.pick
