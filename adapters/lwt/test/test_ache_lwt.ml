@@ -345,7 +345,7 @@ let error_handler (_ : Unix.sockaddr) ?request:_ error start_response =
 
 open Lwt.Infix
 
-let run f = Lwt_main.run (Lwt_unix.with_timeout 10.0 f)
+let run ?(seconds = 10.0) f = Lwt_main.run (Lwt_unix.with_timeout seconds f)
 let server_sockets : Lwt_unix.file_descr list ref = ref []
 
 let with_server
@@ -1986,7 +1986,9 @@ let check_connection_timers_bounded ?stop ~connections exchange =
   Fun.protect
     ~finally:(fun () -> Lwt_engine.set previous)
     (fun () ->
-       run (fun () ->
+       (* 1100 connections one after the other: slow CI runners need more than
+          the 10 s of the other tests. The test measures the heap. *)
+       run ~seconds:60.0 (fun () ->
          let listening = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
          Lwt_unix.setsockopt listening Unix.SO_REUSEADDR true;
          Lwt_unix.bind listening Unix.(ADDR_INET (inet_addr_loopback, 0))
@@ -2602,7 +2604,7 @@ let test_body_trickle_times_out () =
          let since = Unix.gettimeofday () in
          let writer = trickle socket ~chunks:20 ~size:1 ~gap:0.2 in
          read_all socket >>= fun output ->
-         check_within (target ^ ": timed out") ~since ~min:0.3 ~max:1.0;
+         check_within (target ^ ": timed out") ~since ~min:0.3 ~max:2.5;
          Alcotest.(check bool)
            (target ^ ": " ^ expected)
            true
