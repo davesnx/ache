@@ -70,9 +70,16 @@ val of_bigstring : bigstring -> t
     A serializer manages an internal buffer for coalescing small writes. The
     size of this buffer is determined when the serializer is created. If the
     buffer does not contain sufficient space to service a caller's buffered
-    write, the serializer will allocate a new buffer of the sufficient size and
-    use it for the current and subsequent writes. The old buffer will be
-    garbage collected once all of its contents have been {!shift}ed out. *)
+    write, the serializer allocates a new buffer, at least twice as large and
+    with room for the old buffer's contents plus the write, up to 64 KiB, and
+    uses it for the current and subsequent writes. Once all of its output has
+    been {!shift}ed out, writes start again at its beginning, so later output
+    of the same size needs no new buffer. The old buffer will be garbage
+    collected once all of its contents have been {!shift}ed out.
+
+    A write that does not fit and is larger than both 64 KiB and the current
+    buffer is copied into a buffer of its own, scheduled like
+    {!schedule_bigstring}; the serializer keeps its current buffer. *)
 
 val write_string : t -> ?off:int -> ?len:int -> string -> unit
 (** [write_string t ?off ?len str] copies [str] into the serializer's

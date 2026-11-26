@@ -83,9 +83,9 @@ let settings () =
       , " Timeouts of the ache servers: the defaults (on), or all off" )
     ]
     (fun arg -> raise (Arg.Bad arg))
-    "Benchmark server. Routes: GET /fixed/<bytes>, GET /close/<bytes>, GET \
-     /stream/<chunk>/<count>, GET /streamcl/<chunk>/<count>, POST /sink, POST \
-     /echo, GET /gc.";
+    "Benchmark server. Routes: GET /fixed/<bytes>, GET /string/<bytes>, GET \
+     /close/<bytes>, GET /stream/<chunk>/<count>, GET \
+     /streamcl/<chunk>/<count>, POST /sink, POST /echo, GET /gc.";
   { port = !port
   ; read_buffer_size = !read_buffer_size
   ; request_body_buffer_size = !request_body_buffer_size
@@ -105,6 +105,16 @@ let bigstring size =
     Hashtbl.add bigstrings size b;
     b
 
+let strings : (int, string) Hashtbl.t = Hashtbl.create 16
+
+let string size =
+  match Hashtbl.find strings size with
+  | s -> s
+  | exception Not_found ->
+    let s = String.make size 'x' in
+    Hashtbl.add strings size s;
+    s
+
 let gc_json () =
   let s = Gc.quick_stat () in
   Printf.sprintf
@@ -120,6 +130,7 @@ let gc_json () =
 module Make (Http : HTTP) = struct
   type action =
     | Fixed of Http.response * bigstring
+    | Copied of Http.response * string
     | Stream of Http.response * bigstring * int
     | Sink
     | Echo
@@ -144,6 +155,10 @@ module Make (Http : HTTP) = struct
     | [ ""; "fixed"; n ] ->
       (match int_of_string_opt n with
       | Some n when n >= 0 -> Fixed (with_length n, bigstring n)
+      | _ -> Missing)
+    | [ ""; "string"; n ] ->
+      (match int_of_string_opt n with
+      | Some n when n >= 0 -> Copied (with_length n, string n)
       | _ -> Missing)
     | [ ""; "close"; n ] ->
       (match int_of_string_opt n with
@@ -212,6 +227,7 @@ module Make (Http : HTTP) = struct
     incr requests;
     match action (Http.target reqd) with
     | Fixed (response, body) -> Http.respond_with_bigstring reqd response body
+    | Copied (response, body) -> Http.respond_with_string reqd response body
     | Stream (response, chunk, count) ->
       stream (Http.respond_with_streaming reqd response) chunk count
     | Sink -> sink reqd
