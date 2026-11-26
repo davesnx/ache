@@ -93,6 +93,14 @@ module IO_loop = struct
 
   exception Write_timeout
 
+  (* [wake] cancels the watchdog's sleep with it. *)
+  exception Rearm
+
+  type watchdog =
+    | Unstarted
+    | Awake
+    | Sleeping of Eio.Cancel.t
+
   (* The watchdog cancelled a write that had already ended. *)
   exception Late_cancel
 
@@ -134,14 +142,15 @@ module IO_loop = struct
         | Eio.Io (Eio.Net.E (Connection_reset _), _) ) ->
       raise End_of_file
 
-  (* A deadline earlier than the one the watchdog sleeps to wakes it. *)
-  let[@inline] set_read deadlines rearm deadline =
+  (* A deadline earlier than the one the watchdog sleeps to wakes it (or starts
+     it). *)
+  let[@inline] set_read deadlines wake deadline =
     deadlines.read <- deadline;
-    if deadline < deadlines.watchdog then Eio.Condition.broadcast rearm
+    if deadline < deadlines.watchdog then wake ()
 
-  let[@inline] set_write deadlines rearm deadline =
+  let[@inline] set_write deadlines wake deadline =
     deadlines.write <- deadline;
-    if deadline < deadlines.watchdog then Eio.Condition.broadcast rearm
+    if deadline < deadlines.watchdog then wake ()
 
   let[@inline] now = function
     | Some time -> Time.current time
@@ -219,14 +228,16 @@ module IO_loop = struct
     in
     let read_buffer = Buffer.create read_buffer_size in
     (* The watchdog: one fiber that sleeps until the nearest deadline, so that a
-       read or a write that ends in time costs no timer. A deadline that moves
-       later does not wake it; it sleeps again when it wakes. *)
+       read or a write that ends in time costs no timer. It starts with the
+       first finite deadline, so that a connection without one forks no fiber. A
+       deadline that moves later does not wake it; it sleeps again when it
+       wakes. *)
     let deadlines =
       { read = Float.infinity
       ; write = Float.infinity
       ; watchdog = Float.infinity
       }
-    and rearm = Eio.Condition.create ()
+    and watchdog = ref Unstarted
     (* [reading]: the read loop waits in a read. [lingering]: reading ended for
        good, and reads only drop input until it ends. *)
     and reading = ref false
@@ -240,76 +251,90 @@ module IO_loop = struct
        drain closed the connection. The read is not cancelled, which tls-eio
        would keep as an error: it and the reads after it drop their input, and
        the linger deadline ends them by shutting down the receive side. *)
-    let stop_reading () =
+    let rec stop_reading () =
       lingering := true;
       if lingers ()
-      then set_read deadlines rearm (timeout.deadline (now time) `Linger)
+      then set_read deadlines wake (timeout.deadline (now time) `Linger)
       else shutdown_once `Receive
+    and wake () =
+      match !watchdog, time with
+      | Sleeping cc, _ ->
+        watchdog := Awake;
+        Eio.Cancel.cancel cc Rearm
+      | Awake, _ | Unstarted, None -> ()
+      | Unstarted, Some time ->
+        watchdog := Awake;
+        Fiber.fork_daemon ~sw (fun () -> watch time)
+    (* Sleeps in a cancellation context that [wake] cancels: cheaper than racing
+       the sleep against a wake-up in a [Fiber.first] each time. *)
+    and sleep f =
+      match
+        Eio.Cancel.sub (fun cc ->
+          watchdog := Sleeping cc;
+          f ())
+      with
+      | () -> watchdog := Awake
+      | exception Eio.Cancel.Cancelled Rearm -> Fiber.check ()
+      | exception exn ->
+        (* The context is finished: [wake] must not cancel it. *)
+        watchdog := Awake;
+        raise exn
+    and watch time =
+      let deadline = Float.min deadlines.read deadlines.write in
+      deadlines.watchdog <- deadline;
+      (if deadline = Float.infinity
+       then sleep Fiber.await_cancel
+       else
+         let seconds = deadline -. time.Time.now () in
+         if seconds > 0.
+         then
+           sleep (fun () ->
+             time.sleep seconds;
+             timer_fired := true));
+      deadlines.watchdog <- Float.infinity;
+      timer_fired := false;
+      let now = time.now () in
+      if deadlines.read <= now
+      then (
+        deadlines.read <- Float.infinity;
+        if !lingering
+        then
+          (* The linger ends, unless the response is still being written. *)
+          if !send_shut
+          then shutdown_once `Receive
+          else set_read deadlines wake (timeout.deadline now `Linger)
+        else
+          match
+            timeout.ended 0;
+            timeout.expire ()
+          with
+          | true -> stop_reading ()
+          | false ->
+            (* The phase changed while the read waited: the read goes on, with
+               the deadline of the phase now. *)
+            let deadline = timeout.deadline now `Read in
+            set_read
+              deadlines
+              wake
+              (if deadline = Float.infinity
+               then now +. phase_recheck
+               else deadline)
+          | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+          | exception exn ->
+            (* The read loop raises it when its read ends. *)
+            expire_failed := Some (exn, Printexc.get_raw_backtrace ());
+            lingering := true;
+            shutdown_once `Receive);
+      if deadlines.write <= now
+      then (
+        deadlines.write <- Float.infinity;
+        match !write_cancel with
+        | Some cc ->
+          write_expired := true;
+          Eio.Cancel.cancel cc Write_timeout
+        | None -> ());
+      watch time
     in
-    Option.iter
-      (fun time ->
-         Fiber.fork_daemon ~sw (fun () ->
-           let rec watch () =
-             let deadline = Float.min deadlines.read deadlines.write in
-             deadlines.watchdog <- deadline;
-             (if deadline = Float.infinity
-              then Eio.Condition.await_no_mutex rearm
-              else
-                let seconds = deadline -. time.Time.now () in
-                if seconds > 0.
-                then
-                  Fiber.first
-                    (fun () ->
-                       time.sleep seconds;
-                       timer_fired := true)
-                    (fun () -> Eio.Condition.await_no_mutex rearm));
-             deadlines.watchdog <- Float.infinity;
-             timer_fired := false;
-             let now = time.now () in
-             if deadlines.read <= now
-             then (
-               deadlines.read <- Float.infinity;
-               if !lingering
-               then
-                 (* The linger ends, unless the response is still being
-                    written. *)
-                 if !send_shut
-                 then shutdown_once `Receive
-                 else set_read deadlines rearm (timeout.deadline now `Linger)
-               else
-                 match
-                   timeout.ended 0;
-                   timeout.expire ()
-                 with
-                 | true -> stop_reading ()
-                 | false ->
-                   (* The phase changed while the read waited: the read goes on,
-                      with the deadline of the phase now. *)
-                   let deadline = timeout.deadline now `Read in
-                   set_read
-                     deadlines
-                     rearm
-                     (if deadline = Float.infinity
-                      then now +. phase_recheck
-                      else deadline)
-                 | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
-                 | exception exn ->
-                   (* The read loop raises it when its read ends. *)
-                   expire_failed := Some (exn, Printexc.get_raw_backtrace ());
-                   lingering := true;
-                   shutdown_once `Receive);
-             if deadlines.write <= now
-             then (
-               deadlines.write <- Float.infinity;
-               match !write_cancel with
-               | Some cc ->
-                 write_expired := true;
-                 Eio.Cancel.cancel cc Write_timeout
-               | None -> ());
-             watch ()
-           in
-           watch ()))
-      time;
     (* Writes [bufs], [len] bytes, with a clock that counts while the write
        waits, and restarts after [progress_bytes] written. At the deadline the
        watchdog cancels [write_cancel], around the whole write loop. *)
@@ -323,12 +348,12 @@ module IO_loop = struct
       then
         if progress + n >= progress_bytes
         then (
-          set_write deadlines rearm (now time +. limit);
+          set_write deadlines wake (now time +. limit);
           write_timed limit (Cstruct.shiftv bufs n) (len - n) 0)
         else write_timed limit (Cstruct.shiftv bufs n) (len - n) (progress + n)
     in
     let write_timed limit bufs len =
-      set_write deadlines rearm (now time +. limit);
+      set_write deadlines wake (now time +. limit);
       match write_timed limit bufs len 0 with
       | () -> deadlines.write <- Float.infinity
       | exception exn ->
@@ -397,7 +422,7 @@ module IO_loop = struct
                  then (
                    let now = now time in
                    timeout.ended 0;
-                   set_read deadlines rearm (timeout.deadline now `Read)))
+                   set_read deadlines wake (timeout.deadline now `Read)))
       interrupt;
     let read_loop =
       (* Waits for the reader fiber's result. *)
@@ -456,7 +481,7 @@ module IO_loop = struct
           let (_ : bool) = timeout.expire () in
           Error `Timeout)
         else (
-          if timed then set_read deadlines rearm deadline;
+          if timed then set_read deadlines wake deadline;
           reading := true;
           match read_input () with
           | n ->
@@ -499,7 +524,7 @@ module IO_loop = struct
         if not !lingering
         then (
           lingering := true;
-          set_read deadlines rearm (timeout.deadline (now time) `Linger));
+          set_read deadlines wake (timeout.deadline (now time) `Linger));
         let rec drop_input () =
           match read_input () with
           | (_ : int) ->
