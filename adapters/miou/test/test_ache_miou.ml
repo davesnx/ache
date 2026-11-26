@@ -2054,6 +2054,79 @@ let test_head_timeout () =
     "HTTP/1.1 408 Request Timeout"
     (status_line output)
 
+(* Two connections of one domain on socket pairs: [idle] first, so that it leads
+   the domain's timers, then [slow], which sends a partial head and whose
+   [error_handler] waits [error_delay] before it answers 408. *)
+let with_slow_error_handler ~idle_timeout ~error_delay f =
+  Miou_unix.run ~domains:0 (fun () ->
+    with_timeout 8.0 (fun () ->
+      let pair () =
+        let client, server = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+        Miou_unix.of_file_descr client, Miou_unix.of_file_descr server
+      in
+      let error_handler _ ?request:_ _ start_response =
+        Miou_unix.sleep error_delay;
+        Body.Writer.close (start_response Headers.empty)
+      in
+      let serve socket =
+        Miou.async (fun () ->
+          Fun.protect
+            ~finally:(fun () -> Miou_unix.close socket)
+            (fun () ->
+               Ache_miou.Server.create_connection_handler
+                 ~date:false
+                 ~idle_timeout:(Some idle_timeout)
+                 ~head_timeout:(Some 0.2)
+                 ~body_timeout:None
+                 ~write_timeout:None
+                 ~close_timeout:None
+                 ~request_handler
+                 ~error_handler
+                 socket
+                 (Unix.ADDR_UNIX "")))
+      in
+      let idle_client, idle_server = pair ()
+      and slow_client, slow_server = pair () in
+      let from = Unix.gettimeofday () in
+      let idle = serve idle_server in
+      Miou_unix.sleep 0.01;
+      let slow = serve slow_server in
+      send slow_client "GET /hello HTTP/1.1\r\n";
+      f ~from ~idle_client ~slow_client;
+      Miou_unix.close idle_client;
+      Miou_unix.close slow_client;
+      let (_ : (unit, exn) result list) = Miou.await_all [ idle; slow ] in
+      ()))
+
+(* The 408 of one connection waits in its [error_handler]: the idle timeout of
+   another connection of the domain still fires on time. *)
+let test_slow_error_handler_idle_timeout () =
+  with_slow_error_handler
+    ~idle_timeout:0.5
+    ~error_delay:2.0
+    (fun ~from ~idle_client ~slow_client ->
+       Alcotest.(check bool) "closed" true (at_end_of_input idle_client);
+       check_elapsed "idle timeout" ~from ~min:0.45 ~max:1.2;
+       Alcotest.(check string)
+         "status line"
+         "HTTP/1.1 408 Request Timeout"
+         (status_line (read_all slow_client)))
+
+(* The connection that leads the domain's timers ends while another connection's
+   [error_handler] waits: its 408 is still sent. *)
+let test_leader_ends_during_408 () =
+  with_slow_error_handler
+    ~idle_timeout:5.0
+    ~error_delay:0.5
+    (fun ~from:_ ~idle_client ~slow_client ->
+       Miou_unix.sleep 0.4;
+       shutdown_send idle_client;
+       Alcotest.(check bool) "closed" true (at_end_of_input idle_client);
+       Alcotest.(check string)
+         "status line"
+         "HTTP/1.1 408 Request Timeout"
+         (status_line (read_all slow_client)))
+
 let test_head_deadline () =
   with_server ~head_timeout:0.4 (fun addr ->
     let socket = connect addr in
@@ -3680,6 +3753,12 @@ let () =
         ; ( "head timeout counts from the first byte of the head"
           , `Quick
           , test_head_deadline )
+        ; ( "a slow error_handler does not delay another idle timeout"
+          , `Quick
+          , test_slow_error_handler_idle_timeout )
+        ; ( "the timer leader ending does not drop another 408"
+          , `Quick
+          , test_leader_ends_during_408 )
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
         ; ( "unread body after a closing response: response, then the end"
