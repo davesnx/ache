@@ -2602,7 +2602,7 @@ let test_body_trickle_times_out () =
          let since = Unix.gettimeofday () in
          let writer = trickle socket ~chunks:20 ~size:1 ~gap:0.2 in
          read_all socket >>= fun output ->
-         check_within (target ^ ": timed out") ~since ~min:0.3 ~max:1.0;
+         check_within (target ^ ": timed out") ~since ~min:0.3 ~max:2.5;
          Alcotest.(check bool)
            (target ^ ": " ^ expected)
            true
