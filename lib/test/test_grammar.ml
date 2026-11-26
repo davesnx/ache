@@ -162,5 +162,46 @@ let test_chunk_size () =
     ; "\r\n", Error "unexpected '\\r' in chunk-size line"
     ]
 
+(* Targets, field values and reasons are scanned 8 bytes at a time: put each
+   byte at each offset of the first three words, alone and after an HTAB. *)
+let test_byte_at_each_offset () =
+  let field_char c = c = '\t' || (c >= ' ' && c <> '\x7f') in
+  let target_char c = c > ' ' && c <> '\x7f' in
+  let ok = function Ok _ -> true | Error _ -> false in
+  let module G = Ache.Ache_private.Parse.Grammar in
+  for k = 0 to 23 do
+    for b = 0 to 255 do
+      let c = Char.chr b in
+      let around s = String.make k 'a' ^ s ^ String.make (23 - k) 'a' in
+      let check name accepts result =
+        Alcotest.(check bool)
+          (Printf.sprintf "%s, byte %02x at %d" name b k)
+          accepts
+          (ok result)
+      in
+      let value = around (String.make 1 c) in
+      let after_tab = around ("\t" ^ String.make 1 c) in
+      check
+        "target"
+        (target_char c)
+        (G.request ("GET /" ^ value ^ " HTTP/1.1\r\n\r\n"));
+      check
+        "field value"
+        (field_char c)
+        (G.request ("GET / HTTP/1.1\r\nX: " ^ value ^ "\r\n\r\n"));
+      check
+        "field value after HTAB"
+        (field_char c)
+        (G.request ("GET / HTTP/1.1\r\nX: " ^ after_tab ^ "\r\n\r\n"));
+      check
+        "reason"
+        (field_char c)
+        (G.response ("HTTP/1.1 200 " ^ value ^ "\r\n\r\n"))
+    done
+  done
+
 let tests =
-  [ "head corpus", `Quick, test_corpus; "chunk-size", `Quick, test_chunk_size ]
+  [ "head corpus", `Quick, test_corpus
+  ; "chunk-size", `Quick, test_chunk_size
+  ; "byte at each offset", `Quick, test_byte_at_each_offset
+  ]

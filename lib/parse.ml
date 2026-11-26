@@ -155,6 +155,57 @@ let rec skip table bs stop i =
   then skip table bs stop (i + 1)
   else i
 
+let[@inline] zero_bytes x =
+  Int64.logand
+    (Int64.logand (Int64.sub x 0x0101010101010101L) (Int64.lognot x))
+    0x8080808080808080L
+
+(* Index of the lowest byte whose high bit is set in [m]. *)
+let[@inline] first_mark m =
+  let low = Int64.shift_right_logical (Int64.logand m (Int64.neg m)) 7 in
+  Int64.to_int
+    (Int64.shift_right_logical (Int64.mul low 0x0001020304050607L) 56)
+
+(* [skip table] for a table that accepts every byte from [below] up, except DEL,
+   and possibly some bytes under [below]. Eight bytes at a time: a word with no
+   byte under [below] and no DEL is accepted whole; a flagged byte is looked up
+   in [table]. [below] is the byte repeated in each lane, at most 0x80. *)
+let[@inline] skip_word ~below table bs stop i =
+  let i = ref i
+  and found = ref (-1) in
+  if not Sys.big_endian
+  then
+    while !found < 0 && !i + 8 <= stop do
+      let x = Bigstring.unsafe_get_int64_ne bs !i in
+      let m =
+        Int64.logor
+          (Int64.logand
+             (Int64.logand (Int64.sub x below) (Int64.lognot x))
+             0x8080808080808080L)
+          (zero_bytes (Int64.logxor x 0x7f7f7f7f7f7f7f7fL))
+      in
+      if m = 0L
+      then i := !i + 8
+      else
+        let m = ref m in
+        while !found < 0 && !m <> 0L do
+          let j = !i + first_mark !m in
+          if is table (Bigstring.unsafe_get bs j)
+          then m := Int64.logand !m (Int64.sub !m 1L)
+          else found := j
+        done;
+        if !found < 0 then i := !i + 8
+    done;
+  if !found >= 0 then !found else skip table bs stop !i
+
+(* field-char: HTAB, SP to 0x7e, 0x80 to 0xff. *)
+let skip_field bs stop i =
+  skip_word ~below:0x2020202020202020L field_char bs stop i
+
+(* Request target: 0x21 to 0x7e, 0x80 to 0xff. *)
+let skip_target bs stop i =
+  skip_word ~below:0x2121212121212121L target_char bs stop i
+
 let rec skip_zeros bs stop i =
   if i < stop && Bigstring.unsafe_get bs i = '0'
   then skip_zeros bs stop (i + 1)
@@ -247,7 +298,7 @@ let request_line ~eof o bs off stop =
   if meth_end = off || get bs stop meth_end <> ' '
   then unexpected ~eof o bs stop meth_end where
   else
-    let target_end = skip target_char bs stop (meth_end + 1) in
+    let target_end = skip_target bs stop (meth_end + 1) in
     if target_end = meth_end + 1 || get bs stop target_end <> ' '
     then unexpected ~eof o bs stop target_end where
     else
@@ -297,7 +348,7 @@ let status_line ~eof o bs off stop =
     else if get bs stop code_end <> ' '
     then unexpected ~eof o bs stop code_end where
     else
-      let reason_end = skip field_char bs stop (code_end + 1) in
+      let reason_end = skip_field bs stop (code_end + 1) in
       let q = end_line ~eof o bs stop reason_end where in
       if q >= 0
       then (
@@ -328,7 +379,7 @@ let field_line ~eof ~obs_fold o bs off stop =
   then unexpected ~eof o bs stop name_end where
   else
     let start = skip space bs stop (if fold then off else name_end + 1) in
-    let value_end = skip field_char bs stop start in
+    let value_end = skip_field bs stop start in
     let p = end_line ~eof o bs stop value_end where in
     (if p >= 0
      then
