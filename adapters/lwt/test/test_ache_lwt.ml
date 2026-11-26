@@ -156,6 +156,29 @@ let ws_flood ws =
            | Some _ -> Ok "receive returned a message after the reset"))
       (Ache_lwt.Websocket.receive ws))
 
+(* The size of the message that [ws_blocked] sends: more than the 64 KiB of
+   unwritten output at which a WebSocket stops reading, also when the kernel
+   buffers some of it. *)
+let ws_blocked_size = 0x80000
+
+(* On "block", waits for its read to start again, then queues [ws_blocked_size]
+   bytes, so that its reads stop until the client reads them; echoes every other
+   message. *)
+let ws_blocked ws =
+  let rec loop () =
+    Lwt.bind (Ache_lwt.Websocket.receive ws) (function
+      | Some (Text "block") ->
+        Lwt.bind (Lwt_unix.sleep 0.05) (fun () ->
+          Lwt.bind
+            (Ache_lwt.Websocket.send_text ws (String.make ws_blocked_size 'x'))
+            loop)
+      | Some (Text message) ->
+        Lwt.bind (Ache_lwt.Websocket.send_text ws message) loop
+      | Some (Binary _) -> loop ()
+      | None -> Lwt.return_unit)
+  in
+  loop ()
+
 exception Respond_later
 
 let late_error_response : (unit -> unit) option ref = ref None
@@ -235,11 +258,14 @@ let request_handler (_ : Unix.sockaddr) reqd =
      with
     | Ok () -> ()
     | Error _ -> Alcotest.fail "handshake rejected")
-  | `GET, ("/ws-echo" | "/ws-flood") ->
+  | `GET, ("/ws-echo" | "/ws-flood" | "/ws-blocked") ->
     (match
        Ache_lwt.Websocket.upgrade
          reqd
-         (if request.target = "/ws-echo" then ws_echo else ws_flood)
+         (match request.target with
+         | "/ws-echo" -> ws_echo
+         | "/ws-blocked" -> ws_blocked
+         | _ -> ws_flood)
      with
     | Ok () -> ()
     | Error _ ->
@@ -2812,6 +2838,72 @@ let websocket_idle_timeout ~idle_timeout () =
 
 let test_websocket_idle_timeout = websocket_idle_timeout ~idle_timeout:0.3
 
+(* A WebSocket on [/ws-blocked] with small socket buffers: the server's idle
+   timer (0.3 s) passes while its output waits for the client, so the read in
+   progress ends and the read loop yields; it reads again once the client has
+   read the output. [f] runs after the client sent "block" and slept 0.45 s. *)
+let with_blocked_websocket f =
+  let connection_handler ~request_handler ~error_handler addr socket =
+    Lwt_unix.setsockopt_int socket Unix.SO_SNDBUF 4096;
+    Ache_lwt.Server.create_connection_handler
+      ~date:false
+      ~idle_timeout:(Some 0.3)
+      ~request_handler
+      ~error_handler
+      addr
+      socket
+  in
+  with_server ~connection_handler (fun connect ->
+    connect () >>= fun socket ->
+    Lwt_unix.setsockopt_int socket Unix.SO_RCVBUF 4096;
+    write_all socket (ws_handshake "/ws-blocked") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "block") >>= fun () ->
+    Lwt_unix.sleep 0.45 >>= fun () ->
+    let read_blocked_output () =
+      (* A larger window, so that the output arrives at once: with 4 KiB windows
+         on both sides it would take seconds. *)
+      Lwt_unix.setsockopt_int socket Unix.SO_RCVBUF 0x100000;
+      read_exactly socket (10 + ws_blocked_size) >|= fun frame ->
+      Alcotest.(check int)
+        "the whole message"
+        (10 + ws_blocked_size)
+        (String.length frame);
+      Alcotest.(check string)
+        "text frame, 64-bit length"
+        "\x81\x7f"
+        (String.sub frame 0 2)
+    in
+    let within seconds what p =
+      Lwt.pick
+        [ p
+        ; ( Lwt_unix.sleep seconds >>= fun () ->
+            Alcotest.failf "%s: nothing after %.1f s" what seconds )
+        ]
+    in
+    f socket ~read_blocked_output ~within >>= fun () -> Lwt_unix.close socket)
+
+(* The read that resumes after the output is read gets the idle timeout again: a
+   silent client gets 1001. *)
+let test_websocket_idle_after_blocked_output () =
+  with_blocked_websocket (fun socket ~read_blocked_output ~within ->
+    read_blocked_output () >>= fun () ->
+    let since = Unix.gettimeofday () in
+    within 1.5 "idle close" (read_ws_frame socket) >|= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    check_within "idle close" ~since ~min:0.2 ~max:1.0)
+
+(* Input that arrives while the reads wait for the output is read when they
+   start again, without more input. *)
+let test_websocket_input_while_blocked () =
+  with_blocked_websocket (fun socket ~read_blocked_output ~within ->
+    write_all socket (ws_frame 0x1 "while blocked") >>= fun () ->
+    Lwt_unix.sleep 0.05 >>= fun () ->
+    read_blocked_output () >>= fun () ->
+    within 0.25 "echo" (read_ws_frame socket) >|= fun echo ->
+    Alcotest.(check (pair int string)) "echo" (0x81, "while blocked") echo)
+
 (* With a [Keep-Alive] hint, the timer between requests runs 1 s longer, but a
    WebSocket keeps [idle_timeout], and the 101 gets no hint. *)
 let test_websocket_idle_with_hint = websocket_idle_timeout ~idle_timeout:1.0
@@ -3222,6 +3314,12 @@ let () =
         ; ( "an idle WebSocket closes with 1001"
           , `Quick
           , test_websocket_idle_timeout )
+        ; ( "a WebSocket idle after blocked output closes with 1001"
+          , `Quick
+          , test_websocket_idle_after_blocked_output )
+        ; ( "a WebSocket reads input that came while output blocked it"
+          , `Quick
+          , test_websocket_input_while_blocked )
         ; "None turns every timeout off", `Quick, test_timeouts_off
         ] )
     ; ( "keep-alive hints"
