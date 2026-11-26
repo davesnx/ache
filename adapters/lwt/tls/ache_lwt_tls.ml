@@ -252,6 +252,22 @@ module Io = struct
       try Lwt_unix.shutdown t.fd Unix.SHUTDOWN_RECEIVE with
       | Unix.Unix_error _ -> ()
 
+  (* close_notify, then the end of the TCP output, after the writes in
+     progress. *)
+  let shutdown_send t =
+    if (not t.close_notify_sent) && Lwt_unix.state t.fd = Lwt_unix.Opened
+    then (
+      t.close_notify_sent <- true;
+      let state, data = Tls.Engine.send_close_notify t.state in
+      t.state <- state;
+      Lwt.async (fun () ->
+        Lwt.catch
+          (fun () ->
+             send t data >|= fun () ->
+             if Lwt_unix.state t.fd = Lwt_unix.Opened
+             then Lwt_unix.shutdown t.fd Unix.SHUTDOWN_SEND)
+          (fun (_ : exn) -> Lwt.return_unit)))
+
   (* close_notify goes out only if it does not wait: not behind a write in
      progress, and in one write that does not block. *)
   let close t =

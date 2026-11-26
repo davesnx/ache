@@ -5,6 +5,12 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
 
 ### Breaking
 
+- `Ache_lwt.IO` needs `shutdown_send`. The Lwt server now lingers before it
+  closes, as ache-eio does: it shuts down its send side, reads and drops
+  input until the client's end of input or `idle_timeout` (2 s without it),
+  then closes, so a client that is still sending does not lose the response
+  to a reset (RFC 9112 §9.6).
+
 - `httpun` and `httpun-types` become `ache`, `httpun-eio` becomes `ache-eio`,
   and `httpun-lwt` and `httpun-lwt-unix` become `ache-lwt`. The async and
   mirage runtimes are removed.

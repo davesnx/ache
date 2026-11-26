@@ -228,6 +228,7 @@ It creates the core connection and starts the two loops:
   │                            (Lwt.pick with a timer when a timeout applies)
   ├─ write loop (Lwt.async) ── Lwt_unix.writev, one call for all buffers
   └─ Lwt.choose [ both loops ended ; failed ] ─► close the socket once
+     (a server read loop lingers first; the write loop shuts the send side)
 ```
 
 - **Waiting.** On `Yield`, a loop gives the core a function that starts the
@@ -254,6 +255,15 @@ It creates the core connection and starts the two loops:
   `Ache_lwt.Timeout.expired`; a timed write is `Lwt.pick` of the `writev`
   and the write timer. See [Timeouts](#timeouts) for which timer applies
   and why the timers are shared.
+- **Lingering close.** When a server connection stops reading before the
+  end of input (a closing response, a 408 or 413 while the client still
+  sends a body, a timeout), the read loop reads and drops input until the
+  end of input, or until the write loop has shut the send side and
+  `idle_timeout` (2 s when it is `None`) has passed (RFC 9112 §9.6). Closing
+  with unread input would make the kernel send a reset, and the client could
+  lose the response. The timer is made only then, and stops with the
+  connection. After the end of input, and when a WebSocket closes at
+  `close_timeout`, there is no linger.
 - **Errors.** If a write fails, or the core raises in `report_exn`, the
   connection resolves `failed`, and `Lwt.choose` closes the socket.
 
@@ -264,9 +274,8 @@ The application must ignore `SIGPIPE`. `Ache_lwt.Server` and
 socket. For another socket type, implement `Ache_lwt.IO` and apply
 `Ache_lwt.Make`: `read`
 fails with `End_of_file` at the end of the input or when the peer is gone,
-and `writev` returns `` `Closed `` when the peer is gone. The `Ache_lwt.IO`
-documentation has the full contract. The Lwt server does not wait for the
-peer to close after the last response.
+`writev` returns `` `Closed `` when the peer is gone, and `shutdown_send`
+ends the output. The `Ache_lwt.IO` documentation has the full contract.
 
 The server adds a `Date` field with the current time to each response that
 is not 1xx and has none (RFC 9110 §6.6.1). The text is formatted once per

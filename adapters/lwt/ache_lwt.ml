@@ -70,6 +70,7 @@ module IO_loop = struct
     -> timed_read:((unit -> int Lwt.t) -> (int, [ `Timeout ]) result Lwt.t)
     -> close:(unit -> unit Lwt.t)
     -> ?writer_waits:(unit -> unit)
+    -> ?linger:(unit -> (unit -> unit Lwt.t) option)
     -> ?writev:
          (Ache.Bigstring.t Ache.IOVec.t list -> [ `Closed | `Ok of int ] Lwt.t)
     -> fd
@@ -82,9 +83,16 @@ module IO_loop = struct
      ~timed_read
      ~close
      ?(writer_waits = ignore)
+     ?linger
      ?writev
      socket ->
     let read_buffer = Buffer.create read_buffer_size in
+    (* [eof]: a read saw the end of input, so a linger would read nothing. *)
+    let eof = ref false
+    and send_shut, notify_send_shut = Lwt.wait ()
+    (* The last read on the socket. A timed read that timed out leaves it
+       pending: a linger waits for it rather than read the socket twice. *)
+    and last_read = ref (Lwt.return 0) in
     let failed, notify_failed = Lwt.wait () in
     let fail exn =
       (try Runtime.report_exn t exn with _ -> ());
@@ -115,7 +123,10 @@ module IO_loop = struct
                 then Lwt.return (Ok 0)
                 else
                   let reading =
-                    timed_read (fun () -> read (module Io) socket read_buffer)
+                    timed_read (fun () ->
+                      let reading = read (module Io) socket read_buffer in
+                      if Option.is_some linger then last_read := reading;
+                      reading)
                   in
                   if Lwt.is_sleeping reading
                   then reading
@@ -129,6 +140,7 @@ module IO_loop = struct
                | Error `Timeout -> ())
             (function
               | End_of_file ->
+                eof := true;
                 let (_ : int) =
                   Buffer.get read_buffer ~f:(Runtime.read_eof t)
                 in
@@ -138,7 +150,45 @@ module IO_loop = struct
         | `Yield ->
           Runtime.yield_reader t read_loop;
           Lwt.return_unit
-        | `Close -> read_loop_done ()
+        | `Close ->
+          (match linger with
+          | Some lingers when not !eof ->
+            (match lingers () with
+            | Some deadline -> lingering deadline >>= read_loop_done
+            | None -> read_loop_done ())
+          | Some _ | None -> read_loop_done ())
+      (* Lingering close (RFC 9112 9.6): reads and drops input until the end of
+         input, or until the send side is shut and [deadline ()] resolves, so
+         that the close does not reset the connection under unread input and the
+         peer can read the last response. *)
+      and lingering deadline =
+        let drop () =
+          let (_ : int) =
+            Buffer.get read_buffer ~f:(fun _ ~off:_ ~len -> len)
+          in
+          ()
+        in
+        let rec drain reading =
+          (if Lwt.is_sleeping reading
+           then reading >|= ignore
+           else reading >>= fun (_ : int) -> Lwt.pause ())
+          >>= fun () ->
+          drop ();
+          drain (read (module Io) socket read_buffer)
+        in
+        drop ();
+        let reading =
+          if Lwt.is_sleeping !last_read
+          then !last_read
+          else read (module Io) socket read_buffer
+        in
+        Lwt.pick
+          [ Lwt.catch
+              (fun () -> drain reading)
+              (fun (_ : exn) -> Lwt.return_unit)
+          ; send_shut >>= deadline
+          ]
+        >|= drop
       in
       Lwt.async (fun () -> Lwt.catch read_loop_step read_failed)
     in
@@ -157,6 +207,10 @@ module IO_loop = struct
           Lwt.return_unit
         | `Close _ ->
           writer_waits ();
+          if Option.is_some linger
+          then (
+            (try Io.shutdown_send socket with _ -> ());
+            Lwt.wakeup_later notify_send_shut ());
           Lwt.wakeup_later notify_write_loop_exited ();
           Lwt.return_unit
       in
@@ -461,6 +515,9 @@ struct
        connections share one [Timeout] queue for each [body_timeout]. *)
     let body_ticks = 10
 
+    (* The linger limit when [idle_timeout] is [None]. *)
+    let linger_without_idle_timeout = 2.0
+
     let create_connection_handler
           ?(config = Ache.Config.default)
           ?(idle_timeout = Some 60.)
@@ -493,6 +550,11 @@ struct
            restart it, and it is not stopped: a connection closes only once. *)
         and close_timer = Option.map Timeout.create close_timeout
         and close_armed = ref false
+        (* The close timer expired: the connection closes without a linger. *)
+        and close_expired = ref false
+        (* Made when the connection lingers, so that a keep-alive connection
+           does not pay for it. *)
+        and linger_timer = ref None
         and idle_timer = Option.map Timeout.create idle_timeout
         and keep_alive_timeout =
           match idle_timeout with
@@ -666,9 +728,31 @@ struct
           Timeout.expired timer >|= fun () ->
           (* The client may have answered since the read started. *)
           (match Ache.Server_connection.read_timeout connection with
-          | Some (`Close, abort) -> abort ()
+          | Some (`Close, abort) ->
+            close_expired := true;
+            abort ()
           | Some ((`Idle | `Head | `Body), _) | None -> ());
           Error `Timeout
+        in
+        (* Lingering close: after the send side is shut, input is read and
+           dropped for at most [idle_timeout] (or [linger_without_idle_timeout])
+           more. Not after the close timeout of a WebSocket: that client already
+           had its time. *)
+        let linger () =
+          if !close_expired
+          then None
+          else
+            Some
+              (fun () ->
+                let timer =
+                  Timeout.create
+                    (Option.value
+                       idle_timeout
+                       ~default:linger_without_idle_timeout)
+                in
+                linger_timer := Some timer;
+                Timeout.set timer;
+                Timeout.expired timer)
         in
         (* The idle read in progress, which [drain] ends: a drained idle
            connection reads nothing more. *)
@@ -819,6 +903,7 @@ struct
             ~timed_read
             ~close
             ~writer_waits:stop_write_clock
+            ~linger
             ?writev
             socket
         in
@@ -832,6 +917,7 @@ struct
                Option.iter Timeout.stop between_requests_timer;
                Option.iter Timeout.stop tick_timer;
                Option.iter Timeout.stop write_timer;
+               Option.iter Timeout.stop !linger_timer;
                Lwt.return_unit)
         in
         let drain () =
@@ -1051,6 +1137,12 @@ module Io = struct
     then
       try Lwt_unix.shutdown socket Unix.SHUTDOWN_RECEIVE with
       | Unix.Unix_error (Unix.ENOTCONN, _, _) -> ()
+
+  let shutdown_send socket =
+    if Lwt_unix.state socket <> Lwt_unix.Closed
+    then
+      try Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND with
+      | Unix.Unix_error _ -> ()
 end
 
 module Make (Io : IO) =
