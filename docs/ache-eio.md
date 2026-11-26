@@ -235,8 +235,9 @@ Ache_eio.Server.run
 4. `run` returns when every connection in every domain has ended.
 
 A connection that closes still lingers as after any closing response when
-the client may still be sending (see [Linger](#linger)): it drops input until the peer closes, for at most
-`idle_timeout` (2 s without one), and `grace` cuts that short too. A handler
+the client may still be sending (see [Linger](#linger)): it drops input
+until the peer closes, for at most `idle_timeout` (2 s without one), and
+`grace` cuts that short too. A handler
 applied after `stop` was resolved closes the connection without reading a
 request, and the TLS handler starts no handshake; a TLS handshake in
 progress at `stop` is cancelled. With `create_connection_handler` on
@@ -399,24 +400,30 @@ that are forked in it: when the switch ends, they are cancelled.
 `Server.create_connection_handler` is the function that
 `Eio.Net.run_server`, or the accept loop of `Server.run`, calls in a new
 fiber for each accepted socket. It
-creates the core connection and runs the two loops in one switch:
+creates the core connection and one switch for it. The read loop runs in
+a fiber forked in that switch, and the write loop runs in the handler's
+own fiber:
 
 ```
  Eio.Net.run_server ── one fiber per accepted socket
         │
         ▼
- Switch.run
-  ├─ Fiber.first ─┬─ Fiber.both ─┬─ read loop  ── Eio.Flow.single_read
-  │               │              │                 into the read buffer
-  │               │              └─ write loop ── Eio.Flow.write
-  │               │                                (one writev)
-  │               └─ waits for [failed] ─► shut down the socket
-  └─ watchdog fiber (daemon): the deadlines of the read and the write
+ Switch.run: one switch per connection
+  ├─ read loop (forked fiber) ── Eio.Flow.single_read into the read buffer
+  ├─ write loop (the handler's fiber) ── Eio.Flow.write (one writev)
+  ├─ watchdog fiber (daemon, forked at the first deadline)
+  ├─ stop fiber (daemon, with ?stop)
+  └─ WebSocket session fibers (forked on upgrade)
 ```
 
-- **Waiting.** On `Yield`, a loop creates a promise, gives the core a
-  callback that resolves it (`yield_reader` or `yield_writer`), and awaits
-  it. The core resolves the promise when it has work, and the fiber goes on.
+- **Waiting.** On `Yield`, the read loop creates a promise, gives the core
+  a callback that resolves it (`yield_reader`), and awaits it. The write
+  loop has one `Eio.Private.Single_waiter` for the whole connection: it
+  gives the core a callback that wakes the waiter (`yield_writer`) and
+  sleeps on it. The core calls the callback when it has work, and the loop
+  goes on. The waiter must be woken from the domain of the connection, so
+  write response bodies from that domain (see
+  [Runtime notes](#runtime-notes)).
 - **Writes.** The write loop sends all the buffers of one `Write` with one
   `Eio.Flow.write` on a list of `Cstruct`s. Eio makes one `writev` of it.
 - **Reads.** The read loop reads with `Eio.Flow.single_read` into free space
@@ -424,9 +431,9 @@ creates the core connection and runs the two loops in one switch:
 - **The loops call themselves in tail position.** A loop must not call itself
   inside an exception handler: each request would leave frames on the
   fiber's stack, and every minor GC scans fiber stacks.
-- **Errors.** If a write fails, or the core raises in `report_exn`, the
-  connection resolves `failed`. `Fiber.first` then cancels both loops, and
-  the socket is shut down in both directions.
+- **Errors.** Each loop runs in an `Eio.Cancel` context. If a write fails,
+  or the core raises in `report_exn`, the connection shuts the socket down
+  in both directions and cancels both contexts.
 - **Errors for `on_error`.** The core catches an exception that
   `error_handler` raises and closes the connection, so the handler wraps
   `error_handler` and keeps the first exception it raises, with its
@@ -456,11 +463,14 @@ faster on one core and about 27 % faster on 4 domains.
 
 A timer for each read or write would cost a fiber and a timer each time.
 Instead, each connection has one watchdog fiber that sleeps until the
-nearest deadline of its read or its write. Setting a deadline stores a
-float, and a read or write that ends in time only clears it. A deadline
-that moves later does not wake the watchdog, which sleeps again when it
-wakes and finds no deadline passed. On a keep-alive connection it wakes
-about once per `idle_timeout`.
+nearest deadline of its read or its write. The connection forks it with
+its first deadline, so a connection with every timeout off has no
+watchdog. Setting a deadline stores a float, and a read or write that ends
+in time only clears it. The watchdog sleeps in an `Eio.Cancel` context: a
+deadline earlier than the one it sleeps to cancels that context, and the
+watchdog sleeps again to the new one. A deadline that moves later does not
+wake it; it sleeps again when it wakes and finds no deadline passed. On a
+keep-alive connection it wakes about once per `idle_timeout`.
 
 - **Reads.** When a read starts, the server asks the core which timeout
   applies (`read_timeout`) and sets the deadline of that phase. When the
@@ -517,8 +527,7 @@ last one), it does not close at once. It reads and drops input until
 the peer closes, for at most `idle_timeout` (2 s without one). If the server
 closed with unread input, the kernel would reset the connection, and the
 peer could lose the response. When every request was read whole, or after
-a completed WebSocket close handshake, it closes at once (decisions 0023,
-0024).
+a completed WebSocket close handshake, it closes at once.
 
 The time limit is set once, when the linger starts: input from the peer
 does not extend it. If the limit ends while the response is still being
@@ -550,10 +559,17 @@ that show the listening socket itself is not usable (`EBADF`, `EINVAL`,
 ~error_handler` can be given to `Eio.Net.run_server`. The server and the
 client accept any `_ Eio.Flow.two_way`; `ache-eio-tls` gives TLS. The
 server's timeouts are on by default (see [Timeouts](#timeouts)). When the
-server stops reading (after a response that closes the connection) it reads
-and drops input until the peer closes, for at most `idle_timeout` (2 s
-without one), so that the peer can read the response before the connection
-is reset.
+server stops reading while the client may still be sending, it reads and
+drops input until the peer closes, for at most `idle_timeout` (2 s without
+one), so that the peer can read the response before the connection is
+reset (see [Linger](#linger)).
+
+The connection has no lock, and the core is not thread-safe. Call
+`Request_descriptor` and `Body.Writer` functions, such as `write_string`,
+`flush` and `close`, from the domain that runs the connection: the core
+wakes the write loop from the calling domain, and its waiter must be woken
+from the connection's domain. From another domain, hand the work to a
+fiber of the connection's domain, for example through an `Eio.Stream`.
 
 The server adds a `Date` field with the current time to each response that
 is not 1xx and has none (RFC 9110 §6.6.1). The text is formatted once per
