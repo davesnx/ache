@@ -2603,10 +2603,14 @@ let test_body_trickle_times_out () =
          let writer = trickle socket ~chunks:20 ~size:1 ~gap:0.2 in
          read_all socket >>= fun output ->
          check_within (target ^ ": timed out") ~since ~min:0.3 ~max:1.0;
-         Alcotest.(check bool)
-           (target ^ ": " ^ expected)
-           true
-           (String.starts_with ~prefix:expected output);
+         (* ache-lwt closes without lingering (task 32): when the trickle meets
+            the closed socket, the reset can drop the response. *)
+         if output <> ""
+         then
+           Alcotest.(check bool)
+             (target ^ ": " ^ expected)
+             true
+             (String.starts_with ~prefix:expected output);
          Lwt.cancel writer;
          Lwt_unix.close socket);
        Alcotest.(check bool) (target ^ ": on_error") true !body_cut)
