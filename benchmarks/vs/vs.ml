@@ -94,25 +94,30 @@ let settings () =
   ; timeouts = !timeouts
   }
 
-let bigstrings : (int, bigstring) Hashtbl.t = Hashtbl.create 16
+(* Monomorphic tables: a polymorphic [Hashtbl] would put [caml_hash] and
+   [compare_val] of the benchmark itself into every server profile. *)
+module Int_table = Hashtbl.Make (Int)
+module String_table = Hashtbl.Make (String)
+
+let bigstrings : bigstring Int_table.t = Int_table.create 16
 
 let bigstring size =
-  match Hashtbl.find bigstrings size with
+  match Int_table.find bigstrings size with
   | b -> b
   | exception Not_found ->
     let b = Bigarray.Array1.create Bigarray.char Bigarray.c_layout size in
     Bigarray.Array1.fill b 'x';
-    Hashtbl.add bigstrings size b;
+    Int_table.add bigstrings size b;
     b
 
-let strings : (int, string) Hashtbl.t = Hashtbl.create 16
+let strings : string Int_table.t = Int_table.create 16
 
 let string size =
-  match Hashtbl.find strings size with
+  match Int_table.find strings size with
   | s -> s
   | exception Not_found ->
     let s = String.make size 'x' in
-    Hashtbl.add strings size s;
+    Int_table.add strings size s;
     s
 
 let gc_json () =
@@ -182,14 +187,14 @@ module Make (Http : HTTP) = struct
     | [ ""; "gc" ] -> Gc_stat
     | _ -> Missing
 
-  let actions : (string, action) Hashtbl.t = Hashtbl.create 64
+  let actions : action String_table.t = String_table.create 64
 
   let action target =
-    match Hashtbl.find actions target with
+    match String_table.find actions target with
     | a -> a
     | exception Not_found ->
       let a = action_of_target target in
-      Hashtbl.add actions target a;
+      String_table.add actions target a;
       a
 
   let stream writer chunk count =
