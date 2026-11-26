@@ -1,0 +1,69 @@
+name: Conformance
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  DUNE_PROFILE: release
+  OCAMLRUNPARAM: b
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+jobs:
+  conformance:
+    name: h1spec conformance (${{ matrix.runtime }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime:
+          - eio
+          - lwt
+          - miou
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch h1spec
+        uses: actions/checkout@v4
+        with:
+          repository: uNetworking/h1spec
+          ref: f0a5650a20c575fbea0f7179a3a9cfa50f20ba6e
+          path: _h1spec
+
+      - name: Setup OCaml and dependencies
+        uses: ml-in-barcelona/gh-ci-action@v1.2.0
+        with:
+          ocaml-compiler: 5.3.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run h1spec
+        timeout-minutes: 10
+        run: opam exec -- sh conformance/run.sh "h1spec-${{ matrix.runtime }}.txt"
+        env:
+          RUNTIME: ${{ matrix.runtime }}
+          H1SPEC: ${{ github.workspace }}/_h1spec/http_test.ts
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: h1spec-${{ matrix.runtime }}
+          path: h1spec-${{ matrix.runtime }}.txt
+          if-no-files-found: ignore

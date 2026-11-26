@@ -62,7 +62,24 @@ jobs:
         run: make format-check
 
       - name: Run tests
+        timeout-minutes: 10
         run: make test
+
+      # A hung test prints nothing: dune shows a suite's output only when it
+      # ends. Alcotest opens each test's output file when the test starts, so
+      # the newest file of each suite names the test it was running last.
+      - name: Show the last test of each suite
+        if: failure()
+        run: |
+          shopt -s nullglob
+          for run in _build/_tests/*/*/*/; do
+            files=("$run"*.output)
+            (( ${#files[@]} )) || continue
+            ls -t "${files[@]}" > "$RUNNER_TEMP/newest-test"
+            newest=$(head -n 1 "$RUNNER_TEMP/newest-test")
+            echo "== $newest"
+            tail -n 10 "$newest"
+          done
 
       - name: Save dune cache
         uses: ml-in-barcelona/gh-ci-action/dune-cache/save@v1.2.0
@@ -84,52 +101,6 @@ jobs:
 
       - name: Build documentation
         run: make docs
-
-  conformance:
-    name: h1spec conformance (${{ matrix.runtime }})
-    needs: build
-    runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        runtime:
-          - eio
-          - lwt
-          - miou
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Fetch h1spec
-        uses: actions/checkout@v4
-        with:
-          repository: uNetworking/h1spec
-          ref: f0a5650a20c575fbea0f7179a3a9cfa50f20ba6e
-          path: _h1spec
-
-      - name: Setup OCaml and dependencies
-        uses: ml-in-barcelona/gh-ci-action@v1.2.0
-        with:
-          ocaml-compiler: 5.3.0
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Run h1spec
-        run: opam exec -- sh conformance/run.sh "h1spec-${{ matrix.runtime }}.txt"
-        env:
-          RUNTIME: ${{ matrix.runtime }}
-          H1SPEC: ${{ github.workspace }}/_h1spec/http_test.ts
-
-      - name: Upload report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: h1spec-${{ matrix.runtime }}
-          path: h1spec-${{ matrix.runtime }}.txt
-          if-no-files-found: ignore
 
   release:
     name: Release to opam
