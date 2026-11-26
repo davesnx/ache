@@ -2243,6 +2243,48 @@ let test_timeout_cancelled_expired () =
       ~max:0.5
       (Unix.gettimeofday () -. since))
 
+(* A [set] of a queued timeout moves it behind the timeouts set after it was
+   queued: they expire first. *)
+let test_timeout_set_reorders () =
+  run (fun () ->
+    let first = Ache_lwt.Timeout.create 0.15
+    and second = Ache_lwt.Timeout.create 0.15 in
+    Ache_lwt.Timeout.set first;
+    let first_expired = expired_after first in
+    Lwt_unix.sleep 0.03 >>= fun () ->
+    Ache_lwt.Timeout.set second;
+    let second_expired = expired_after second in
+    Lwt_unix.sleep 0.03 >>= fun () ->
+    Ache_lwt.Timeout.set first;
+    second_expired >>= fun elapsed ->
+    check_between "second" ~min:0.15 ~max:0.4 elapsed;
+    Alcotest.(check bool) "first pending" true (Lwt.is_sleeping first_expired);
+    first_expired >|= check_between "first" ~min:0.21 ~max:0.5)
+
+(* A timeout set over and over expires its length after the last [set]. *)
+let test_timeout_set_repeatedly () =
+  run (fun () ->
+    let timer = Ache_lwt.Timeout.create 0.1 in
+    Ache_lwt.Timeout.set timer;
+    let expired = Ache_lwt.Timeout.expired timer in
+    let rec keep n =
+      if n = 0
+      then Lwt.return_unit
+      else
+        Lwt_unix.sleep 0.04 >>= fun () ->
+        Alcotest.(check bool) "pending while set" true (Lwt.is_sleeping expired);
+        Ache_lwt.Timeout.set timer;
+        keep (n - 1)
+    in
+    keep 6 >>= fun () ->
+    let since = Unix.gettimeofday () in
+    expired >|= fun () ->
+    check_between
+      "after the last set"
+      ~min:0.1
+      ~max:0.4
+      (Unix.gettimeofday () -. since))
+
 let test_flood_does_not_block_event_loop () =
   let flood_seconds = 2.0 in
   let batch = String.concat "" (List.init 200 (fun _ -> get_hello)) in
@@ -3164,6 +3206,12 @@ let () =
         ; "set moves the deadline", `Quick, test_timeout_set_moves_deadline
         ; "stop keeps it from expiring", `Quick, test_timeout_stop
         ; "two lengths expire in order", `Quick, test_timeout_lengths
+        ; ( "set orders a timeout behind later ones"
+          , `Quick
+          , test_timeout_set_reorders )
+        ; ( "set over and over expires after the last"
+          , `Quick
+          , test_timeout_set_repeatedly )
         ; ( "cancelling expired does not change it"
           , `Quick
           , test_timeout_cancelled_expired )

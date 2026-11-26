@@ -225,7 +225,7 @@ It creates the core connection and starts the two loops:
         ▼
  IO_loop.start
   ├─ read loop  (Lwt.async) ── Lwt_bytes.read into the read buffer
-  │                            (Lwt.pick with a timer when a timeout applies)
+  │                            (a timer ends a read that waits too long)
   ├─ write loop (Lwt.async) ── Lwt_unix.writev, one call for all buffers
   └─ Lwt.choose [ both loops ended ; failed ] ─► close the socket once
      (a server read loop lingers first; the write loop shuts the send side)
@@ -251,10 +251,14 @@ It creates the core connection and starts the two loops:
   its header and its padding). A large response goes out in about one write
   for each record. With the default 4 KiB buffer, each record takes 4
   writes.
-- **Timeouts.** A timed read is `Lwt.pick` of the socket read and
-  `Ache_lwt.Timeout.expired`; a timed write is `Lwt.pick` of the `writev`
-  and the write timer. See [Timeouts](#timeouts) for which timer applies
-  and why the timers are shared.
+- **Timeouts.** A read that waits has one deadline: the timer of its
+  phase, set when the read starts to wait. The read itself is a plain
+  `Lwt_bytes.read`. When the timer expires, its callback runs the action
+  that the core gives at that moment, then ends the read loop's wait; the
+  socket read stays, and the next read or the linger takes its bytes. A
+  timed write is `Lwt.pick` of the `writev` and the write timer. See
+  [Timeouts](#timeouts) for which timer applies and why the timers are
+  shared.
 - **Lingering close.** When a server connection stops reading before the
   end of input (a closing response, a 408 or 413 while the client still
   sends a body, a timeout), the read loop reads and drops input until the
@@ -316,7 +320,15 @@ writing anything, also when the timer has not run yet. The TLS client does
 the same.
 
 Before each read, the server asks the core which timeout applies
-(`Server_connection.read_timeout`). While the request handler runs and the
+(`Server_connection.read_timeout`), once. When the read waits, the timer of
+that phase is armed: the idle timer (set again for each read), the head
+timer (set at the first read of a head, not for each read), a tick of the
+body clock, or the close timer. When the timer expires while the read still
+waits, its callback asks the core again: if the phase is the same, it runs
+that phase's action (close, 408, close frame) and ends the wait; the action
+stops the connection's reads. If the phase changed and the core still
+wants input, the read takes the new phase's deadline. A drain ends an idle
+read's wait the same way. While the request handler runs and the
 connection waits for nothing from the client, no timeout applies.
 
 The body and write timeouts measure progress, not single reads or writes:
@@ -338,7 +350,10 @@ frees a cancelled sleep at once.
 
 `Ache_lwt.Timeout` avoids this. All timeouts of one length share one queue,
 in deadline order, and one sleep for the front of the queue that is never
-cancelled. `set` and `stop` only move an entry in the queue. The servers of
+cancelled. `stop` takes an entry out of the queue. `set` of a queued entry
+only moves its deadline, which a `set` never makes earlier; when the sleep
+ends, the queue moves such an entry back in deadline order. Deadlines are
+whole microseconds, so a `set` does not allocate. The servers of
 `ache-lwt` and `ache-lwt-tls` use it for each server timeout and the TLS
 handshake. An application can use it for its own timeouts:
 

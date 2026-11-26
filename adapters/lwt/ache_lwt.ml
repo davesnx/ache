@@ -36,6 +36,49 @@ module Buffer = Ache.Ache_private.Runtime.Buffer
 module Upgradable = Ache.Ache_private.Runtime.Upgradable
 
 module IO_loop = struct
+  (* Ends a read that waits, without reading the socket: the read loop goes on
+     without its bytes. *)
+  exception Interrupted
+
+  (* The read of the read loop. A timer or a drain ends a read that waits with
+     [interrupt]; the socket read stays, as [left]. *)
+  type reader =
+    { mutable reading : int Lwt.t
+    ; mutable resolver : int Lwt.u
+    ; (* The socket read of an interrupted read, while it waits. *)
+      mutable left : (int Lwt.t * int Lwt.u) option
+    }
+
+  let reader () =
+    { reading = Lwt.return 0; resolver = snd (Lwt.wait ()); left = None }
+
+  (* The hooks of a server around each socket read of the read loop. *)
+  type timing =
+    { reader : reader
+    ; (* Before the read starts. *)
+      starts : unit -> unit
+    ; (* The read waits. *)
+      waits : unit -> unit
+    ; (* The read returned this many bytes. *)
+      returned : int -> unit
+    }
+
+  let untimed () =
+    { reader = reader (); starts = ignore; waits = ignore; returned = ignore }
+
+  let waiting r = Lwt.is_sleeping r.reading
+
+  let interrupt r exn =
+    if Lwt.is_sleeping r.reading
+    then (
+      r.left <- Some (Lwt.wait ());
+      Lwt.wakeup_later_exn r.resolver exn)
+
+  let pending_left r =
+    match r.left with
+    | Some (left, _) when Lwt.is_sleeping left -> Some left
+    | Some _ | None -> None
+
   let read (type fd) (module Io : IO with type socket = fd) socket read_buffer =
     let p, u = Lwt.wait () in
     Buffer.put
@@ -48,7 +91,40 @@ module IO_loop = struct
       (fun n -> Lwt.wakeup_later u n);
     p
 
-  let untimed_read read = read () >|= Result.ok
+  (* A read that [interrupt] can end. *)
+  let read_interruptible
+        (type fd)
+        (module Io : IO with type socket = fd)
+        r
+        socket
+        read_buffer
+    =
+    let p, u = Lwt.wait () in
+    r.reading <- p;
+    r.resolver <- u;
+    let finish n =
+      if Lwt.is_sleeping p
+      then Lwt.wakeup_later u n
+      else
+        match r.left with
+        | Some (left, u) when Lwt.is_sleeping left -> Lwt.wakeup_later u n
+        | Some _ | None -> ()
+    and fail exn =
+      if Lwt.is_sleeping p
+      then Lwt.wakeup_later_exn u exn
+      else
+        match r.left with
+        | Some (left, u) when Lwt.is_sleeping left -> Lwt.wakeup_later_exn u exn
+        | Some _ | None -> ()
+    in
+    Buffer.put
+      ~f:(fun buf ~off ~len k ->
+        if len = 0
+        then fail (Failure "ache-lwt: read buffer full")
+        else Lwt.on_any (Io.read socket buf ~off ~len) k fail)
+      read_buffer
+      finish;
+    p
 
   let close_once close socket =
     let closing = ref None in
@@ -67,7 +143,7 @@ module IO_loop = struct
     -> (module Ache.Runtime.ENGINE with type t = t)
     -> t
     -> read_buffer_size:int
-    -> timed_read:((unit -> int Lwt.t) -> (int, [ `Timeout ]) result Lwt.t)
+    -> ?timing:timing
     -> close:(unit -> unit Lwt.t)
     -> ?writer_waits:(unit -> unit)
     -> ?linger:(unit -> (unit -> unit Lwt.t) option)
@@ -80,7 +156,7 @@ module IO_loop = struct
      (module Runtime)
      t
      ~read_buffer_size
-     ~timed_read
+     ?(timing = untimed ())
      ~close
      ?(writer_waits = ignore)
      ?linger
@@ -90,9 +166,7 @@ module IO_loop = struct
     (* [eof]: a read saw the end of input, so a linger would read nothing. *)
     let eof = ref false
     and send_shut, notify_send_shut = Lwt.wait ()
-    (* The last read on the socket. A timed read that timed out leaves it
-       pending: a linger waits for it rather than read the socket twice. *)
-    and last_read = ref (Lwt.return 0) in
+    and reader = timing.reader in
     let failed, notify_failed = Lwt.wait () in
     let fail exn =
       (try Runtime.report_exn t exn with _ -> ());
@@ -120,25 +194,30 @@ module IO_loop = struct
           Lwt.catch
             (fun () ->
                (if Buffer.unread read_buffer
-                then Lwt.return (Ok 0)
+                then Lwt.return 0
                 else
-                  let reading =
-                    timed_read (fun () ->
-                      let reading = read (module Io) socket read_buffer in
-                      if Option.is_some linger then last_read := reading;
+                  match pending_left reader with
+                  (* An interrupted read whose socket read still waits: its
+                     bytes are the next input. *)
+                  | Some left -> left
+                  | None ->
+                    timing.starts ();
+                    let reading =
+                      read_interruptible (module Io) reader socket read_buffer
+                    in
+                    if Lwt.is_sleeping reading
+                    then (
+                      timing.waits ();
                       reading)
-                  in
-                  if Lwt.is_sleeping reading
-                  then reading
-                  else
-                    reading >>= fun result ->
-                    Lwt.pause () >|= fun () -> result)
-               >|= function
-               | Ok (_ : int) ->
-                 let (_ : int) = Buffer.get read_buffer ~f:(Runtime.read t) in
-                 ()
-               | Error `Timeout -> ())
+                    else
+                      reading >>= fun n ->
+                      Lwt.pause () >|= fun () -> n)
+               >|= fun n ->
+               timing.returned n;
+               let (_ : int) = Buffer.get read_buffer ~f:(Runtime.read t) in
+               ())
             (function
+              | Interrupted -> Lwt.return_unit
               | End_of_file ->
                 eof := true;
                 let (_ : int) =
@@ -178,9 +257,9 @@ module IO_loop = struct
         in
         drop ();
         let reading =
-          if Lwt.is_sleeping !last_read
-          then !last_read
-          else read (module Io) socket read_buffer
+          match pending_left reader with
+          | Some left -> left
+          | None -> read (module Io) socket read_buffer
         in
         Lwt.pick
           [ Lwt.catch
@@ -223,16 +302,26 @@ module IO_loop = struct
 end
 
 module Timeout = struct
+  (* Deadlines are in microseconds, so that a [set] neither allocates nor calls
+     [caml_modify]. A [set] of a queued timeout only moves [at]; the queue keeps
+     it at [queued_at] until [run] meets it and puts it back in order. All
+     timeouts of a queue have one length, so a [set] never moves a deadline
+     earlier. *)
   type t =
     { queue : queue
-    ; mutable at : float
+    ; mutable at : int
+    ; mutable queued_at : int
     ; mutable prev : t
     ; mutable next : t
-    ; mutable expired : unit Lwt.t * unit Lwt.u
+    ; (* The promise of [expired], made by its first call. *)
+      mutable expired : (unit Lwt.t * unit Lwt.u) option
+    ; (* Called when the deadline passes. *)
+      on_expire : t -> unit
     }
 
   and queue =
     { seconds : float
+    ; span : int
     ; root : t
     ; mutable sleeping : bool
     }
@@ -255,6 +344,10 @@ module Timeout = struct
   (* The queue of the last [create]: a server creates timeouts of a few lengths
      over and over. *)
   let last_queue = ref None
+  let no_callback (_ : t) = ()
+
+  (* [expired] of a timeout that expired before anyone asked for it. *)
+  let resolved = Some (Lwt.return_unit, snd (Lwt.wait ()))
 
   let find_queue seconds =
     match !last_queue with
@@ -264,13 +357,20 @@ module Timeout = struct
         match Queues.find_opt queues seconds with
         | Some queue -> queue
         | None ->
-          let rec queue = { seconds; root; sleeping = false }
+          let rec queue =
+            { seconds
+            ; span = int_of_float (Float.ceil (seconds *. 1e6))
+            ; root
+            ; sleeping = false
+            }
           and root =
             { queue
-            ; at = infinity
+            ; at = max_int
+            ; queued_at = max_int
             ; prev = root
             ; next = root
-            ; expired = Lwt.wait ()
+            ; expired = None
+            ; on_expire = no_callback
             }
           in
           Queues.add queues seconds queue;
@@ -279,12 +379,26 @@ module Timeout = struct
       last_queue := Some queue;
       queue
 
-  let create seconds =
+  let create_with seconds on_expire =
     if not (seconds > 0.)
     then invalid_arg "Ache_lwt.Timeout.create: seconds must be positive";
     let queue = find_queue seconds in
-    let rec t = { queue; at = 0.; prev = t; next = t; expired = Lwt.wait () } in
+    let rec t =
+      { queue
+      ; at = 0
+      ; queued_at = 0
+      ; prev = t
+      ; next = t
+      ; expired = None
+      ; on_expire
+      }
+    in
     t
+
+  let create seconds = create_with seconds no_callback
+
+  (* The deadline of [t] is set and has not passed. *)
+  let pending t = t.next != t
 
   let stop t =
     t.prev.next <- t.next;
@@ -292,37 +406,68 @@ module Timeout = struct
     t.prev <- t;
     t.next <- t
 
+  let now () = int_of_float (Unix.gettimeofday () *. 1e6)
+
+  (* Queues [t] in deadline order, from the back: [t] is usually last. *)
+  let enqueue queue t =
+    t.queued_at <- t.at;
+    let rec after p =
+      if p != queue.root && p.queued_at > t.at then after p.prev else p
+    in
+    let p = after queue.root.prev in
+    t.prev <- p;
+    t.next <- p.next;
+    p.next.prev <- t;
+    p.next <- t
+
   let rec run queue () =
-    let now = Unix.gettimeofday () in
+    let now = now () in
     let rec expire () =
       let t = queue.root.next in
-      if t != queue.root && t.at <= now
+      if t != queue.root && t.at <> t.queued_at
+      then (
+        (* Set again since it was queued. *)
+        stop t;
+        enqueue queue t;
+        expire ())
+      else if t != queue.root && t.at <= now
       then (
         stop t;
-        Lwt.wakeup_later (snd t.expired) ();
+        (match t.expired with
+        | Some (p, u) when Lwt.is_sleeping p -> Lwt.wakeup_later u ()
+        | Some _ -> ()
+        | None -> t.expired <- resolved);
+        (try t.on_expire t with exn -> !Lwt.async_exception_hook exn);
         expire ())
     in
     expire ();
     let front = queue.root.next in
     if front == queue.root
     then queue.sleeping <- false
-    else Lwt.on_success (Lwt_unix.sleep (front.at -. now)) (run queue)
+    else
+      Lwt.on_success
+        (Lwt_unix.sleep (float (front.at - now) /. 1e6))
+        (run queue)
 
   let set t =
     let queue = t.queue in
-    stop t;
-    if not (Lwt.is_sleeping (fst t.expired)) then t.expired <- Lwt.wait ();
-    t.at <- Unix.gettimeofday () +. queue.seconds;
-    t.prev <- queue.root.prev;
-    t.next <- queue.root;
-    queue.root.prev.next <- t;
-    queue.root.prev <- t;
+    (match t.expired with
+    | Some (p, _) when not (Lwt.is_sleeping p) -> t.expired <- None
+    | Some _ | None -> ());
+    t.at <- now () + queue.span;
+    if t.next == t then enqueue queue t;
     if not queue.sleeping
     then (
       queue.sleeping <- true;
       Lwt.on_success (Lwt_unix.sleep queue.seconds) (run queue))
 
-  let expired t = Lwt.protected (fst t.expired)
+  let expired t =
+    match t.expired with
+    | Some (p, _) -> Lwt.protected p
+    | None ->
+      let ((p, _) as expired) = Lwt.wait () in
+      t.expired <- Some expired;
+      Lwt.protected p
 end
 
 module Websocket = struct
@@ -552,14 +697,25 @@ struct
         mutable close_timer : Timeout.t option
       ; (* The close timer expired: the connection closes without a linger. *)
         mutable close_expired : bool
-      ; (* The WebSocket read that waits in the [`Idle] phase. When the server
-           queues its close frame meanwhile, that read stays (the socket read
-           cannot be cancelled), and its limit becomes the close timeout. *)
-        mutable closing_wait : Timeout.t Lwt.u option
       }
 
+    (* The phase of the read in progress, from
+       [Ache.Server_connection.read_timeout] when it started. *)
+    type phase =
+      [ `Idle
+      | `Head
+      | `Body
+      | `Close
+      | `None
+      ]
+
     (* The timeouts of a connection and their state. Each timer is made on its
-       first [set], so that a connection pays only for the timers it uses. *)
+       first [set], so that a connection pays only for the timers it uses.
+
+       A read that waits has at most one deadline: the timer in [armed]. The
+       timer's callback runs the action that [read_timeout] gives at that
+       moment, then ends the read with [IO_loop.interrupt]. The socket read
+       stays: the next read, or the linger, takes its bytes. *)
     type timers =
       { socket : socket
       ; close : unit -> unit Lwt.t
@@ -570,6 +726,9 @@ struct
       ; close_timeout : float option
       ; (* Responses get a [Keep-Alive] hint. *)
         keep_alive_hint : bool
+      ; reader : IO_loop.reader
+      ; mutable phase : phase
+      ; mutable armed : Timeout.t option
       ; mutable head_timer : Timeout.t option
       ; mutable head_armed : bool
       ; mutable idle_timer : Timeout.t option
@@ -583,7 +742,6 @@ struct
       ; mutable ticks : int
       ; mutable body_progress : int
       ; mutable ticking : bool
-      ; mutable body_wait : unit Lwt.u option
       ; (* Write clock: runs while output waits to be written; restarts when all
            of it is written or after [progress_bytes]. *)
         mutable write_timer : Timeout.t option
@@ -592,11 +750,6 @@ struct
       ; (* Made when the connection lingers, so that a keep-alive connection
            does not pay for it. *)
         mutable linger_timer : Timeout.t option
-      ; (* The idle read in progress, which [drain] ends: a drained idle
-           connection reads nothing more. *)
-        mutable idle_read :
-          ((int, [ `Timeout ]) result Lwt.t * (int, [ `Timeout ]) result Lwt.u)
-            option
       ; mutable websocket : websocket option
       ; cancelled : unit Lwt.t
       ; notify_cancelled : unit Lwt.u
@@ -609,55 +762,11 @@ struct
       ; is_websocket : unit -> bool
       }
 
-    let head_timer t seconds =
-      match t.head_timer with
-      | Some timer -> timer
-      | None ->
-        let timer = Timeout.create seconds in
-        t.head_timer <- Some timer;
-        timer
-
-    let idle_timer t =
-      match t.idle_timer, t.idle_timeout with
-      | (Some _ as timer), _ -> timer
-      | None, None -> None
-      | None, Some seconds ->
-        let timer = Some (Timeout.create seconds) in
-        t.idle_timer <- timer;
-        timer
-
-    let between_requests_timer t =
-      match t.between_requests_timer, t.idle_timeout with
-      | (Some _ as timer), _ -> timer
-      | None, Some seconds when t.keep_alive_hint ->
-        let timer = Some (Timeout.create (seconds +. 1.)) in
-        t.between_requests_timer <- timer;
-        timer
-      | None, (Some _ | None) -> idle_timer t
-
-    let tick_timer t seconds =
-      match t.tick_timer with
-      | Some timer -> timer
-      | None ->
-        let timer = Timeout.create seconds in
-        t.tick_timer <- Some timer;
-        timer
-
-    let write_timer t seconds =
-      match t.write_timer with
-      | Some timer -> timer
-      | None ->
-        let timer = Timeout.create seconds in
-        t.write_timer <- Some timer;
-        timer
-
     let websocket t =
       match t.websocket with
       | Some websocket -> websocket
       | None ->
-        let websocket =
-          { close_timer = None; close_expired = false; closing_wait = None }
-        in
+        let websocket = { close_timer = None; close_expired = false } in
         t.websocket <- Some websocket;
         websocket
 
@@ -686,39 +795,207 @@ struct
         t.head_armed <- false;
         Option.iter Timeout.stop t.head_timer)
 
+    let phase_of = function
+      | Some (((`Idle | `Head | `Body | `Close) as phase), _) ->
+        (phase :> phase)
+      | None -> `None
+
+    let same_phase (a : phase) (b : phase) =
+      match a, b with
+      | `Idle, `Idle | `Head, `Head | `Body, `Body | `Close, `Close -> true
+      | (`Idle | `Head | `Body | `Close | `None), _ -> false
+
+    (* [armed] is the deadline of the last read that waited; it counts only
+       while the read loop waits ([IO_loop.waiting]). Writing it only when it
+       changes saves a [caml_modify] for each read. *)
+    let arm t armed = if t.armed != armed then t.armed <- armed
+
+    let is_armed t timer =
+      match t.armed with
+      | Some armed -> armed == timer && IO_loop.waiting t.reader
+      | None -> false
+
+    (* The deadline of the waiting read passed: run the action of [phase], if
+       the connection is still in it, and end the read. The action stops the
+       reads of the connection, so the read loop goes on to close. *)
+    let rec expire c (phase : phase) =
+      let t = c.timers in
+      t.armed <- None;
+      (match phase with
+      | `Body -> restart_body_clock t
+      | `Idle | `Head | `Close | `None -> ());
+      let timeout = Ache.Server_connection.read_timeout c.connection in
+      match timeout with
+      | Some (now, action) when same_phase (now :> phase) phase ->
+        (match phase with
+        | `Close -> (websocket t).close_expired <- true
+        | `Idle | `Head | `Body | `None -> ());
+        (match action () with
+        | () -> IO_loop.interrupt t.reader IO_loop.Interrupted
+        | exception exn -> IO_loop.interrupt t.reader exn)
+      | Some _ | None ->
+        (match Ache.Server_connection.next_read_operation c.connection with
+        | `Read ->
+          (* The read waits in another phase: it takes that phase's deadline. *)
+          start c timeout;
+          wait c
+        | `Yield | `Close -> IO_loop.interrupt t.reader IO_loop.Interrupted)
+
+    and on_expire c phase timer = if is_armed c.timers timer then expire c phase
+
+    (* One tick of the body clock. A tick that ends while no read waits in the
+       [`Body] phase is not counted, and the clock stops until the next such
+       read. *)
+    and tick c timer =
+      let t = c.timers in
+      if is_armed t timer
+      then (
+        t.ticks <- t.ticks + 1;
+        if t.ticks >= body_ticks
+        then (
+          t.ticking <- false;
+          expire c `Body)
+        else Timeout.set timer)
+      else t.ticking <- false
+
+    and head_timer c seconds =
+      let t = c.timers in
+      match t.head_timer with
+      | Some timer -> timer
+      | None ->
+        let timer = Timeout.create_with seconds (on_expire c `Head) in
+        t.head_timer <- Some timer;
+        timer
+
+    and idle_timer c =
+      let t = c.timers in
+      match t.idle_timer, t.idle_timeout with
+      | (Some _ as timer), _ -> timer
+      | None, None -> None
+      | None, Some seconds ->
+        let timer = Some (Timeout.create_with seconds (on_expire c `Idle)) in
+        t.idle_timer <- timer;
+        timer
+
+    and between_requests_timer c =
+      let t = c.timers in
+      match t.between_requests_timer, t.idle_timeout with
+      | (Some _ as timer), _ -> timer
+      | None, Some seconds when t.keep_alive_hint ->
+        let timer =
+          Some (Timeout.create_with (seconds +. 1.) (on_expire c `Idle))
+        in
+        t.between_requests_timer <- timer;
+        timer
+      | None, (Some _ | None) -> idle_timer c
+
+    and tick_timer c seconds =
+      let t = c.timers in
+      match t.tick_timer with
+      | Some _ as timer -> timer
+      | None ->
+        let timer = Some (Timeout.create_with seconds (tick c)) in
+        t.tick_timer <- timer;
+        timer
+
     (* Arms the close timer when the server's close frame is queued. The frame
        wakes the writer, whoever queued it: [Ache_lwt.Websocket] or the callback
-       API. *)
-    let observe_close c =
-      match c.timers.close_timeout with
-      | Some seconds
-        when Option.is_none (close_timer c.timers) && c.is_websocket () ->
-        (match Ache.Server_connection.read_timeout c.connection with
-        | Some (`Close, _) ->
-          let websocket = websocket c.timers in
-          let timer = Timeout.create seconds in
-          websocket.close_timer <- Some timer;
-          Timeout.set timer;
-          (match websocket.closing_wait with
-          | Some u ->
-            websocket.closing_wait <- None;
-            Lwt.wakeup_later u timer
-          | None -> ())
-        | Some ((`Idle | `Head | `Body), _) | None -> ())
-      | Some _ | None -> ()
+       API. A read that waits in the [`Idle] phase takes it as its deadline. *)
+    and observe_close c timeout =
+      let t = c.timers in
+      match timeout, t.close_timeout with
+      | Some (`Close, _), Some seconds
+        when Option.is_none (close_timer t) && c.is_websocket () ->
+        let websocket = websocket t in
+        let timer = Timeout.create_with seconds (on_expire c `Close) in
+        websocket.close_timer <- Some timer;
+        Timeout.set timer;
+        (match t.phase with
+        | `Idle when IO_loop.waiting t.reader ->
+          Option.iter Timeout.stop t.idle_timer;
+          t.armed <- websocket.close_timer
+        | `Idle | `Head | `Body | `Close | `None -> ())
+      | Some ((`Idle | `Head | `Body | `Close), _), _ | None, _ -> ()
 
-    let observe c =
-      (match c.timers.head_timeout with
+    (* A read starts in the phase of [timeout]: the head clock starts with the
+       first read of the [`Head] phase and stops outside it. *)
+    and start c timeout =
+      let t = c.timers in
+      (match t.head_timeout with
       | None -> ()
       | Some seconds ->
-        (match Ache.Server_connection.read_timeout c.connection with
+        (match timeout with
         | Some (`Head, _) ->
-          if not c.timers.head_armed
+          if not t.head_armed
           then (
-            c.timers.head_armed <- true;
-            Timeout.set (head_timer c.timers seconds))
-        | Some ((`Idle | `Body | `Close), _) | None -> stop_head_timer c.timers));
-      observe_close c
+            t.head_armed <- true;
+            Timeout.set (head_timer c seconds))
+        | Some ((`Idle | `Body | `Close), _) | None -> stop_head_timer t));
+      observe_close c timeout;
+      t.phase <- phase_of timeout
+
+    (* The read waits: arm the deadline of its phase. The head and close timers
+       are not set again; when they already expired, so does the read. *)
+    and wait c =
+      let t = c.timers in
+      match t.phase with
+      | `Idle ->
+        let armed =
+          if c.upgraded () then idle_timer c else between_requests_timer c
+        in
+        Option.iter Timeout.set armed;
+        arm t armed
+      | `Head ->
+        (match t.head_timer with
+        | Some timer as armed when t.head_armed ->
+          if Timeout.pending timer then arm t armed else expire c `Head
+        | Some _ | None -> arm t None)
+      | `Body ->
+        (match t.tick_timeout with
+        | Some seconds ->
+          let armed = tick_timer c seconds in
+          arm t armed;
+          if not t.ticking
+          then (
+            t.ticking <- true;
+            Option.iter Timeout.set armed)
+        | None -> arm t None)
+      | `Close ->
+        (match close_timer t with
+        | Some timer as armed ->
+          if Timeout.pending timer then arm t armed else expire c `Close
+        | None -> arm t None)
+      | `None -> arm t None
+
+    let write_timer t seconds =
+      match t.write_timer with
+      | Some timer -> timer
+      | None ->
+        let timer = Timeout.create seconds in
+        t.write_timer <- Some timer;
+        timer
+
+    let observe_close_on_write c =
+      match c.timers.close_timeout with
+      | Some _ when Option.is_none (close_timer c.timers) && c.is_websocket ()
+        ->
+        observe_close c (Ache.Server_connection.read_timeout c.connection)
+      | Some _ | None -> ()
+
+    let timing c =
+      { IO_loop.reader = c.timers.reader
+      ; starts =
+          (fun () -> start c (Ache.Server_connection.read_timeout c.connection))
+      ; waits = (fun () -> wait c)
+      ; returned =
+          (fun n ->
+            let t = c.timers in
+            match t.phase, t.tick_timeout with
+            | `Body, Some _ ->
+              t.body_progress <- t.body_progress + n;
+              if t.body_progress >= progress_bytes then restart_body_clock t
+            | (`Idle | `Head | `Body | `Close | `None), _ -> ())
+      }
 
     module Observed = struct
       type t = connection
@@ -727,14 +1004,10 @@ struct
         Ache.Server_connection.next_read_operation c.connection
 
       let read c bs ~off ~len =
-        let n = Ache.Server_connection.read c.connection bs ~off ~len in
-        observe c;
-        n
+        Ache.Server_connection.read c.connection bs ~off ~len
 
       let read_eof c bs ~off ~len =
-        let n = Ache.Server_connection.read_eof c.connection bs ~off ~len in
-        observe c;
-        n
+        Ache.Server_connection.read_eof c.connection bs ~off ~len
 
       let yield_reader c k = Ache.Server_connection.yield_reader c.connection k
 
@@ -742,7 +1015,7 @@ struct
         let operation =
           Ache.Server_connection.next_write_operation c.connection
         in
-        observe_close c;
+        observe_close_on_write c;
         operation
 
       let report_write_result c result =
@@ -753,56 +1026,6 @@ struct
       let is_closed c = Ache.Server_connection.is_closed c.connection
       let shutdown c = Ache.Server_connection.shutdown c.connection
     end
-
-    let expire timer on_timeout =
-      Timeout.expired timer >|= fun () ->
-      on_timeout ();
-      Error `Timeout
-
-    (* One tick of the body clock. A tick that ends while no read waits in the
-       [`Body] phase is not counted, and the clock stops until the next such
-       read. *)
-    let rec tick t timer () =
-      match t.body_wait with
-      | Some u ->
-        t.ticks <- t.ticks + 1;
-        if t.ticks >= body_ticks
-        then (
-          t.ticking <- false;
-          t.body_wait <- None;
-          Lwt.wakeup_later u ())
-        else (
-          Timeout.set timer;
-          Lwt.on_success (Timeout.expired timer) (tick t timer))
-      | None -> t.ticking <- false
-
-    let body_limit c seconds =
-      let t = c.timers in
-      let p, u = Lwt.wait () in
-      t.body_wait <- Some u;
-      if not t.ticking
-      then (
-        t.ticking <- true;
-        let timer = tick_timer t seconds in
-        Timeout.set timer;
-        Lwt.on_success (Timeout.expired timer) (tick t timer));
-      p >|= fun () ->
-      restart_body_clock t;
-      (* The action depends on the state when the clock runs out. *)
-      (match Ache.Server_connection.read_timeout c.connection with
-      | Some (`Body, expire) -> expire ()
-      | Some ((`Idle | `Head | `Close), _) | None -> ());
-      Error `Timeout
-
-    let close_limit c timer =
-      Timeout.expired timer >|= fun () ->
-      (* The client may have answered since the read started. *)
-      (match Ache.Server_connection.read_timeout c.connection with
-      | Some (`Close, abort) ->
-        (websocket c.timers).close_expired <- true;
-        abort ()
-      | Some ((`Idle | `Head | `Body), _) | None -> ());
-      Error `Timeout
 
     (* Lingering close: after the send side is shut, input is read and dropped
        for at most [idle_timeout] (or [linger_without_idle_timeout]) more. Not
@@ -823,99 +1046,6 @@ struct
             t.linger_timer <- Some timer;
             Timeout.set timer;
             Timeout.expired timer)
-
-    let drainable t =
-      let p, u = Lwt.wait () in
-      t.idle_read <- Some (p, u);
-      p
-
-    let closing_limit c =
-      let t = c.timers in
-      let p, u = Lwt.wait () in
-      (websocket t).closing_wait <- Some u;
-      p >>= fun timer ->
-      Option.iter Timeout.stop t.idle_timer;
-      close_limit c timer
-
-    let closing_wait t =
-      match t.websocket with
-      | Some { closing_wait; _ } -> closing_wait
-      | None -> None
-
-    let timed_read c ~stop read =
-      let t = c.timers in
-      observe c;
-      let reading = IO_loop.untimed_read read in
-      let phase = Ache.Server_connection.read_timeout c.connection in
-      let counted =
-        match phase, t.tick_timeout with
-        | Some (`Body, _), Some _ ->
-          reading >|= fun result ->
-          (match result with
-          | Ok n ->
-            t.body_progress <- t.body_progress + n;
-            if t.body_progress >= progress_bytes then restart_body_clock t
-          | Error `Timeout -> ());
-          result
-        | (Some ((`Idle | `Head | `Body | `Close), _) | None), _ -> reading
-      in
-      let limits =
-        if not (Lwt.is_sleeping reading)
-        then []
-        else
-          match phase with
-          | Some (`Idle, on_timeout) ->
-            (match
-               if c.upgraded () then idle_timer t else between_requests_timer t
-             with
-            | Some timer ->
-              Timeout.set timer;
-              [ expire timer on_timeout ]
-            | None -> [])
-          | Some (`Head, on_timeout) when t.head_armed ->
-            Option.to_list
-              (Option.map (fun timer -> expire timer on_timeout) t.head_timer)
-          | Some (`Head, _) -> []
-          | Some (`Body, _) ->
-            Option.to_list (Option.map (body_limit c) t.tick_timeout)
-          | Some (`Close, _) ->
-            Option.to_list (Option.map (close_limit c) (close_timer t))
-          | None -> []
-      in
-      let limits =
-        match phase, t.close_timeout with
-        | Some (`Idle, _), Some _
-          when Lwt.is_sleeping reading && c.is_websocket () ->
-          closing_limit c :: limits
-        | (Some _ | None), (Some _ | None) -> limits
-      in
-      let limits =
-        match stop, phase with
-        | Some _, Some (`Idle, _) when Lwt.is_sleeping reading ->
-          drainable t :: limits
-        (* A drain ends the reads of a WebSocket at once (it sends 1001 and
-           stops reading): only an idle read needs waking. *)
-        | (Some _ | None), (Some ((`Idle | `Head | `Body | `Close), _) | None)
-          ->
-          limits
-      in
-      match limits with
-      | [] -> counted
-      | limits ->
-        let waiting = t.body_wait
-        and closing_waiting = closing_wait t in
-        let result = Lwt.pick (counted :: limits) in
-        (* The next read can start before this callback runs. *)
-        Lwt.on_termination result (fun () ->
-          (match t.body_wait, waiting with
-          | Some u, Some mine when u == mine -> t.body_wait <- None
-          | _ -> ());
-          match t.websocket, closing_waiting with
-          | Some ({ closing_wait = Some u; _ } as websocket), Some mine
-            when u == mine ->
-            websocket.closing_wait <- None
-          | _ -> ());
-        result
 
     let cancel c =
       (try Ache.Server_connection.shutdown c.connection with _ -> ());
@@ -973,10 +1103,12 @@ struct
 
     let drain c ~grace ~ended =
       Ache.Server_connection.drain c.connection;
-      (match c.timers.idle_read with
-      | Some (p, u) when Lwt.is_sleeping p ->
-        Lwt.wakeup_later u (Error `Timeout)
-      | Some _ | None -> ());
+      (* A drained idle connection reads nothing more. A drain ends the reads of
+         a WebSocket at once (it sends 1001 and stops reading): only an idle
+         read needs waking. *)
+      (match c.timers.phase with
+      | `Idle -> IO_loop.interrupt c.timers.reader IO_loop.Interrupted
+      | `Head | `Body | `Close | `None -> ());
       match grace with
       | None -> ()
       | Some seconds ->
@@ -1030,6 +1162,9 @@ struct
                 body_timeout
           ; close_timeout
           ; keep_alive_hint = Option.is_some keep_alive_timeout
+          ; reader = IO_loop.reader ()
+          ; phase = `None
+          ; armed = None
           ; head_timer = None
           ; head_armed = false
           ; idle_timer = None
@@ -1038,12 +1173,10 @@ struct
           ; ticks = 0
           ; body_progress = 0
           ; ticking = false
-          ; body_wait = None
           ; write_timer = None
           ; written = 0
           ; write_clock = false
           ; linger_timer = None
-          ; idle_read = None
           ; websocket = None
           ; cancelled
           ; notify_cancelled
@@ -1078,7 +1211,7 @@ struct
             (module Observed)
             c
             ~read_buffer_size:config.read_buffer_size
-            ~timed_read:(timed_read c ~stop)
+            ~timing:(timing c)
             ~close
             ~writer_waits:(stop_write_clock timers)
             ~linger:(linger timers)
@@ -1200,7 +1333,6 @@ struct
                (module Observed)
                runtime
                ~read_buffer_size:config.read_buffer_size
-               ~timed_read:IO_loop.untimed_read
                ~close
                socket)
           (fun () ->
