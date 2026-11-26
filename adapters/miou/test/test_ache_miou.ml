@@ -1064,6 +1064,69 @@ let test_websocket_close_timeout_no_linger () =
       (await ended);
     Miou_unix.close socket)
 
+(* [connection_done_within seconds] is [true] when a connection handler returns
+   within [seconds]. *)
+let connection_done_within seconds =
+  let until = Unix.gettimeofday () +. seconds in
+  let rec poll () =
+    if !connections_done > !connections_taken
+    then (
+      incr connections_taken;
+      true)
+    else if Unix.gettimeofday () >= until
+    then false
+    else (
+      Miou_unix.sleep 0.001;
+      poll ())
+  in
+  poll ()
+
+(* After a completed close handshake the server ends the TCP connection first
+   (RFC 6455 7.1.1, decision 0019): the client, which keeps its socket open
+   without sending FIN, sees the end of input within 100 ms. [~server_first]:
+   the server sends the first close frame; otherwise the client does. *)
+let test_websocket_close_handshake_fin ~server_first () =
+  let ended = wait_ws_end () in
+  with_server ~idle_timeout:30. ~close_timeout:30. (fun addr ->
+    let socket = ws_connect addr "/ws-echo" in
+    let from =
+      if server_first
+      then (
+        send socket (ws_frame 0x1 "close-me");
+        Alcotest.(check (pair int string))
+          "close 1001"
+          (0x88, "\x03\xe9")
+          (read_ws_frame socket);
+        let from = Unix.gettimeofday () in
+        send socket (ws_frame 0x8 "\x03\xe8");
+        from)
+      else
+        let from = Unix.gettimeofday () in
+        send socket (ws_frame 0x8 "\x03\xe8bye");
+        Alcotest.(check (pair int string))
+          "close echoed"
+          (0x88, "\x03\xe8")
+          (read_ws_frame socket);
+        from
+    in
+    Alcotest.(check bool) "end of input" true (at_end_of_input socket);
+    check_elapsed "end of input" ~from ~min:0. ~max:0.1;
+    (* Known linger (runtime-cost F9, task 48): after its FIN the server reads
+       and drops input until the client's FIN or [idle_timeout], although
+       nothing may follow the client's close frame. When the server closes at
+       once, replace this with [check_elapsed] on [wait_connection_done]. *)
+    if connection_done_within 0.5
+    then Alcotest.fail "the connection no longer lingers: assert that instead";
+    Miou_unix.close socket;
+    with_timeout 2.0 wait_connection_done;
+    Alcotest.(check (result string reject))
+      "session"
+      (Ok
+         (if server_first
+          then "closed, client close 1000 \"\""
+          else "receive None, client close 1000 \"bye\""))
+      (await ended))
+
 let test_websocket_close_timeout_silent ?idle_timeout () =
   let ended = wait_ws_end () in
   with_server ?idle_timeout ~close_timeout:0.2 (fun addr ->
@@ -3491,6 +3554,12 @@ let () =
         ; ( "WebSocket close timeout: no linger after it"
           , `Quick
           , test_websocket_close_timeout_no_linger )
+        ; ( "WebSocket close handshake from the client: FIN at once"
+          , `Quick
+          , test_websocket_close_handshake_fin ~server_first:false )
+        ; ( "WebSocket close handshake from the server: FIN at once"
+          , `Quick
+          , test_websocket_close_handshake_fin ~server_first:true )
         ; "WebSocket ping", `Quick, test_websocket_ping
         ; ( "WebSocket send loop to a reset peer ends"
           , `Quick

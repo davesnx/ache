@@ -2644,6 +2644,66 @@ let test_websocket_close_timeout_no_linger () =
       (Eio.Stream.take ws_reports);
     Eio.Flow.close socket)
 
+(* After a completed close handshake the server ends the TCP connection first
+   (RFC 6455 7.1.1, decision 0019): the client, which keeps its socket open
+   without sending FIN, sees the end of input within 100 ms. [~server_first]:
+   the server sends the first close frame; otherwise the client does. *)
+let test_websocket_close_handshake_fin ~server_first () =
+  with_server ~idle_timeout:30. ~close_timeout:30. (fun ~sw ~net addr ->
+    let socket, reader = ws_connect ~sw ~net addr "/ws-echo" in
+    let from =
+      if server_first
+      then (
+        Eio.Flow.copy_string (ws_frame 0x1 "close-me") socket;
+        Alcotest.check
+          frame
+          "close 1001"
+          (0x88, "\x03\xe9")
+          (read_ws_frame reader);
+        let from = Unix.gettimeofday () in
+        Eio.Flow.copy_string (ws_frame 0x8 "\x03\xe8") socket;
+        from)
+      else
+        let from = Unix.gettimeofday () in
+        Eio.Flow.copy_string (ws_frame 0x8 "\x03\xe8bye") socket;
+        Alcotest.check
+          frame
+          "close echoed"
+          (0x88, "\x03\xe8")
+          (read_ws_frame reader);
+        from
+    in
+    Alcotest.(check bool)
+      "end of input"
+      true
+      (Eio.Buf_read.at_end_of_input reader);
+    let elapsed = Unix.gettimeofday () -. from in
+    Alcotest.(check bool)
+      (Printf.sprintf "end of input within 100 ms (%.3f s)" elapsed)
+      true
+      (elapsed < 0.1);
+    (* Known linger (runtime-cost F9, task 48): after its FIN the server reads
+       and drops input until the client's FIN or [idle_timeout], although
+       nothing may follow the client's close frame. When the server closes at
+       once, assert that the handler returns here instead. *)
+    if
+      Eio.Fiber.first
+        (fun () ->
+           Eio.Stream.take connections_done;
+           true)
+        (fun () ->
+           !real_sleep 0.5;
+           false)
+    then Alcotest.fail "the connection no longer lingers: assert that instead";
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done;
+    Alcotest.(check string)
+      "session"
+      (if server_first
+       then "closed, client close 1000 \"\""
+       else "receive None, client close 1000 \"bye\"")
+      (Eio.Stream.take ws_reports))
+
 let test_websocket_close_timeout_callbacks () =
   with_server ~close_timeout:0.2 (fun ~sw ~net addr ->
     callbacks_ws := None;
@@ -4071,6 +4131,12 @@ let () =
         ; ( "close timeout, no linger"
           , `Quick
           , test_websocket_close_timeout_no_linger )
+        ; ( "close handshake from the client: FIN at once"
+          , `Quick
+          , test_websocket_close_handshake_fin ~server_first:false )
+        ; ( "close handshake from the server: FIN at once"
+          , `Quick
+          , test_websocket_close_handshake_fin ~server_first:true )
         ; ( "close timeout, callback API"
           , `Quick
           , test_websocket_close_timeout_callbacks )
