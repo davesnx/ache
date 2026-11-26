@@ -2527,7 +2527,9 @@ let test_drain_websocket () =
     Lwt.wakeup_later stop_now ();
     read_ws_frame socket >>= fun close ->
     Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
-    write_all socket (ws_frame 0x8 "\x03\xe9") >>= fun () ->
+    (* A drain closes at once, without waiting for the client's close frame:
+       sending one could meet a closed socket and a reset. *)
+    Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
     read_all socket >>= fun rest ->
     Alcotest.(check string) "then end of input" "" rest;
     ended >>= fun (_ : (string, exn) result) -> Lwt_unix.close socket);

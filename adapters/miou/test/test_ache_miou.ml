@@ -2994,7 +2994,9 @@ let test_stop_websocket () =
       "close frame 1001"
       (0x88, "\x03\xe9")
       (read_ws_frame socket);
-    send socket (ws_frame 0x8 "\x03\xe9");
+    (* A drain closes at once, without waiting for the client's close frame:
+       sending one could meet a closed socket and a reset. *)
+    shutdown_send socket;
     Alcotest.(check string) "then end of input" "" (read_all socket);
     Alcotest.(check (result string reject))
       "session"
