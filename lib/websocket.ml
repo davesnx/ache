@@ -366,7 +366,9 @@ let read_header t bs ~off ~len =
     let control = opcode >= 0x8 in
     if
       b0 land 0x70 <> 0
-      || (not (List.mem opcode [ 0x0; 0x1; 0x2; 0x8; 0x9; 0xA ]))
+      || (match opcode with
+        | 0x0 | 0x1 | 0x2 | 0x8 | 0x9 | 0xA -> false
+        | _ -> true)
       || b1 land 0x80 = 0
       || (control && ((not fin) || len7 > 125))
       || (opcode = 0x0 && not t.fragmented)
@@ -425,7 +427,7 @@ let read_header t bs ~off ~len =
         size)
 
 let read_payload t bs ~off ~len =
-  let n = min len t.remaining in
+  let n = Int.min len t.remaining in
   let control = t.opcode >= 0x8 in
   let dst = if control then t.control else t.message in
   let check = (not control) && t.text in

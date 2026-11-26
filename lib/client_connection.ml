@@ -263,7 +263,7 @@ let keep_alive_timeout headers =
         String.lowercase_ascii name = "timeout"
         && is_digits value
         && String.length value <= 9
-      then Some (min (int_of_string value) max_keep_alive_timeout)
+      then Some (Int.min (int_of_string value) max_keep_alive_timeout)
       else None)
 
 let remember_response t respd =
