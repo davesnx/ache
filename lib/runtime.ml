@@ -50,17 +50,21 @@ module type ENGINE = sig
 end
 
 type 't hooks =
-  { drain : 't -> unit
+  { protocol : [ `Websocket | `Other ]
+  ; drain : 't -> unit
   ; read_timeout : 't -> ([ `Idle | `Close ] * (unit -> unit)) option
   }
 
 type impl = Impl : (module ENGINE with type t = 't) * 't * 't hooks -> impl
 
-let no_hooks = { drain = (fun _ -> ()); read_timeout = (fun _ -> None) }
+let no_hooks =
+  { protocol = `Other; drain = (fun _ -> ()); read_timeout = (fun _ -> None) }
+
 let make runtime t = Impl (runtime, t, no_hooks)
 let make_with_hooks runtime t hooks = Impl (runtime, t, hooks)
 let drain (Impl (_, t, hooks)) = hooks.drain t
 let read_timeout (Impl (_, t, hooks)) = hooks.read_timeout t
+let protocol (Impl (_, _, hooks)) = hooks.protocol
 
 module Upgradable = struct
   type t = { mutable impl : impl }

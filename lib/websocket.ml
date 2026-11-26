@@ -673,5 +673,5 @@ let upgrade
       (Runtime.make_with_hooks
          (module Engine)
          t
-         { drain = (fun t -> fail t 1001); read_timeout });
+         { protocol = `Websocket; drain = (fun t -> fail t 1001); read_timeout });
     Ok ()

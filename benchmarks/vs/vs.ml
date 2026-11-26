@@ -27,6 +27,31 @@ module type HTTP = sig
   val writer_is_closed : writer -> bool
 end
 
+(* Requests the handler has started, for [cost.sh]. *)
+let requests = ref 0
+
+(* On [SIGUSR1], one line on stderr with the request count and the GC counters
+   of this domain. [cost.sh] reads two such lines around its window and divides
+   by the requests between them. *)
+let print_counters () =
+  let s = Gc.quick_stat () in
+  Printf.eprintf
+    "vs-counters requests=%d minor_words=%.0f promoted_words=%.0f \
+     minor_collections=%d major_collections=%d\n\
+     %!"
+    !requests
+    (Gc.minor_words ())
+    s.promoted_words
+    s.minor_collections
+    s.major_collections
+
+let () =
+  match
+    Sys.set_signal Sys.sigusr1 (Sys.Signal_handle (fun _ -> print_counters ()))
+  with
+  | () -> ()
+  | exception Invalid_argument _ -> ()
+
 type settings =
   { port : int
   ; read_buffer_size : int
@@ -55,12 +80,12 @@ let settings () =
       , " (4096)" )
     ; ( "--timeouts"
       , Arg.Symbol ([ "on"; "off" ], fun mode -> timeouts := mode = "on")
-      , " Timeouts of the ache-eio server: the defaults (on), or all off" )
+      , " Timeouts of the ache servers: the defaults (on), or all off" )
     ]
     (fun arg -> raise (Arg.Bad arg))
-    "Benchmark server. Routes: GET /fixed/<bytes>, GET /close/<bytes>, GET \
-     /stream/<chunk>/<count>, GET /streamcl/<chunk>/<count>, POST /sink, POST \
-     /echo, GET /gc.";
+    "Benchmark server. Routes: GET /fixed/<bytes>, GET /string/<bytes>, GET \
+     /close/<bytes>, GET /stream/<chunk>/<count>, GET \
+     /streamcl/<chunk>/<count>, POST /sink, POST /echo, GET /gc.";
   { port = !port
   ; read_buffer_size = !read_buffer_size
   ; request_body_buffer_size = !request_body_buffer_size
@@ -80,6 +105,16 @@ let bigstring size =
     Hashtbl.add bigstrings size b;
     b
 
+let strings : (int, string) Hashtbl.t = Hashtbl.create 16
+
+let string size =
+  match Hashtbl.find strings size with
+  | s -> s
+  | exception Not_found ->
+    let s = String.make size 'x' in
+    Hashtbl.add strings size s;
+    s
+
 let gc_json () =
   let s = Gc.quick_stat () in
   Printf.sprintf
@@ -95,6 +130,7 @@ let gc_json () =
 module Make (Http : HTTP) = struct
   type action =
     | Fixed of Http.response * bigstring
+    | Copied of Http.response * string
     | Stream of Http.response * bigstring * int
     | Sink
     | Echo
@@ -119,6 +155,10 @@ module Make (Http : HTTP) = struct
     | [ ""; "fixed"; n ] ->
       (match int_of_string_opt n with
       | Some n when n >= 0 -> Fixed (with_length n, bigstring n)
+      | _ -> Missing)
+    | [ ""; "string"; n ] ->
+      (match int_of_string_opt n with
+      | Some n when n >= 0 -> Copied (with_length n, string n)
       | _ -> Missing)
     | [ ""; "close"; n ] ->
       (match int_of_string_opt n with
@@ -184,8 +224,10 @@ module Make (Http : HTTP) = struct
     Http.schedule_read body ~on_eof ~on_read
 
   let handle reqd =
+    incr requests;
     match action (Http.target reqd) with
     | Fixed (response, body) -> Http.respond_with_bigstring reqd response body
+    | Copied (response, body) -> Http.respond_with_string reqd response body
     | Stream (response, chunk, count) ->
       stream (Http.respond_with_streaming reqd response) chunk count
     | Sink -> sink reqd

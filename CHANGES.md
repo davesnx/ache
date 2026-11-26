@@ -181,6 +181,14 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `Ache_lwt.Timeout`, and `ache-miou-tls` sleeps at most 0.5 s at a time.
 - The responses to all pipelined requests in one read go out in one write.
   `ache-miou` sends all buffers with one `sendmsg`, not one write per buffer.
+- A full write buffer is replaced by one that also holds the next write and
+  is at least twice as large, up to 64 KiB, and the connection keeps it, so
+  a keep-alive connection answering with `respond_with_string` no longer
+  allocates a buffer for each response larger than
+  `Config.response_buffer_size`. A write that does not fit and is larger
+  than 64 KiB and the buffer gets a buffer of its own, which is not kept.
+  The buffer was replaced by one sized for that write alone and was kept
+  whatever its size.
 - The TLS runtimes join the buffers of a write into TLS records of up to
   16 KiB. ocaml-tls made one record for each buffer, so a chunked response
   of many small writes sent a record, with its overhead, for each one.
