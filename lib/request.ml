@@ -107,16 +107,27 @@ let host_classes =
       lor (if is_ip_literal_char c then ip_literal_class else 0)
       lor if Message.is_digit c then digit_class else 0))
 
-(* [stop] must not exceed [String.length s]. *)
+let[@inline always] in_class s i cls =
+  Char.code (String.unsafe_get host_classes (Char.code (String.unsafe_get s i)))
+  land cls
+  <> 0
+
+let rec skip_class_bytes s i stop cls =
+  if i < stop && in_class s i cls
+  then skip_class_bytes s (i + 1) stop cls
+  else i
+
+(* [stop] must not exceed [String.length s]. Four bytes per step while they
+   fit. *)
 let rec skip_class s i stop cls =
   if
-    i < stop
-    && Char.code
-         (String.unsafe_get host_classes (Char.code (String.unsafe_get s i)))
-       land cls
-       <> 0
-  then skip_class s (i + 1) stop cls
-  else i
+    i + 4 <= stop
+    && in_class s i cls
+    && in_class s (i + 1) cls
+    && in_class s (i + 2) cls
+    && in_class s (i + 3) cls
+  then skip_class s (i + 4) stop cls
+  else skip_class_bytes s i stop cls
 
 (* RFC 3986 §3.2.2: the end of the uri-host that starts [s], or -1. *)
 let host_end s =
@@ -222,36 +233,112 @@ let transfer_coding_error { version; headers; _ } =
       else None
     | _ -> Some (`Bad_request "chunked is not the final transfer coding")
 
-let received_body_length ({ meth; target; version; headers } as t) =
+(* [content_lengths] holds the Content-Length values in received order, as
+   [Headers.get_multi] returns them. *)
+let received_framing
+      ({ headers; _ } as t)
+      ~has_transfer_encoding
+      content_lengths
+  =
+  if has_transfer_encoding
+  then
+    match transfer_coding_error t with
+    | Some error -> Error error
+    | None ->
+      (match body_length t with
+      | `Error `Bad_request ->
+        if Headers.mem headers "transfer-encoding"
+        then Error (`Bad_request "both Content-Length and Transfer-Encoding")
+        else Error (`Bad_request "invalid Content-Length")
+      | (`Fixed _ | `Chunked) as length -> Ok length)
+  else
+    match content_lengths with
+    | [] -> Ok (`Fixed 0L)
+    | value :: values ->
+      let len = Message.content_length value values in
+      if len >= 0L
+      then Ok (`Fixed len)
+      else Error (`Bad_request "invalid Content-Length")
+
+let is_origin_form target =
+  String.length target > 0 && String.unsafe_get target 0 = '/'
+
+(* [hosts] counts the Host fields and [host] is the last one seen. *)
+let check_received
+      ({ meth; target; version; _ } as t)
+      ~hosts
+      ~host
+      ~has_transfer_encoding
+      content_lengths
+  =
+  if hosts = 0 && Message.at_least_v1_1 version
+  then Error (`Bad_request "missing Host field")
+  else if hosts > 1
+  then Error (`Bad_request "more than one Host field")
+  else if hosts = 1 && not (is_host_field host)
+  then Error (`Bad_request "invalid Host field value")
+  else if meth <> `CONNECT && is_origin_form target
+  then received_framing t ~has_transfer_encoding content_lengths
+  else if
+    meth <> `CONNECT
+    && is_absolute_form target
+    && not (has_valid_authority target)
+  then Error (`Bad_request "userinfo or an empty host in the request-target")
+  else if not (target_fits_method meth target)
+  then
+    Error (`Bad_request "request-target does not fit the method")
+    (* RFC 9110 §9.3.6: a CONNECT request has no content; its framing fields are
+       ignored (decision 0016). *)
+  else if meth = `CONNECT
+  then Ok (`Fixed 0L)
+  else received_framing t ~has_transfer_encoding content_lengths
+
+(* One pass over the fields for Host, Transfer-Encoding and Content-Length. The
+   fields are in reverse order, so consing gives the received order. *)
+let rec scan_fields t fields ~hosts ~host ~has_transfer_encoding content_lengths
+  =
+  match fields with
+  | [] -> check_received t ~hosts ~host ~has_transfer_encoding content_lengths
+  | (name, value) :: fields ->
+    (match String.length name with
+    | 4 when Headers.ci_equal name "host" ->
+      scan_fields
+        t
+        fields
+        ~hosts:(hosts + 1)
+        ~host:value
+        ~has_transfer_encoding
+        content_lengths
+    | 14 when Headers.ci_equal name "content-length" ->
+      scan_fields
+        t
+        fields
+        ~hosts
+        ~host
+        ~has_transfer_encoding
+        (value :: content_lengths)
+    | 17 when Headers.ci_equal name "transfer-encoding" ->
+      scan_fields
+        t
+        fields
+        ~hosts
+        ~host
+        ~has_transfer_encoding:true
+        content_lengths
+    | _ ->
+      scan_fields t fields ~hosts ~host ~has_transfer_encoding content_lengths)
+
+let received_body_length ({ version; headers; _ } as t) =
   if version.major <> 1
   then Error `Http_version_not_supported
   else
-    match Headers.get_multi headers "host" with
-    | [] when Message.at_least_v1_1 version ->
-      Error (`Bad_request "missing Host field")
-    | _ :: _ :: _ -> Error (`Bad_request "more than one Host field")
-    | [ host ] when not (is_host_field host) ->
-      Error (`Bad_request "invalid Host field value")
-    | _
-      when meth <> `CONNECT
-           && is_absolute_form target
-           && not (has_valid_authority target) ->
-      Error (`Bad_request "userinfo or an empty host in the request-target")
-    | _ when not (target_fits_method meth target) ->
-      Error (`Bad_request "request-target does not fit the method")
-    (* RFC 9110 §9.3.6: a CONNECT request has no content; its framing fields are
-       ignored (decision 0016). *)
-    | _ when meth = `CONNECT -> Ok (`Fixed 0L)
-    | _ ->
-      (match transfer_coding_error t with
-      | Some error -> Error error
-      | None ->
-        (match body_length t with
-        | `Error `Bad_request ->
-          if Headers.mem headers "transfer-encoding"
-          then Error (`Bad_request "both Content-Length and Transfer-Encoding")
-          else Error (`Bad_request "invalid Content-Length")
-        | (`Fixed _ | `Chunked) as length -> Ok length))
+    scan_fields
+      t
+      (Headers.to_rev_list headers)
+      ~hosts:0
+      ~host:""
+      ~has_transfer_encoding:false
+      []
 
 let persistent_connection ?proxy { version; headers; _ } =
   Message.persistent_connection ?proxy version headers

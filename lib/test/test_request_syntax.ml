@@ -358,6 +358,26 @@ let host_accepted () =
   ignore (accepted "GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n" : exchange);
   ignore (accepted "GET / HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n" : exchange)
 
+(* The Host scan steps four bytes at a time; a bad byte at any position of any
+   length must still be found. *)
+let host_bad_byte_at_each_position () =
+  for length = 1 to 11 do
+    let host = String.make length 'a' in
+    ignore
+      (accepted ("GET / HTTP/1.1\r\nHost: " ^ host ^ ":8080\r\n\r\n")
+       : exchange);
+    for i = 0 to length - 1 do
+      let bad = String.mapi (fun j c -> if j = i then '/' else c) host in
+      check_rejected_both
+        ~status:400
+        ("GET / HTTP/1.1\r\nHost: " ^ bad ^ "\r\n\r\n");
+      let port = String.mapi (fun j _ -> if j = i then 'x' else '1') host in
+      check_rejected_both
+        ~status:400
+        ("GET / HTTP/1.1\r\nHost: a:" ^ port ^ "\r\n\r\n")
+    done
+  done
+
 let client_request_with_two_hosts () =
   let conn = Client_connection.create () in
   Alcotest.check_raises
@@ -720,6 +740,9 @@ let tests =
   ; "field syntax accepted", `Quick, field_syntax_accepted
   ; "host rejected", `Quick, host_rejected
   ; "host accepted", `Quick, host_accepted
+  ; ( "host with a bad byte at each position"
+    , `Quick
+    , host_bad_byte_at_each_position )
   ; "client request with two hosts", `Quick, client_request_with_two_hosts
   ; "connect rejected", `Quick, connect_rejected
   ; "connect accepted", `Quick, connect_accepted
