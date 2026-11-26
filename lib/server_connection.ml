@@ -63,9 +63,12 @@ type t =
   ; response_body_buffer : Bigstring.t
   ; request_handler : request_handler
   ; error_handler : error_handler
-  ; request_queue : Request_descriptor.t Queue.t
-    (* invariant: If [request_queue] is not empty, then the head of the queue
-       has already had [request_handler] called on it. *)
+  ; mutable current : Request_descriptor.t option
+    (* The head of the request queue, which has already had [request_handler]
+       called on it. Kept out of [pipelined] because a queue push and take cost
+       four write barriers, and most connections never pipeline. *)
+  ; pipelined : Request_descriptor.t Queue.t
+    (* The requests after [current]; empty when [current] is [None]. *)
   ; mutable error_code : error_code
     (* Represents an unrecoverable error that will cause the connection to *
        shutdown. Holds on to the response body created by the error handler *
@@ -78,8 +81,10 @@ type t =
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
-let is_active t = not (Queue.is_empty t.request_queue)
-let current_reqd_exn t = Queue.peek t.request_queue
+let is_active t = Option.is_some t.current
+
+let current_reqd_exn t =
+  match t.current with Some reqd -> reqd | None -> raise Queue.Empty
 
 let yield_reader t k =
   if Reader.is_closed t.reader then k () else Reader.on_wakeup t.reader k
@@ -192,7 +197,6 @@ let create
       date
   in
   let writer = Writer.create ~buffer_size:response_buffer_size () in
-  let request_queue = Queue.create () in
   let response_body_buffer = Bigstring.create response_body_buffer_size in
   let self = ref None in
   let handler request request_body =
@@ -228,9 +232,11 @@ let create
         | Some n -> t.requests >= n
         | None -> false
       then Request_descriptor.close_after reqd;
-      let call_handler = Queue.is_empty request_queue in
-      Queue.push reqd request_queue;
-      if call_handler then request_handler reqd
+      (match t.current with
+      | None ->
+        t.current <- Some reqd;
+        request_handler reqd
+      | Some _ -> Queue.push reqd t.pipelined)
   in
   let t =
     { reader = Reader.request ~max_header_size:config.max_header_size handler
@@ -238,7 +244,8 @@ let create
     ; response_body_buffer
     ; request_handler
     ; error_handler
-    ; request_queue
+    ; current = None
+    ; pipelined = Queue.create ()
     ; error_code = No_error
     ; config
     ; upgraded = None
@@ -337,15 +344,15 @@ let set_error_and_handle ?request t error =
 let report_exn t exn = set_error_and_handle t (`Exn exn)
 
 let advance_request_queue t =
-  ignore (Queue.take t.request_queue);
-  if Queue.is_empty t.request_queue && not (Writer.is_closed t.writer)
-  then Reader.resume t.reader;
-  if not (Queue.is_empty t.request_queue)
-  then
-    let reqd = Queue.peek t.request_queue in
-    match t.request_handler reqd with
+  match Queue.take_opt t.pipelined with
+  | None ->
+    t.current <- None;
+    if not (Writer.is_closed t.writer) then Reader.resume t.reader
+  | Some reqd ->
+    t.current <- Some reqd;
+    (match t.request_handler reqd with
     | () -> ()
-    | exception exn -> Request_descriptor.report_exn reqd exn
+    | exception exn -> Request_descriptor.report_exn reqd exn)
 
 let at_request_start t =
   match Reader.next t.reader with

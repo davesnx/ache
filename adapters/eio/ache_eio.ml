@@ -626,6 +626,16 @@ module IO_loop = struct
             ignore (Promise.try_resolve resolve_read_closed () : bool))
     in
     let write_loop () =
+      (* One waiter for all the yields of the connection: a promise each time
+         costs a broadcast, a trace id and their write barriers. The core wakes
+         the writer from this domain. *)
+      let waiter = Eio.Private.Single_waiter.create ()
+      and woken = ref false
+      and trace_id = Eio.Private.Trace.mint_id () in
+      let wake () =
+        woken := true;
+        Eio.Private.Single_waiter.wake_if_sleeping waiter
+      in
       let rec write_loop_step () =
         match Runtime.next_write_operation t with
         | `Write io_vectors ->
@@ -634,9 +644,11 @@ module IO_loop = struct
           if !write_expired then raise Late_cancel;
           write_loop_step ()
         | `Yield ->
-          let p, u = Promise.create () in
-          Runtime.yield_writer t (fun () -> Promise.resolve u ());
-          Promise.await p;
+          (* [yield_writer] calls [wake] at once when the writer is closed. *)
+          woken := false;
+          Runtime.yield_writer t wake;
+          if not !woken
+          then Eio.Private.Single_waiter.await waiter "ache.write" trace_id;
           write_loop_step ()
         | `Close _ -> shutdown_once `Send
       in
@@ -883,8 +895,9 @@ module Server = struct
           ?date:(if date then Some current_date else None)
           ?keep_alive_timeout
           (fun reqd ->
-             head_deadline := None;
-             body_spent := 0.;
+             (* Usually already reset: skip the write barriers. *)
+             if Option.is_some !head_deadline then head_deadline := None;
+             if !body_spent <> 0. then body_spent := 0.;
              body_progress := 0;
              request_handler client_addr reqd)
       in

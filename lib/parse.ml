@@ -296,14 +296,18 @@ let version ~eof o bs stop p where =
     then unexpected ~eof o bs stop (p + 1) where
     else if not (is digit minor)
     then unexpected ~eof o bs stop (p + 2) where
-    else (
-      o.version <-
-        (match major, minor with
+    else
+      let v =
+        match major, minor with
         | '1', '1' -> Version.v1_1
         | '1', '0' -> Version.v1_0
         | _ ->
-          { Version.major = Char.code major - 48; minor = Char.code minor - 48 });
-      p + 3)
+          { Version.major = Char.code major - 48; minor = Char.code minor - 48 }
+      in
+      (* Most messages on a connection repeat the version: skip the write
+         barrier. *)
+      if o.version != v then o.version <- v;
+      p + 3
 
 let rec same bs off s i =
   i = String.length s
@@ -341,7 +345,8 @@ let request_line ~eof o bs off stop =
       let p = if p < 0 then p else end_line ~eof o bs stop p where in
       if p >= 0
       then (
-        o.meth <- meth bs off (meth_end - off) methods;
+        (let m = meth bs off (meth_end - off) methods in
+         if o.meth != m then o.meth <- m);
         o.text <-
           substring bs ~off:(meth_end + 1) ~len:(target_end - meth_end - 1));
       p
