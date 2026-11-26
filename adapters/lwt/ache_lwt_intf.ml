@@ -34,6 +34,7 @@ module type IO = sig
     -> [ `Closed | `Ok of int ] Lwt.t
 
   val shutdown_receive : socket -> unit
+  val shutdown_send : socket -> unit
   val close : socket -> unit Lwt.t
 end
 
@@ -43,8 +44,14 @@ module type Server = sig
 
   val create_connection_handler :
      ?config:Ache.Config.t
-    -> ?idle_timeout:float
-    -> ?head_timeout:float
+    -> ?idle_timeout:float option
+    -> ?head_timeout:float option
+    -> ?body_timeout:float option
+    -> ?write_timeout:float option
+    -> ?close_timeout:float option
+    -> ?date:bool
+    -> ?stop:unit Lwt.t
+    -> ?grace:float
     -> request_handler:(addr -> Ache.Request_descriptor.t -> unit)
     -> error_handler:(addr -> Ache.Server_connection.error_handler)
     -> addr
@@ -65,6 +72,11 @@ module type Client = sig
     -> error_handler:Ache.Client_connection.error_handler
     -> response_handler:Ache.Client_connection.response_handler
     -> Ache.Body.Writer.t
+  (** [request] is {!Ache.Client_connection.request}. When no request waits
+      for a response and response bytes already arrived (a read returned them
+      or, for {!Ache_lwt.Client}, they wait on the socket), or the end of
+      input did, it first closes the connection: the request then gets
+      [`Connection_closed]. *)
 
   val shutdown : t -> unit Lwt.t
   val is_closed : t -> bool

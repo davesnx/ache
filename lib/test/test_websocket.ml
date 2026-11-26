@@ -25,8 +25,9 @@ let response_101 =
 type conn =
   { server : Server_connection.t
   ; mutable leftover : string
-  ; messages : string list ref
-  ; closed : int option list ref
+  ; messages : Websocket.message list ref
+  ; pongs : string list ref
+  ; closed : Websocket.close option list ref
   ; ws : Websocket.t option ref
   }
 
@@ -96,6 +97,7 @@ let check_output ?(msg = "output") c expected state =
 
 let connect ?max_message_size ?(on_open = fun (_ : Websocket.t) -> ()) () =
   let messages = ref []
+  and pongs = ref []
   and closed = ref []
   and ws = ref None in
   let server =
@@ -105,13 +107,14 @@ let connect ?max_message_size ?(on_open = fun (_ : Websocket.t) -> ()) () =
           ws := Some t;
           on_open t;
           { on_message = (fun m -> messages := m :: !messages)
-          ; on_close = (fun code -> closed := code :: !closed)
+          ; on_pong = (fun p -> pongs := p :: !pongs)
+          ; on_close = (fun close -> closed := close :: !closed)
           })
       with
       | Ok () -> ()
       | Error _ -> Alcotest.fail "handshake rejected")
   in
-  let c = { server; leftover = ""; messages; closed; ws } in
+  let c = { server; leftover = ""; messages; pongs; closed; ws } in
   feed c (request_string handshake_headers);
   c
 
@@ -170,11 +173,33 @@ let close_frame_out code =
 let close_payload code =
   Printf.sprintf "%c%c" (Char.chr (code lsr 8)) (Char.chr (code land 0xff))
 
+let message =
+  Alcotest.testable
+    (fun fmt m ->
+       match m with
+       | Websocket.Text s -> Format.fprintf fmt "Text %S" s
+       | Binary s -> Format.fprintf fmt "Binary %S" s)
+    ( = )
+
+let check_message_list c expected =
+  Alcotest.(check (list message)) "messages" expected (List.rev !(c.messages))
+
 let check_messages c expected =
-  Alcotest.(check (list string)) "messages" expected (List.rev !(c.messages))
+  check_message_list c (List.map (fun s -> Websocket.Text s) expected)
 
 let check_closed c expected =
-  Alcotest.(check (list (option int))) "on_close calls" expected !(c.closed)
+  Alcotest.(check (list (option int)))
+    "on_close calls"
+    expected
+    (List.map (Option.map (fun { Websocket.code; _ } -> code)) !(c.closed))
+
+let check_close_reasons c expected =
+  Alcotest.(check (list (option (pair int string))))
+    "on_close calls"
+    expected
+    (List.map
+       (Option.map (fun { Websocket.code; reason } -> code, reason))
+       !(c.closed))
 
 let check_reader_closed c =
   Alcotest.(check bool)
@@ -280,9 +305,32 @@ let test_handshake_reject () =
     (replace "sec-websocket-key" "dGhlIHNhbXBsZSBub25jZ*==")
     (Error `Invalid_key);
   check_handshake
+    "key whose padding bits are not zero"
+    (replace "sec-websocket-key" "AAAAAAAAAAAAAAAAAAAAAB==")
+    (Error `Invalid_key);
+  check_handshake
+    "key with the RFC sample's last data character changed"
+    (replace "sec-websocket-key" "dGhlIHNhbXBsZSBub25jZR==")
+    (Error `Invalid_key);
+  check_handshake
     "two keys"
     (handshake_headers @ [ "sec-websocket-key", rfc_key ])
     (Error `Invalid_key)
+
+let test_canonical_keys () =
+  String.iter
+    (fun last ->
+       let key = String.make 21 'A' ^ String.make 1 last ^ "==" in
+       Alcotest.(check bool)
+         key
+         (String.contains "AQgw" last)
+         (Result.is_ok
+            (Websocket.check_handshake
+               (Request.create
+                  ~headers:(Headers.of_list (replace "sec-websocket-key" key))
+                  `GET
+                  "/"))))
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 let test_upgrade_rejected_responds_nothing () =
   let result = ref None in
@@ -298,7 +346,13 @@ let test_upgrade_rejected_responds_nothing () =
         "")
   in
   let c =
-    { server; leftover = ""; messages = ref []; closed = ref []; ws = ref None }
+    { server
+    ; leftover = ""
+    ; messages = ref []
+    ; pongs = ref []
+    ; closed = ref []
+    ; ws = ref None
+    }
   in
   feed c (request_string (remove "sec-websocket-version"));
   Alcotest.(check (option (result unit handshake_error)))
@@ -310,6 +364,99 @@ let test_upgrade_rejected_responds_nothing () =
     "only the caller's response"
     "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n"
     output
+
+let bare_conn server =
+  { server
+  ; leftover = ""
+  ; messages = ref []
+  ; pongs = ref []
+  ; closed = ref []
+  ; ws = ref None
+  }
+
+let no_handler _ =
+  { Websocket.on_message = ignore; on_pong = ignore; on_close = ignore }
+
+let test_upgrade_adds_headers () =
+  let offered = ref [] in
+  let server =
+    Server_connection.create (fun reqd ->
+      offered := Websocket.requested_protocols (Request_descriptor.request reqd);
+      match
+        Websocket.upgrade
+          ~headers:(Headers.of_list [ "Sec-WebSocket-Protocol", "chat" ])
+          reqd
+          no_handler
+      with
+      | Ok () -> ()
+      | Error _ -> Alcotest.fail "handshake rejected")
+  in
+  let c = bare_conn server in
+  feed
+    c
+    (request_string
+       (handshake_headers @ [ "sec-websocket-protocol", "chat, superchat" ]));
+  Alcotest.(check (list string)) "offered" [ "chat"; "superchat" ] !offered;
+  let output, state = drain c in
+  Alcotest.(check string)
+    "101 with the added field last"
+    "HTTP/1.1 101 Switching Protocols\r\n\
+     upgrade: websocket\r\n\
+     connection: Upgrade\r\n\
+     sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+     Sec-WebSocket-Protocol: chat\r\n\
+     \r\n"
+    output;
+  Alcotest.check write_state "101 written" `Yield state
+
+let test_upgrade_rejects_headers () =
+  let check name headers request =
+    let raised = ref None in
+    let server =
+      Server_connection.create (fun reqd ->
+        match
+          Websocket.upgrade ~headers:(Headers.of_list headers) reqd (fun _ ->
+            Alcotest.fail (name ^ ": handler called"))
+        with
+        | Ok () | Error _ -> raised := Some false
+        | exception Invalid_argument _ -> raised := Some true)
+    in
+    let c = bare_conn server in
+    feed c (request_string request);
+    Alcotest.(check (option bool)) (name ^ ": raises") (Some true) !raised;
+    let output, (_ : [ `Yield | `Close ]) = drain c in
+    Alcotest.(check string) (name ^ ": writes nothing") "" output
+  in
+  List.iter
+    (fun (name, headers) ->
+       check name headers handshake_headers;
+       check (name ^ ", invalid handshake") headers (remove "upgrade"))
+    [ "Upgrade", [ "Upgrade", "websocket" ]
+    ; "connection", [ "x-a", "b"; "connection", "close" ]
+    ; "SEC-WEBSOCKET-ACCEPT", [ "SEC-WEBSOCKET-ACCEPT", "x" ]
+    ; "name not a token", [ "bad name", "x" ]
+    ; "CR LF in a value", [ "x-a", "b\r\nx-b: c" ]
+    ; "NUL in a value", [ "x-a", "b\000" ]
+    ]
+
+let test_requested_protocols () =
+  let protocols fields =
+    Websocket.requested_protocols
+      (Request.create ~headers:(Headers.of_list fields) `GET "/")
+  in
+  Alcotest.(check (list string)) "none" [] (protocols handshake_headers);
+  Alcotest.(check (list string))
+    "members of all fields, in order, trimmed, empty dropped"
+    [ "chat"; "superchat"; "v2.json" ]
+    (protocols
+       [ "Sec-WebSocket-Protocol", " chat ,\tsuperchat"
+       ; "host", "a"
+       ; "sec-websocket-protocol", ", ,v2.json,"
+       ]);
+  Alcotest.(check (list string))
+    "empty field"
+    []
+    (protocols [ "sec-websocket-protocol", "" ])
 
 let hello_masked = "\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58"
 
@@ -389,20 +536,21 @@ let test_ping_pong () =
   feed c (client_frame 0x9 "Hello");
   check_output c "\x8a\x05Hello" `Yield;
   feed c (client_frame 0xA "unsolicited");
-  check_output ~msg:"no answer to a pong" c "" `Yield
+  check_output ~msg:"no answer to a pong" c "" `Yield;
+  Alcotest.(check (list string)) "on_pong" [ "unsolicited" ] !(c.pongs)
 
 let test_close_echo () =
   let c = upgraded () in
   feed c (client_frame 0x8 (close_payload 1000 ^ "bye"));
   check_closed c [];
   check_output c (close_frame_out 1000) `Close;
-  check_closed c [ Some 1000 ];
+  check_close_reasons c [ Some (1000, "bye") ];
   check_reader_closed c;
   Alcotest.(check bool) "is_closed" true (Websocket.is_closed (ws c));
   let c = upgraded () in
   feed c (client_frame 0x8 "");
   check_output ~msg:"empty close" c "\x88\x00" `Close;
-  check_closed c [ Some 1005 ]
+  check_close_reasons c [ Some (1005, "") ]
 
 let test_data_after_close_ignored () =
   let c = upgraded () in
@@ -437,6 +585,12 @@ let protocol_errors =
     , client_frame ~fin:false 0x1 "Hel" ^ client_frame 0x1 "lo" )
   ; ( "binary inside a fragmented message"
     , client_frame ~fin:false 0x1 "Hel" ^ client_frame 0x2 "lo" )
+  ; ( "16-bit length below 126"
+    , "\x81\xfe\x00\x7d" ^ mask_key ^ String.make 125 'a' )
+  ; ( "64-bit length below 65536"
+    , "\x81\xff\x00\x00\x00\x00\x00\x00\xff\xff"
+      ^ mask_key
+      ^ String.make 65535 'a' )
   ; ( "64-bit length with the high bit set"
     , "\x81\xff\x80\x00\x00\x00\x00\x00\x00\x00" ^ mask_key )
   ; "close with 1 byte", client_frame 0x8 "\x03"
@@ -486,7 +640,141 @@ let test_max_size_exact () =
     ("\x8a\x7d" ^ String.make 125 'p')
     `Yield
 
-let test_binary = fails_with 1003 (client_frame 0x2 "\x00\x01")
+let test_binary () =
+  let c = upgraded () in
+  feed c (client_frame 0x2 "\x00\xff");
+  feed
+    c
+    (client_frame ~fin:false 0x2 "\xc3"
+    ^ client_frame 0x9 "p"
+    ^ client_frame 0x0 "\xff\xfe");
+  feed c (client_frame 0x1 "text");
+  check_message_list c [ Binary "\x00\xff"; Binary "\xc3\xff\xfe"; Text "text" ];
+  check_output c "\x8a\x01p" `Yield
+
+let test_send_binary () =
+  let c = upgraded () in
+  Websocket.send_binary (ws c) "\xff";
+  Websocket.send_binary (ws c) (String.make 300 '\000');
+  check_output
+    c
+    ("\x82\x01\xff" ^ "\x82\x7e\x01\x2c" ^ String.make 300 '\000')
+    `Yield
+
+let test_ping () =
+  let c = upgraded () in
+  Websocket.ping (ws c) "x";
+  check_output c "\x89\x01x" `Yield;
+  feed c (client_frame 0xA "x");
+  Alcotest.(check (list string)) "on_pong" [ "x" ] !(c.pongs);
+  Alcotest.check_raises
+    "126 bytes"
+    (Invalid_argument "Ache.Websocket.ping: payload longer than 125 bytes")
+    (fun () -> Websocket.ping (ws c) (String.make 126 'p'));
+  check_output ~msg:"nothing written by the raise" c "" `Yield;
+  Websocket.close (ws c) ~code:1000;
+  Websocket.ping (ws c) "late";
+  check_output ~msg:"no ping after close" c (close_frame_out 1000) `Yield
+
+let test_close_reason () =
+  let c = upgraded () in
+  Alcotest.check_raises
+    "reason not UTF-8"
+    (Invalid_argument "Ache.Websocket.close: reason is not valid UTF-8")
+    (fun () -> Websocket.close ~reason:"\xff" (ws c) ~code:1000);
+  Alcotest.check_raises
+    "reason of 124 bytes"
+    (Invalid_argument "Ache.Websocket.close: reason longer than 123 bytes")
+    (fun () -> Websocket.close ~reason:(String.make 124 'r') (ws c) ~code:1000);
+  check_output ~msg:"nothing written by the raises" c "" `Yield;
+  Websocket.close ~reason:"bye" (ws c) ~code:1000;
+  check_output c "\x88\x05\x03\xe8bye" `Yield;
+  let c = upgraded () in
+  let reason = String.make 123 'r' in
+  Websocket.close ~reason (ws c) ~code:4000;
+  check_output c ("\x88\x7d\x0f\xa0" ^ reason) `Yield
+
+let test_length_boundaries () =
+  let c = upgraded () in
+  feed c (client_frame 0x2 (String.make 126 'a'));
+  feed c (client_frame 0x2 (String.make 65536 'b'));
+  check_message_list
+    c
+    [ Binary (String.make 126 'a'); Binary (String.make 65536 'b') ];
+  check_output c "" `Yield
+
+(* RFC 3629 §4 boundaries. *)
+let valid_utf8 =
+  [ "\xc2\x80"
+  ; "\xdf\xbf"
+  ; "\xe0\xa0\x80"
+  ; "\xed\x9f\xbf"
+  ; "\xee\x80\x80"
+  ; "\xef\xbf\xbf"
+  ; "\xf0\x90\x80\x80"
+  ; "\xf4\x8f\xbf\xbf"
+  ]
+
+let invalid_utf8 =
+  [ "overlong 2-byte", "\xc0\x80"
+  ; "overlong 2-byte C1", "\xc1\xbf"
+  ; "overlong 3-byte", "\xe0\x80\x80"
+  ; "surrogate", "\xed\xa0\x80"
+  ; "overlong 4-byte", "\xf0\x80\x80\x80"
+  ; "above U+10FFFF", "\xf4\x90\x80\x80"
+  ; "F5", "\xf5\x80\x80\x80"
+  ; "lone continuation", "\x80"
+  ; "ASCII inside a sequence", "\xe2\x82a"
+  ; "truncated at the end", "caf\xc3"
+  ]
+
+let test_utf8_boundaries () =
+  let c = upgraded () in
+  List.iter (fun s -> feed c (client_frame 0x1 s)) valid_utf8;
+  check_messages c valid_utf8;
+  check_output c "" `Yield;
+  let c = upgraded () in
+  let text = "caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80" in
+  String.iter
+    (fun ch -> feed c (String.make 1 ch))
+    (client_frame ~fin:false 0x1 (String.sub text 0 4)
+    ^ client_frame ~fin:false 0x0 (String.sub text 4 5)
+    ^ client_frame 0x0 (String.sub text 9 (String.length text - 9)));
+  check_messages c [ text ]
+
+let test_utf8_state_across_control_frames () =
+  let c = upgraded () in
+  feed
+    c
+    (client_frame ~fin:false 0x1 "\xe2"
+    ^ client_frame 0x9 "\xff"
+    ^ client_frame 0xA "\xff"
+    ^ client_frame 0x0 "\x82\xac");
+  check_messages c [ "\xe2\x82\xac" ];
+  check_output c "\x8a\x01\xff" `Yield;
+  fails_with
+    1007
+    (client_frame ~fin:false 0x1 "\xe2"
+    ^ client_frame 0xA ""
+    ^ client_frame 0x0 "a")
+    ()
+
+let test_utf8_fails_in_first_fragment () =
+  let c = upgraded () in
+  feed c (client_frame ~fin:false 0x1 "ok\xff");
+  check_reader_closed c;
+  check_output c (close_frame_out 1007) `Close;
+  check_messages c []
+
+let test_utf8_fails_inside_a_frame () =
+  let c = upgraded () in
+  let frame =
+    client_frame 0x1 (String.make 10 'a' ^ "\xff" ^ String.make 989 'a')
+  in
+  feed c (String.sub frame 0 28);
+  check_reader_closed c;
+  check_output c (close_frame_out 1007) `Close;
+  check_messages c []
 
 let test_eof_without_close () =
   let c = upgraded () in
@@ -523,17 +811,63 @@ let test_write_closed_no_spin () =
   Alcotest.(check bool) "is_closed" true (Websocket.is_closed (ws c));
   check_closed c [ None ]
 
+let read_operation c =
+  match Server_connection.next_read_operation c.server with
+  | `Read -> "`Read"
+  | `Yield -> "`Yield"
+  | `Close -> "`Close"
+
 let test_server_close () =
   let c = upgraded () in
   Websocket.close (ws c) ~code:1001;
-  check_reader_closed c;
   Websocket.send_text (ws c) "dropped";
-  check_output c (close_frame_out 1001) `Close;
-  check_closed c [ None ];
+  Websocket.close (ws c) ~code:1000;
+  check_output
+    ~msg:"one close frame, then wait for the client's"
+    c
+    (close_frame_out 1001)
+    `Yield;
+  Alcotest.(check string) "still reading" "`Read" (read_operation c);
+  feed c (client_frame 0x1 "dropped" ^ client_frame 0x9 "ping");
+  check_messages c [];
+  check_output ~msg:"a ping after our close gets a pong" c "\x8a\x04ping" `Yield;
+  feed c (client_frame 0x8 (close_payload 4000 ^ "done"));
+  check_reader_closed c;
+  check_output ~msg:"no second close frame" c "" `Close;
+  check_close_reasons c [ Some (4000, "done") ];
   Alcotest.check_raises
     "reserved code"
     (Invalid_argument "Ache.Websocket.close: invalid close code")
     (fun () -> Websocket.close (ws c) ~code:1006)
+
+let test_server_close_eof () =
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1001;
+  check_output c (close_frame_out 1001) `Yield;
+  feed_eof c;
+  check_reader_closed c;
+  check_output ~msg:"closes at the end of input" c "" `Close;
+  check_closed c [ None ]
+
+let test_server_close_resumes_reading () =
+  let c = upgraded () in
+  Websocket.pause_reading (ws c);
+  Alcotest.(check string) "paused" "`Yield" (read_operation c);
+  Websocket.close (ws c) ~code:1000;
+  check_output c (close_frame_out 1000) `Yield;
+  Alcotest.(check string) "reads the client's close" "`Read" (read_operation c);
+  feed c (client_frame 0x8 (close_payload 1000));
+  check_output c "" `Close;
+  check_closed c [ Some 1000 ]
+
+let test_server_close_protocol_error () =
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1000;
+  check_output c (close_frame_out 1000) `Yield;
+  feed c (client_frame ~rsv:1 0x1 "x");
+  check_reader_closed c;
+  check_output ~msg:"no second close frame" c "" `Close;
+  check_closed c [ None ]
 
 let test_101_not_written () =
   let c = connect () in
@@ -543,12 +877,6 @@ let test_101_not_written () =
   | _ -> Alcotest.fail "expected the 101");
   check_closed c [ None ];
   Alcotest.(check bool) "is_closed" true (Websocket.is_closed (ws c))
-
-let read_operation c =
-  match Server_connection.next_read_operation c.server with
-  | `Read -> "`Read"
-  | `Yield -> "`Yield"
-  | `Close -> "`Close"
 
 let test_pong_backpressure () =
   let c = upgraded () in
@@ -590,13 +918,105 @@ let test_pause_reading () =
   feed c hello_masked;
   check_messages c [ "Hello" ]
 
+let timeout_kind c =
+  match Server_connection.read_timeout c.server with
+  | Some (`Idle, _) -> "idle"
+  | Some (`Close, _) -> "close"
+  | Some ((`Head | `Body), _) -> "other"
+  | None -> "none"
+
+let test_close_timeout () =
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1000;
+  check_output c (close_frame_out 1000) `Yield;
+  Alcotest.(check string)
+    "waits for the client's close"
+    "close"
+    (timeout_kind c);
+  feed c (client_frame 0x1 "dropped");
+  Alcotest.(check string)
+    "a message does not change the phase"
+    "close"
+    (timeout_kind c);
+  (match Server_connection.read_timeout c.server with
+  | Some (`Close, abort) -> abort ()
+  | _ -> Alcotest.fail "expected a close timeout");
+  check_reader_closed c;
+  check_output ~msg:"nothing more written" c "" `Close;
+  check_closed c [ None ];
+  Alcotest.(check string) "no timeout once closed" "none" (timeout_kind c)
+
+let test_close_timeout_paused () =
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1000;
+  Websocket.pause_reading (ws c);
+  check_output c (close_frame_out 1000) `Yield;
+  Alcotest.(check string)
+    "a pause after close does not stop the read"
+    "`Read"
+    (read_operation c);
+  Alcotest.(check string) "the close timeout applies" "close" (timeout_kind c);
+  feed c (client_frame 0x9 "p");
+  check_output ~msg:"a ping gets a pong" c "\x8a\x01p" `Yield;
+  feed c (client_frame 0x8 (close_payload 1000));
+  check_output c "" `Close;
+  check_closed c [ Some 1000 ]
+
+let test_close_answered_no_timeout () =
+  let c = upgraded () in
+  Websocket.close (ws c) ~code:1000;
+  check_output c (close_frame_out 1000) `Yield;
+  feed c (client_frame 0x8 (close_payload 1000));
+  Alcotest.(check string) "no timeout after the answer" "none" (timeout_kind c);
+  check_output c "" `Close;
+  check_closed c [ Some 1000 ]
+
+let test_idle_timeout () =
+  let c = upgraded () in
+  (match
+     Websocket.read_timeout (ws c), Server_connection.read_timeout c.server
+   with
+  | Some (`Idle, _), Some (`Idle, close) -> close ()
+  | _ -> Alcotest.fail "expected an idle timeout on an open connection");
+  check_output c (close_frame_out 1001) `Close;
+  check_reader_closed c;
+  Alcotest.(check bool)
+    "no timeout once closed"
+    true
+    (Option.is_none (Websocket.read_timeout (ws c)));
+  let c = upgraded () in
+  Websocket.pause_reading (ws c);
+  Alcotest.(check bool)
+    "no timeout while reading is paused"
+    true
+    (Option.is_none (Server_connection.read_timeout c.server));
+  Websocket.resume_reading (ws c);
+  Alcotest.(check bool)
+    "timeout again after resume"
+    true
+    (Option.is_some (Server_connection.read_timeout c.server))
+
 let tests =
   [ "accept key", `Quick, test_accept_key
+  ; "idle timeout closes with 1001", `Quick, test_idle_timeout
+  ; "close timeout aborts the closing handshake", `Quick, test_close_timeout
+  ; ( "a pause after close still reads the close frame"
+    , `Quick
+    , test_close_timeout_paused )
+  ; ( "no close timeout after the client's answer"
+    , `Quick
+    , test_close_answered_no_timeout )
   ; "handshake accepted", `Quick, test_handshake_accept
   ; "handshake rejected", `Quick, test_handshake_reject
+  ; "canonical keys only", `Quick, test_canonical_keys
   ; ( "rejected upgrade responds nothing"
     , `Quick
     , test_upgrade_rejected_responds_nothing )
+  ; "upgrade adds response fields", `Quick, test_upgrade_adds_headers
+  ; ( "upgrade rejects reserved and invalid fields"
+    , `Quick
+    , test_upgrade_rejects_headers )
+  ; "requested_protocols", `Quick, test_requested_protocols
   ; "masked text frame", `Quick, test_masked_text
   ; "send_text with 7, 16 and 64-bit lengths", `Quick, test_send_text
   ; "send before the 101 is written", `Quick, test_send_before_101
@@ -620,12 +1040,31 @@ let tests =
   ; "too large fragments close 1009", `Quick, test_too_large_fragments
   ; "too large 64-bit length closes 1009", `Quick, test_too_large_64bit
   ; "message of max_message_size", `Quick, test_max_size_exact
-  ; "binary frame closes 1003", `Quick, test_binary
+  ; "binary messages", `Quick, test_binary
+  ; "send_binary", `Quick, test_send_binary
+  ; "ping and on_pong", `Quick, test_ping
+  ; "close with a reason", `Quick, test_close_reason
+  ; "shortest lengths at 126 and 65536", `Quick, test_length_boundaries
+  ; "UTF-8 boundaries and splits", `Quick, test_utf8_boundaries
+  ; ( "control frames keep the UTF-8 state of a message"
+    , `Quick
+    , test_utf8_state_across_control_frames )
+  ; ( "invalid UTF-8 in the first fragment closes 1007"
+    , `Quick
+    , test_utf8_fails_in_first_fragment )
+  ; ( "invalid UTF-8 closes 1007 before the end of the frame"
+    , `Quick
+    , test_utf8_fails_inside_a_frame )
   ; "end of input without a close frame", `Quick, test_eof_without_close
   ; ( "no write after the write side reports `Closed"
     , `Quick
     , test_write_closed_no_spin )
   ; "server close", `Quick, test_server_close
+  ; "server close, then end of input", `Quick, test_server_close_eof
+  ; "server close resumes reading", `Quick, test_server_close_resumes_reading
+  ; ( "server close, then a protocol error"
+    , `Quick
+    , test_server_close_protocol_error )
   ; "101 not written shuts the connection down", `Quick, test_101_not_written
   ; "pongs to a client that does not read", `Quick, test_pong_backpressure
   ; "pause and resume reading", `Quick, test_pause_reading
@@ -633,3 +1072,7 @@ let tests =
   @ List.map
       (fun (name, bytes) -> "1002: " ^ name, `Quick, fails_with 1002 bytes)
       protocol_errors
+  @ List.map
+      (fun (name, bytes) ->
+         "1007: " ^ name, `Quick, fails_with 1007 (client_frame 0x1 bytes))
+      invalid_utf8

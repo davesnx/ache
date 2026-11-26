@@ -70,9 +70,9 @@ module Server = struct
     | `Exn exn ->
       Body.Writer.write_string response_body (Printexc.to_string exn);
       Body.Writer.write_string response_body "\n"
-    | #Status.standard as error ->
+    | error ->
       Body.Writer.write_string
         response_body
-        (Status.default_reason_phrase error));
+        (Status.to_string (Server_connection.error_status error)));
     Body.Writer.close response_body
 end

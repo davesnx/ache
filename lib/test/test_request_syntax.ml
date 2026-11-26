@@ -330,7 +330,7 @@ let host_rejected () =
        check_rejected_both ~status:400 input;
        let s = serve input in
        match s.errors with
-       | [ (`Bad_request, Some r) ] ->
+       | [ (`Bad_request _, Some r) ] ->
          Alcotest.(check string) "error handler gets the request" "/" r.target
        | _ -> Alcotest.failf "%S: expected one Bad_request with request" input)
     [ "GET / HTTP/1.1\r\n\r\n"
@@ -360,25 +360,26 @@ let host_accepted () =
 
 let client_request_with_two_hosts () =
   let conn = Client_connection.create () in
-  let body =
-    Client_connection.request
-      conn
-      ~flush_headers_immediately:true
-      (Request.create
-         ~headers:(Headers.of_list [ "Host", "a"; "Host", "b" ])
-         `GET
-         "/")
-      ~error_handler:(fun _ -> ())
-      ~response_handler:(fun _ _ -> ())
-  in
-  Body.Writer.close body;
-  match Client_connection.next_write_operation conn with
-  | `Write iovecs ->
-    Alcotest.(check string)
-      "request written"
-      "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"
-      (Helpers.Write_operation.iovecs_to_string iovecs)
-  | _ -> Alcotest.fail "expected a write"
+  Alcotest.check_raises
+    "two Host fields"
+    (Invalid_argument "ache: more than one host field")
+    (fun () ->
+       ignore
+         (Client_connection.request
+            conn
+            ~flush_headers_immediately:true
+            (Request.create
+               ~headers:(Headers.of_list [ "Host", "a"; "Host", "b" ])
+               `GET
+               "/")
+            ~error_handler:(fun _ -> ())
+            ~response_handler:(fun _ _ -> ())
+          : Body.Writer.t));
+  Alcotest.check
+    Helpers.write_operation
+    "nothing written"
+    `Yield
+    (Client_connection.next_write_operation conn)
 
 let connect_rejected () =
   List.iter

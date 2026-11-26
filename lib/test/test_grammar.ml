@@ -12,8 +12,10 @@ let outcome =
 (* Results of the head parsers of httpun 37fdcd8 on [Grammar_corpus.all], except
    four status codes that made httpun raise [Failure] and the rows where httpun
    accepted a method, field-name or field value outside RFC 9110 §9.1, §5.1 and
-   §5.5, and the response with an obs-fold, which RFC 9112 §5.2 makes a client
-   accept. *)
+   §5.5, the response with an obs-fold, which RFC 9112 §5.2 makes a client
+   accept, the target with a raw byte above 0x7F, which decision 0007 rejects,
+   and the status-line with CRLF right after the code, which a client accepts as
+   an empty reason. *)
 let expected =
   [ Accept "\"GET\" \"/\" HTTP/1.1 []"
   ; Accept "\"some-other-verb\" \"/\" HTTP/1.1 []"
@@ -64,7 +66,7 @@ let expected =
   ; Accept "md5:ecf8c5041016e0906cc3d2aac94a3c82"
   ; Accept "md5:555caf2783ecc303d87090628a1fb389"
   ; Accept "md5:6d36e436a7519fc9b1d1d86508dbe3ff"
-  ; Accept "\"GET\" \"/\\195\\169\" HTTP/1.1 []"
+  ; Reject
   ; Accept "\"GET\" \"/\" HTTP/1.1 [\"X\":\"caf\\195\\169\"]"
   ; Reject
   ; Reject
@@ -101,7 +103,7 @@ let expected =
   ; Accept "HTTP/1.1 200 \"\\226\\156\\147\" []"
   ; Accept "HTTP/1.1 200 \"OK\\tfoo\" []"
   ; Accept "md5:3af961f8ea3aa8bb66d161d080ff6d97"
-  ; Reject
+  ; Accept "HTTP/1.1 200 \"\" []"
   ; Reject
   ; Reject
   ; Reject
@@ -162,11 +164,10 @@ let test_chunk_size () =
     ; "\r\n", Error "unexpected '\\r' in chunk-size line"
     ]
 
-(* Targets, field values and reasons are scanned 8 bytes at a time: put each
-   byte at each offset of the first three words, alone and after an HTAB. *)
+(* Field values and reasons are scanned 8 bytes at a time: put each byte at each
+   offset of the first three words, alone and after an HTAB. *)
 let test_byte_at_each_offset () =
   let field_char c = c = '\t' || (c >= ' ' && c <> '\x7f') in
-  let target_char c = c > ' ' && c <> '\x7f' in
   let ok = function Ok _ -> true | Error _ -> false in
   let module G = Ache.Ache_private.Parse.Grammar in
   for k = 0 to 23 do
@@ -181,10 +182,6 @@ let test_byte_at_each_offset () =
       in
       let value = around (String.make 1 c) in
       let after_tab = around ("\t" ^ String.make 1 c) in
-      check
-        "target"
-        (target_char c)
-        (G.request ("GET /" ^ value ^ " HTTP/1.1\r\n\r\n"));
       check
         "field value"
         (field_char c)

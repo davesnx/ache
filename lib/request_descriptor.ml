@@ -30,7 +30,7 @@
   ----------------------------------------------------------------------------*)
 
 type error =
-  [ `Bad_request
+  [ `Bad_request of string
   | `Not_implemented
   | `Http_version_not_supported
   | `Uri_too_long
@@ -43,6 +43,14 @@ type error =
 
 type error_handler =
   ?request:Request.t -> error -> (Headers.t -> Body.Writer.t) -> unit
+
+let error_status : error -> Status.t = function
+  | `Exn _ -> `Internal_server_error
+  | `Bad_request _ -> `Bad_request
+  | ( `Not_implemented | `Http_version_not_supported | `Uri_too_long
+    | `Bad_gateway | `Internal_server_error | `Request_header_fields_too_large
+    | `Request_timeout ) as status ->
+    (status :> Status.t)
 
 module Reader = Parse.Reader
 module Writer = Serialize.Writer
@@ -78,11 +86,30 @@ type t =
   ; response_body_buffer : Bigstring.t
   ; error_handler : error_handler
   ; upgrade : Runtime.impl -> unit
+  ; max_discard_body : int
+  ; mutable discarded : int
   ; mutable persistent : bool
   ; mutable response_state : Response_state.t
   ; mutable error_code : [ `Ok | error ]
   ; proxy : bool
+  ; date : (unit -> string) option
+  ; keep_alive : string
   }
+
+let continue_response = Response.create `Continue
+
+let expects_continue (request : Request.t) =
+  Message.at_least_v1_1 request.version
+  && Message.has_member
+       (Headers.get_multi request.headers "expect")
+       "100-continue"
+
+let send_continue t =
+  match t.response_state, t.error_code with
+  | Waiting, `Ok when not (Writer.is_closed t.writer) ->
+    Writer.write_response t.writer continue_response;
+    Writer.wakeup t.writer
+  | _ -> ()
 
 let create
       ~error_handler
@@ -91,21 +118,40 @@ let create
       ~writer
       ~response_body_buffer
       ~proxy
+      ~max_discard_body
+      ~date
+      ~keep_alive
+      ~auto_continue
       request
       request_body
   =
-  { request
-  ; request_body
-  ; reader
-  ; writer
-  ; response_body_buffer
-  ; error_handler
-  ; upgrade
-  ; persistent = Request.persistent_connection request
-  ; response_state = Waiting
-  ; error_code = `Ok
-  ; proxy
-  }
+  let t =
+    { request
+    ; request_body
+    ; reader
+    ; writer
+    ; response_body_buffer
+    ; error_handler
+    ; upgrade
+    ; max_discard_body
+    ; discarded = 0
+    ; persistent = Request.persistent_connection request
+    ; response_state = Waiting
+    ; error_code = `Ok
+    ; proxy
+    ; date
+    ; keep_alive
+    }
+  in
+  if
+    auto_continue
+    && (not (Body.Reader.is_closed request_body))
+    && expects_continue request
+  then
+    Body.Reader.set_on_first_read
+      request_body
+      (Optional_thunk.some (fun () -> send_continue t));
+  t
 
 let request { request; _ } = request
 let request_body { request_body; _ } = request_body
@@ -121,6 +167,19 @@ let response_exn { response_state; _ } =
     failwith "ache.Request_descriptor.response_exn: response has not started"
   | Streaming (response, _) | Fixed response | Upgrade response -> response
 
+(* Decision 0010: the connection drains at most [max_discard_body] bytes of an
+   unread body after the response, so a longer known remainder closes it. A body
+   the application closed is dropped the same way. *)
+let unread_body_too_large t =
+  match Reader.body_remaining t.reader t.request_body with
+  | Some n -> Int64.compare n (Int64.of_int t.max_discard_body) > 0
+  | None -> false
+
+(* After a CONNECT the next bytes may be tunnel data, so a response that does
+   not start the tunnel closes the connection. *)
+let keeps_connection t =
+  t.persistent && t.request.meth <> `CONNECT && not (unread_body_too_large t)
+
 let frame ~fn ~length t (response : Response.t) =
   if Status.is_informational response.status
   then
@@ -133,22 +192,52 @@ let frame ~fn ~length t (response : Response.t) =
     ~proxy:t.proxy
     ~request_method:t.request.meth
     ~request_version:t.request.version
-    ~persistent:t.persistent
+    ~persistent:(keeps_connection t)
     ~length
     response
+
+let needs_date (response : Response.t) =
+  (not (Status.is_informational response.status))
+  && not (Headers.mem response.headers "date")
+
+let persists_after t (response : Response.t) =
+  keeps_connection t && Response.persistent_connection response
+
+let needs_keep_alive t (response : Response.t) =
+  t.keep_alive <> ""
+  && (not (Status.is_informational response.status))
+  && persists_after t response
+  && not (Headers.mem response.headers "keep-alive")
 
 let write_response t response =
   if Writer.is_closed t.writer
   then Serialize.check_response response
-  else Writer.write_response t.writer response
+  else
+    match t.date, t.keep_alive with
+    | None, "" -> Writer.write_response t.writer response
+    | _ ->
+      let date =
+        match t.date with
+        | Some date when needs_date response -> date ()
+        | _ -> ""
+      in
+      let keep_alive =
+        if needs_keep_alive t response then t.keep_alive else ""
+      in
+      if date == "" && keep_alive == ""
+      then Writer.write_response t.writer response
+      else Writer.write_response_with t.writer response ~date ~keep_alive
 
 let commit_persistence t (response : Response.t) =
-  if t.persistent
-  then
-    t.persistent <-
-      Response.persistent_connection response
-      && not (t.request.meth = `CONNECT && Status.is_successful response.status);
+  t.persistent <- persists_after t response;
   if not t.persistent then Reader.pause t.reader
+
+let close_after t =
+  match t.response_state with
+  | Upgrade _ -> ()
+  | Waiting | Fixed _ | Streaming _ ->
+    t.persistent <- false;
+    Reader.pause t.reader
 
 let has_body t encoding =
   encoding <> `No_body && not (Writer.is_closed t.writer)
@@ -230,6 +319,8 @@ let respond_with_informational t (response : Response.t) =
        transfer-encoding in a 1xx";
   match t.response_state with
   | Waiting ->
+    if Status.to_code response.status = 100
+    then Body.Reader.set_on_first_read t.request_body Optional_thunk.none;
     if Message.at_least_v1_1 t.request.version
     then (
       write_response t response;
@@ -253,8 +344,17 @@ let unsafe_respond_with_streaming ~flush_headers_immediately t response =
         t
         response
     in
+    let send_trailers =
+      match encoding with
+      | `Chunked -> Message.accepts_trailers t.request.headers
+      | `Fixed _ | `Close_delimited | `No_body -> false
+    in
     let response_body =
-      Body.Writer.create t.response_body_buffer ~encoding ~writer:t.writer
+      Body.Writer.create
+        ~send_trailers
+        t.response_body_buffer
+        ~encoding
+        ~writer:t.writer
     in
     write_response t response;
     if Writer.is_closed t.writer then Body.Writer.close_and_drain response_body;
@@ -302,7 +402,7 @@ let unsafe_respond_with_upgrade ?status t headers impl =
     Writer.flush t.writer (function
       | `Written when not closed -> t.upgrade impl
       | `Written | `Closed ->
-        let (Runtime.Impl ((module Engine), engine)) = impl in
+        let (Runtime.Impl ((module Engine), engine, _)) = impl in
         Engine.shutdown engine;
         Reader.force_close t.reader;
         Reader.wakeup t.reader);
@@ -328,11 +428,7 @@ let report_error t error =
   match t.response_state, t.error_code with
   | Waiting, `Ok ->
     t.error_code <- (error :> [ `Ok | error ]);
-    let status =
-      match (error :> [ error | Status.standard ]) with
-      | `Exn _ -> `Internal_server_error
-      | #Status.standard as status -> status
-    in
+    let status = error_status error in
     (match
        t.error_handler ~request:t.request error (fun headers ->
          let response_body =
@@ -403,6 +499,15 @@ let persistent_connection t =
     not (Body.Writer.is_incomplete response_body)
   | Waiting | Fixed _ | Upgrade _ -> true
 
+(* The application closed the body while the parser is still inside it: on a
+   persistent connection its rest is dropped, within the discard budget, before
+   the next request. *)
+let drops_closed_body t =
+  t.persistent
+  && Body.Reader.is_closed t.request_body
+  && (not (Reader.is_closed t.reader))
+  && Reader.in_body t.reader t.request_body
+
 let input_state t : Io_state.t =
   match t.response_state, t.request.meth with
   | Upgrade _, _ when Reader.is_closed t.reader -> Complete
@@ -414,13 +519,30 @@ let input_state t : Io_state.t =
     Wait
   | _ ->
     if Body.Reader.is_closed t.request_body
-    then Complete
+    then if drops_closed_body t then Wait else Complete
     else if Body.Reader.is_read_scheduled t.request_body
     then Ready
     else Wait
 
 let output_state { response_state; writer; _ } =
   Response_state.output_state response_state ~writer
+
+(* The parser is still inside the request body, and its bytes are dropped: the
+   connection discards it, or the application closed it. *)
+let drops_body t =
+  Reader.in_body t.reader t.request_body
+  && (Body.Reader.is_discarding t.request_body
+     || Body.Reader.is_closed t.request_body)
+
+(* The bytes the connection may still read to drop the unread body, while it
+   drops it. *)
+let discard_budget t =
+  if drops_body t
+  then Some (Int.max 0 (t.max_discard_body - t.discarded))
+  else None
+
+let add_discarded t n = t.discarded <- t.discarded + n
+let discard_budget_spent t = discard_budget t = Some 0
 
 let flush_request_body t =
   if Body.Reader.has_pending_output t.request_body

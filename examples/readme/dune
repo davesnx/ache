@@ -1,13 +1,29 @@
 (executable
- (name gen_readme))
+ (name gen_readme)
+ (modules gen_readme))
+
+(executable
+ (name testing_example)
+ (modules testing_example)
+ (libraries ache))
+
+(executable
+ (name trailers_example)
+ (modules trailers_example)
+ (libraries ache))
 
 (rule
  (deps
   (glob_files ../eio/*.ml)
   (glob_files ../lwt/*.ml)
-  (glob_files ../miou/*.ml))
+  (glob_files ../miou/*.ml)
+  testing_example.ml
+  trailers_example.ml)
  (action
   (progn
+   (with-stdout-to
+    ache.md.gen
+    (run ./gen_readme.exe ../.. %{dep:../../docs/ache.md}))
    (with-stdout-to
     ache-eio.md.gen
     (run ./gen_readme.exe ../.. %{dep:../../docs/ache-eio.md}))
@@ -17,13 +33,16 @@
    (with-stdout-to
     ache-miou.md.gen
     (run ./gen_readme.exe ../.. %{dep:../../docs/ache-miou.md}))))
- (targets ache-eio.md.gen ache-lwt.md.gen ache-miou.md.gen))
+ (targets ache.md.gen ache-eio.md.gen ache-lwt.md.gen ache-miou.md.gen))
 
 (rule
  (alias runtest)
  (package ache)
  (action
   (progn
+   (run %{exe:testing_example.exe})
+   (run %{exe:trailers_example.exe})
+   (diff ../../docs/ache.md ache.md.gen)
    (diff ../../docs/ache-eio.md ache-eio.md.gen)
    (diff ../../docs/ache-lwt.md ache-lwt.md.gen)
    (diff ../../docs/ache-miou.md ache-miou.md.gen))))

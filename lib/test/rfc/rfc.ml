@@ -325,6 +325,7 @@ module Server = struct
     ; mutable body : string
     ; mutable body_complete : bool
     ; mutable body_cut : bool
+    ; mutable trailers : Headers.t
     }
 
   type t =
@@ -340,6 +341,7 @@ module Server = struct
         body
         ~on_eof:(fun () ->
           ex.body_complete <- true;
+          ex.trailers <- Body.Reader.trailers body;
           on_complete ex.body)
         ~on_error:(fun () -> ex.body_cut <- true)
         ~on_read:(fun bs ~off ~len ->
@@ -384,6 +386,7 @@ module Server = struct
         ?config
         ?(handler = echo)
         ?(error_handler = default_error_handler)
+        ?date
         ()
     =
     let state = ref None in
@@ -396,6 +399,7 @@ module Server = struct
         ; body = ""
         ; body_complete = false
         ; body_cut = false
+        ; trailers = Headers.empty
         }
       in
       s.exchanges <- s.exchanges @ [ ex ];
@@ -407,14 +411,14 @@ module Server = struct
       error_handler ?request error respond
     in
     let conn =
-      Server_connection.create ?config ~error_handler request_handler
+      Server_connection.create ?config ~error_handler ?date request_handler
     in
     let s = { driver = Driver.make conn; exchanges = []; errors = [] } in
     state := Some s;
     s
 
-  let run ?config ?handler ?error_handler ?(eof = false) input =
-    let s = create ?config ?handler ?error_handler () in
+  let run ?config ?handler ?error_handler ?date ?(eof = false) input =
+    let s = create ?config ?handler ?error_handler ?date () in
     Driver.feed s.driver input;
     if eof then Driver.close_input s.driver;
     s
@@ -444,6 +448,7 @@ module Client = struct
     ; mutable body : string
     ; mutable body_eof : bool
     ; mutable body_cut : bool
+    ; mutable trailers : Headers.t
     ; mutable errors : string list
     }
 
@@ -467,7 +472,9 @@ module Client = struct
            let rec loop () =
              Body.Reader.schedule_read
                reader
-               ~on_eof:(fun () -> ex.body_eof <- true)
+               ~on_eof:(fun () ->
+                 ex.body_eof <- true;
+                 ex.trailers <- Body.Reader.trailers reader)
                ~on_error:(fun () -> ex.body_cut <- true)
                ~on_read:(fun bs ~off ~len ->
                  ex.body <- ex.body ^ Ache.Bigstring.substring bs ~off ~len;
@@ -493,6 +500,7 @@ module Client = struct
          ; body = ""
          ; body_eof = false
          ; body_cut = false
+         ; trailers = Headers.empty
          ; errors = []
          })
     in

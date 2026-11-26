@@ -70,11 +70,17 @@ module Client : sig
     -> [> Eio.Flow.two_way_ty | Eio.Resource.close_ty ] Eio.Resource.t
     -> t
   (** [create_connection ~sw ~tls ~peer flow] does the client side of the TLS
-      handshake on [flow] and runs {!Ache_eio.Client} on the TLS flow. When the
-      handshake fails, for example because the certificate is not valid for
-      [peer], it raises the exception of [Tls_eio.client_of_flow]
-      ([Tls_eio.Tls_failure (`Error (`AuthenticationFailure _))] for a
-      rejected certificate). The caller closes [flow]. *)
+      handshake on [flow] and runs {!Ache_eio.Client} on the TLS flow, which
+      it drives with [Tls.Engine]. When the handshake fails, for example
+      because the certificate is not valid for [peer], it raises the
+      exceptions of [tls-eio] ([Tls_eio.Tls_failure
+      (`Error (`AuthenticationFailure _))] for a rejected certificate,
+      [Tls_eio.Tls_alert], or [End_of_file] when the server closes). The
+      caller closes [flow].
+
+      On an idle connection, {!request} first reads the TLS records that wait
+      on a non-blocking [flow] ([eio_posix]) and decrypts them; see
+      {!Ache_eio.Client.create_connection} for what closes the connection. *)
 
   val request :
      t
@@ -96,8 +102,14 @@ module Server : sig
   val create_connection_handler :
      ?config:Ache.Config.t
     -> ?clock:_ Eio.Time.clock
-    -> ?idle_timeout:float
-    -> ?head_timeout:float
+    -> ?idle_timeout:float option
+    -> ?head_timeout:float option
+    -> ?close_timeout:float option
+    -> ?body_timeout:float option
+    -> ?write_timeout:float option
+    -> ?date:bool
+    -> ?stop:unit Eio.Promise.t
+    -> ?grace:float
     -> tls:Tls.Config.server
     -> request_handler:
          (Eio.Net.Sockaddr.stream -> Ache.Request_descriptor.t -> unit)
@@ -110,11 +122,17 @@ module Server : sig
       passed to [Eio.Net.run_server]. In the connection fiber, it does the TLS
       handshake on the accepted flow and then serves HTTP/1.1 as
       {!Ache_eio.Server.create_connection_handler} does, with the same
-      timeouts. When [idle_timeout] or [head_timeout] is set (both need
-      [clock]), the handshake must be complete within the smaller of them.
-      Without either, the handshake has no time limit: a client that sends plain HTTP to the TLS port gets no
-      answer (ocaml-tls waits for the rest of what it reads as a TLS record),
-      and the connection stays open until the client closes it.
+      timeouts, [date], [stop] and [grace]. A handshake in progress when [stop]
+      is resolved is treated as an idle connection: it is cancelled and the
+      handler returns. When [stop] is already resolved, no handshake starts.
+      The handshake must be complete within the smaller of [idle_timeout]
+      and [head_timeout] (30 s by default). With both [None], the handshake
+      has no time limit: a client that sends plain HTTP to the TLS port gets
+      no answer (ocaml-tls waits for the rest of what it reads as a TLS
+      record), and the connection stays open until the client closes it.
+      [write_timeout] applies to the TLS records: a write that is cancelled
+      leaves the TLS session unusable, and the connection closes without
+      [close_notify].
 
       When the handshake fails, it raises the exception of [tls-eio]
       ([End_of_file], [Tls_eio.Tls_alert], [Tls_eio.Tls_failure], an
@@ -123,7 +141,7 @@ module Server : sig
 
       @raise Invalid_argument
         in the cases of {!Ache_eio.Server.create_connection_handler}: when
-        [~error_handler] is applied if all four optional arguments are given
+        [~error_handler] is applied if all ten optional arguments are given
         too, and otherwise when the handler is applied to a flow, before the
         handshake. *)
 end

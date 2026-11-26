@@ -225,7 +225,11 @@ let tests =
          check_malformed
            "HTTP/1.1 200 OK\r\nX\rY: 1\r\nContent-Length: 0\r\n\r\n")
   ; test "§2.2 client MUST NOT: no CRLF before or after a request" (fun () ->
-      let c = Client.create () in
+      let c =
+        Client.create
+          ~config:{ Config.default with max_pipelined_requests = 16 }
+          ()
+      in
       let _ =
         client_request
           ~meth:`PUT

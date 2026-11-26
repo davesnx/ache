@@ -112,6 +112,108 @@ let cases = lazy (load data)
 
 module Parse_oracle = Run (Ache.Ache_private.Parse)
 
+(* Decision 0007: a request-target byte outside RFC 3986, which v1 accepted. *)
+let rfc3986_target_char = function
+  | 'a' .. 'z'
+  | 'A' .. 'Z'
+  | '0' .. '9'
+  | '-' | '.' | '_' | '~' | ':' | '/' | '?' | '[' | ']' | '@' | '!' | '$' | '&'
+  | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '=' | '%' ->
+    true
+  | _ -> false
+
+let drop_empty_line s =
+  if String.starts_with ~prefix:"\r\n" s
+  then String.sub s 2 (String.length s - 2)
+  else s
+
+let rejected_target input =
+  let s = drop_empty_line input in
+  match String.index_opt s ' ' with
+  | None -> false
+  | Some i ->
+    let rec go j =
+      j < String.length s
+      && s.[j] > ' '
+      && s.[j] <> '\x7f'
+      && ((not (rfc3986_target_char s.[j])) || go (j + 1))
+    in
+    go (i + 1)
+
+(* Task 13: a status-line with CRLF right after the status code, which v1
+   rejected. *)
+let rec drop_empty_lines s =
+  let t = drop_empty_line s in
+  if t == s then s else drop_empty_lines t
+
+let reasonless_status_line input =
+  let s = drop_empty_lines input in
+  String.length s >= 14
+  && String.sub s 0 5 = "HTTP/"
+  && s.[8] = ' '
+  && String.for_all
+       (function '0' .. '9' -> true | _ -> false)
+       (String.sub s 9 3)
+  && String.sub s 12 2 = "\r\n"
+
+(* A CR right after a status code: v1 rejected at the CR, the reader now waits
+   for the next byte. *)
+let cr_after_status_code input =
+  let n = String.length input in
+  let rec from i =
+    i + 13 <= n
+    && ((String.sub input i 5 = "HTTP/"
+        && input.[i + 8] = ' '
+        && String.for_all
+             (function '0' .. '9' -> true | _ -> false)
+             (String.sub input (i + 9) 3)
+        && input.[i + 12] = '\r')
+       || from (i + 1))
+  in
+  from 0
+
+(* Decision 0017: a request after two empty lines, which v1 rejected. *)
+let empty_lines_before_request c =
+  c.kind = Request && String.starts_with ~prefix:"\r\n\r" c.input
+
+let changed_on_purpose c =
+  rejected_target c.input
+  || cr_after_status_code c.input
+  || empty_lines_before_request c
+
+let test_changed_on_purpose () =
+  let changed = List.filter changed_on_purpose (Lazy.force cases) in
+  List.iter
+    (fun c ->
+       let g = Parse_oracle.grammar c.input in
+       if rejected_target c.input
+       then
+         Alcotest.(check bool)
+           (Printf.sprintf "%S: request rejected" c.input)
+           true
+           (Result.is_error g.request);
+       if reasonless_status_line c.input
+       then
+         Alcotest.(check bool)
+           (Printf.sprintf "%S: response accepted" c.input)
+           true
+           (Result.is_ok g.response);
+       if empty_lines_before_request c
+       then
+         (* The same messages as the input with one empty line less. *)
+         let now = Parse_oracle.case c.kind ~limit:c.limit c.input in
+         let one_less =
+           Parse_oracle.case c.kind ~limit:c.limit (drop_empty_line c.input)
+         in
+         let one_read o = o.outcomes.(0) in
+         Alcotest.(check bool)
+           (Printf.sprintf "%S: one empty line less" c.input)
+           true
+           ((one_read now).messages = (one_read one_less).messages
+           && same_next (one_read now).post.next (one_read one_less).post.next))
+    changed;
+  Alcotest.(check int) "cases changed on purpose" 1379 (List.length changed)
+
 let test_size () =
   let cases = Lazy.force cases in
   Alcotest.(check int) "cases" 21294 (List.length cases);
@@ -121,7 +223,9 @@ let test_size () =
     (List.fold_left (fun n c -> n + Array.length c.outcomes) 0 cases)
 
 let check name differs =
-  let cases = Lazy.force cases in
+  let cases =
+    List.filter (fun c -> not (changed_on_purpose c)) (Lazy.force cases)
+  in
   let failures = List.filter differs cases in
   List.iteri
     (fun i c -> if i < 20 then Printf.printf "%s differs: %S\n" name c.input)
@@ -164,4 +268,7 @@ let tests =
   ; "grammar matches v1", `Quick, test_grammar
   ; "reader matches v1 at every split", `Quick, test_reader
   ; "every split ends as one read", `Quick, test_splits_end_as_one_read
+  ; ( "inputs changed by decisions 0007, 0017 and the status-line fix"
+    , `Quick
+    , test_changed_on_purpose )
   ]

@@ -67,7 +67,9 @@ let no_body_server_test ~status ~streaming =
   check_no_body_then_next ~status s
 
 let pipelined_client requests =
-  let c = Client.create () in
+  let c =
+    Client.create ~config:{ Config.default with max_pipelined_requests = 16 } ()
+  in
   let exs = List.map (fun r -> Client.request c r) requests in
   c, exs
 
@@ -230,18 +232,36 @@ let content_tests =
         ~first_response:"HTTP/1.1 204 No Content\r\n\r\n"
         ~status:204)
   ; test
-      "§6.4.1 client DEF: 304 response with Content-Length ends after the head"
+      "§6.4.1 client DEF: 304 response with Content-Length ends after the \
+       head, and the connection closes"
       (fun () ->
-         client_no_body_test
-           ~first_request:(client_get "/a")
-           ~first_response:
-             "HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\n"
-           ~status:304)
+         let c, exs = pipelined_client [ client_get "/a"; client_get "/b" ] in
+         Client.feed
+           c
+           ("HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\n" ^ next_ok);
+         match exs with
+         | [ a; b ] ->
+           check_client_ex "first response" ~status:304 ~body:"" a;
+           Alcotest.(check (list string))
+             "second response: Connection_closed"
+             [ "Connection_closed" ]
+             b.errors;
+           Alcotest.(check bool) "closed" true (Client.is_closed c)
+         | _ -> assert false)
   ; test "§6.4.1 client DEF: 100 response ends after the head" (fun () ->
       let c = Client.create () in
       let ex = Client.request c (client_get "/") in
       Client.feed c ("HTTP/1.1 100 Continue\r\n\r\n" ^ next_ok);
       check_client_ex "final response" ~status:200 ~body:"ok" ex)
+  ]
+
+let forbidden_trailers =
+  [ "Content-Length"
+  ; "transfer-encoding"
+  ; "Host"
+  ; "TE"
+  ; "Trailer"
+  ; "Connection"
   ]
 
 let trailer_tests =
@@ -265,7 +285,11 @@ let trailer_tests =
            Alcotest.(check (option string))
              "trailer not in headers"
              None
-             (Headers.get ex.request.headers "x-trailer")
+             (Headers.get ex.request.headers "x-trailer");
+           Alcotest.(check (option string))
+             "trailer given apart"
+             (Some "1")
+             (Headers.get ex.trailers "x-trailer")
          | _ -> Alcotest.fail "expected one request")
   ; test
       "§6.5.1 client MUST NOT: trailer not merged into response headers"
@@ -283,6 +307,10 @@ let trailer_tests =
             X-Trailer: 1\r\n\
             \r\n";
          check_client_ex "response" ~status:200 ~body:"abc" ex;
+         Alcotest.(check (option string))
+           "trailer given apart"
+           (Some "1")
+           (Headers.get ex.trailers "x-trailer");
          match ex.responses with
          | [ r ] ->
            Alcotest.(check (option string))
@@ -290,6 +318,71 @@ let trailer_tests =
              None
              (Headers.get r.headers "x-trailer")
          | _ -> Alcotest.fail "expected one response")
+  ; test
+      "§6.5.1 server MUST NOT: framing and routing fields are refused as \
+       trailers"
+      (fun () ->
+         let raised = ref [] in
+         let s =
+           Server.run
+             ~handler:(fun ex ->
+               let w =
+                 Request_descriptor.respond_with_streaming
+                   ex.Server.reqd
+                   (Response.create `OK)
+               in
+               List.iter
+                 (fun name ->
+                    match
+                      Body.Writer.close
+                        ~trailers:(Headers.of_list [ name, "1" ])
+                        w
+                    with
+                    | () -> ()
+                    | exception Invalid_argument _ -> raised := name :: !raised)
+                 forbidden_trailers;
+               Body.Writer.close w)
+             (req
+                ~headers:[ "Host", "example.com"; "TE", "trailers" ]
+                "GET"
+                "/")
+         in
+         Alcotest.(check (list string))
+           "refused"
+           forbidden_trailers
+           (List.rev !raised);
+         if not (contains (Server.output s) "\r\n\r\n0\r\n\r\n")
+         then Alcotest.failf "no empty last chunk in %S" (Server.output s))
+  ; test
+      "§6.5.1 client MUST NOT: framing and routing fields are refused as \
+       trailers"
+      (fun () ->
+         let c = Client.create () in
+         let ex =
+           Client.request
+             ~close_body:false
+             c
+             (Request.create
+                ~headers:
+                  (Headers.of_list
+                     [ "host", "example.com"; "transfer-encoding", "chunked" ])
+                `POST
+                "/")
+         in
+         List.iter
+           (fun name ->
+              match
+                Body.Writer.close
+                  ~trailers:(Headers.of_list [ name, "1" ])
+                  ex.writer
+              with
+              | () -> Alcotest.failf "%s accepted" name
+              | exception Invalid_argument _ -> ())
+           forbidden_trailers;
+         Body.Writer.close ex.writer;
+         Client.pump c;
+         if not (contains (Client.written c) "\r\n\r\n0\r\n\r\n")
+         then Alcotest.failf "no empty last chunk in %S" (Client.written c))
   ]
 
 let date_tests =
@@ -310,6 +403,46 @@ let date_tests =
       in
       check_status "error response" [ 400 ] error;
       check_no_date "error response" error)
+  ; test
+      "§6.6.1 server MUST: with a clock, one Date in 2xx, 3xx, 4xx and 5xx"
+      (fun () ->
+         let date = "Sun, 06 Nov 1994 08:49:37 GMT" in
+         let date_count s =
+           String.split_on_char '\n' (String.lowercase_ascii (Server.output s))
+           |> List.filter (fun line -> String.starts_with ~prefix:"date:" line)
+           |> List.length
+         in
+         let check_one_date msg s =
+           if
+             date_count s <> 1
+             || not (contains (Server.output s) ("Date: " ^ date ^ "\r\n"))
+           then Alcotest.failf "%s: expected one Date: %S" msg (Server.output s)
+         in
+         List.iter
+           (fun (status, code) ->
+              let s =
+                Server.run
+                  ~date:(fun () -> date)
+                  ~handler:(Server.respond ~body:"" status)
+                  (get "/")
+              in
+              check_status (string_of_int code) [ code ] s;
+              check_one_date (string_of_int code) s)
+           [ `OK, 200
+           ; `Moved_permanently, 301
+           ; `Not_found, 404
+           ; `Internal_server_error, 500
+           ];
+         let error =
+           Server.run
+             ~date:(fun () -> date)
+             (req
+                ~headers:[ "Host", "example.com"; "Content-Length", "-1" ]
+                "POST"
+                "/")
+         in
+         check_status "error response" [ 400 ] error;
+         check_one_date "error response" error)
   ]
 
 let tests =

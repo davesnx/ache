@@ -1,5 +1,11 @@
 (executables
- (names h1spec_eio h1spec_lwt h1spec_miou)
+ (names
+  h1spec_eio
+  h1spec_lwt
+  h1spec_miou
+  ws_echo_eio
+  ws_echo_lwt
+  ws_echo_miou)
  (libraries
   ache
   ache-eio

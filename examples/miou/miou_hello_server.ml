@@ -12,8 +12,10 @@ let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
   (match error with
   | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
-  | #Status.standard as status ->
-    Body.Writer.write_string body (Status.default_reason_phrase status));
+  | error ->
+    Body.Writer.write_string
+      body
+      (Status.to_string (Server_connection.error_status error)));
   Body.Writer.close body
 
 let rec clean_up orphans =

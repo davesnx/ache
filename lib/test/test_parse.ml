@@ -3,7 +3,7 @@ open Ache
 let iovecs_to_string = Helpers.Write_operation.iovecs_to_string
 
 let error_to_string = function
-  | `Bad_request -> "Bad_request"
+  | `Bad_request _ -> "Bad_request"
   | `Not_implemented -> "Not_implemented"
   | `Http_version_not_supported -> "Http_version_not_supported"
   | `Uri_too_long -> "Uri_too_long"
@@ -942,22 +942,67 @@ let test_reader_resume_after_upgrade () =
       !heads
   done
 
-let test_reader_bad_byte_at_line_end () =
+let test_reader_bad_byte_when_it_arrives () =
   List.iter
-    (fun (name, finish) ->
+    (fun (first, second, error) ->
        let r, heads, _ = reader () in
-       Alcotest.(check int) "line start" 18 (read r "GET / HTTP/1.1\r\nHo");
-       Alcotest.(check int) "bad byte" 6 (read r "st: \001b");
-       Alcotest.(check string) "not rejected yet" "read" (next r);
-       finish r;
-       Alcotest.(check string)
-         name
-         "parse: unexpected '\\001' in field line"
-         (next r);
-       Alcotest.(check (list string)) "no head" [] !heads)
-    [ ("rejected when the line ends", fun r -> ignore (read r "\r\n\r\n" : int))
-    ; ("rejected at EOF", fun r -> ignore (read_eof r "" : int))
+       Alcotest.(check int)
+         (first ^ ": consumed")
+         (String.length first)
+         (read r first);
+       Alcotest.(check string) (first ^ ": valid so far") "read" (next r);
+       Alcotest.(check int)
+         (second ^ ": consumed")
+         (String.length second)
+         (read r second);
+       Alcotest.(check string) (second ^ ": rejected") error (next r);
+       Alcotest.(check int)
+         "heads"
+         (if String.starts_with ~prefix:chunked_head first then 1 else 0)
+         (List.length !heads))
+    [ ( "GET / HTTP/1.1\r\nHo"
+      , "st: \001b"
+      , "parse: unexpected '\\001' in field line" )
+    ; ( "GET / HTTP/1.1\r\nHost: a"
+      , "\001"
+      , "parse: unexpected '\\001' in field line" )
+    ; ( "GET /" ^ String.make 100 'a'
+      , "\001"
+      , "parse: unexpected '\\001' in request-line" )
+    ; "g", "/", "parse: unexpected '/' in request-line"
+    ; "\r", ".", "parse: unexpected '.' in request-line"
+    ; ( chunked_head ^ "5;a=\"x\\"
+      , "\001"
+      , "parse: unexpected '\\001' in chunk-size line" )
+    ; ( chunked_head ^ "5;a=\"x\\\"y"
+      , "\\\"\"\001"
+      , "parse: unexpected '\\001' in chunk-size line" )
+    ; ( chunked_head ^ "5 ;a=b;c"
+      , " d"
+      , "parse: unexpected 'd' in chunk-size line" )
     ]
+
+(* A bad byte in a line split over reads gets a 400 in the read that brings it,
+   without waiting for the end of the line or of the input. *)
+let test_bad_byte_in_split_line () =
+  List.iter
+    (fun input ->
+       List.iter
+         (fun chunks ->
+            let s = run_server chunks in
+            let msg =
+              Printf.sprintf
+                "%S in reads [%s]"
+                input
+                (String.concat "," (List.map String.escaped chunks))
+            in
+            Alcotest.(check (list string)) msg [ "Bad_request" ] s.errors;
+            Alcotest.(check string)
+              (msg ^ ": status line")
+              "HTTP/1.1 400"
+              (String.sub (Buffer.contents s.output) 0 12))
+         (all_splits input))
+    [ "\r."; "g/"; "GET / HTTP/1.1\r\nHost: a\001"; "GET /a\001b" ]
 
 let test_reader_force_close () =
   let r, heads, _ = reader () in
@@ -1034,6 +1079,43 @@ let test_reader_many_empty_lines () =
   Alcotest.(check (list string)) "errors" [] c.cerrors;
   Alcotest.(check int) "consumed" (String.length input) c.cfeeder.consumed
 
+(* Decision 0017: any number of empty lines before a request line, counted
+   against max_header_size. *)
+let test_empty_lines_before_request () =
+  let get = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" in
+  let summary = {|"GET" "/" HTTP/1.1 ["Host":"a"]|} in
+  check_server ~expect:[ summary, "" ] ("\r\n\r\n\r\n" ^ get);
+  check_server
+    ~expect:
+      [ {|"POST" "/" HTTP/1.1 ["Host":"a";"Content-Length":"2"]|}, "ok"
+      ; summary, ""
+      ]
+    ("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nok\r\n\r\n" ^ get);
+  let config = { Config.default with max_header_size = 100 } in
+  let at = head_of_size 90 in
+  let s =
+    run_server ~config [ String.concat "" (List.init 5 (fun _ -> "\r\n")) ^ at ]
+  in
+  Alcotest.(check int)
+    "10 bytes of empty lines and a 90-byte head"
+    1
+    (List.length s.requests);
+  Alcotest.(check (list string)) "no error" [] s.errors;
+  List.iter
+    (fun input ->
+       List.iter
+         (fun chunks ->
+            let s = run_server ~config chunks in
+            Alcotest.(check (list request_body)) "no request" [] s.requests;
+            Alcotest.(check (list string))
+              (Printf.sprintf "%S: 431" input)
+              [ "Request_header_fields_too_large" ]
+              s.errors)
+         (all_splits input))
+    [ String.concat "" (List.init 6 (fun _ -> "\r\n")) ^ at
+    ; String.concat "" (List.init 50 (fun _ -> "\r\n"))
+    ]
+
 let test_reader_empty_trailer_split () =
   let s = server () in
   Feeder.feed s.feeder (chunked_head ^ "5\r\nhello\r\n0\r\n");
@@ -1091,6 +1173,295 @@ let test_reader_handler_raises () =
     ]
     !heads
 
+let overhead_message = "chunked encoding contains too much non-data"
+
+(* One chunk of one byte whose line carries [line - 6] bytes of extension. *)
+let chunk_with_line line = "1;x=" ^ String.make (line - 6) 'v' ^ "\r\na\r\n"
+
+let check_overhead_rejected ?config input ~body =
+  List.iter
+    (fun chunks ->
+       let s = run_server ?config chunks in
+       Alcotest.(check (list string)) "400" [ "Bad_request" ] s.errors;
+       Alcotest.(check (list request_body))
+         "body cut short"
+         [ chunked_summary, "incomplete: " ^ body ]
+         s.requests;
+       Alcotest.(check string)
+         "status line"
+         "HTTP/1.1 400"
+         (String.sub (Buffer.contents s.output) 0 12);
+       Alcotest.(check bool)
+         "connection closes"
+         true
+         (Server_connection.next_read_operation s.conn = `Close))
+    (all_splits input)
+
+let test_chunk_overhead_budget () =
+  let line = chunk_with_line 1006 in
+  (* Each chunk adds 1006 - 18 = 988 bytes of overhead: 16 chunks stay below 16
+     KiB, the 17th passes it. *)
+  check_server
+    ~expect:[ chunked_summary, String.make 16 'a' ]
+    (chunked_head
+    ^ String.concat "" (List.init 16 (fun _ -> line))
+    ^ "0\r\n\r\n");
+  check_overhead_rejected
+    (chunked_head
+    ^ String.concat "" (List.init 20 (fun _ -> line))
+    ^ "0\r\n\r\n")
+    ~body:(String.make 16 'a')
+
+let test_chunk_overhead_boundary () =
+  let config = { Config.default with max_header_size = 0x8000 } in
+  (* A line of 16402 bytes leaves 16402 - 18 = 16384 bytes of overhead. *)
+  check_server
+    ~config
+    ~expect:[ chunked_summary, "a" ]
+    (chunked_head ^ chunk_with_line 16402 ^ "0\r\n\r\n");
+  check_overhead_rejected
+    ~config
+    (chunked_head ^ chunk_with_line 16403 ^ "0\r\n\r\n")
+    ~body:""
+
+let test_chunk_overhead_small_chunks () =
+  let n = 100_000 in
+  let body = String.make n 'a' in
+  let input =
+    chunked_head
+    ^ String.concat "" (List.init n (fun _ -> "1\r\na\r\n"))
+    ^ "0\r\n\r\n"
+  in
+  List.iter
+    (fun chunks ->
+       let s = run_server chunks in
+       Alcotest.(check (list string)) "errors" [] s.errors;
+       Alcotest.(check (list request_body))
+         (Printf.sprintf "%d reads" (List.length chunks))
+         [ chunked_summary, body ]
+         s.requests)
+    [ [ input ]; sized 1 input; sized 7 input; sized 4096 input ]
+
+let test_chunk_overhead_client () =
+  let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" in
+  let line = chunk_with_line 1006 in
+  let chunks n = String.concat "" (List.init n (fun _ -> line)) ^ "0\r\n\r\n" in
+  check_client
+    ~expect:
+      [ ( {|HTTP/1.1 200 "OK" ["Transfer-Encoding":"chunked"]|}
+        , String.make 16 'a' )
+      ]
+    (head ^ chunks 16);
+  List.iter
+    (fun split ->
+       let c = run_client split in
+       Alcotest.(check (list string))
+         "client error"
+         [ "Malformed_response " ^ overhead_message ]
+         c.cerrors;
+       Alcotest.(check (list request_body))
+         "body cut short"
+         [ ( {|HTTP/1.1 200 "OK" ["Transfer-Encoding":"chunked"]|}
+           , "incomplete: " ^ String.make 16 'a' )
+         ]
+         c.responses)
+    (all_splits (head ^ chunks 20))
+
+let check_rejected_400 input =
+  List.iter
+    (fun chunks ->
+       let s = run_server chunks in
+       let msg = Printf.sprintf "%S" input in
+       Alcotest.(check (list string)) (msg ^ ": 400") [ "Bad_request" ] s.errors;
+       Alcotest.(check (list request_body))
+         (msg ^ ": not handled")
+         []
+         s.requests;
+       Alcotest.(check string)
+         (msg ^ ": status line")
+         "HTTP/1.1 400"
+         (String.sub (Buffer.contents s.output) 0 12))
+    (all_splits input)
+
+(* Decision 0007. *)
+let test_target_rfc3986 () =
+  List.iter
+    (fun target ->
+       check_rejected_400 ("GET " ^ target ^ " HTTP/1.1\r\nHost: a\r\n\r\n"))
+    ([ "/a#b"; "/#"; "/\xc3\xa9"; "/a\x80"; "/a\xff" ]
+    @ List.map
+        (fun c -> "/a" ^ String.make 1 c ^ "b")
+        [ '"'; '<'; '>'; '{'; '}'; '|'; '^'; '`'; '\\' ]);
+  let target = "/az-AZ_09.~:/?[]@!$&'()*+,;=%41" in
+  check_server
+    ~expect:[ Printf.sprintf {|"GET" %S HTTP/1.1 ["Host":"a"]|} target, "" ]
+    ("GET " ^ target ^ " HTTP/1.1\r\nHost: a\r\n\r\n")
+
+let test_absolute_form_authority () =
+  List.iter
+    (fun target ->
+       check_rejected_400 ("GET " ^ target ^ " HTTP/1.1\r\nHost: a\r\n\r\n"))
+    [ "http://u:p@a/"
+    ; "http://u@a/"
+    ; "http://@a/"
+    ; "http://a@/"
+    ; "http:///x"
+    ; "http://"
+    ; "http://?x"
+    ; "http://:80/"
+    ; "https://u@a:443"
+    ];
+  List.iter
+    (fun target ->
+       check_server
+         ~expect:
+           [ Printf.sprintf {|"GET" %S HTTP/1.1 ["Host":"a"]|} target, "" ]
+         ("GET " ^ target ^ " HTTP/1.1\r\nHost: a\r\n\r\n"))
+    [ "http://a"
+    ; "http://a/"
+    ; "http://a:80/x?u@v"
+    ; "http://a?u@v"
+    ; "http://[::1]:80/"
+    ; "urn:u@a"
+    ; "a:80"
+    ]
+
+let test_host_empty_host () =
+  List.iter
+    (fun host ->
+       check_rejected_400 ("GET / HTTP/1.1\r\nHost: " ^ host ^ "\r\n\r\n"))
+    [ ":80"; ":" ];
+  check_server
+    ~expect:[ {|"GET" "/" HTTP/1.1 ["Host":""]|}, "" ]
+    "GET / HTTP/1.1\r\nHost: \r\n\r\n"
+
+(* A CONNECT that is not tunnelled closes the connection: the bytes after it may
+   be tunnel data, never a request (Go c8ef343b2b). *)
+let test_connect_refused_closes () =
+  let input =
+    "CONNECT a:443 HTTP/1.1\r\n\
+     Host: a:443\r\n\
+     \r\n\
+     GET / HTTP/1.1\r\n\
+     Host: a\r\n\
+     \r\n"
+  in
+  List.iter
+    (fun chunks ->
+       let handled = ref [] in
+       let output = Buffer.create 64 in
+       let conn =
+         Server_connection.create (fun reqd ->
+           let request = Request_descriptor.request reqd in
+           handled := request.target :: !handled;
+           Request_descriptor.respond_with_string
+             reqd
+             (Response.create `Proxy_authentication_required)
+             "")
+       in
+       let rec drain () =
+         match Server_connection.next_write_operation conn with
+         | `Write iovecs ->
+           let out = iovecs_to_string iovecs in
+           Buffer.add_string output out;
+           Server_connection.report_write_result conn (`Ok (String.length out));
+           drain ()
+         | `Yield | `Close _ -> ()
+       in
+       let feeder =
+         { Feeder.pending = ""
+         ; consumed = 0
+         ; next_read_operation =
+             (fun () -> Server_connection.next_read_operation conn)
+         ; read = Server_connection.read conn
+         ; read_eof = Server_connection.read_eof conn
+         ; drain
+         }
+       in
+       List.iter (Feeder.feed feeder) chunks;
+       let msg = Printf.sprintf "%d reads" (List.length chunks) in
+       Alcotest.(check (list string)) (msg ^ ": handled") [ "a:443" ] !handled;
+       Alcotest.(check string)
+         (msg ^ ": 407, then close")
+         "HTTP/1.1 407 Proxy Authentication Required\r\n\
+          content-length: 0\r\n\
+          connection: close\r\n\
+          \r\n"
+         (Buffer.contents output);
+       Alcotest.(check bool)
+         (msg ^ ": closed")
+         true
+         (Server_connection.next_read_operation conn = `Close
+         && Server_connection.is_closed conn))
+    (all_splits input)
+
+(* Decision 0016: a CONNECT request has no body; its framing fields are
+   ignored. *)
+let test_connect_no_body () =
+  List.iter
+    (fun field ->
+       check_server
+         ~expect:
+           [ ( Printf.sprintf
+                 {|"CONNECT" "a:443" HTTP/1.1 ["Host":"a:443";%s]|}
+                 (match String.split_on_char ':' field with
+                 | [ name; value ] ->
+                   Printf.sprintf "%S:%S" name (String.trim value)
+                 | _ -> assert false)
+             , "" )
+           ]
+         ("CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n" ^ field ^ "\r\n\r\n"))
+    [ "Content-Length: 5"
+    ; "Content-Length: x"
+    ; "Transfer-Encoding: chunked"
+    ; "Transfer-Encoding: gzip"
+    ]
+
+let test_status_line_without_reason () =
+  check_client
+    ~expect:[ {|HTTP/1.1 301 "" ["Content-Length":"2"]|}, "ok" ]
+    "HTTP/1.1 301\r\nContent-Length: 2\r\n\r\nok";
+  check_client
+    ~eof:true
+    ~expect:[ {|HTTP/1.1 200 "" []|}, "rest" ]
+    "HTTP/1.1 200\r\n\r\nrest";
+  List.iter
+    (fun chunks ->
+       let c = run_client chunks in
+       Alcotest.(check (list string))
+         "CR without LF"
+         [ {|Malformed_response unexpected '\r' in status-line|} ]
+         c.cerrors)
+    (all_splits "HTTP/1.1 200\rOK\r\n\r\n")
+
+let test_empty_transfer_encoding_client () =
+  List.iter
+    (fun input ->
+       List.iter
+         (fun chunks ->
+            let c = run_client chunks in
+            Alcotest.(check (list string))
+              (Printf.sprintf "%S" input)
+              [ "Malformed_response empty transfer-encoding" ]
+              c.cerrors;
+            Alcotest.(check (list request_body))
+              (Printf.sprintf "%S: no response" input)
+              []
+              c.responses)
+         (all_splits input))
+    [ "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n\r\nhello"
+    ; "HTTP/1.1 200 OK\r\nTransfer-Encoding: ,\r\n\r\nhello"
+    ];
+  check_client
+    ~expect:[ {|HTTP/1.1 200 "OK" ["Transfer-Encoding":", chunked"]|}, "hello" ]
+    "HTTP/1.1 200 OK\r\n\
+     Transfer-Encoding: , chunked\r\n\
+     \r\n\
+     5\r\n\
+     hello\r\n\
+     0\r\n\
+     \r\n"
+
 let tests =
   [ "GET at every split", `Quick, test_get
   ; "POST fixed body at every split", `Quick, test_post_fixed
@@ -1118,15 +1489,41 @@ let tests =
   ; "shutdown with a suspended parse", `Quick, test_shutdown_suspended
   ; "10 KB bodies in many splits", `Quick, test_large_body_every_split
   ; "100,000 one-byte chunks in one read", `Quick, test_many_small_chunks
+  ; "chunk overhead budget at every split", `Quick, test_chunk_overhead_budget
+  ; ( "chunk overhead budget: 16 KiB, then one byte more"
+    , `Quick
+    , test_chunk_overhead_boundary )
+  ; ( "chunk overhead budget: 100,000 one-byte chunks"
+    , `Quick
+    , test_chunk_overhead_small_chunks )
+  ; "chunk overhead budget (client)", `Quick, test_chunk_overhead_client
+  ; "target bytes outside RFC 3986: 400", `Quick, test_target_rfc3986
+  ; ( "absolute-form userinfo or empty host: 400"
+    , `Quick
+    , test_absolute_form_authority )
+  ; "Host with an empty host: 400", `Quick, test_host_empty_host
+  ; ( "CONNECT refused: closes, next bytes not served"
+    , `Quick
+    , test_connect_refused_closes )
+  ; "CONNECT: framing fields ignored, no body", `Quick, test_connect_no_body
+  ; ( "status-line without reason (client)"
+    , `Quick
+    , test_status_line_without_reason )
+  ; ( "empty Transfer-Encoding (client)"
+    , `Quick
+    , test_empty_transfer_encoding_client )
   ; "pipelined bodies read late", `Quick, test_pipelined_body_read_late
   ; "unread body: backpressure", `Quick, test_unread_body_backpressure
   ; "reader: head at every split and byte", `Quick, test_reader_every_split
   ; ( "reader: limit -1, at, +1 in each stage"
     , `Quick
     , test_reader_limit_per_stage )
-  ; ( "reader: bad byte in a split line found at its end"
+  ; ( "reader: bad byte in a split line found when it arrives"
     , `Quick
-    , test_reader_bad_byte_at_line_end )
+    , test_reader_bad_byte_when_it_arrives )
+  ; ( "bad byte in a split line: 400 at every split"
+    , `Quick
+    , test_bad_byte_in_split_line )
   ; "reader: force_close with a partial line", `Quick, test_reader_force_close
   ; "reader: negative limit", `Quick, test_reader_negative_limit
   ; ( "reader: resume after a split Upgrade head"
@@ -1141,6 +1538,9 @@ let tests =
   ; ( "reader: 8,000 empty lines then a response, one byte per read"
     , `Quick
     , test_reader_many_empty_lines )
+  ; ( "empty lines before a request: skipped, counted in the head limit"
+    , `Quick
+    , test_empty_lines_before_request )
   ; ( "reader: empty trailer split as CR, LF"
     , `Quick
     , test_reader_empty_trailer_split )

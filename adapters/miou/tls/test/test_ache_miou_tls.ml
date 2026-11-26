@@ -78,11 +78,27 @@ end
 let pending_upgrade : Request_descriptor.t option ref = ref None
 let pending_body : Request_descriptor.t option ref = ref None
 let pending_body_failed = ref false
+let stream_closed = ref false
+
+(* A chunked response of many small buffers, each its own iovec. *)
+let stream_piece = String.make 64 'x'
+let stream_pieces = 1024
 
 let request_handler (_ : Unix.sockaddr) reqd =
   let request = Request_descriptor.request reqd in
   let body = Request_descriptor.request_body reqd in
   match request.meth, request.target with
+  | `GET, "/ws-echo" ->
+    let rec echo ws =
+      match Ache_miou.Websocket.receive ws with
+      | Some (Text message) ->
+        Ache_miou.Websocket.send_text ws message;
+        echo ws
+      | Some (Binary _) | None -> ()
+    in
+    (match Ache_miou.Websocket.upgrade reqd echo with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
   | `POST, "/echo" ->
     let headers =
       Headers.of_list
@@ -125,6 +141,45 @@ let request_handler (_ : Unix.sockaddr) reqd =
     and on_error () = pending_body_failed := true in
     Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | `GET, "/raise" -> failwith "handler failed"
+  | `GET, "/stream" ->
+    Body.Reader.close body;
+    let response_body =
+      Request_descriptor.respond_with_streaming
+        reqd
+        (Response.create
+           ~headers:(Headers.of_list [ "transfer-encoding", "chunked" ])
+           `OK)
+    in
+    let piece =
+      Ache.Bigstring.of_string
+        ~off:0
+        ~len:(String.length stream_piece)
+        stream_piece
+    in
+    for _ = 1 to stream_pieces do
+      Body.Writer.schedule_bigstring response_body piece
+    done;
+    Body.Writer.close response_body
+  | `GET, "/stream-forever" ->
+    Body.Reader.close body;
+    let response_body =
+      Request_descriptor.respond_with_streaming
+        reqd
+        (Response.create
+           ~headers:(Headers.of_list [ "transfer-encoding", "chunked" ])
+           `OK)
+    in
+    let chunk = String.make 0x10000 'x' in
+    let rec write n =
+      if n = 0
+      then Body.Writer.close response_body
+      else (
+        Body.Writer.write_string response_body chunk;
+        Body.Writer.flush response_body (function
+          | `Written -> write (n - 1)
+          | `Closed -> stream_closed := true))
+    in
+    write 1024
   | _, target ->
     Body.Reader.close body;
     Request_descriptor.respond_with_string reqd (Response.create `OK) target
@@ -214,13 +269,27 @@ let with_listener handler f =
              !handlers_done)));
   Alcotest.(check int) "no file descriptor leaked" fds (open_fds ())
 
-let with_server ?idle_timeout ?head_timeout f =
+(* Timeouts that a test does not give are off, not at their defaults. *)
+let with_server
+      ?idle_timeout
+      ?head_timeout
+      ?body_timeout
+      ?write_timeout
+      ?stop
+      ?grace
+      f
+  =
   server_errors := [];
   partial_body_cut := false;
   with_listener
     (Ache_miou_tls.Server.create_connection_handler_with_fd
-       ?idle_timeout
-       ?head_timeout
+       ~date:false
+       ~idle_timeout
+       ~head_timeout
+       ~body_timeout
+       ~write_timeout
+       ?stop
+       ?grace
        ~tls:server_config
        ~request_handler
        ~error_handler)
@@ -365,6 +434,118 @@ let with_client connect f =
 let with_raw_client connect f =
   let fd = connect () in
   Fun.protect ~finally:(fun () -> Miou_unix.close fd) (fun () -> f fd)
+
+(* A TLS client that decrypts the bytes from the server one record at a time, to
+   count the records that carry response bytes. *)
+module Records = struct
+  type t =
+    { mutable state : Tls.Engine.state
+    ; mutable pending : string
+    ; plain : Stdlib.Buffer.t
+    ; mutable data_records : int
+    ; mutable closed : bool
+    }
+
+  let create state =
+    { state
+    ; pending = ""
+    ; plain = Stdlib.Buffer.create 4096
+    ; data_records = 0
+    ; closed = false
+    }
+
+  let rec take t replies =
+    let available = String.length t.pending in
+    let size =
+      if available < 5
+      then max_int
+      else 5 + ((Char.code t.pending.[3] lsl 8) lor Char.code t.pending.[4])
+    in
+    if available < size
+    then List.rev replies
+    else
+      let record = String.sub t.pending 0 size in
+      t.pending <- String.sub t.pending size (available - size);
+      match Tls.Engine.handle_tls t.state record with
+      | Ok (state, eof, `Response reply, `Data data) ->
+        t.state <- state;
+        if Option.is_some eof then t.closed <- true;
+        (match data with
+        | Some data when data <> "" ->
+          t.data_records <- t.data_records + 1;
+          Stdlib.Buffer.add_string t.plain data
+        | _ -> ());
+        take t (Option.fold ~none:replies ~some:(fun r -> r :: replies) reply)
+      | Error (failure, _) ->
+        Alcotest.failf "TLS client: %s" (Tls.Engine.string_of_failure failure)
+
+  (* The replies to send back. *)
+  let feed t bytes =
+    t.pending <- t.pending ^ bytes;
+    take t []
+
+  let send t s =
+    match Tls.Engine.send_application_data t.state [ s ] with
+    | Some (state, data) ->
+      t.state <- state;
+      data
+    | None -> Alcotest.fail "TLS client not ready"
+end
+
+let stream_request =
+  "GET /stream HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+
+let check_stream_records (records : Records.t) =
+  let plain = Stdlib.Buffer.contents records.plain in
+  let body =
+    String.concat "" (List.init stream_pieces (fun _ -> stream_piece))
+  in
+  Alcotest.(check bool)
+    "chunked body"
+    true
+    (String.ends_with
+       ~suffix:
+         (Printf.sprintf "%x\r\n%s\r\n0\r\n\r\n" (String.length body) body)
+       plain);
+  (* One record for each 16 KiB, and one more in case the head goes in a write
+     of its own. Without coalescing it is one for each iovec. *)
+  let limit = ((String.length plain + 0x3fff) / 0x4000) + 1 in
+  if records.data_records > limit
+  then
+    Alcotest.failf
+      "%d application-data records for %d bytes, expected at most %d"
+      records.data_records
+      (String.length plain)
+      limit
+
+let test_stream_records () =
+  with_server (fun connect ->
+    let fd = connect () in
+    Fun.protect
+      ~finally:(fun () -> Miou_unix.close fd)
+      (fun () ->
+         let state, init =
+           Tls.Engine.client (Tls.Config.peer client_config localhost)
+         in
+         let records = Records.create state in
+         Miou_unix.write fd init;
+         let buf = Bytes.create 0x4000 in
+         let rec pump ~reply until =
+           if not (until ())
+           then
+             match Miou_unix.read fd buf with
+             | 0 -> ()
+             | n ->
+               let replies = Records.feed records (Bytes.sub_string buf 0 n) in
+               if reply then List.iter (Miou_unix.write fd) replies;
+               pump ~reply until
+         in
+         pump ~reply:true (fun () ->
+           not (Tls.Engine.handshake_in_progress records.state));
+         Miou_unix.write fd (Records.send records stream_request);
+         pump ~reply:false (fun () -> records.closed);
+         check_stream_records records));
+  check_no_handler_error ()
 
 let body_result = Alcotest.(result string string)
 
@@ -585,7 +766,8 @@ let test_timeout_check_timing () =
     let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, 0) in
     let bound =
       Ache_miou_tls.Server.create_connection_handler_with_fd
-        ~head_timeout:(-1.)
+        ~date:false
+        ~head_timeout:(Some (-1.))
         ~tls:server_config
         ~request_handler
         ~error_handler
@@ -600,9 +782,15 @@ let test_timeout_check_timing () =
       (raises (fun () ->
          ignore
            (Ache_miou_tls.Server.create_connection_handler_with_fd
+              ~date:false
               ~config:Ache.Config.default
-              ~idle_timeout:1.
-              ~head_timeout:(-1.)
+              ~idle_timeout:(Some 1.)
+              ~head_timeout:(Some (-1.))
+              ~close_timeout:(Some 1.)
+              ~body_timeout:(Some 1.)
+              ~write_timeout:(Some 1.)
+              ~stop:(Miou.Computation.create ())
+              ~grace:1.
               ~tls:server_config
               ~request_handler
               ~error_handler
@@ -786,7 +974,7 @@ let test_head_timeout_then_data () =
 let respond_while_body_read_waits ?idle_timeout () =
   pending_body := None;
   pending_body_failed := false;
-  with_server ?idle_timeout (fun connect ->
+  with_server ?idle_timeout ~body_timeout:0.2 (fun connect ->
     with_raw_client connect (fun fd ->
       let raw = raw_client fd in
       raw_write
@@ -993,8 +1181,11 @@ let check_handshake_timers_bounded ~connections exchange =
     let closed = ref 0 in
     let handler =
       Ache_miou_tls.Server.create_connection_handler_with_fd
-        ~idle_timeout:30.
-        ~head_timeout:30.
+        ~date:false
+        ~idle_timeout:(Some 30.)
+        ~head_timeout:(Some 30.)
+        ~body_timeout:None
+        ~write_timeout:None
         ~tls:server_config
         ~request_handler
         ~error_handler
@@ -1076,12 +1267,212 @@ let test_cut_handshake_timers_bounded () =
     ~connections:1000
     (fun (_ : Miou_unix.file_descr) -> Miou_unix.sleep 0.001)
 
+let test_websocket_echo () =
+  with_server (fun connect ->
+    with_raw_client connect (fun fd ->
+      let raw = raw_client fd in
+      raw_write
+        raw
+        "GET /ws-echo HTTP/1.1\r\n\
+         host: localhost\r\n\
+         upgrade: websocket\r\n\
+         connection: Upgrade\r\n\
+         sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         sec-websocket-version: 13\r\n\
+         \r\n";
+      raw_read_head raw;
+      raw_write raw "\x81\x82\x00\x00\x00\x00hi";
+      Alcotest.(check string) "echo" "\x81\x02hi" (raw_take raw 4);
+      raw_write raw "\x88\x82\x00\x00\x00\x00\x03\xe8";
+      Alcotest.(check string) "close echoed" "\x88\x02\x03\xe8" (raw_take raw 4);
+      let rest, (_ : [ `Tcp_eof | `Close_notify ]) = raw_read_until_eof raw in
+      Alcotest.(check string) "then the end" "" rest));
+  check_no_handler_error ()
+
+let hello_response = "HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\n/hello"
+
+let test_stop_idle_connection () =
+  let stop = Miou.Computation.create () in
+  with_server ~stop ~grace:2.0 (fun connect ->
+    with_raw_client connect (fun fd ->
+      let raw = raw_client fd in
+      raw_write raw "GET /hello HTTP/1.1\r\nhost: localhost\r\n\r\n";
+      Alcotest.(check string)
+        "response"
+        hello_response
+        (raw_take raw (String.length hello_response));
+      let since = Unix.gettimeofday () in
+      resolve stop ();
+      let rest, ending = raw_read_until_eof raw in
+      Alcotest.(check string) "nothing more" "" rest;
+      Alcotest.(check bool) "close_notify" true (ending = `Close_notify);
+      check_bounded "idle TLS connection" ~max:0.5 since));
+  check_no_handler_error ()
+
+let test_stop_during_handshake () =
+  let stop = Miou.Computation.create () in
+  with_server ~stop (fun connect ->
+    with_raw_client connect (fun fd ->
+      Miou_unix.sleep 0.1;
+      let since = Unix.gettimeofday () in
+      resolve stop ();
+      Alcotest.(check int)
+        "server closed"
+        0
+        (Miou_unix.read fd (Bytes.create 16));
+      check_bounded "handshake" ~max:0.5 since));
+  check_no_handler_error ()
+
+let test_write_timeout () =
+  stream_closed := false;
+  with_server ~write_timeout:0.3 (fun connect ->
+    with_raw_client connect (fun fd ->
+      let raw = raw_client fd in
+      raw_write raw "GET /stream-forever HTTP/1.1\r\nhost: localhost\r\n\r\n";
+      let from = Unix.gettimeofday () in
+      while (not !stream_closed) && Unix.gettimeofday () -. from < 3. do
+        Miou_unix.sleep 0.01
+      done;
+      check_bounded "write timeout" ~max:1.5 from;
+      Alcotest.(check bool)
+        "the handler's flush got `Closed"
+        true
+        !stream_closed;
+      let rec at_end () =
+        match Miou_unix.read fd (Bytes.create 0x10000) with
+        | 0 -> ()
+        | _ -> at_end ()
+        | exception Unix.Unix_error (ECONNRESET, _, _) -> ()
+      in
+      at_end ()));
+  check_no_handler_error ()
+
+let test_keep_alive_hint () =
+  with_server ~idle_timeout:3.5 (fun connect ->
+    with_raw_client connect (fun fd ->
+      let raw = raw_client fd in
+      raw_write raw "GET /hint HTTP/1.1\r\nhost: localhost\r\n\r\n";
+      let expected =
+        "HTTP/1.1 200 OK\r\n\
+         content-length: 5\r\n\
+         Keep-Alive: timeout=3\r\n\
+         \r\n\
+         /hint"
+      in
+      Alcotest.(check string)
+        "hint"
+        expected
+        (raw_take raw (String.length expected))));
+  check_no_handler_error ()
+
+let stray_outcome client =
+  let result = Miou.Computation.create () in
+  let finish r = ignore (Miou.Computation.try_return result r : bool) in
+  let writer =
+    Ache_miou_tls.Client.request
+      client
+      (Ache.Request.create
+         ~headers:(Ache.Headers.of_list [ "host", "localhost" ])
+         `GET
+         "/")
+      ~error_handler:(function
+        | `Connection_closed -> finish "Connection_closed"
+        | `Malformed_response _ -> finish "Malformed_response"
+        | `Invalid_response_body_length _ ->
+          finish "Invalid_response_body_length"
+        | `Exn exn -> finish (Printexc.to_string exn))
+      ~response_handler:(fun response reader ->
+        let body = Stdlib.Buffer.create 16 in
+        let rec loop () =
+          Ache.Body.Reader.schedule_read
+            reader
+            ~on_error:(fun () -> finish "body error")
+            ~on_eof:(fun () ->
+              finish
+                (Printf.sprintf
+                   "%d %s"
+                   (Ache.Status.to_code response.status)
+                   (Stdlib.Buffer.contents body)))
+            ~on_read:(fun bs ~off ~len ->
+              Stdlib.Buffer.add_string
+                body
+                (Ache.Bigstring.substring bs ~off ~len);
+              loop ())
+        in
+        loop ())
+  in
+  Ache.Body.Writer.close writer;
+  match Miou.Computation.await result with
+  | Ok outcome -> outcome
+  | Error (exn, bt) -> Printexc.raise_with_backtrace exn bt
+
+(* Client: TLS records that arrive on an idle connection (undici
+   GHSA-35p6-xmwp-9g52). Application data or a close_notify closes the
+   connection; a key update or an empty line does not. *)
+let test_stray_records_on_idle_connection () =
+  let port, server =
+    Ache_test_tls_stray.start server_config Ache_test_tls_stray.strays
+  in
+  List.iter
+    (fun (name, _, expected) ->
+       Miou_unix.run ~domains:0 (fun () ->
+         let socket = Miou_unix.tcpv4 () in
+         Miou_unix.connect
+           socket
+           (Unix.ADDR_INET (Unix.inet_addr_loopback, port));
+         let client =
+           Ache_miou_tls.Client.create_connection_with_fd
+             ~tls:client_config
+             ~peer:(`Host localhost)
+             socket
+         in
+         Alcotest.(check string)
+           (name ^ ": first")
+           "200 ok"
+           (stray_outcome client);
+         (* The stray records arrive while this domain does not run the read
+            loop. *)
+         Unix.sleepf 0.2;
+         Alcotest.(check string)
+           (name ^ ": second")
+           expected
+           (stray_outcome client);
+         Ache_miou_tls.Client.shutdown client;
+         Miou_unix.close socket))
+    Ache_test_tls_stray.cases;
+  Alcotest.(check (list bool))
+    "second requests sent"
+    Ache_test_tls_stray.second_requests_sent
+    (List.map (fun second -> second <> "") (Domain.join server))
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
     "ache-miou-tls"
     [ ( "tls"
       , [ Alcotest.test_case "GET" `Quick test_get
+        ; Alcotest.test_case
+            "client: TLS records on an idle connection"
+            `Quick
+            test_stray_records_on_idle_connection
+        ; Alcotest.test_case "Keep-Alive hint" `Quick test_keep_alive_hint
+        ; Alcotest.test_case
+            "write timeout: a client that stops reading"
+            `Quick
+            test_write_timeout
+        ; Alcotest.test_case
+            "stop closes an idle connection"
+            `Quick
+            test_stop_idle_connection
+        ; Alcotest.test_case
+            "stop ends a handshake in progress"
+            `Quick
+            test_stop_during_handshake
+        ; Alcotest.test_case "WebSocket echo" `Quick test_websocket_echo
+        ; Alcotest.test_case
+            "a streamed response: one TLS record for each 16 KiB"
+            `Quick
+            test_stream_records
         ; Alcotest.test_case
             "client_of_fd, epoch and create_connection"
             `Quick
@@ -1160,11 +1551,11 @@ let () =
             test_peer_insecure
         ; Alcotest.test_case "idle timeout" `Quick test_idle_timeout
         ; Alcotest.test_case
-            "response while a body read waits, no idle_timeout: closes"
+            "response while a body read waits: body_timeout"
             `Quick
             (respond_while_body_read_waits ?idle_timeout:None)
         ; Alcotest.test_case
-            "response while a body read waits: idle_timeout"
+            "response while a body read waits: body_timeout, idle_timeout"
             `Quick
             (respond_while_body_read_waits ~idle_timeout:0.2)
         ; Alcotest.test_case "head timeout" `Quick test_head_timeout

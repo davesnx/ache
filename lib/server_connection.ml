@@ -36,7 +36,7 @@ type request_handler = Request_descriptor.t -> unit
 
 type error =
   [ `Bad_gateway
-  | `Bad_request
+  | `Bad_request of string
   | `Not_implemented
   | `Http_version_not_supported
   | `Uri_too_long
@@ -72,6 +72,9 @@ type t =
        that might be streaming to the client. *)
   ; mutable upgraded : Runtime.impl option
   ; mutable reader_waits_for_output : bool
+  ; date : (unit -> string) option
+  ; mutable requests : int
+  ; mutable draining : bool
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
@@ -96,13 +99,13 @@ let yield_writer t k =
   if Writer.is_closed t.writer then k () else Writer.on_wakeup t.writer k
 
 let wakeup_writer t = Writer.wakeup t.writer
+let error_status = Request_descriptor.error_status
 
 let default_error_handler ?request:_ error handle =
   let message =
     match error with
     | `Exn exn -> Printexc.to_string exn
-    | (#Status.client_error | #Status.server_error) as error ->
-      Status.to_string error
+    | error -> Status.to_string (error_status error)
   in
   let body = handle Headers.empty in
   Body.Writer.write_string body message;
@@ -138,19 +141,56 @@ let shutdown t =
     ~finally:(fun () -> shutdown_writer t)
     (fun () -> shutdown_reader t)
 
-let upgrade t (Runtime.Impl ((module Engine), engine) as impl) =
+let upgrade t (Runtime.Impl ((module Engine), engine, _) as impl) =
   let eof = Reader.is_closed t.reader in
   t.upgraded <- Some impl;
   shutdown t;
+  if t.draining then Runtime.drain impl;
   if eof
   then ignore (Engine.read_eof engine Bigstring.empty ~off:0 ~len:0 : int)
 
 let create
       ?(config = Config.default)
       ?(error_handler = default_error_handler)
+      ?date
+      ?keep_alive_timeout
       request_handler
   =
-  let { Config.response_buffer_size; response_body_buffer_size; _ } = config in
+  let { Config.response_buffer_size
+      ; response_body_buffer_size
+      ; max_requests_per_connection
+      ; _
+      }
+    =
+    config
+  in
+  (match max_requests_per_connection with
+  | Some n when n < 1 ->
+    invalid_arg
+      "ache.Server_connection.create: max_requests_per_connection must be \
+       positive"
+  | _ -> ());
+  let keep_alive =
+    match keep_alive_timeout with
+    | None -> ""
+    | Some s when s < 1 ->
+      invalid_arg
+        "ache.Server_connection.create: keep_alive_timeout must be positive"
+    | Some s -> "timeout=" ^ string_of_int s
+  in
+  let date =
+    Option.map
+      (fun date ->
+         let checked = ref "" in
+         fun () ->
+           let d = date () in
+           if d != !checked
+           then (
+             Serialize.check_date d;
+             checked := d);
+           d)
+      date
+  in
   let writer = Writer.create ~buffer_size:response_buffer_size () in
   let request_queue = Queue.create () in
   let response_body_buffer = Bigstring.create response_body_buffer_size in
@@ -159,6 +199,13 @@ let create
     match !self with
     | None -> assert false
     | Some (t, upgrade) ->
+      t.requests <- t.requests + 1;
+      let keep_alive =
+        match max_requests_per_connection with
+        | Some n when keep_alive <> "" && n > t.requests ->
+          keep_alive ^ ", max=" ^ string_of_int (n - t.requests)
+        | _ -> keep_alive
+      in
       let reqd =
         Request_descriptor.create
           ~error_handler
@@ -167,9 +214,20 @@ let create
           ~writer
           ~response_body_buffer
           ~proxy:config.proxy
+          ~max_discard_body:config.max_discard_body
+          ~date
+          ~keep_alive
+          ~auto_continue:config.auto_continue
           request
           request_body
       in
+      if
+        t.draining
+        ||
+        match max_requests_per_connection with
+        | Some n -> t.requests >= n
+        | None -> false
+      then Request_descriptor.close_after reqd;
       let call_handler = Queue.is_empty request_queue in
       Queue.push reqd request_queue;
       if call_handler then request_handler reqd
@@ -185,6 +243,9 @@ let create
     ; config
     ; upgraded = None
     ; reader_waits_for_output = false
+    ; date
+    ; requests = 0
+    ; draining = false
     }
   in
   self := Some (t, upgrade t);
@@ -195,13 +256,10 @@ let set_error_and_handle ?request t error =
   then (
     assert (request = None);
     let reqd = current_reqd_exn t in
-    Request_descriptor.report_error reqd error)
+    Request_descriptor.report_error reqd error;
+    wakeup_writer t)
   else
-    let status =
-      match (error :> [ error | Status.standard ]) with
-      | `Exn _ -> `Internal_server_error
-      | #Status.standard as status -> status
-    in
+    let status = error_status error in
     shutdown_reader t;
     let writer = t.writer in
     match t.error_code with
@@ -238,11 +296,23 @@ let set_error_and_handle ?request t error =
                 * (is_active t == false), and are therefore not making use of
                 that * buffer. *)
              Body.Writer.create
+               ~send_trailers:
+                 (match encoding, request with
+                 | `Chunked, Some (request : Request.t) ->
+                   Message.accepts_trailers request.headers
+                 | _ -> false)
                t.response_body_buffer
                ~encoding
                ~writer:t.writer
            in
-           Writer.write_response writer response;
+           (match t.date with
+           | Some date when Request_descriptor.needs_date response ->
+             Writer.write_response_with
+               writer
+               response
+               ~date:(date ())
+               ~keep_alive:""
+           | _ -> Writer.write_response writer response);
            t.error_code <-
              Error
                { request; response_state = Streaming (response, response_body) };
@@ -277,6 +347,11 @@ let advance_request_queue t =
     | () -> ()
     | exception exn -> Request_descriptor.report_exn reqd exn
 
+let at_request_start t =
+  match Reader.next t.reader with
+  | `Start -> true
+  | `Read | `Close | `Error _ -> false
+
 let output_full t = Writer.pending_bytes t.writer > t.config.max_pending_output
 
 let wait_for_output t =
@@ -289,6 +364,9 @@ let rec _next_read_operation t =
     match t.error_code with
     | Error _ -> `Close
     | No_error when Writer.is_closed t.writer ->
+      shutdown t;
+      `Close
+    | No_error when t.draining && at_request_start t ->
       shutdown t;
       `Close
     | No_error when output_full t && not (Reader.is_closed t.reader) ->
@@ -308,7 +386,11 @@ let rec _next_read_operation t =
       | Complete ->
         if Option.is_some (Request_descriptor.response reqd)
         then Body.Reader.discard (Request_descriptor.request_body reqd);
-        Reader.next t.reader
+        if Request_descriptor.discard_budget_spent reqd
+        then (
+          shutdown t;
+          `Close)
+        else Reader.next t.reader
       | Wait | Ready ->
         (* `Wait` signals that we should add backpressure to the read channel, *
            meaning the reader should tell the runtime to yield. * * The
@@ -350,8 +432,8 @@ and _final_read_operation_for t reqd =
 
 let next_read_operation t =
   match _next_read_operation t with
-  | `Error (`Parse _) ->
-    set_error_and_handle t `Bad_request;
+  | `Error (`Parse message) ->
+    set_error_and_handle t (`Bad_request message);
     `Close
   | `Error `Header_too_large ->
     set_error_and_handle t `Request_header_fields_too_large;
@@ -371,7 +453,27 @@ let next_read_operation t =
 let read_with_more t bs ~off ~len more =
   Writer.hold t.writer;
   match
+    let discarding =
+      if is_active t
+      then
+        let reqd = current_reqd_exn t in
+        Option.map
+          (fun budget -> reqd, budget)
+          (Request_descriptor.discard_budget reqd)
+      else None
+    in
+    let len, more =
+      match discarding with
+      | Some (_, budget) when budget < len ->
+        (* Bytes past the budget are not offered, so the input has not ended
+           yet: the runtime offers them again. *)
+        budget, Parse.Incomplete
+      | Some _ | None -> len, more
+    in
     let consumed = Reader.read_with_more t.reader bs ~off ~len more in
+    (match discarding with
+    | Some (reqd, _) -> Request_descriptor.add_discarded reqd consumed
+    | None -> ());
     (if is_active t
      then
        let reqd = current_reqd_exn t in
@@ -465,60 +567,70 @@ let report_write_result t result =
 let next_read_operation t =
   match t.upgraded with
   | None -> next_read_operation t
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.next_read_operation engine
 
 let read t bs ~off ~len =
   match t.upgraded with
   | None -> read t bs ~off ~len
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.read engine bs ~off ~len
 
 let read_eof t bs ~off ~len =
   match t.upgraded with
   | None -> read_eof t bs ~off ~len
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.read_eof engine bs ~off ~len
 
 let yield_reader t k =
   match t.upgraded with
   | None -> yield_reader t k
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.yield_reader engine k
 
 let next_write_operation t =
   match t.upgraded with
   | None -> next_write_operation t
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.next_write_operation engine
 
 let report_write_result t result =
   match t.upgraded with
   | None -> report_write_result t result
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.report_write_result engine result
 
 let yield_writer t k =
   match t.upgraded with
   | None -> yield_writer t k
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.yield_writer engine k
 
 let report_exn t exn =
   match t.upgraded with
   | None -> report_exn t exn
-  | Some (Runtime.Impl ((module Engine), engine)) ->
+  | Some (Runtime.Impl ((module Engine), engine, _)) ->
     Engine.report_exn engine exn
 
 let is_closed t =
   match t.upgraded with
   | None -> is_closed t
-  | Some (Runtime.Impl ((module Engine), engine)) -> Engine.is_closed engine
+  | Some (Runtime.Impl ((module Engine), engine, _)) -> Engine.is_closed engine
 
 let shutdown t =
   match t.upgraded with
   | None -> shutdown t
-  | Some (Runtime.Impl ((module Engine), engine)) -> Engine.shutdown engine
+  | Some (Runtime.Impl ((module Engine), engine, _)) -> Engine.shutdown engine
+
+let body_timed_out t =
+  if is_active t
+  then
+    let reqd = current_reqd_exn t in
+    match
+      Request_descriptor.response reqd, Request_descriptor.error_code reqd
+    with
+    | None, None -> Request_descriptor.report_error reqd `Request_timeout
+    | _ -> shutdown t
 
 let read_timeout t =
   match t.upgraded, t.error_code with
@@ -532,7 +644,29 @@ let read_timeout t =
     (match
        Request_descriptor.output_state reqd, Request_descriptor.input_state reqd
      with
-    | Complete, (Wait | Ready) when not (Reader.is_closed t.reader) ->
-      Some (`Body, fun () -> shutdown t)
+    | ((Wait | Ready | Complete), Ready | Complete, Wait)
+      when not (Reader.is_closed t.reader) ->
+      Some (`Body, fun () -> body_timed_out t)
     | _ -> None)
-  | _ -> None
+  | Some impl, _ ->
+    (Runtime.read_timeout impl
+      :> ([ `Idle | `Head | `Body | `Close ] * (unit -> unit)) option)
+  | None, Error _ -> None
+
+let drain t =
+  if not t.draining
+  then (
+    t.draining <- true;
+    match t.upgraded with
+    | Some impl -> Runtime.drain impl
+    | None ->
+      (match t.error_code with
+      | Error _ -> ()
+      | No_error ->
+        if is_active t
+        then (
+          Request_descriptor.close_after (current_reqd_exn t);
+          wakeup_writer t)
+        else if at_request_start t
+        then shutdown t);
+      wakeup_reader t)

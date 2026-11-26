@@ -16,7 +16,8 @@ let main port host =
   let request_headers =
     Request.create ~headers:(Headers.of_list [ "host", host ]) `GET "/"
   in
-  Client.create_connection socket >>= fun connection ->
+  let config = { Config.default with max_pipelined_requests = 2 } in
+  Client.create_connection ~config socket >>= fun connection ->
   let request_body =
     Client.request connection ~response_handler ~error_handler request_headers
   in

@@ -15,6 +15,7 @@ let () =
   Eio_main.run @@ fun env ->
   match
     Ache_eio.Server.run
+      ~date:false
       ~domains:2
       ~backlog:256
       ~on_error:(fun exn ->

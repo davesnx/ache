@@ -106,7 +106,10 @@ module Body : sig
 
         [on_read] receives every byte available at the time of the call. The
         library does not reuse the bytes it passes to [on_read], so the
-        application may keep them after [on_read] returns. *)
+        application may keep them after [on_read] returns.
+
+        With {!Config.auto_continue}, the first call on a server request body
+        may send [100 Continue]. *)
 
     val close : t -> unit
     (** [close t] closes [t]: input received after it is discarded. Bytes
@@ -116,6 +119,19 @@ module Body : sig
     val is_closed : t -> bool
     (** [is_closed t] is [true] if {!close} has been called on [t] and [false]
         otherwise. A closed [t] may still have bytes available for reading. *)
+
+    val trailers : t -> Headers.t
+    (** [trailers t] is the trailer section of a chunked body (RFC 9112
+        §7.1.2), to read in [on_eof]: it is {!Headers.empty} until [on_eof] is
+        called, and always on a body that is not chunked or ends with
+        [on_error]. A [Trailer] header field is ignored. Fields that must
+        not be trailers are dropped: [authorization], [cache-control], [connection], [content-encoding],
+        [content-length], [content-range], [content-type], [expect], [host],
+        [keep-alive], [max-forwards], [pragma], [proxy-authenticate],
+        [proxy-authorization], [proxy-connection], [range], [realm], [te],
+        [trailer], [transfer-encoding] and [www-authenticate]. The trailer
+        section counts against {!Config.max_header_size}; a larger one ends
+        the body with [on_error]. *)
   end
 
   module Writer : sig
@@ -153,10 +169,21 @@ module Body : sig
         about whether those packets have been queued for delivery or have
         actually been received by the intended recipient. *)
 
-    val close : t -> unit
-    (** [close t] closes [t]. Later writes to [t] are ignored. If [t] is
-        writable, this will cause any pending output to become available to the
-        output channel. *)
+    val close : ?trailers:Headers.t -> t -> unit
+    (** [close ?trailers t] closes [t]. Later writes to [t] are ignored, and a
+        later [close] does nothing. If [t] is writable, this will cause any
+        pending output to become available to the output channel.
+
+        [trailers] (default {!Headers.empty}) are sent in the trailer section
+        after the last chunk of a chunked body (RFC 9112 §7.1.2). A server
+        sends them only when the request had [TE: trailers], and drops them
+        otherwise; a client always sends them. They are dropped on a body that
+        is close-delimited or has no content (a response to [HEAD], [204],
+        [304]).
+
+        Raises [Invalid_argument], and leaves [t] open, when [trailers] holds an
+        invalid field, a field that {!Reader.trailers} drops, or when [t] is
+        framed by [Content-Length]. *)
 
     val is_closed : t -> bool
     (** [is_closed t] is [true] if {!close} has been called on [t], or if the
@@ -291,7 +318,7 @@ module Request_descriptor : sig
   type t
 
   type error =
-    [ `Bad_request
+    [ `Bad_request of string
     | `Not_implemented
     | `Http_version_not_supported
     | `Uri_too_long
@@ -317,10 +344,10 @@ module Request_descriptor : sig
       No body is sent in a response to [HEAD] or with status 1xx, 204 or 304
       (RFC 9112 §6.3). A [HEAD] or 304 response can carry the [Content-Length]
       of the matching [GET] response. To start a tunnel for a [CONNECT]
-      request, use {!respond_with_upgrade}. The body of a 2xx response to
-      [CONNECT] given to another [respond_with_*] function is sent as it is,
-      then the connection closes, and the bytes after the [CONNECT] request
-      are not read.
+      request, use {!respond_with_upgrade}. Any other response to [CONNECT]
+      closes the connection, and the bytes after the [CONNECT] request are
+      not read: a 2xx is sent as it is, another status gets
+      [connection: close].
 
       ache adds:
       - [Content-Length] to a string or bigstring response that has neither
@@ -391,8 +418,9 @@ module Request_descriptor : sig
       for example [100 Continue] to a request with [Expect: 100-continue]
       (RFC 9110 §10.1.1), or [103 Early Hints]. Only the head is sent. A final
       response must follow with one of the other [respond_with_*] functions.
-      It can be called more than once. ache never sends [100 Continue] on its
-      own: the request handler decides.
+      It can be called more than once. ache sends [100 Continue] on its own
+      only with {!Config.auto_continue}; then an explicit [100 Continue] sent
+      first is not sent again.
 
       Nothing is sent to an HTTP/1.0 request (RFC 9110 §15.2).
 
@@ -436,15 +464,46 @@ module Config : sig
     ; response_body_buffer_size : int  (** Default is [4096] *)
     ; max_header_size : int
       (** Largest request or response head, chunk-size line or trailer
-              section, in bytes. Default is [16384]. A larger request head gets
-              a [501], [414] or [431] response, see
-              {!Server_connection.create}. *)
+              section, in bytes, each counted on its own. Default is
+              [16384]. A larger request head gets a [501], [414] or [431]
+              response, see {!Server_connection.create}. A larger trailer
+              section ends the body with [on_error]. *)
     ; proxy : bool
     ; max_pending_output : int
       (** Server: while more response bytes than this wait to be written, the
           connection reads and dispatches no new request. A client that
           pipelines requests and does not read the responses then stops
           being read. Default is [65536]. *)
+    ; max_discard_body : int
+      (** Server: the most bytes of a request body that is unread or closed
+          by {!Body.Reader.close} the connection reads and discards after the
+          response, to serve the next request.
+          A response sent while more than this remains of a body framed by
+          Content-Length has [connection: close]. The connection closes once
+          it has read this many bytes of a body it discards and the body is
+          not complete. Default is [262144]. *)
+    ; max_pipelined_requests : int
+      (** Client: the most requests that wait for a response on one
+          connection. A request with a non-idempotent method, or one that may
+          switch protocols, is never written while another response is
+          pending. Default is [1]: a request is written after the previous
+          response is complete. *)
+    ; max_requests_per_connection : int option
+      (** Server: with [Some n], the [n]-th request on a connection is the
+          last one. Its response gets [Connection: close], and the connection
+          closes after it (as after {!Server_connection.drain}). Default is
+          [None]: no limit.
+          {!Server_connection.create} raises [Invalid_argument] when [n] is
+          less than 1. *)
+    ; auto_continue : bool
+      (** Server: when [true], the first {!Body.Reader.schedule_read} on the
+          body of an HTTP/1.1 request with [Expect: 100-continue] sends
+          [100 Continue] (RFC 9110 §10.1.1), unless a response has started or
+          a [100 Continue] was sent with
+          {!Request_descriptor.respond_with_informational}. It is sent even
+          when body bytes already arrived. A request without a body, an
+          HTTP/1.0 request, or one that the handler answers without reading
+          its body gets no [100 Continue]. Default is [false]. *)
     }
 
   val default : t
@@ -457,6 +516,15 @@ end
 module Server_connection : sig
   type t
   type error = Request_descriptor.error
+
+  val error_status : error -> Status.t
+  (** [error_status error] is the status of the error response that the
+      connection starts for [error]: [`Bad_request _] is [`Bad_request] (400),
+      [`Exn _] is [`Internal_server_error] (500), and every other case is the
+      status of the same name. An error handler that only needs the status
+      can write [Status.to_code (error_status error)] instead of matching
+      every case. *)
+
   type request_handler = Request_descriptor.t -> unit
 
   type error_handler =
@@ -465,18 +533,43 @@ module Server_connection : sig
   val create :
      ?config:Config.t
     -> ?error_handler:error_handler
+    -> ?date:(unit -> string)
+    -> ?keep_alive_timeout:int
     -> request_handler
     -> t
-  (** [create ?config ?error_handler ~request_handler] creates a connection
-      handler that will service individual requests with [request_handler].
+  (** [create ?config ?error_handler ?date ?keep_alive_timeout
+       request_handler] creates a connection handler that will service
+      individual requests with [request_handler].
+
+      With [keep_alive_timeout], every response after which the connection
+      stays open (not 1xx, not a tunnel, no [Connection: close]) and that
+      has no [Keep-Alive] field gets [Keep-Alive: timeout=n], with
+      [, max=m] when [Config.max_requests_per_connection] is set ([m] is
+      the number of requests the connection still serves after this one).
+      [n] is the idle timeout that the runtime announces; the runtime keeps
+      its own idle timer 1 s longer, so that a client that trusts the hint
+      never writes into a connection that is closing. Raises
+      [Invalid_argument] when [n] is less than 1.
+
+      With [date], every response that is not 1xx and has no [Date] field
+      (in any case) gets [Date: (date ())] after its other fields (RFC 9110
+      §6.6.1: an origin server with a clock sends [Date]). [date] returns an
+      IMF-fixdate such as [Sun, 06 Nov 1994 08:49:37 GMT]; the runtimes pass
+      a function that formats the time once per second. Without [date] the
+      connection adds no [Date] field.
 
       The connection rejects a request before [request_handler] runs, calls
       [error_handler] and closes after the error response:
-      - [`Bad_request] (400): the request line or a field line does not match
+      - [`Bad_request reason] (400): the request line or a field line does not match
         RFC 9112 §3 and §5 (lines end with CRLF; a bare LF is an error;
         obs-fold is an error); an HTTP/1.1 request has no Host field; a request
         has more than one Host field or a Host value that is not
-        [uri-host [":" port]] (RFC 3986 §3.2); a CONNECT target is not
+        [uri-host [":" port]] (RFC 3986 §3.2) or has an empty host, as in
+        [:80] (RFC 9110 §4.2.1); a target byte is not allowed by RFC 3986
+        ([#], a byte above 0x7F, a CTL, a double quote, an angle bracket, a
+        brace, a bar, a caret, a backquote or a backslash); an
+        absolute-form target has userinfo or an empty host (RFC 9110 §4.2.1,
+        §4.2.4); a CONNECT target is not
         [host:port] with a port of 0 to 65535; the target is [*] and the
         method is not OPTIONS; the method is not CONNECT and the target is
         not [*] for OPTIONS, nor origin-form ([/...]), nor absolute-form
@@ -485,7 +578,11 @@ module Server_connection : sig
         method; one such as [127.0.0.1:80] or [[::1]:80] is not); Content-Length is not a list of one
         repeated [1*DIGIT] value; the request has both Content-Length and
         Transfer-Encoding; an HTTP/1.0 request has Transfer-Encoding; chunked
-        is not the final transfer coding or is applied twice.
+        is not the final transfer coding or is applied twice. The string is
+        a short reason for logs, such as [unexpected ' ' in field line] or
+        [invalid Content-Length]; it shows a received byte or value only
+        escaped as an OCaml character or string literal. The default error
+        handler does not send it.
       - [`Not_implemented] (501): a transfer coding other than chunked, or a
         method that reaches [Config.max_header_size] before its end.
       - [`Uri_too_long] (414): a request-target that reaches
@@ -497,8 +594,7 @@ module Server_connection : sig
         runtime's head timeout expires (see {!read_timeout}).
 
       A request with version HTTP/1.x, x > 1, is processed as HTTP/1.1. Its
-      [version] field keeps the received minor version. Request-target bytes
-      0x80 to 0xFF are accepted, because clients send them unencoded.
+      [version] field keeps the received minor version.
 
       A request that is rejected after earlier pipelined requests gets its
       error response after the responses to those requests. A request that
@@ -516,9 +612,9 @@ module Server_connection : sig
       nothing past the end of that request until its response is decided
       (RFC 9110 §7.8, §9.3.6). After {!Request_descriptor.respond_with_upgrade}
       (a 101, or a 2xx to [CONNECT]), those bytes go to the new protocol.
-      After a 2xx response to [CONNECT] sent another way, they are not read,
-      and the connection closes when the response is written. After any
-      other response, they are read as the next request. When the input ends
+      After any other response to [CONNECT], they are not read, and the
+      connection closes when the response is written. After any other
+      response to an [Upgrade] request, they are read as the next request. When the input ends
       before the upgrade response is written, the new protocol gets end of
       input after the switch.
 
@@ -599,13 +695,37 @@ module Server_connection : sig
   (** [error_code t] returns the [error_code] that caused the connection to
       close, if one exists. *)
 
+  val drain : t -> unit
+  (** [drain t] makes the request in progress the last one on [t], for a
+      graceful stop of a server:
+      - When no request is in progress and no byte of a next request has
+        been read, the connection closes at once: {!next_read_operation}
+        returns [`Close], and output that is not written yet is still
+        written. A runtime that waits for input stops waiting, as when its
+        idle timeout fires.
+      - When a request is in progress, or its head is partly read, the
+        connection serves it and reads no other request. Its response gets
+        [Connection: close] if its head is not written yet; otherwise the
+        response is sent as it was framed and the connection closes after
+        it. Requests that were pipelined after it are not served.
+      - On a connection upgraded with {!Websocket.upgrade}, the WebSocket
+        connection sends a close frame with code [1001] (going away) and
+        closes as {!Websocket.close} does. Another upgraded protocol is not
+        told; the runtime stops it when its grace period ends.
+
+      A runtime calls [drain] on each of its connections when it stops, and
+      closes the ones that are still open after a grace period. Calling
+      [drain] again does nothing. *)
+
   (**/**)
 
   val shutdown : t -> unit
 
   (**/**)
 
-  val read_timeout : t -> ([ `Idle | `Head | `Body ] * (unit -> unit)) option
+  val read_timeout :
+     t
+    -> ([ `Idle | `Head | `Body | `Close ] * (unit -> unit)) option
   (** [read_timeout t] tells a runtime which read timeout applies while it
       waits for input on [t], and the action to run when that timeout expires.
       - [Some (`Idle, close)]: no request is in progress. [close] closes the
@@ -613,53 +733,66 @@ module Server_connection : sig
       - [Some (`Head, reject)]: a request head is partly read. [reject] calls
         [error_handler] with [`Request_timeout] (408) and closes the connection
         after the error response. The request handler is not called.
-      - [Some (`Body, close)]: the response is complete, and the rest of the
-        request body has not arrived. The application reads it, or the
-        connection drops it to find the next request. A runtime waits for it
-        at most its idle timeout; a runtime without an idle timeout calls
-        [close] instead of waiting. [close] calls the body's [on_error] and
-        closes the connection after its pending output.
-      - [None]: a request is in progress and its response is not complete,
-        or the connection is closing or upgraded. No timeout applies. The
-        answer can change to [Some (`Body, _)] while the runtime waits for
-        input, when the response completes. A runtime asks again each time
-        its write loop waits or ends. *)
+      - [Some (`Body, expire)]: the connection waits for request body bytes:
+        the application has scheduled a read on the request body, or the
+        response is complete and the rest of the body has not arrived (the
+        connection drops it to find the next request). The peer must make
+        progress; the runtimes give it their body timeout and restart it
+        only after enough bytes. [expire] calls the body's [on_error]; then,
+        when no response has started, it calls [error_handler] with
+        [`Request_timeout] (408) and closes the connection after the error
+        response, and otherwise it closes the connection after its pending
+        output.
+      - [Some (`Idle, close)] or [Some (`Close, abort)] on a connection
+        upgraded with {!Websocket.upgrade}: see {!Websocket.read_timeout}.
+      - [None]: no read is waiting for the peer (the application runs, a
+        response is being written, the connection is closing), or the
+        connection was upgraded to another protocol. No timeout applies.
+        A runtime asks again before each read. *)
 end
 
 (** {2 WebSocket Server} *)
 
-(** A WebSocket server connection (RFC 6455), for text messages, that runs
+(** A WebSocket server connection (RFC 6455), for text and binary messages,
+    that runs
     after a [101] response sent with {!Request_descriptor.respond_with_upgrade}. It needs no
     runtime code: every runtime drives it like {!Server_connection}.
 
-    It has no extensions and no subprotocols. It does not check [Origin] or
-    authentication: the request handler does that before
-    {!Websocket.upgrade}.
+    It has no extensions. The application chooses a subprotocol: it reads the
+    offered ones with {!Websocket.requested_protocols} and answers
+    [Sec-WebSocket-Protocol] with the [headers] of {!Websocket.upgrade}. It
+    does not check [Origin] or authentication: the request handler does that
+    before {!Websocket.upgrade}.
 
     What the connection does on its own:
     - it answers a ping with a pong that has the same payload;
-    - it reassembles a fragmented text message and gives it whole to
+    - it reassembles a fragmented message and gives it whole to
       [on_message];
     - when the client sends a close frame, it sends a close frame with the
-      same code, then closes the connection;
+      same code (without the reason), then closes the connection;
     - it fails the connection, that is, it sends a close frame with a code
       and closes the connection, with code [1002] for a protocol error (an
       unmasked frame, an unknown opcode, a reserved bit set, a control frame
       that is fragmented or longer than 125 bytes, a continuation frame
       without a message to continue, a new data frame inside a fragmented
-      message, a payload length with the high bit set, a close frame with a
-      1-byte payload or an invalid code), [1007] for a text message or close
-      reason that is not valid UTF-8, [1009] for a message longer than
-      [max_message_size] (before it reads the payload), and [1003] for a
-      binary frame (RFC 6455 §7.4.1).
+      message, a payload length with the high bit set or not in its shortest
+      form, a close frame with a 1-byte payload or an invalid code), [1007]
+      for a text message or close reason that is not valid UTF-8, and [1009]
+      for a message longer than [max_message_size] (before it reads the
+      payload) (RFC 6455 §7.4.1). Text is checked as it arrives: the first
+      byte that cannot start or continue valid UTF-8 fails the connection,
+      without reading the rest of the message.
 
-    After it sends a close frame, the connection reads no more messages and
-    closes the TCP connection once the frame is written. It does not wait for
-    the client's close frame.
+    After it sends a close frame, the connection drops the messages that
+    still arrive and closes the TCP connection at the client's close frame or
+    the end of input (RFC 6455 §7.1.1). After a protocol error it reads
+    nothing more.
 
-    ache has no timeout on an upgraded connection. A client that stops
-    reading, or never answers a close frame, keeps the connection open until
-    the caller closes the socket, for example with its own timer.
+    The runtimes close a connection that receives nothing for their idle
+    timeout, with close code [1001] (see {!read_timeout}), and one whose
+    writes make no progress for their write timeout. A client that never
+    answers the server's close frame is cut off after their close timeout
+    (10 s by default), counted from the moment the close frame is queued.
 
     Reading stops while more than 64 KiB of frames (messages, pongs and close
     frames) are queued and not yet written, and starts again when the writes
@@ -680,8 +813,8 @@ module Websocket : sig
           with [426 Upgrade Required] and [Sec-WebSocket-Version: 13]
           (RFC 6455 §4.4). *)
     | `Invalid_key
-      (** [Sec-WebSocket-Key] is not one field with the base64 encoding of 16
-          bytes. *)
+      (** [Sec-WebSocket-Key] is not one field with the canonical base64
+          encoding of 16 bytes (RFC 4648 §3.5: the padding bits are zero). *)
     ]
 
   val accept_key : string -> string
@@ -694,32 +827,53 @@ module Websocket : sig
       handshake (RFC 6455 §4.2.1) and returns the [Sec-WebSocket-Accept]
       value. *)
 
+  type message =
+    | Text of string  (** A text message: valid UTF-8. *)
+    | Binary of string  (** A binary message: any bytes. *)
+
+  type close =
+    { code : int
+    ; reason : string  (** Valid UTF-8, at most 123 bytes. *)
+    }
+  (** The client's close frame. *)
+
   type handler =
-    { on_message : string -> unit
-      (** Called with each whole text message, in order. *)
-    ; on_close : int option -> unit
+    { on_message : message -> unit
+      (** Called with each whole message, in order. *)
+    ; on_pong : string -> unit
+      (** Called with the payload of each pong from the client, for example
+          the answer to {!ping}. *)
+    ; on_close : close option -> unit
       (** Called once, when the connection is closed and no more messages
-          come. The argument is the code of the client's close frame, [1005]
-          for a close frame without a code, or [None] when the client sent no
-          valid close frame (end of input, a reset, a protocol error, or a
-          close that the server started). *)
+          come. The argument is the client's close frame: its code and
+          reason, [{ code = 1005; reason = "" }] for a close frame without a
+          code, or [None] when the client sent no valid close frame (end of
+          input, a reset, a protocol error, or a close that the server
+          started). *)
     }
 
   val default_max_message_size : int
   (** [1048576] bytes (1 MiB). *)
 
+  val requested_protocols : Request.t -> string list
+  (** [requested_protocols request] is the subprotocols that the client
+      offers: the members of all [Sec-WebSocket-Protocol] fields of
+      [request], in order, without surrounding whitespace and without empty
+      members. *)
+
   val upgrade :
      ?max_message_size:int
+    -> ?headers:Headers.t
     -> Request_descriptor.t
     -> (t -> handler)
     -> (unit, handshake_error) result
-  (** [upgrade ?max_message_size reqd make_handler] checks the request of
-      [reqd] with {!check_handshake}. When it is valid, [upgrade] calls
-      [make_handler] with the new connection, then responds with [101] and
-      the headers [Upgrade: websocket], [Connection: Upgrade] and
-      [Sec-WebSocket-Accept], and returns [Ok ()]. The connection starts to
-      read and write when the [101] is written. Messages sent before that are
-      written after the [101].
+  (** [upgrade ?max_message_size ?headers reqd make_handler] checks the
+      request of [reqd] with {!check_handshake}. When it is valid, [upgrade]
+      calls [make_handler] with the new connection, then responds with [101]
+      and the headers [Upgrade: websocket], [Connection: Upgrade],
+      [Sec-WebSocket-Accept] and then [headers], and returns [Ok ()]. The
+      connection starts to read and write when the [101] is written.
+      Messages sent before that are written after the [101].
 
       When the request is not valid, [upgrade] responds with nothing and
       returns the error: the caller responds, for example with [400].
@@ -727,26 +881,54 @@ module Websocket : sig
       [max_message_size] limits the length of a message, all fragments
       together. Default {!default_max_message_size}.
 
-      @raise Invalid_argument if [max_message_size] is not positive. *)
+      [headers] adds fields to the [101], for example
+      [Sec-WebSocket-Protocol] with a subprotocol chosen from
+      {!requested_protocols}. Default empty.
+
+      @raise Invalid_argument
+        if [max_message_size] is not positive, or if [headers] has a field
+        named [Upgrade], [Connection] or [Sec-WebSocket-Accept] (in any case)
+        or an invalid field (a name that is not a token, a value with CR, LF
+        or NUL). It raises before it checks the handshake, and writes
+        nothing. *)
 
   val send_text : t -> string -> unit
   (** [send_text t message] queues [message] as one text frame without a
       mask. After the connection started to close, it does nothing. [message]
       must be valid UTF-8: [send_text] does not check it. *)
 
+  val send_binary : t -> string -> unit
+  (** [send_binary t message] queues [message] as one binary frame without a
+      mask. After the connection started to close, it does nothing. *)
+
+  val ping : t -> string -> unit
+  (** [ping t payload] queues a ping frame. The client answers with a pong,
+      reported to [on_pong]. A server that wants to find a client that is
+      gone can ping it and close the connection when no pong comes in time.
+      After the connection started to close, it does nothing.
+
+      @raise Invalid_argument if [payload] is longer than 125 bytes. *)
+
   val flush : t -> ([ `Written | `Closed ] -> unit) -> unit
   (** [flush t k] calls [k `Written] when all frames queued before it are
       written, and [k `Closed] when the connection closed first. After the
       connection started to close, it calls [k `Closed] at once. *)
 
-  val close : t -> code:int -> unit
-  (** [close t ~code] sends a close frame with [code], stops reading
-      messages, and closes the connection when the frame is written. It does
-      nothing when the connection already started to close.
+  val close : ?reason:string -> t -> code:int -> unit
+  (** [close ?reason t ~code] sends a close frame with [code] and [reason]
+      (default [""]) and completes the closing handshake: it keeps reading
+      until the client's close frame or the end of input, then closes the
+      connection (RFC 6455 §7.1.1). Messages that arrive meanwhile are
+      dropped, and reading is no longer paused. [on_close] gets the client's
+      close frame. The runtimes wait at most their close timeout for it (see
+      {!read_timeout}); then the connection closes and [on_close] gets
+      [None]. [close] does nothing when the connection already started to
+      close.
 
       @raise Invalid_argument
         if [code] is not one that an endpoint may send: [1000] to [1003],
-        [1007] to [1014], or [3000] to [4999]. *)
+        [1007] to [1014], or [3000] to [4999]; or if [reason] is not valid
+        UTF-8 or longer than 123 bytes. *)
 
   val pause_reading : t -> unit
   (** [pause_reading t] stops reading from the client, so that no
@@ -762,6 +944,24 @@ module Websocket : sig
   val is_closed : t -> bool
   (** [is_closed t] is [true] once the connection is closed: [on_close] was
       called and nothing more is written. *)
+
+  val read_timeout : t -> ([ `Idle | `Close ] * (unit -> unit)) option
+  (** [read_timeout t] tells a runtime which read timeout applies while it
+      waits for input on [t], as {!Server_connection.read_timeout} does (and
+      that function answers with it once the connection is upgraded).
+      - [Some (`Idle, close)]: the connection reads frames. When nothing
+        arrives for the runtime's idle timeout, [close] sends a close frame
+        with code [1001] (going away) and closes the connection.
+      - [Some (`Close, abort)]: the server sent its close frame ({!close})
+        and waits for the client's. The runtimes give the client their close
+        timeout, counted from the moment the close frame is queued and not
+        restarted by the messages that still arrive. A close after a
+        protocol error, an idle timeout or a drain stops reading at once and
+        never enters this phase. [abort] closes the
+        connection without the client's close frame: [on_close] gets
+        [None].
+      - [None]: reading is paused or waits for the writes, or the
+        connection has closed. No timeout applies. *)
 end
 
 (** {2 Client Connection} *)
@@ -788,8 +988,9 @@ module Client_connection : sig
       - [`Connection_closed]: the connection stopped reading responses before
         any byte of the response to this request arrived: end of input, a
         previous response that closes the connection, {!shutdown}, or an error
-        on an earlier response. RFC 9112 §9.3.1 lets the application send the
-        request again on a new connection.
+        on an earlier response. The request may still have reached the
+        server: RFC 9112 §9.3.1 lets the application send it again on a new
+        connection only when its method is idempotent.
       - [`Exn]: an exception from the application or reported with
         {!report_exn}. *)
 
@@ -797,6 +998,16 @@ module Client_connection : sig
   type error_handler = error -> unit
 
   val create : ?config:Config.t -> unit -> t
+
+  val reuse_timeout : t -> float option
+  (** [reuse_timeout t] is [Some s] when no request is in progress on [t]
+      and the last response kept the connection open with a [Keep-Alive]
+      field that has [timeout=n] ([n] is digits; other parameters and
+      invalid values are ignored). The server may close the connection [n]
+      seconds after that response, so a runtime does not reuse it once [s]
+      seconds have passed since the response ended: [s] is [min n 600]
+      minus 2, and at least 0. [None] when there is no such hint or a
+      request is in progress. *)
 
   val request :
      t
@@ -819,15 +1030,18 @@ module Client_connection : sig
       An obs-fold in a response field value is replaced with one space
       (RFC 9112 §5.2).
 
-      A request is written right away, or after the requests before it: it is
-      pipelined behind a request with an idempotent method (RFC 9110 §9.2.2)
-      whose request has been sent, and it waits behind any other request, and
-      behind a request that may switch protocols ([CONNECT], or [Upgrade] with
-      the [upgrade] connection option), until
-      that request's response is complete (RFC 9112 §9.3.2). When a response
-      ends the connection ([Connection: close], an HTTP/1.0 response without
-      keep-alive or with [Transfer-Encoding], or both [Content-Length] and
-      [Transfer-Encoding]), the connection stops writing, also in the middle of
+      A request is written right away when no response is pending, or after
+      the requests before it. With {!Config.max_pipelined_requests} above 1, it
+      is pipelined while fewer responses than that limit are pending, when it
+      and the requests before it have an idempotent method (RFC 9110 §9.2.2)
+      and none may switch protocols ([CONNECT], or [Upgrade] with the
+      [upgrade] connection option). Otherwise it waits until the response
+      before it is complete (RFC 9112 §9.3.2). When a response ends the
+      connection ([Connection: close], an HTTP/1.0 response without
+      keep-alive or with [Transfer-Encoding], both [Content-Length] and
+      [Transfer-Encoding], or a 204 or 304 to a method other than [HEAD] with
+      [Transfer-Encoding] or a [Content-Length] other than 0), the connection
+      stops writing, also in the middle of
       a request body, and the later requests get [`Connection_closed]. A
       request made after the connection stopped writing gets
       [`Connection_closed] once: from inside [request], before it returns,
@@ -835,12 +1049,16 @@ module Client_connection : sig
       responses are complete.
 
       Response bytes that arrive when no request waits for a response close the
-      connection. Empty lines before a response are discarded.
+      connection, also before their head is complete. Empty lines before a
+      response are discarded.
 
       Raises [Invalid_argument], naming the offending field, when the head of
       [req] is invalid, before the request is queued: a method or field name that is not a token (RFC 9110
-      §9.1, §5.1), a field value with CR, LF or NUL (§5.5), or a request target
-      with CR, LF, NUL or space. *)
+      §9.1, §5.1), a field value with CR, LF or NUL (§5.5), a request target
+      with CR, LF, NUL or space, more than one [Host] field (§7.2), both
+      [Content-Length] and [Transfer-Encoding], a [Content-Length] that is
+      not one repeated [1*DIGIT] value, or a [Transfer-Encoding] whose last
+      coding is not [chunked] (RFC 9112 §6). *)
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
   (** [next_read_operation t] returns a value describing the next operation that
@@ -903,6 +1121,85 @@ module Client_connection : sig
       the connection, rendering it unusable for any further communication. *)
 end
 
+(** {2 Testing} *)
+
+(** Run a request handler on bytes, without sockets and without a runtime.
+
+    The functions drive a {!Server_connection} the way a runtime does, but
+    in the calling thread: they give it the input, write its output to a
+    buffer, and stop when neither side can make progress. An exception that
+    the request handler raises while the connection reads goes to
+    {!Server_connection.report_exn}, as in the runtimes, so the error
+    handler answers ([500] by default).
+
+    {!serve} and {!serve_request} give the connection all of the input and
+    the end of input, then return. They see only what the handler does
+    before they return: a response that the handler gives later, for
+    example when a promise resolves, is not in their result. For such a
+    handler, use {!create}, {!feed} and {!output}: run your scheduler until
+    the handler has responded, then call {!output}. The request handler
+    must return without blocking, as with every runtime.
+
+    After a protocol upgrade, the functions drive the new protocol with the
+    rest of the input. *)
+module Testing : sig
+  val serve :
+     ?config:Config.t
+    -> ?error_handler:Server_connection.error_handler
+    -> Server_connection.request_handler
+    -> string
+    -> string
+  (** [serve ?config ?error_handler handler input] creates a connection that
+      serves [handler], gives it [input] then the end of input, and returns
+      every byte that the connection writes. [input] may hold several
+      pipelined requests. *)
+
+  val serve_request :
+     ?config:Config.t
+    -> ?error_handler:Server_connection.error_handler
+    -> ?body:string
+    -> Server_connection.request_handler
+    -> Request.t
+    -> Response.t * string
+  (** [serve_request ?config ?error_handler ?body handler request] writes
+      [request] and [body] (default: no body) as a client does, runs them
+      through {!serve}, and returns the final response with its decoded body.
+      When [body] is given and [request] has neither [Content-Length] nor
+      [Transfer-Encoding], it adds [Content-Length]. A chunked request body
+      is chunked. Interim [1xx] responses are dropped, and a chunked or
+      close-delimited response body is decoded, as by
+      {!Client_connection}.
+
+      Raises [Invalid_argument] when the head of [request] is invalid (see
+      {!Client_connection.request}), and [Failure] when no complete response
+      comes. *)
+
+  type t
+  (** A server connection driven step by step. *)
+
+  val create :
+     ?config:Config.t
+    -> ?error_handler:Server_connection.error_handler
+    -> Server_connection.request_handler
+    -> t
+
+  val feed : t -> string -> unit
+  (** [feed t input] gives [input] to the connection and runs it until it
+      cannot progress. Raises [Invalid_argument] after {!feed_eof}. *)
+
+  val feed_eof : t -> unit
+  (** [feed_eof t] gives the end of input to the connection and runs it
+      until it cannot progress. *)
+
+  val output : t -> string
+  (** [output t] runs the connection until it cannot progress, and returns
+      the bytes that it wrote since the last call to [output]. *)
+
+  val is_closed : t -> bool
+  (** [is_closed t] is [true] once both the read and the write sides of the
+      connection are closed. *)
+end
+
 (**/**)
 
 module Ache_private : sig
@@ -936,10 +1233,32 @@ module Ache_private : sig
     end
   end
 
+  module Http_date : sig
+    val imf_fixdate : int -> string
+    (** [imf_fixdate seconds] is the IMF-fixdate (RFC 9110 §5.6.7) of
+        [seconds] since the Unix epoch, such as
+        [Sun, 06 Nov 1994 08:49:37 GMT]. *)
+
+    val cached : int -> string
+    (** [cached seconds] is [imf_fixdate seconds], kept per domain: it
+        allocates only when [seconds] differs from the previous call in the
+        same domain. *)
+
+    val now : unit -> string
+    (** [now ()] is [cached] of the current second ([time(2)]): the [Date]
+        function that the runtimes give to {!Server_connection.create}. *)
+  end
+
   module Response_descriptor : sig
     type t
 
     val awaiting : Request.t -> (Response.t -> Body.Reader.t -> unit) -> t
+  end
+
+  module Client_connection : sig
+    val is_waiting : Client_connection.t -> bool
+    (** [is_waiting t] is [true] when [t] is open and no request waits for a
+        response. *)
   end
 
   module Parse : sig
@@ -958,7 +1277,10 @@ module Ache_private : sig
       type request_error =
         [ `Invalid_request of
             Request.t
-            * [ `Bad_request | `Not_implemented | `Http_version_not_supported ]
+            * [ `Bad_request of string
+              | `Not_implemented
+              | `Http_version_not_supported
+              ]
         | `Parse of string
         | `Method_too_long
         | `Target_too_long

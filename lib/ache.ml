@@ -13,6 +13,7 @@ module Config = Config
 module Server_connection = Server_connection
 module Client_connection = Client_connection
 module Websocket = Websocket
+module Testing = Testing
 
 module Ache_private = struct
   module Encoder = Encoder
@@ -21,6 +22,8 @@ module Ache_private = struct
     module Upgradable = Runtime.Upgradable
     module Buffer = Runtime.Buffer
   end
+
+  module Http_date = Http_date
 
   module Response_descriptor = struct
     type t = Response_descriptor.t
@@ -37,6 +40,10 @@ module Ache_private = struct
       in
       Response_descriptor.write_request respd;
       respd
+  end
+
+  module Client_connection = struct
+    let is_waiting = Client_connection.is_waiting
   end
 
   module Parse = Parse

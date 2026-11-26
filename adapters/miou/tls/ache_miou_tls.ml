@@ -46,29 +46,31 @@ let send t data =
 
 let send_ignoring_errors t data = try send t data with Unix.Unix_error _ -> ()
 
+let feed t raw =
+  match Tls.Engine.handle_tls t.state raw with
+  | Ok (state, eof, `Response response, `Data data) ->
+    t.state <- state;
+    if Option.is_some eof then t.close_notify_received <- true;
+    Option.iter
+      (fun data ->
+         t.plain <-
+           String.sub t.plain t.plain_off (String.length t.plain - t.plain_off)
+           ^ data;
+         t.plain_off <- 0)
+      data;
+    Option.iter (send_ignoring_errors t) response
+  | Error (failure, `Response response) ->
+    send_ignoring_errors t response;
+    raise
+      (match failure with
+      | `Alert alert -> Tls_miou_unix.Tls_alert alert
+      | failure -> Tls_miou_unix.Tls_failure failure)
+
 let pull t =
   match Miou_unix.read t.fd t.input with
   | 0 | (exception Unix.Unix_error ((ECONNRESET | ENOTCONN), _, _)) ->
     t.tcp_eof <- true
-  | n ->
-    (match Tls.Engine.handle_tls t.state (Bytes.sub_string t.input 0 n) with
-    | Ok (state, eof, `Response response, `Data data) ->
-      t.state <- state;
-      if Option.is_some eof then t.close_notify_received <- true;
-      Option.iter
-        (fun data ->
-           t.plain <-
-             String.sub t.plain t.plain_off (String.length t.plain - t.plain_off)
-             ^ data;
-           t.plain_off <- 0)
-        data;
-      Option.iter (send_ignoring_errors t) response
-    | Error (failure, `Response response) ->
-      send_ignoring_errors t response;
-      raise
-        (match failure with
-        | `Alert alert -> Tls_miou_unix.Tls_alert alert
-        | failure -> Tls_miou_unix.Tls_failure failure))
+  | n -> feed t (Bytes.sub_string t.input 0 n)
 
 let ended t = t.close_notify_received || t.tcp_eof
 
@@ -101,6 +103,76 @@ let client_of_fd config ~(peer : peer) fd =
 
 let epoch t = Tls.Engine.epoch t.state
 
+(* ocaml-tls makes one record for each string it is given, so the iovecs are
+   joined into strings of up to 16 KiB, the largest record. *)
+let record_size = 0x4000
+
+let coalesce iovecs =
+  let rec fill chunk pos iovecs src_off =
+    let size = Bytes.length chunk in
+    match iovecs with
+    | [] -> [], 0
+    | _ when pos = size -> iovecs, src_off
+    | { Ache.IOVec.buffer; off; len } :: rest ->
+      let n = min (len - src_off) (size - pos) in
+      Ache.Bigstring.unsafe_blit_to_bytes
+        buffer
+        ~src_off:(off + src_off)
+        chunk
+        ~dst_off:pos
+        ~len:n;
+      if src_off + n = len
+      then fill chunk (pos + n) rest 0
+      else iovecs, src_off + n
+  in
+  let rec chunks acc remaining iovecs src_off =
+    if remaining = 0
+    then List.rev acc
+    else
+      let chunk = Bytes.create (min record_size remaining) in
+      let iovecs, src_off = fill chunk 0 iovecs src_off in
+      chunks
+        (Bytes.unsafe_to_string chunk :: acc)
+        (remaining - Bytes.length chunk)
+        iovecs
+        src_off
+  in
+  let length = Ache.IOVec.lengthv iovecs in
+  length, chunks [] length iovecs 0
+
+(* An idle client connection: without blocking, read the TCP bytes that wait and
+   give them to the TLS engine. Response bytes other than CR and LF, a
+   close_notify or the end of TCP mean that the connection must not be reused
+   (undici GHSA-35p6-xmwp-9g52). Decrypted bytes stay for the next read; a
+   session ticket or a key update is not input. *)
+let input_waiting t =
+  let fd = Miou_unix.to_file_descr t.fd in
+  let buf = Bytes.create 0x4000 in
+  let rec poll () =
+    if not (ended t)
+    then
+      match Unix.select [ fd ] [] [] 0. with
+      | [], _, _ -> ()
+      | _ :: _, _, _ ->
+        (match Unix.read fd buf 0 (Bytes.length buf) with
+        | 0 -> t.tcp_eof <- true
+        | n ->
+          feed t (Bytes.sub_string buf 0 n);
+          poll ())
+  in
+  let rec response_byte i =
+    i < String.length t.plain
+    && match t.plain.[i] with '\r' | '\n' -> response_byte (i + 1) | _ -> true
+  in
+  match poll () with
+  | () -> ended t || response_byte t.plain_off
+  | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK | EINTR), _, _) ->
+    ended t || response_byte t.plain_off
+  | exception
+      ( Unix.Unix_error _ | Tls_miou_unix.Tls_alert _
+      | Tls_miou_unix.Tls_failure _ ) ->
+    true
+
 module Io = struct
   type nonrec socket = socket
 
@@ -129,13 +201,7 @@ module Io = struct
     if t.close_notify_sent
     then `Closed
     else
-      let length, strings =
-        List.fold_left_map
-          (fun acc { Ache.IOVec.buffer; off; len } ->
-             acc + len, Ache.Bigstring.substring buffer ~off ~len)
-          0
-          iovecs
-      in
+      let length, strings = coalesce iovecs in
       match Tls.Engine.send_application_data t.state strings with
       | None -> invalid_arg "Ache_miou_tls: the TLS session is not ready"
       | Some (state, data) ->
@@ -151,18 +217,43 @@ module Io = struct
 
   let shutdown t command =
     (match command with
-    | Unix.SHUTDOWN_SEND | SHUTDOWN_ALL ->
+    | Unix.SHUTDOWN_SEND ->
       if not t.close_notify_sent
       then (
         t.close_notify_sent <- true;
         let state, data = Tls.Engine.send_close_notify t.state in
         t.state <- state;
         send_ignoring_errors t data)
+    | SHUTDOWN_ALL ->
+      (* The connection is stopped at once, maybe because a write is stuck: send
+         close_notify only if it does not wait. *)
+      if not t.close_notify_sent
+      then (
+        t.close_notify_sent <- true;
+        if (not t.writing) && Queue.is_empty t.output
+        then (
+          let state, data = Tls.Engine.send_close_notify t.state in
+          t.state <- state;
+          try
+            ignore
+              (Unix.single_write_substring
+                 (Miou_unix.to_file_descr t.fd)
+                 data
+                 0
+                 (String.length data)
+               : int)
+          with
+          | Unix.Unix_error _ -> ()))
     | SHUTDOWN_RECEIVE -> ());
     shutdown_tcp t command
 end
 
-include Ache_miou.Make (Io)
+include
+  Ache_miou.Make_with_idle_check
+    (Io)
+    (struct
+      let input_waiting = input_waiting
+    end)
 
 let handshake_limit idle_timeout head_timeout =
   match idle_timeout, head_timeout with
@@ -185,10 +276,21 @@ let sleep_until at =
 module Server = struct
   include Server
 
+  (* The defaults of [Ache_miou.Server.create_connection_handler], which the
+     handshake limit needs. *)
+  let default_idle_timeout = Some 60.
+  let default_head_timeout = Some 30.
+
   let create_connection_handler_with_fd
         ?config
-        ?idle_timeout
-        ?head_timeout
+        ?(idle_timeout = default_idle_timeout)
+        ?(head_timeout = default_head_timeout)
+        ?body_timeout
+        ?write_timeout
+        ?close_timeout
+        ?date
+        ?stop
+        ?grace
         ~tls
         ~request_handler
         ~error_handler
@@ -196,12 +298,30 @@ module Server = struct
     let handler =
       create_connection_handler
         ?config
-        ?idle_timeout
-        ?head_timeout
+        ~idle_timeout
+        ~head_timeout
+        ?body_timeout
+        ?write_timeout
+        ?close_timeout
+        ?date
+        ?stop
+        ?grace
         ~request_handler
         ~error_handler
     in
     fun fd client_addr ->
+      let stopped =
+        match stop with
+        | None -> []
+        | Some stop ->
+          [ Miou.async (fun () ->
+              (match Miou.Computation.await stop with
+              | Error (exn, bt) when Miou.Computation.is_running stop ->
+                Printexc.raise_with_backtrace exn bt
+              | Ok () | Error _ -> ());
+              None)
+          ]
+      in
       let timer =
         match handshake_limit idle_timeout head_timeout with
         | None -> []
@@ -214,7 +334,8 @@ module Server = struct
       in
       match
         Miou.await_first
-          (Miou.async (fun () -> Some (server_of_fd tls fd)) :: timer)
+          ((Miou.async (fun () -> Some (server_of_fd tls fd)) :: timer)
+          @ stopped)
       with
       | Ok (Some socket) -> handler socket client_addr
       | Ok None | Error _ -> ()
