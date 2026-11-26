@@ -111,7 +111,9 @@ let final_coding = function
 
 (* RFC 9112 §6.1: a Transfer-Encoding field that lists no coding. *)
 let has_empty_transfer_encoding { headers; _ } =
-  final_coding (fields headers).codings = Some ""
+  match final_coding (fields headers).codings with
+  | Some "" -> true
+  | Some _ | None -> false
 
 let length_of_fields ~proxy f : Body_length.t =
   match final_coding f.codings with

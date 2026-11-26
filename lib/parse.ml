@@ -250,7 +250,7 @@ let fail o message =
   o.error <- message;
   invalid
 
-let fail_at ~eof o stop p message =
+let fail_at ~eof o (stop : int) p message =
   if p >= stop && not eof then partial else fail o message
 
 let unexpected ~eof o bs stop p where =
