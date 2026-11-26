@@ -653,6 +653,11 @@ let read_timeout t =
       :> ([ `Idle | `Head | `Body | `Close ] * (unit -> unit)) option)
   | None, Error _ -> None
 
+let upgrade_state t =
+  match t.upgraded with
+  | None -> `None
+  | Some impl -> (Runtime.protocol impl :> [ `None | `Websocket | `Other ])
+
 let drain t =
   if not t.draining
   then (

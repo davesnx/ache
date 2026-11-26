@@ -583,38 +583,6 @@ struct
           | Some _, Some seconds -> Some (Timeout.create (seconds +. 1.))
           | None, _ -> idle_timer
           | Some _, None -> None
-        and last_reqd = ref None in
-        let upgraded () =
-          match Option.bind !last_reqd Ache.Request_descriptor.response with
-          | Some { Ache.Response.status = `Switching_protocols; _ } -> true
-          | Some _ | None -> false
-        in
-        (* [true] once the connection is upgraded with [Ache.Websocket.upgrade],
-           whose [101] carries [Upgrade: websocket]. The answer is cached once
-           there is a [101]: other protocols never reach the [`Close] phase. *)
-        let websocket = ref false
-        and checked_reqd = ref None in
-        let is_websocket () =
-          !websocket
-          ||
-          match !last_reqd with
-          | Some reqd
-            when match !checked_reqd with
-                 | Some checked -> checked != reqd
-                 | None -> true ->
-            (* Each request's response is checked once it is known. *)
-            (match Ache.Request_descriptor.response reqd with
-            | Some { Ache.Response.status; headers; _ } ->
-              checked_reqd := Some reqd;
-              (websocket :=
-                 status = `Switching_protocols
-                 &&
-                 match Ache.Headers.get headers "upgrade" with
-                 | Some value -> String.lowercase_ascii value = "websocket"
-                 | None -> false);
-              !websocket
-            | None -> false)
-          | Some _ | None -> false
         in
         let stop_head_timer () =
           head_armed := false;
@@ -627,10 +595,18 @@ struct
             ?date:(if date then Some current_date else None)
             ?keep_alive_timeout
             (fun reqd ->
-               last_reqd := Some reqd;
                stop_head_timer ();
                restart_body_clock ();
                request_handler client_addr reqd)
+        in
+        let upgraded () =
+          match Ache.Server_connection.upgrade_state connection with
+          | `Websocket | `Other -> true
+          | `None -> false
+        and is_websocket () =
+          match Ache.Server_connection.upgrade_state connection with
+          | `Websocket -> true
+          | `None | `Other -> false
         in
         (* The WebSocket read that waits in the [`Idle] phase. When the server
            queues its close frame meanwhile, that read stays (the socket read
