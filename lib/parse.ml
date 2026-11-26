@@ -168,6 +168,53 @@ let rec skip table bs stop i =
   then skip table bs stop (i + 1)
   else i
 
+let[@inline] zero_bytes x =
+  Int64.logand
+    (Int64.logand (Int64.sub x 0x0101010101010101L) (Int64.lognot x))
+    0x8080808080808080L
+
+(* Index of the lowest byte whose high bit is set in [m]. *)
+let[@inline] first_mark m =
+  let low = Int64.shift_right_logical (Int64.logand m (Int64.neg m)) 7 in
+  Int64.to_int
+    (Int64.shift_right_logical (Int64.mul low 0x0001020304050607L) 56)
+
+(* [skip table] for a table that accepts every byte from [below] up, except DEL,
+   and possibly some bytes under [below]. Eight bytes at a time: a word with no
+   byte under [below] and no DEL is accepted whole; a flagged byte is looked up
+   in [table]. [below] is the byte repeated in each lane, at most 0x80. *)
+let[@inline] skip_word ~below table bs stop i =
+  let i = ref i
+  and found = ref (-1) in
+  if not Sys.big_endian
+  then
+    while !found < 0 && !i + 8 <= stop do
+      let x = Bigstring.unsafe_get_int64_ne bs !i in
+      let m =
+        Int64.logor
+          (Int64.logand
+             (Int64.logand (Int64.sub x below) (Int64.lognot x))
+             0x8080808080808080L)
+          (zero_bytes (Int64.logxor x 0x7f7f7f7f7f7f7f7fL))
+      in
+      if m = 0L
+      then i := !i + 8
+      else
+        let m = ref m in
+        while !found < 0 && !m <> 0L do
+          let j = !i + first_mark !m in
+          if is table (Bigstring.unsafe_get bs j)
+          then m := Int64.logand !m (Int64.sub !m 1L)
+          else found := j
+        done;
+        if !found < 0 then i := !i + 8
+    done;
+  if !found >= 0 then !found else skip table bs stop !i
+
+(* field-char: HTAB, SP to 0x7e, 0x80 to 0xff. *)
+let skip_field bs stop i =
+  skip_word ~below:0x2020202020202020L field_char bs stop i
+
 (* A line that stops inside a run of one class of bytes stays an unfinished
    valid line when more bytes of that class follow. [o.run] names that class (an
    index into [runs]), or is 0 when the line did not stop inside a run.
@@ -187,6 +234,11 @@ let run_escape = 8
 let[@inline] skip_run o run bs stop i =
   let j = skip (Array.unsafe_get runs run) bs stop i in
   if j >= stop then o.run <- run;
+  j
+
+let[@inline] skip_field_run o bs stop i =
+  let j = skip_field bs stop i in
+  if j >= stop then o.run <- run_field;
   j
 
 let rec skip_zeros bs stop i =
@@ -340,7 +392,7 @@ let status_line ~eof o bs off stop =
       let reason_start =
         if get bs stop code_end = ' ' then code_end + 1 else code_end
       in
-      let reason_end = skip_run o run_field bs stop reason_start in
+      let reason_end = skip_field_run o bs stop reason_start in
       let q = end_line ~eof o bs stop reason_end where in
       if q >= 0
       then (
@@ -372,7 +424,7 @@ let field_line ~eof ~obs_fold o bs off stop =
     let start =
       skip_run o run_space bs stop (if fold then off else name_end + 1)
     in
-    let value_end = skip_run o run_field bs stop start in
+    let value_end = skip_field_run o bs stop start in
     let p = end_line ~eof o bs stop value_end where in
     (if p >= 0
      then
