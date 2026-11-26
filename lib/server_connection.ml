@@ -679,7 +679,7 @@ let lingers t =
   | Some impl -> Runtime.lingers impl
   | None ->
     t.unread_input
-    || Queue.length t.request_queue > 1
+    || (not (Queue.is_empty t.pipelined))
     || not (Reader.between_messages t.reader)
 
 let upgrade_state t =
