@@ -14,6 +14,7 @@
   test_headers
   test_ache
   test_iovec
+  test_encoder
   test_method
   test_request
   test_request_syntax

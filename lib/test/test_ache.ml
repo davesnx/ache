@@ -5,6 +5,7 @@ let () =
     ; "version", Test_version.tests
     ; "method", Test_method.tests
     ; "iovec", Test_iovec.tests
+    ; "encoder", Test_encoder.tests
     ; "headers", Test_headers.tests
     ; "request", Test_request.tests
     ; "response", Test_response.tests

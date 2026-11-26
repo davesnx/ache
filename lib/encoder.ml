@@ -222,35 +222,81 @@ let schedule_bigstring t ?(off = 0) ?len a =
   in
   if len > 0 then schedule_iovec t ~off ~len a
 
-let ensure_space t len =
-  if free_bytes_in_buffer t < len
-  then begin
-    flush_buffer t;
-    t.buffer <- Bigstring.create (Int.max (Bigstring.length t.buffer) len);
-    t.write_pos <- 0;
-    t.scheduled_pos <- 0
-  end
+(* The size up to which a full buffer is replaced by a larger one. The
+   replacement becomes the serializer's buffer for good: once all its output is
+   shifted, writes start again at its beginning, so later output of the same
+   size reuses it. Above this size a write gets a buffer of its own (see
+   [oversized]), so one large write does not stay pinned to the serializer. 64
+   KiB is [Config.max_pending_output]'s default, the output a server lets wait
+   before it stops reading, and below glibc's default mmap threshold. *)
+let max_buffer_size = 0x10000
+
+(* A write of [len] bytes that does not fit the buffer and is larger than both
+   the buffer and [max_buffer_size] is copied into a buffer of exactly [len]
+   bytes, scheduled on its own; the serializer keeps its buffer. *)
+let oversized t len = len > Int.max max_buffer_size (Bigstring.length t.buffer)
+
+(* Replaces a buffer without room for [len] bytes by one at least twice as large
+   and with room for its current contents plus [len], up to [max_buffer_size]: a
+   response written as a head and then a body fits the new buffer whole, and
+   steady streaming writes grow it geometrically. A buffer already larger than
+   [max_buffer_size] (given to [of_bigstring]) is replaced by one of the same
+   size. Bytes of the old buffer stay scheduled until they are shifted. Requires
+   [not (oversized t len)]. *)
+let grow t len =
+  flush_buffer t;
+  let size = Bigstring.length t.buffer in
+  let size =
+    if size >= max_buffer_size
+    then size
+    else Int.min max_buffer_size (Int.max (2 * size) (size + len))
+  in
+  t.buffer <- Bigstring.create size;
+  t.write_pos <- 0;
+  t.scheduled_pos <- 0
+
+let ensure_space t len = if free_bytes_in_buffer t < len then grow t len
+
+let schedule_copy t buffer ~len =
+  flush_buffer t;
+  schedule_iovec t ~len buffer
 
 let write_string t ?(off = 0) ?len a =
   writable_exn t;
   let len = match len with None -> String.length a - off | Some len -> len in
-  ensure_space t len;
-  Bigstring.unsafe_blit_from_string
-    a
-    ~src_off:off
-    t.buffer
-    ~dst_off:t.write_pos
-    ~len;
-  t.write_pos <- t.write_pos + len
+  if free_bytes_in_buffer t < len && oversized t len
+  then begin
+    let copy = Bigstring.create len in
+    Bigstring.unsafe_blit_from_string a ~src_off:off copy ~dst_off:0 ~len;
+    schedule_copy t copy ~len
+  end
+  else begin
+    ensure_space t len;
+    Bigstring.unsafe_blit_from_string
+      a
+      ~src_off:off
+      t.buffer
+      ~dst_off:t.write_pos
+      ~len;
+    t.write_pos <- t.write_pos + len
+  end
 
 let write_bigstring t ?(off = 0) ?len a =
   writable_exn t;
   let len =
     match len with None -> Bigstring.length a - off | Some len -> len
   in
-  ensure_space t len;
-  Bigstring.unsafe_blit a ~src_off:off t.buffer ~dst_off:t.write_pos ~len;
-  t.write_pos <- t.write_pos + len
+  if free_bytes_in_buffer t < len && oversized t len
+  then begin
+    let copy = Bigstring.create len in
+    Bigstring.unsafe_blit a ~src_off:off copy ~dst_off:0 ~len;
+    schedule_copy t copy ~len
+  end
+  else begin
+    ensure_space t len;
+    Bigstring.unsafe_blit a ~src_off:off t.buffer ~dst_off:t.write_pos ~len;
+    t.write_pos <- t.write_pos + len
+  end
 
 let write_char t c =
   writable_exn t;

@@ -2315,6 +2315,48 @@ let test_timeout_cancelled_expired () =
       ~max:0.5
       (Unix.gettimeofday () -. since))
 
+(* A [set] of a queued timeout moves it behind the timeouts set after it was
+   queued: they expire first. *)
+let test_timeout_set_reorders () =
+  run (fun () ->
+    let first = Ache_lwt.Timeout.create 0.15
+    and second = Ache_lwt.Timeout.create 0.15 in
+    Ache_lwt.Timeout.set first;
+    let first_expired = expired_after first in
+    Lwt_unix.sleep 0.03 >>= fun () ->
+    Ache_lwt.Timeout.set second;
+    let second_expired = expired_after second in
+    Lwt_unix.sleep 0.03 >>= fun () ->
+    Ache_lwt.Timeout.set first;
+    second_expired >>= fun elapsed ->
+    check_between "second" ~min:0.15 ~max:0.4 elapsed;
+    Alcotest.(check bool) "first pending" true (Lwt.is_sleeping first_expired);
+    first_expired >|= check_between "first" ~min:0.21 ~max:0.5)
+
+(* A timeout set over and over expires its length after the last [set]. *)
+let test_timeout_set_repeatedly () =
+  run (fun () ->
+    let timer = Ache_lwt.Timeout.create 0.1 in
+    Ache_lwt.Timeout.set timer;
+    let expired = Ache_lwt.Timeout.expired timer in
+    let rec keep n =
+      if n = 0
+      then Lwt.return_unit
+      else
+        Lwt_unix.sleep 0.04 >>= fun () ->
+        Alcotest.(check bool) "pending while set" true (Lwt.is_sleeping expired);
+        Ache_lwt.Timeout.set timer;
+        keep (n - 1)
+    in
+    keep 6 >>= fun () ->
+    let since = Unix.gettimeofday () in
+    expired >|= fun () ->
+    check_between
+      "after the last set"
+      ~min:0.1
+      ~max:0.4
+      (Unix.gettimeofday () -. since))
+
 let test_flood_does_not_block_event_loop () =
   let flood_seconds = 2.0 in
   let batch = String.concat "" (List.init 200 (fun _ -> get_hello)) in
@@ -2717,6 +2759,49 @@ let test_body_timeout_linger () =
     check_server_sockets_closed ();
     Lwt_unix.close socket);
   Alcotest.(check bool) "on_error" true !body_cut
+
+(* With [idle_timeout], the linger ends [idle_timeout] after the server's output
+   ends, though the client still sends. *)
+let test_linger_ends_at_idle_timeout () =
+  with_server ~idle_timeout:0.5 ~body_timeout:0.3 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (count_request 100_000_000) >>= fun () ->
+    let rec send n =
+      let chunk = if n < 10 then "b" else String.make 1024 'b' in
+      Lwt_unix.sleep (if n < 10 then 0.05 else 0.01) >>= fun () ->
+      write_all socket chunk >>= fun () -> send (n + 1)
+    in
+    let writer =
+      Lwt.catch (fun () -> send 0) (fun (_ : exn) -> Lwt.return_unit)
+    in
+    read_all socket >>= fun output ->
+    Alcotest.(check string) "408, then the end of input" response_408 output;
+    let since = Unix.gettimeofday () in
+    writer >>= fun () ->
+    check_within "server closes after the linger" ~since ~min:0.3 ~max:1.5;
+    check_server_sockets_closed ();
+    Lwt_unix.close socket)
+
+(* A client that reads a closing response and then ends its output ends the
+   linger at once, long before [idle_timeout]. *)
+let test_linger_ends_at_end_of_input () =
+  let since = ref 0. in
+  with_server ~idle_timeout:30. (fun connect ->
+    connect () >>= fun socket ->
+    write_all
+      socket
+      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+    >>= fun () ->
+    read_all socket >>= fun output ->
+    Alcotest.(check bool)
+      "200"
+      true
+      (String.starts_with ~prefix:"HTTP/1.1 200 OK\r\n" output);
+    since := Unix.gettimeofday ();
+    Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
+    Lwt_unix.close socket);
+  check_within "server closes at the end of input" ~since:!since ~min:0. ~max:1.;
+  check_server_sockets_closed ()
 
 let test_body_progress_not_timed_out () =
   body_cut := false;
@@ -3197,6 +3282,12 @@ let () =
         ; ( "a client that sends after a 408 reads it, then the end of input"
           , `Quick
           , test_body_timeout_linger )
+        ; ( "the linger ends at idle_timeout though the client sends"
+          , `Quick
+          , test_linger_ends_at_idle_timeout )
+        ; ( "the linger ends at the client's end of input"
+          , `Quick
+          , test_linger_ends_at_end_of_input )
         ; ( "a body that makes progress is not timed out"
           , `Quick
           , test_body_progress_not_timed_out )
@@ -3242,6 +3333,12 @@ let () =
         ; "set moves the deadline", `Quick, test_timeout_set_moves_deadline
         ; "stop keeps it from expiring", `Quick, test_timeout_stop
         ; "two lengths expire in order", `Quick, test_timeout_lengths
+        ; ( "set orders a timeout behind later ones"
+          , `Quick
+          , test_timeout_set_reorders )
+        ; ( "set over and over expires after the last"
+          , `Quick
+          , test_timeout_set_repeatedly )
         ; ( "cancelling expired does not change it"
           , `Quick
           , test_timeout_cancelled_expired )
