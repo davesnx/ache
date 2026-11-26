@@ -642,9 +642,7 @@ struct
         and close_deadline = ref None
         and retimed = ref false
         and close_aborted = ref false
-        and websocket = ref None
         and read_closed = Read_closed.create ()
-        and last_request = ref None
         and body_spent = ref 0.
         and body_received = ref 0
         and error_handler_failure = ref None
@@ -667,40 +665,21 @@ struct
             ?keep_alive_timeout
             (fun reqd ->
                head_deadline := None;
-               last_request := Some reqd;
-               websocket := None;
                body_spent := 0.;
                body_received := 0;
                with_sessions (fun () -> request_handler client_addr reqd))
         in
-        (* [`Idle] after a [101] is the idle timeout of a WebSocket. *)
+        (* [`Idle] after an upgrade is the idle timeout of a WebSocket or
+           another protocol, which announces nothing. *)
         let upgraded () =
-          match Option.bind !last_request Ache.Request_descriptor.response with
-          | Some { status = `Switching_protocols; _ } -> true
-          | Some _ | None -> false
-        in
-        (* [is_websocket ()] is [true] after the [101] of
-           [Ache.Websocket.upgrade]. The answer is kept once the response of the
-           request is known, so plain HTTP and other upgrades check it once. *)
-        let is_websocket () =
-          match !websocket with
-          | Some answer -> answer
-          | None ->
-            (match
-               Option.bind !last_request Ache.Request_descriptor.response
-             with
-            | None -> false
-            | Some { status = `Switching_protocols; headers; _ } ->
-              let answer =
-                match Ache.Headers.get headers "upgrade" with
-                | Some value -> String.lowercase_ascii value = "websocket"
-                | None -> false
-              in
-              websocket := Some answer;
-              answer
-            | Some _ ->
-              websocket := Some false;
-              false)
+          match Ache.Server_connection.upgrade_state connection with
+          | `Websocket | `Other -> true
+          | `None -> false
+        (* Only a WebSocket ([Ache.Websocket.upgrade]) reaches [`Close]. *)
+        and is_websocket () =
+          match Ache.Server_connection.upgrade_state connection with
+          | `Websocket -> true
+          | `None | `Other -> false
         in
         (* The close deadline is set the first time the connection is seen
            waiting for the client's close frame, and never moves after. *)
