@@ -45,6 +45,8 @@ type out =
   ; mutable folds : string list
   ; mutable size : int
   ; mutable error : string
+  ; mutable run : int
+  ; mutable resume : int
   }
 
 let out () =
@@ -56,6 +58,8 @@ let out () =
   ; folds = []
   ; size = 0
   ; error = ""
+  ; run = 0
+  ; resume = 0
   }
 
 let join_folds o =
@@ -114,7 +118,16 @@ let quoted_pair_char =
     | '\t' | ' ' | '\x21' .. '\x7e' | '\x80' .. '\xff' -> true
     | _ -> false)
 
-let target_char = table (fun c -> c > ' ' && c <> '\x7f')
+(* RFC 3986 §2: unreserved, reserved but '#', and '%' (decision 0007). *)
+let target_char =
+  table (function
+    | 'a' .. 'z'
+    | 'A' .. 'Z'
+    | '0' .. '9'
+    | '-' | '.' | '_' | '~' | ':' | '/' | '?' | '[' | ']' | '@' | '!' | '$'
+    | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '=' | '%' ->
+      true
+    | _ -> false)
 
 let field_char =
   table (function
@@ -154,6 +167,27 @@ let rec skip table bs stop i =
   if i < stop && is table (Bigstring.unsafe_get bs i)
   then skip table bs stop (i + 1)
   else i
+
+(* A line that stops inside a run of one class of bytes stays an unfinished
+   valid line when more bytes of that class follow. [o.run] names that class (an
+   index into [runs]), or is 0 when the line did not stop inside a run.
+   [run_escape] is a quoted-string that stops after its backslash. *)
+let runs =
+  [| ""; tchar; target_char; field_char; space; digit; hex; qdtext; "" |]
+
+let run_tchar = 1
+let run_target = 2
+let run_field = 3
+let run_space = 4
+let run_digit = 5
+let run_hex = 6
+let run_qdtext = 7
+let run_escape = 8
+
+let[@inline] skip_run o run bs stop i =
+  let j = skip (Array.unsafe_get runs run) bs stop i in
+  if j >= stop then o.run <- run;
+  j
 
 let rec skip_zeros bs stop i =
   if i < stop && Bigstring.unsafe_get bs i = '0'
@@ -243,11 +277,11 @@ let rec meth bs off len = function
 
 let request_line ~eof o bs off stop =
   let where = "request-line" in
-  let meth_end = skip tchar bs stop off in
+  let meth_end = skip_run o run_tchar bs stop off in
   if meth_end = off || get bs stop meth_end <> ' '
   then unexpected ~eof o bs stop meth_end where
   else
-    let target_end = skip target_char bs stop (meth_end + 1) in
+    let target_end = skip_run o run_target bs stop (meth_end + 1) in
     if target_end = meth_end + 1 || get bs stop target_end <> ' '
     then unexpected ~eof o bs stop target_end where
     else
@@ -278,7 +312,7 @@ let status_line ~eof o bs off stop =
   else if get bs stop p <> ' '
   then unexpected ~eof o bs stop p where
   else
-    let code_end = skip digit bs stop (p + 1) in
+    let code_end = skip_run o run_digit bs stop (p + 1) in
     let n = code_end - p - 1 in
     if n = 0
     then fail_at ~eof o stop code_end "status-code empty"
@@ -294,10 +328,19 @@ let status_line ~eof o bs off stop =
             then "status-code too long: %S"
             else "invalid status-code: %S")
            (substring bs ~off:(p + 1) ~len:n))
-    else if get bs stop code_end <> ' '
+    else if get bs stop code_end = '\r' && code_end + 1 >= stop && not eof
+    then partial
+    else if
+      get bs stop code_end <> ' '
+      && not (get bs stop code_end = '\r' && get bs stop (code_end + 1) = '\n')
     then unexpected ~eof o bs stop code_end where
     else
-      let reason_end = skip field_char bs stop (code_end + 1) in
+      (* A status-line without the SP before an empty reason, as llhttp
+         accepts. *)
+      let reason_start =
+        if get bs stop code_end = ' ' then code_end + 1 else code_end
+      in
+      let reason_end = skip_run o run_field bs stop reason_start in
       let q = end_line ~eof o bs stop reason_end where in
       if q >= 0
       then (
@@ -306,8 +349,7 @@ let status_line ~eof o bs off stop =
             ((100 * digit_at bs (p + 1))
             + (10 * digit_at bs (p + 2))
             + digit_at bs (p + 3));
-        o.text <-
-          substring bs ~off:(code_end + 1) ~len:(reason_end - code_end - 1));
+        o.text <- substring bs ~off:reason_start ~len:(reason_end - reason_start));
       q
 
 let rec trim_end bs off i =
@@ -323,12 +365,14 @@ let field_line ~eof ~obs_fold o bs off stop =
     && (match o.fields with [] -> false | _ :: _ -> true)
     && is space (get bs stop off)
   in
-  let name_end = if fold then off else skip tchar bs stop off in
+  let name_end = if fold then off else skip_run o run_tchar bs stop off in
   if (not fold) && (name_end = off || get bs stop name_end <> ':')
   then unexpected ~eof o bs stop name_end where
   else
-    let start = skip space bs stop (if fold then off else name_end + 1) in
-    let value_end = skip field_char bs stop start in
+    let start =
+      skip_run o run_space bs stop (if fold then off else name_end + 1)
+    in
+    let value_end = skip_run o run_field bs stop start in
     let p = end_line ~eof o bs stop value_end where in
     (if p >= 0
      then
@@ -351,41 +395,63 @@ let rec fields ~eof ~obs_fold o bs p stop where =
     if p < 0 then p else fields ~eof ~obs_fold o bs p stop where
 
 let rec quoted_string ~eof o bs stop p where =
-  let p = skip qdtext bs stop p in
+  let p = skip_run o run_qdtext bs stop p in
   match get bs stop p with
   | '"' -> p + 1
   | '\\' ->
     if is quoted_pair_char (get bs stop (p + 1))
     then quoted_string ~eof o bs stop (p + 2) where
-    else unexpected ~eof o bs stop (p + 1) where
+    else (
+      if p + 1 >= stop then o.run <- run_escape;
+      unexpected ~eof o bs stop (p + 1) where)
   | _ -> unexpected ~eof o bs stop p where
+
+(* The run that [run] becomes after the bytes from [i] to [stop], or 0 when one
+   of them ends it. *)
+let rec continue_run run bs i stop =
+  if run = 0 || i >= stop
+  then run
+  else if run = run_escape
+  then
+    if is quoted_pair_char (Bigstring.unsafe_get bs i)
+    then continue_run run_qdtext bs (i + 1) stop
+    else 0
+  else
+    let j = skip (Array.unsafe_get runs run) bs stop i in
+    if j >= stop
+    then run
+    else if run = run_qdtext && Bigstring.unsafe_get bs j = '\\'
+    then continue_run run_escape bs (j + 1) stop
+    else 0
 
 (* RFC 9112 §7.1.1 chunk-ext *)
 let rec chunk_ext ~eof o bs stop p where =
+  (* More bytes leave the line before [p] as it is: parsing may resume here. *)
+  if p < stop then o.resume <- p;
   match get bs stop p with
   | ' ' | '\t' | ';' ->
-    let p = skip space bs stop p in
+    let p = skip_run o run_space bs stop p in
     if get bs stop p <> ';'
     then unexpected ~eof o bs stop p where
     else
-      let name = skip space bs stop (p + 1) in
-      let name_end = skip tchar bs stop name in
+      let name = skip_run o run_space bs stop (p + 1) in
+      let name_end = skip_run o run_tchar bs stop name in
       if name_end = name
       then unexpected ~eof o bs stop name where
       else (
         match get bs stop name_end with
         | ' ' | '\t' | '=' ->
-          let p = skip space bs stop name_end in
+          let p = skip_run o run_space bs stop name_end in
           if get bs stop p <> '='
           then unexpected ~eof o bs stop p where
           else
-            let value = skip space bs stop (p + 1) in
+            let value = skip_run o run_space bs stop (p + 1) in
             if get bs stop value = '"'
             then
               let p = quoted_string ~eof o bs stop (value + 1) where in
               if p < 0 then p else chunk_ext ~eof o bs stop p where
             else
-              let value_end = skip tchar bs stop value in
+              let value_end = skip_run o run_tchar bs stop value in
               if value_end = value
               then unexpected ~eof o bs stop value where
               else chunk_ext ~eof o bs stop value_end where
@@ -414,7 +480,7 @@ let rec hex_number bs acc i stop =
 let chunk_size_line ~eof o bs off stop =
   let where = "chunk-size line" in
   let digits = skip_zeros bs stop off in
-  let digits_end = skip hex bs stop digits in
+  let digits_end = skip_run o run_hex bs stop digits in
   if digits_end = off
   then unexpected ~eof o bs stop off where
   else if digits_end - digits > max_chunk_size_digits
@@ -524,7 +590,6 @@ module Reader = struct
 
   type stage =
     | Leading
-    | First
     | Fields
     | Trailer
     | Chunk_size
@@ -543,8 +608,10 @@ module Reader = struct
         ]
         -> 'error
     ; mutable state : ('head, 'error) state
+    ; mutable failed_in : Body.Reader.t option
     ; mutable stage : stage
     ; mutable fed : int
+    ; mutable excess : int
     ; mutable buffer : Bigstring.t
     ; mutable buffered : int
     ; mutable paused : bool
@@ -562,8 +629,10 @@ module Reader = struct
     ; on_head
     ; fail
     ; state = Done
+    ; failed_in = None
     ; stage = Ended
     ; fed = 0
+    ; excess = 0
     ; buffer = Bigstring.empty
     ; buffered = 0
     ; paused = false
@@ -660,6 +729,9 @@ module Reader = struct
           | `Error `Bad_gateway -> assert false
           | `Error `Internal_server_error ->
             t.state <- Fail (`Invalid_response_body_length response)
+          | `Close_delimited when Response.has_empty_transfer_encoding response
+            ->
+            t.state <- Fail (`Parse "empty transfer-encoding")
           | `No_body | `Fixed 0L ->
             Response_descriptor.handle_response
               respd
@@ -681,13 +753,15 @@ module Reader = struct
 
   let line t bs p stop =
     let o = t.out in
+    o.run <- 0;
+    o.resume <- p;
     match t.stage with
+    (* RFC 9112 §2.2: empty lines before the start line are skipped, any number
+       of them, counted against the head limit (decision 0017). *)
     | Leading when get bs stop p = '\r' ->
       let where = if t.request then "request-line" else "status-line" in
-      let q = end_line ~eof:false o bs stop p where in
-      if q >= 0 && t.request then t.stage <- First;
-      q
-    | Leading | First ->
+      end_line ~eof:false o bs stop p where
+    | Leading ->
       let q =
         if t.request
         then request_line ~eof:false o bs p stop
@@ -738,38 +812,57 @@ module Reader = struct
     Body.Reader.close body;
     t.state <- Done
 
-  let ended t =
+  let failed t error =
+    t.buffer <- Bigstring.empty;
+    (match t.state with Body (body, _) -> t.failed_in <- Some body | _ -> ());
+    t.state <- Fail (t.fail error)
+
+  (* Go's budget (net/http/internal/chunked.go): each chunk line adds its bytes,
+     and takes back 16 plus twice the chunk's data. *)
+  let max_chunk_overhead = 16 * 1024
+
+  let ended t ~line =
     drop t;
     match t.state with
     | Head ->
       t.state <- Head_done;
       t.on_head t
     | Body (body, Chunk_line) ->
-      if t.out.size = 0
+      t.excess <- Int.max 0 (t.excess + line - 16 - (2 * t.out.size));
+      if t.excess > max_chunk_overhead
+      then failed t (`Parse "chunked encoding contains too much non-data")
+      else if t.out.size = 0
       then (
         t.stage <- Trailer;
         t.state <- Body (body, Trailers))
       else t.state <- Body (body, Chunk_data (Int64.of_int t.out.size))
     | Body (body, Trailers) ->
-      t.out.fields <- [];
+      (match t.out.fields with
+      | [] -> ()
+      | fields ->
+        t.out.fields <- [];
+        Body.Reader.set_trailers
+          body
+          (Headers.of_rev_list
+             (List.filter
+                (fun (name, _) -> not (Message.is_forbidden_trailer name))
+                fields)));
       finish t body
     | Done | Head_done | Body _ | Fail _ | Cancelled_parse -> ()
 
-  let failed t error =
-    t.buffer <- Bigstring.empty;
-    t.state <- Fail (t.fail error)
-
   let too_large t =
     match t.stage with
-    | (Leading | First) when t.request ->
+    | Leading when t.request ->
       let meth_end = skip tchar t.buffer t.buffered 0 in
-      if get t.buffer t.buffered meth_end = ' '
+      if meth_end = 0 && t.fed > 0
+      then (* Empty lines filled the head (decision 0017). *)
+        `Header_too_large
+      else if get t.buffer t.buffered meth_end = ' '
       then `Target_too_long
       else `Method_too_long
     | _ -> `Header_too_large
 
-  let unfinished t bs ~off ~take more p =
-    save t bs p (off + take - p);
+  let pending t ~take more =
     t.fed <- t.fed + take;
     if t.fed < t.limit && more = Incomplete
     then take
@@ -783,6 +876,23 @@ module Reader = struct
          then too_large t
          else `Parse "unexpected end of input");
       take
+
+  let unfinished t bs ~off ~take more p =
+    save t bs p (off + take - p);
+    t.out.resume <- t.out.resume - p;
+    pending t ~take more
+
+  (* Parses the buffered line again, from the last point where its parse can
+     resume, so that a line split over many reads is parsed in linear time. *)
+  let reparse t =
+    let o = t.out in
+    match t.stage with
+    | Chunk_size when o.resume > 0 ->
+      let where = "chunk-size line" in
+      o.run <- 0;
+      let p = chunk_ext ~eof:false o t.buffer t.buffered o.resume where in
+      if p < 0 then p else end_line ~eof:false o t.buffer t.buffered p where
+    | _ -> line t t.buffer 0 t.buffered
 
   let parse_lines t bs ~off ~take more p =
     let q = lines t bs p (off + take) in
@@ -800,7 +910,7 @@ module Reader = struct
     else
       match t.stage with
       | Ended ->
-        ended t;
+        ended t ~line:(t.fed + q - off);
         q - off
       | _ -> unfinished t bs ~off ~take more q
 
@@ -813,7 +923,26 @@ module Reader = struct
     else
       let nl = Bigstring.memchr bs off '\n' take in
       if nl < 0
-      then unfinished t bs ~off ~take more off
+      then (
+        (* The buffered line is valid so far. Bytes that continue the run it
+           stopped in keep it so; other bytes are checked with the whole line,
+           so that a bad byte is found when it arrives. *)
+        let run = continue_run t.out.run bs off (off + take) in
+        save t bs off take;
+        let q =
+          if take = 0
+          then partial
+          else if run > 0
+          then (
+            t.out.run <- run;
+            partial)
+          else reparse t
+        in
+        if q <> partial
+        then (
+          failed t (`Parse t.out.error);
+          take)
+        else pending t ~take more)
       else (
         save t bs off (nl + 1 - off);
         if line t t.buffer 0 t.buffered < 0
@@ -841,6 +970,7 @@ module Reader = struct
     | Done ->
       t.state <- Head;
       t.stage <- Leading;
+      t.excess <- 0;
       section t bs ~off ~len more
     | Head
     | Body (_, (Chunk_line | Chunk_data _ | Chunk_crlf _ | Trailers | Fixed _))
@@ -906,6 +1036,18 @@ module Reader = struct
       t.state <- Cancelled_parse;
       t.buffer <- Bigstring.empty
     | Done | Head | Head_done | Body _ | Fail _ | Cancelled_parse -> ()
+
+  let body_remaining t body =
+    match t.state with
+    | Body (b, Fixed n) when b == body -> Some n
+    | Body (b, _) when b == body -> None
+    | Done | Head | Head_done | Body _ | Fail _ | Cancelled_parse -> Some 0L
+
+  let in_body t body =
+    match t.state with
+    | Body (b, _) -> b == body
+    | Fail _ -> (match t.failed_in with Some b -> b == body | None -> false)
+    | Done | Head | Head_done | Cancelled_parse -> false
 
   let next t =
     match t.state with

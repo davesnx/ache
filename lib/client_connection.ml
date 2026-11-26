@@ -50,6 +50,11 @@ type t =
   ; request_queue : Response_descriptor.t Queue.t
     (* invariant: If [request_queue] is not empty, then the head of the queue
        has already written the request headers to the wire. *)
+  ; mutable last_headers : Headers.t
+    (* The head of the last complete response that kept the connection open,
+       parsed for its Keep-Alive hint only when asked. *)
+  ; mutable reuse_parsed : bool
+  ; mutable reuse_timeout : float option
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
@@ -74,6 +79,9 @@ let create ?(config = Config.default) () =
       Reader.response ~max_header_size:config.max_header_size request_queue
   ; writer = Writer.create ()
   ; request_queue
+  ; last_headers = Headers.empty
+  ; reuse_parsed = true
+  ; reuse_timeout = None
   }
 
 let create_request_body ~request t =
@@ -81,11 +89,13 @@ let create_request_body ~request t =
   | `Fixed 0L -> Body.Writer.create_empty ~writer:t.writer
   | (`Fixed _ | `Chunked) as encoding ->
     Body.Writer.create
+      ~send_trailers:true
       (Bigstring.create t.config.request_body_buffer_size)
       ~encoding
       ~writer:t.writer
   | `Error `Bad_request ->
-    failwith "ache.Client_connection.request: invalid body length"
+    (* [Serialize.check_request] rejected this request before. *)
+    assert false
 
 let request
       t
@@ -143,18 +153,35 @@ let shutdown t =
   shutdown_reader t;
   shutdown_writer t
 
+exception Reading of Response_descriptor.t option
+
+(* The request whose response the reader is in. Bytes after a complete response
+   belong to the next request, or to none after a response that closes the
+   connection or with no request waiting: they are unsolicited. *)
+let reading t =
+  match
+    Queue.iter
+      (fun respd ->
+         match
+           ( respd.Response_descriptor.state
+           , Response_descriptor.input_state respd )
+         with
+         | Awaiting_response, _ | Received_response _, (Wait | Ready) ->
+           raise (Reading (Some respd))
+         | Received_response (_, body), Complete ->
+           (* The application may close a body that the reader still reads. *)
+           if Reader.in_body t.reader body
+           then raise (Reading (Some respd))
+           else if not (Response_descriptor.persistent_connection respd)
+           then raise (Reading None)
+         | (Uninitialized | Upgraded _ | Closed), _ -> ())
+      t.request_queue
+  with
+  | () -> None
+  | exception Reading respd -> respd
+
 let set_error_and_handle t error =
-  let reading respd =
-    match
-      respd.Response_descriptor.state, Response_descriptor.input_state respd
-    with
-    | Awaiting_response, _ -> true
-    | Received_response _, (Wait | Ready) -> true
-    | Received_response _, Complete ->
-      (match Reader.next t.reader with `Error _ | `Read -> true | _ -> false)
-    | (Uninitialized | Upgraded _ | Closed), _ -> false
-  in
-  (match List.find_opt reading (List.of_seq (Queue.to_seq t.request_queue)) with
+  (match reading t with
   | Some respd -> Response_descriptor.report_error respd error
   | None -> ());
   (* From RFC7230§6.5: * A client sending a message body SHOULD monitor the
@@ -177,38 +204,79 @@ let pipelinable respd =
   | #Method.standard as meth -> Method.is_idempotent meth
   | `Other _ -> false
 
+(* RFC 9112 §9.3.2: a request is written while an earlier response is pending
+   only when it and every request before it are idempotent and cannot switch
+   protocols, and fewer than [max_pipelined_requests] responses are pending. A
+   request that cannot be written stops the ones behind it. *)
 let maybe_pipeline_queued_requests t =
-  (* Don't bother trying to pipeline if there aren't multiple requests in the *
-     queue. *)
-  if Queue.length t.request_queue > 1
+  let limit = t.config.max_pipelined_requests in
+  if Queue.length t.request_queue > 1 && limit > 1
   then
     try
-      let _ =
+      let (_ : int * Response_descriptor.t option) =
         Queue.fold
-          (fun prev respd ->
+          (fun (pending, prev) respd ->
              (match prev with
              | None -> ()
              | Some prev ->
-               (match
-                  ( respd.Response_descriptor.state
-                  , Response_descriptor.output_state prev )
-                with
-               | Uninitialized, Complete when pipelinable prev ->
-                 Response_descriptor.write_request respd;
-                 Response_descriptor.flush_request_body respd
-               | _ ->
-                 (* bail early. If we can't pipeline this request, we can't
-                    write * next ones either. *)
-                 raise Local));
-             Some respd)
-          None
+               (match respd.Response_descriptor.state with
+               | Uninitialized ->
+                 if
+                   pending < limit
+                   && pipelinable prev
+                   && pipelinable respd
+                   &&
+                   match Response_descriptor.output_state prev with
+                   | Complete -> true
+                   | Wait | Ready -> false
+                 then (
+                   Response_descriptor.write_request respd;
+                   Response_descriptor.flush_request_body respd)
+                 else raise Local
+               | Awaiting_response | Received_response _ | Upgraded _ | Closed
+                 ->
+                 ()));
+             pending + 1, Some respd)
+          (0, None)
           t.request_queue
       in
       ()
     with
     | _ -> ()
 
+let max_keep_alive_timeout = 600
+let keep_alive_margin = 2.
+let is_digits s = s <> "" && String.for_all (fun c -> c >= '0' && c <= '9') s
+
+let keep_alive_timeout headers =
+  Headers.get_multi headers "keep-alive"
+  |> List.concat_map (String.split_on_char ',')
+  |> List.find_map (fun param ->
+    match String.index_opt param '=' with
+    | None -> None
+    | Some i ->
+      let name = String.trim (String.sub param 0 i)
+      and value =
+        String.trim (String.sub param (i + 1) (String.length param - i - 1))
+      in
+      if
+        String.lowercase_ascii name = "timeout"
+        && is_digits value
+        && String.length value <= 9
+      then Some (min (int_of_string value) max_keep_alive_timeout)
+      else None)
+
+let remember_response t respd =
+  t.last_headers <-
+    (match respd.Response_descriptor.state with
+    | Received_response (response, _)
+      when Response_descriptor.persistent_connection respd ->
+      response.Response.headers
+    | _ -> Headers.empty);
+  t.reuse_parsed <- false
+
 let advance_request_queue t =
+  remember_response t (Queue.peek t.request_queue);
   ignore (Queue.take t.request_queue);
   if not (Queue.is_empty t.request_queue)
   then
@@ -271,10 +339,23 @@ let next_read_operation t =
   | `Start -> `Read
   | (`Read | `Yield | `Close) as operation -> operation
 
+let rec has_response_byte bs i stop =
+  i < stop
+  &&
+  match Bigstring.unsafe_get bs i with
+  | '\r' | '\n' -> has_response_byte bs (i + 1) stop
+  | _ -> true
+
 let read_with_more t bs ~off ~len more =
+  let idle = not (is_active t) in
   let consumed = Reader.read_with_more t.reader bs ~off ~len more in
   if is_active t
-  then Response_descriptor.flush_response_body (current_respd_exn t);
+  then Response_descriptor.flush_response_body (current_respd_exn t)
+  else if idle && has_response_byte bs off (off + consumed)
+  then
+    (* A response that starts when no request waits for one is unsolicited, also
+       before its head is complete. *)
+    shutdown t;
   consumed
 
 let read t bs ~off ~len = read_with_more t bs ~off ~len Incomplete
@@ -329,3 +410,18 @@ let report_write_result t result =
   match result with
   | `Ok _ -> ()
   | `Closed -> Queue.iter Response_descriptor.flush_request_body t.request_queue
+
+let reuse_timeout t =
+  if is_active t
+  then None
+  else (
+    if not t.reuse_parsed
+    then (
+      t.reuse_parsed <- true;
+      t.reuse_timeout <-
+        Option.map
+          (fun seconds ->
+             Float.max 0. (float_of_int seconds -. keep_alive_margin))
+          (keep_alive_timeout t.last_headers);
+      t.last_headers <- Headers.empty);
+    t.reuse_timeout)

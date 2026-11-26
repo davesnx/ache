@@ -17,7 +17,8 @@ Status: experimental. The API can change before 1.0.
   response (see [Requests the server rejects](#requests-the-server-rejects)).
 - No dependencies: the core package `ache` needs only OCaml.
 - Runtimes for Eio, Lwt and Miou, each with TLS through ocaml-tls.
-- A WebSocket server (RFC 6455) for text messages, on every runtime (see
+- A WebSocket server (RFC 6455) for text and binary messages, on every
+  runtime (see
   [WebSocket](#websocket)).
 
 ## Packages
@@ -70,15 +71,15 @@ every other case the end of TCP without `close_notify` counts as the end of
 the input, as without TLS: a complete response with `Content-Length` or
 chunked framing is not an error, and a request that got no byte of its
 response gets `` `Connection_closed ``, so that the application can retry
-it. `Ache_eio` also accepts a `Tls_eio` flow directly,
+it when its method is idempotent. `Ache_eio` also accepts a `Tls_eio` flow directly,
 but `tls-eio` 2.1.5 does not tell `close_notify` from the end of TCP, so a
 client on such a flow reports a cut response as complete. A request body
 always has an explicit length, so a server reports a cut body without this
 check.
 
-Timeouts: when `?idle_timeout` or `?head_timeout` is set (with `?clock` for
-Eio), the TLS handshake must be complete within the smaller of them. Without
-either, the handshake has no time limit. A client that sends plain HTTP to a
+Timeouts: the TLS handshake must be complete within the smaller of
+`?idle_timeout` and `?head_timeout` (30 s by default). With both off, the
+handshake has no time limit. A client that sends plain HTTP to a
 TLS port gets no answer, because ocaml-tls waits for the rest of what it
 reads as a TLS record, so without a timeout the connection stays open until
 the client closes it.
@@ -89,27 +90,38 @@ the client closes it.
 
 The server calls the error handler, sends the error response with
 `connection: close`, and closes the connection. Requests that came before it
-on the same connection get their responses first.
+on the same connection get their responses first. For a 400 the error handler
+gets `` `Bad_request reason ``, a short text for logs such as
+`"unexpected ' ' in field line"` or `"invalid Content-Length"`. The default
+error handler does not send it.
 
 | Request | Response |
 |---|---|
 | A bare LF or a bare CR as a line end, obs-fold, a field name that is not a token, a CTL (for example NUL) in a field value | 400 |
 | A request line without a version | 400 |
-| An HTTP/1.1 request without `Host`, two `Host` fields, a `Host` value that is not `uri-host [":" port]` | 400 |
+| A target byte outside RFC 3986: `#`, a byte above 0x7F, a CTL, or one of `"` `<` `>` `{` `}` `\|` `^` `` ` `` `\` | 400 |
+| An absolute-form target with userinfo (`http://u:p@host/`) or an empty host (`http:///x`, `http://:80/`) | 400 |
+| An HTTP/1.1 request without `Host`, two `Host` fields, a `Host` value that is not `uri-host [":" port]`, a `Host` with an empty host (`:80`) | 400 |
 | A target form that does not fit the method: `*` with a method other than OPTIONS; without CONNECT, a target that is neither `/...` nor `scheme:...` (an authority such as `example.com:80` reads as a URI with scheme `example.com` and is accepted; `127.0.0.1:80` or `[::1]:80` is not) | 400 |
 | A CONNECT target that is not `host:port` with a port of 0 to 65535 | 400 |
 | A `Content-Length` that is not one repeated `1*DIGIT` value, such as `+3` or `3, 4` | 400 |
 | Both `Content-Length` and `Transfer-Encoding`; `Transfer-Encoding` in an HTTP/1.0 request; `chunked` that is not the final coding or is there twice | 400 |
+| A chunked body whose chunk lines and extensions exceed its data by more than 16 KiB: each chunk line counts its bytes, less 16 and twice the chunk size (Go's budget) | 400 |
 | A transfer coding other than `chunked`, as in `gzip, chunked` | 501 |
 | A method longer than `Config.max_header_size` | 501 |
 | A target that makes the request line longer than `max_header_size` | 414 |
 | A head longer than `max_header_size` (default 16 KiB) | 431 |
-| A head that is not complete when `?head_timeout` expires (off by default) | 408 |
+| A head that is not complete when `?head_timeout` expires (30 s by default) | 408 |
 | A major version other than 1 | 505 |
 
-ache accepts HTTP/1.x with x > 1 as HTTP/1.1, one empty line before the
-request line, chunk extensions (ignored) and trailer fields (discarded).
-httpun rejected chunk extensions and trailers.
+ache accepts HTTP/1.x with x > 1 as HTTP/1.1, any number of empty lines
+before the request line (they count against `max_header_size`, as part of
+the head), chunk extensions (ignored) and trailer fields (see
+[Trailers](#trailers)). httpun rejected chunk extensions and trailers.
+
+A `CONNECT` request has no body (RFC 9110 §9.3.6): the server ignores its
+`Content-Length` and `Transfer-Encoding` fields, as llhttp does, and does
+not check them. The bytes after the head belong to the tunnel.
 
 ### Responses
 
@@ -118,6 +130,12 @@ httpun rejected chunk extensions and trailers.
   persistent connection. Otherwise a streaming body ends when the connection
   closes.
 - A response to `HEAD`, and a 1xx, 204 or 304 response, has no body.
+- `Server_connection.create ~date` adds `Date: (date ())` after the other
+  fields of each response that is not 1xx and has no `Date` field, error
+  responses included (RFC 9110 §6.6.1). A `Date` set by the application is
+  kept. Without `~date` the core adds no `Date`. The servers of `ache-eio`,
+  `ache-lwt` and `ache-miou` pass the current time by default, formatted
+  once per second in each domain; `~date:false` turns it off.
 - Each final response after which the connection closes has
   `connection: close`. A response to an HTTP/1.0 request on a connection that
   stays open has `connection: keep-alive`.
@@ -131,13 +149,18 @@ httpun rejected chunk extensions and trailers.
   write past its `Content-Length`.
 - `Request_descriptor.respond_with_informational` sends `100 Continue`,
   `103 Early Hints` or another interim response before the final response.
+  With `Config.auto_continue` (default `false`), the first
+  `Body.Reader.schedule_read` on the body of an HTTP/1.1 request with
+  `Expect: 100-continue` sends `100 Continue`, unless a response has started
+  or a `100 Continue` was already sent. A handler that responds without
+  reading the body sends no `100 Continue`.
 - `Request_descriptor.respond_with_upgrade` on a `CONNECT` request sends a
   2xx (`200` unless `?status` says otherwise) and gives the connection to
-  the tunnel, with the bytes that came after the `CONNECT` head. A 2xx
-  response to `CONNECT` sent with another `respond_with_*` function is sent
-  as it is, then the connection closes; the bytes after the request are not
-  read. Another response to `CONNECT` lets the connection serve the next
-  request.
+  the tunnel, with the bytes that came after the `CONNECT` head, also when
+  the request has `Content-Length` or `Transfer-Encoding`. Any other
+  response to `CONNECT` closes the connection, and the bytes after the
+  request are not read: they may be tunnel data. A 2xx is sent as it is,
+  another status gets `connection: close`.
 - `Status` has the codes of the IANA registry that httpun did not have (102,
   103, 207, 208, 226, 308, 421, 422, 423, 424, 425, 451, 506, 507, 508).
   `` `Payload_too_large `` is now `` `Content_too_large ``, and 422 is
@@ -153,8 +176,102 @@ httpun rejected chunk extensions and trailers.
   many small chunks is delivered in linear time. ache does not reuse the
   bytes it gives to `on_read`.
 - When the response is complete, the server reads and drops the rest of a
-  request body that the application did not read. It waits for the rest of
-  the body at most `?idle_timeout` (see [Limits](#limits)).
+  request body that the application did not read or closed, within the
+  body timeout (see [Timeouts](#timeouts)), and reads at most
+  `Config.max_discard_body` (256 KiB) of it. A response sent while more
+  than that remains of a `Content-Length` body has `connection: close`; a
+  chunked body that passes the limit closes the connection after the
+  response. httpun read the whole body, so a 413 to a 10 GB upload read
+  10 GB.
+
+### Trailers
+
+A chunked body can end with trailer fields, such as the `grpc-status` of
+gRPC. On both sides:
+
+- `Body.Reader.trailers body` returns the received trailer fields. It is
+  `Headers.empty` until `on_eof` is called, so read it in `on_eof`.
+- `Body.Writer.close ~trailers body` sends trailer fields after the last
+  chunk. A server sends them only when the request has `TE: trailers`, and
+  drops them otherwise; a client always sends them. On a close-delimited
+  body, or a response with no body (`HEAD`, 204, 304), they are dropped.
+- Fields that frame, route or authenticate a message (`content-length`,
+  `transfer-encoding`, `host`, `trailer`, `te`, `connection`,
+  `authorization`, `content-type`, and the rest of Go's `badTrailer` list)
+  are dropped when received. `Body.Writer.close ~trailers` raises
+  `Invalid_argument` for them, for an invalid field, and on a body framed
+  by `Content-Length`. A `Trailer` field in the head is ignored.
+- The trailer section counts against `Config.max_header_size` on its own;
+  a larger one ends the body with `on_error`, and the server answers 431.
+
+<!-- example: examples/readme/trailers_example.ml -->
+```ocaml
+open Ache
+
+(* The server streams a gRPC response and sends its status in trailers. *)
+let request_handler reqd =
+  let body =
+    Request_descriptor.respond_with_streaming
+      reqd
+      (Response.create
+         ~headers:(Headers.of_list [ "content-type", "application/grpc" ])
+         `OK)
+  in
+  Body.Writer.write_string body "\000\000\000\000\002hi";
+  Body.Writer.close
+    ~trailers:(Headers.of_list [ "grpc-status", "0"; "grpc-message", "OK" ])
+    body
+
+(* The client reads grpc-status when the response body ends. *)
+let response_handler status _response body =
+  let rec read () =
+    Body.Reader.schedule_read
+      body
+      ~on_read:(fun _ ~off:_ ~len:_ -> read ())
+      ~on_error:ignore
+      ~on_eof:(fun () ->
+        status := Headers.get (Body.Reader.trailers body) "grpc-status")
+  in
+  read ()
+
+let () =
+  let request =
+    Request.create
+      ~headers:
+        (Headers.of_list
+           [ "host", "a"; "te", "trailers"; "content-length", "0" ])
+      `POST
+      "/helloworld.Greeter/SayHello"
+  in
+  let client = Client_connection.create () in
+  let status = ref None in
+  let _ : Body.Writer.t =
+    Client_connection.request
+      client
+      request
+      ~error_handler:ignore
+      ~response_handler:(response_handler status)
+  in
+  let output =
+    Testing.serve
+      request_handler
+      "POST /helloworld.Greeter/SayHello HTTP/1.1\r\n\
+       Host: a\r\n\
+       TE: trailers\r\n\
+       Content-Length: 0\r\n\
+       \r\n"
+  in
+  let len = String.length output in
+  let read =
+    Client_connection.read
+      client
+      (Bigstring.of_string output ~off:0 ~len)
+      ~off:0
+      ~len
+  in
+  assert (read = len);
+  assert (!status = Some "0")
+```
 
 ### Client
 
@@ -162,21 +279,53 @@ httpun rejected chunk extensions and trailers.
   byte of its response before the connection stopped reading. httpun called
   no handler for these requests, or gave them
   `` `Malformed_response "unexpected eof" ``.
-- A request is pipelined only behind requests with an idempotent method. It
-  waits behind other requests, and behind `CONNECT` and `Upgrade` requests,
-  until their responses are complete.
+- `Config.max_pipelined_requests` (default 1) limits the requests that wait
+  for a response on one connection: by default a request is written after
+  the previous response is complete. httpun pipelined without a limit. A
+  request with a non-idempotent method, or a `CONNECT` or `Upgrade` request,
+  is never written while another response is pending, and the requests
+  behind it wait too. A request that gets `` `Connection_closed `` may have
+  reached the server: retry it only when its method is idempotent.
+- A 204 or 304 response (not to `HEAD`) with `Transfer-Encoding` or a
+  `Content-Length` other than 0 has no body and closes the connection after
+  it.
+- Response bytes that arrive when no request waits for a response close the
+  connection, also before their head is complete. On an idle connection,
+  `Client.request` first looks, without blocking, for such bytes that a read
+  returned and the connection has not handled yet, or that wait on the
+  socket, and for the end of input; if there are some, the connection closes
+  and the request gets `` `Connection_closed `` instead of them as its
+  response (undici GHSA-35p6-xmwp-9g52). `Ache_eio.Client.request` yields
+  twice first, so that a read that io_uring completed returns. The socket is
+  looked at by `ache-lwt` and `ache-miou`, and by `ache-eio` on a
+  non-blocking descriptor (`eio_posix`). The TLS clients of
+  `ache-lwt-tls`, `ache-eio-tls` and `ache-miou-tls` read the TLS records
+  that wait on the socket, without blocking, and decrypt them: application
+  data other than empty lines, a `close_notify` or the end of TCP closes
+  the connection; a session ticket or a key update does not, and decrypted
+  bytes are kept for the next read. On a blocking descriptor (Lwt) or with
+  io_uring (Eio) they look only at the records that reads returned.
 - Interim 1xx responses other than 101 are dropped. After a 101, or a 2xx
   response to `CONNECT`, the client stops reading HTTP and `upgrade` gives
   the bytes after the head to the new protocol.
 - An obs-fold in a response field value becomes one space. Empty lines
-  before a response are ignored.
+  before a response are ignored. A status-line with CRLF right after the
+  status code (`HTTP/1.1 301\r\n`) has an empty reason phrase.
+- A response whose `Transfer-Encoding` lists no coding gives
+  `` `Malformed_response ``.
+- A chunked response body over the chunk overhead budget of the server
+  table above gives `` `Malformed_response ``.
 - `Client_connection.request` raises `Invalid_argument` for a method or field
-  name that is not a token, a CR, LF or NUL in a field value, and a CR, LF,
-  NUL or space in the target. Later requests are still sent.
+  name that is not a token, a CR, LF or NUL in a field value, a CR, LF,
+  NUL or space in the target, two `Host` fields, both `Content-Length` and
+  `Transfer-Encoding`, an invalid `Content-Length`, and a
+  `Transfer-Encoding` whose last coding is not `chunked`. Later requests are
+  still sent.
 
 ## WebSocket
 
-`Ache.Websocket` is a WebSocket server (RFC 6455) for text messages. It runs
+`Ache.Websocket` is a WebSocket server (RFC 6455) for text and binary
+messages. It runs
 after a `101 Switching Protocols` response on the same connection, so it
 works on Eio, Lwt and Miou, with or without TLS, and needs no runtime code.
 `ache-lwt` adds a promise API on top of it (see
@@ -191,13 +340,15 @@ handshake (RFC 6455 §4.2.1):
 - a `websocket` token in `Upgrade` and an `upgrade` token in `Connection`,
   compared without case;
 - one `Sec-WebSocket-Version` field with the value `13`;
-- one `Sec-WebSocket-Key` field with the base64 encoding of 16 bytes.
+- one `Sec-WebSocket-Key` field with the canonical base64 encoding of 16
+  bytes (its padding bits are zero, RFC 4648 §3.5).
 
 When the handshake is valid, `upgrade` calls your function with the new
 connection, responds with `101`, `Upgrade: websocket`, `Connection: Upgrade`
 and `Sec-WebSocket-Accept`, and returns `Ok ()`. Your function returns the
-two callbacks: `on_message` gets each whole text message, and `on_close` is
-called once when the connection ends. When the handshake is not valid,
+three callbacks: `on_message` gets each whole message, `Text s` or
+`Binary s`; `on_pong` gets the payload of each pong; and `on_close` is called
+once when the connection ends. When the handshake is not valid,
 `upgrade` responds nothing and returns the error, so that you send the
 response. `Websocket.check_handshake` does the same check without the
 upgrade.
@@ -222,11 +373,12 @@ let request_handler _client_address reqd =
   let result =
     Websocket.upgrade reqd (fun ws ->
       { on_message =
-          (fun message ->
-            if message = "bye"
-            then Websocket.close ws ~code:1000
-            else Websocket.send_text ws message)
-      ; on_close = (fun _code -> ())
+          (function
+            | Text "bye" -> Websocket.close ~reason:"bye" ws ~code:1000
+            | Text message -> Websocket.send_text ws message
+            | Binary message -> Websocket.send_binary ws message)
+      ; on_pong = ignore
+      ; on_close = (fun _close -> ())
       })
   in
   match result with
@@ -234,15 +386,51 @@ let request_handler _client_address reqd =
   | Error `Unsupported_version ->
     respond_empty
       reqd
-      ~headers:[ "sec-websocket-version", "13" ]
+      ~headers:
+        [ "sec-websocket-version", "13"
+        ; "upgrade", "websocket"
+        ; "connection", "upgrade"
+        ]
       `Upgrade_required
   | Error (`Not_get | `Not_websocket | `Invalid_key) ->
     respond_empty reqd `Bad_request
 ```
 
-`send_text` queues one text frame. The connection writes it after the `101`,
-also when you call it from your function before the `101` is written.
-`send_text` does not check that the message is valid UTF-8. To know when the
+### Choose a subprotocol
+
+A client can offer subprotocols in `Sec-WebSocket-Protocol`, for example
+`new WebSocket(url, ["chat"])` in a browser. ache has none of its own: read
+the offered ones with `Websocket.requested_protocols request` (the members of
+all `Sec-WebSocket-Protocol` fields, in order), choose one, and answer it with
+`?headers` of `upgrade`. `upgrade` adds `headers` to the `101` after its own
+fields. A browser that offers protocols fails the connection when the `101`
+names none of them, so answer only when you support one, and reject the
+request otherwise if your service needs a subprotocol.
+
+```ocaml
+open Ache
+
+let upgrade_chat reqd make_handler =
+  let request = Request_descriptor.request reqd in
+  let headers =
+    if List.mem "chat" (Websocket.requested_protocols request)
+    then Headers.of_list [ "sec-websocket-protocol", "chat" ]
+    else Headers.empty
+  in
+  Websocket.upgrade ~headers reqd make_handler
+```
+
+`headers` cannot set `Upgrade`, `Connection` or `Sec-WebSocket-Accept`, in
+any case: `upgrade` owns them and raises `Invalid_argument`, as it does for
+an invalid field. It raises before it checks the handshake and writes
+nothing.
+
+### Send messages
+
+`send_text` queues one text frame, and `send_binary` one binary frame. The
+connection writes them after the `101`, also when you call them from your
+function before the `101` is written. `send_text` does not check that the
+message is valid UTF-8. To know when the
 frames are written, call `Websocket.flush` with a callback: it gets
 `` `Written `` when all frames queued before it are written, or `` `Closed ``
 when the connection closed first.
@@ -252,18 +440,27 @@ when the connection closed first.
 - It answers a ping with a pong that has the same payload.
 - It gives a fragmented message to `on_message` in one piece.
 - When the client sends a close frame, it sends a close frame with the same
-  code, then closes the connection. `on_close` gets the client's code, or
-  `Some 1005` for a close frame without a code.
-- `Websocket.close ws ~code` sends a close frame, stops reading, and closes
-  the connection when the frame is written. It does not wait for the
-  client's close frame.
+  code, then closes the connection. `on_close` gets the client's code and
+  reason, or `Some { code = 1005; reason = "" }` for a close frame without a
+  code.
+- `Websocket.close ?reason ws ~code` sends a close frame and waits for the
+  client's: it keeps reading, drops the messages that arrive meanwhile, and
+  closes the connection at the client's close frame or the end of input.
+  `on_close` gets the client's code and reason. Paused reading starts again,
+  so the client's close frame is seen. The runtimes wait at most
+  `close_timeout` (10 s by default) for it, then close the connection and
+  `on_close` gets `None`. The reason must be valid UTF-8 and at most 123
+  bytes.
+- `Websocket.ping ws payload` sends a ping; the client's pong reaches
+  `on_pong`. To find a client that is gone, ping it on a timer and close the
+  connection when no pong comes in time. A client that is gone does not
+  answer the close frame either: the close timeout ends the connection.
 - It closes the connection with a code when the client breaks the protocol.
   `on_close` then gets `None`:
 
 | Code | Cause |
 |---|---|
-| 1002 | An unmasked frame, an unknown opcode, a reserved bit, a control frame that is fragmented or longer than 125 bytes, a continuation frame without a message, a new message inside a fragmented one, a length with the high bit set, or a close frame with a 1-byte payload or an invalid code |
-| 1003 | A binary frame |
+| 1002 | An unmasked frame, an unknown opcode, a reserved bit, a control frame that is fragmented or longer than 125 bytes, a continuation frame without a message, a new message inside a fragmented one, a length with the high bit set or not in its shortest form, or a close frame with a 1-byte payload or an invalid code |
 | 1007 | A text message or close reason that is not valid UTF-8 |
 | 1009 | A message longer than `max_message_size` |
 
@@ -271,6 +468,10 @@ when the connection closed first.
 fragments together. The default is `Websocket.default_max_message_size`,
 1 MiB. The connection checks the length in the frame header, before it reads
 the payload. Control frames do not count.
+
+Text is checked as UTF-8 while it arrives, across fragments: the first byte
+that cannot be valid UTF-8 closes the connection with 1007, without reading
+the rest of the message. Binary messages are not checked.
 
 ### Backpressure
 
@@ -397,22 +598,76 @@ The core decides which limit applies to the next read
 
 - the head timeout, while a request head is only partly received;
 - the idle timeout, on a keep-alive connection that waits for its next
-  request;
-- the idle timeout, once the response is complete and the rest of the
-  request body has not arrived;
-- none, while a request is in progress and its response is not complete,
-  for example while a body arrives for a handler that has not answered.
+  request, and on a WebSocket connection that reads frames;
+- the close timeout, on a WebSocket connection that sent its close frame
+  and waits for the client's. It is a deadline: the messages that still
+  arrive do not restart it;
+- the body timeout, while the connection waits for request body bytes: the
+  application has scheduled a read on the body, or the response is complete
+  and the rest of the body has not arrived;
+- none, while no read waits for the peer, for example while the handler
+  runs and has not asked for the body, or after an upgrade to a protocol
+  other than WebSocket.
 
-The runtime owns the clock and starts the timer. When the timer fires first,
-the core sends `408`, or closes the connection (a request body that has not
-ended gets `on_error`). Without `?idle_timeout` and `?head_timeout` (and, in
-`ache-eio`, without `?clock`), no timer is used, and the runtime does not
-wait for the rest of a body after its response: it closes the connection
-at once.
+The runtime owns the clock and starts the timer, and asks again before each
+read. When the timer fires first, it calls the action that the core gave
+for the state at that time: `408` for a head; for a body, `on_error` and
+then `408` if no response has started, or a close; a close for an idle
+connection, with close code 1001 on a WebSocket; for a WebSocket close, a
+close without the client's answer.
 
-A read can start before the response is complete, and the response can
-complete while the read waits. Each time the write loop waits or ends, it
-tells the read loop, which then asks the core for the limit again.
+The runtimes count the body and write limits as progress, after warp and
+Cowboy: the body clock runs only while the connection waits for body bytes,
+the write clock only while a write waits, and each starts again from zero
+after 2048 bytes. A peer that trickles one byte at a time cannot keep a
+connection open, and a handler that is slow to answer is never timed out.
+A write that makes no progress closes the connection; the core sees it as
+a failed write (`` `Closed ``).
+
+All five timeouts are on by default in every runtime: head 30 s, idle,
+body and write 60 s, close 10 s. Passing `None` turns one off.
+
+### Keep-Alive
+
+A client cannot see when a server closes an idle connection. If it sends a
+request just as the server closes, the request is lost, and it cannot
+always be retried. ache announces the limit and keeps a margin on both
+sides (Node's `keepAliveTimeoutBuffer`, undici's reading of the hint):
+
+- The server: with an idle timeout of 1 s or more, every response after
+  which the connection stays open gets `Keep-Alive: timeout=n`, `n` being
+  the idle timeout rounded down (`Server_connection.create
+  ?keep_alive_timeout`), with `, max=m` when
+  `Config.max_requests_per_connection` is set. A response that closes the
+  connection, a 1xx, a tunnel, or a response whose handler set
+  `Keep-Alive` itself gets none. The runtimes then wait 1 s longer than
+  they announced before they close an idle connection. With the idle
+  timeout off there is no hint.
+- The client: after a response with `Keep-Alive: timeout=n` that keeps the
+  connection open, `Client_connection.reuse_timeout` gives `n - 2` seconds
+  (`n` at most 600). The runtimes count from the end of the response and,
+  when that time has passed with no request started, close the
+  connection; a request after it gets `` `Connection_closed `` and nothing
+  is written. Without the hint a connection is reused as before.
+
+### Graceful stop
+
+`Server_connection.drain` makes the request in progress the last one on a
+connection. An idle connection closes at once: the core shuts down, and the
+runtime ends a read that waits for the next request, as when the idle
+timeout fires. A connection with a request in progress, or with a head
+partly read, serves that request and reads no other; its response gets
+`Connection: close` if its head is not written yet, and requests pipelined
+after it are not served. A WebSocket connection sends a close frame with
+code 1001. `drain` is not thread-safe: call it where the connection runs.
+
+The runtimes call `drain` for you. Their servers take a `stop` signal and a
+`grace` period in seconds: when `stop` resolves, `Server.run` (Eio, Miou)
+stops accepting, every connection drains, and what is left closes `grace`
+seconds later. With Lwt the caller stops its accept loop. See
+[ache-eio](ache-eio.md#graceful-stop),
+[ache-lwt](ache-lwt.md#graceful-stop) and
+[ache-miou](ache-miou.md#graceful-stop).
 
 ### Where the time of a request goes
 
@@ -441,28 +696,87 @@ runtimes.
 
 - HTTP/1.0 and HTTP/1.1 only. There is no HTTP/2 or HTTP/3.
 - TLS is ocaml-tls only (see [TLS](#tls)): there is no OpenSSL runtime.
-- Trailer fields are read and discarded. The API does not give them to the
-  application.
-- Server timeouts are off by default. `?idle_timeout` closes a connection
-  that waits for a request, or for the rest of a request body after its
-  response. `?head_timeout` answers 408 to a request head that is not
-  complete in time. A request body is not timed out before its response is
-  complete, and a response in progress is never timed out.
-- After the response, the server waits for the rest of the request body at
-  most `?idle_timeout`. Without `?idle_timeout` it does not wait: the body
-  gets `on_error` and the connection closes. This applies to a response that
-  closes the connection and to a keep-alive response, such as a 413, sent
-  before the body was read.
+- Trailer fields named in Go's `badTrailer` list are dropped on receipt
+  and refused on send. The server sends trailer fields only to a request
+  with `TE: trailers` (see [Trailers](#trailers)).
+- Server timeouts are on by default (see [Timeouts](#timeouts)): 30 s for a
+  request head, 60 s for an idle connection, and 60 s without progress for
+  a request body or a write. `None` turns one off. With
+  `~body_timeout:None` the server waits without a time limit for the rest
+  of an unread request body (at most `Config.max_discard_body` of it); with
+  `~write_timeout:None` a client that stops reading keeps the connection
+  open.
+- After the response, the server reads the rest of the request body
+  within the body timeout, to find the next request. This applies to a
+  response that closes the connection and to a keep-alive response, such
+  as a 413, sent before the body was read.
+- After the response, the server reads at most `Config.max_discard_body`
+  (256 KiB) of a request body the application did not read or closed, then
+  closes the connection.
 - Once its write side has closed, the server reads and dispatches no new
-  request; the request in progress still gets its body, within the limit
+  request; the request in progress still gets its body, within the limits
   above.
 - While more than `Config.max_pending_output` bytes of responses wait to be
   written, the server reads no new request.
-- WebSocket: server only, text messages only. There are no extensions, no
-  subprotocols and no binary messages. ache has no timeout on an upgraded
-  connection: a client that stops reading, or never answers a close frame,
-  keeps the connection open until you close the socket.
+- WebSocket: server only. There are no extensions. The application chooses
+  a subprotocol and answers it with `?headers` of `upgrade`. A WebSocket
+  connection that receives nothing for the idle timeout is closed with
+  code 1001, one whose writes make no progress for the write timeout is
+  closed, and one whose client does not answer the server's close frame
+  within the close timeout is closed.
 - The API is not stable before 1.0.
+
+## Test a handler
+
+`Ache.Testing` runs a request handler without sockets and without a
+runtime, so a unit test can call it directly:
+
+- `Testing.serve handler input` gives the bytes `input` to a server
+  connection, then the end of input, and returns every byte the connection
+  writes. `input` can hold several pipelined requests.
+- `Testing.serve_request ?body handler request` writes `request` and `body`
+  as a client does (it adds `Content-Length` when the request has no framing
+  field), and returns the final response and its decoded body: a chunked
+  body is decoded, and `1xx` responses are dropped. It raises `Failure` when
+  no complete response comes.
+
+An exception that the handler raises gets the error handler's response,
+`500` by default, as with a runtime.
+
+<!-- example: examples/readme/testing_example.ml -->
+```ocaml
+open Ache
+
+let request_handler reqd =
+  let request = Request_descriptor.request reqd in
+  Request_descriptor.respond_with_string
+    reqd
+    (Response.create `OK)
+    ("Hello, " ^ request.target)
+
+let () =
+  let output =
+    Testing.serve request_handler "GET /a HTTP/1.1\r\nHost: a\r\n\r\n"
+  in
+  assert (output = "HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\nHello, /a");
+  let response, body =
+    Testing.serve_request
+      request_handler
+      (Request.create ~headers:(Headers.of_list [ "host", "a" ]) `GET "/b")
+  in
+  assert (response.status = `OK);
+  assert (body = "Hello, /b")
+```
+
+`serve` and `serve_request` return when the input is used up. They see
+only what the handler does before that: a response that the handler gives
+later, for example when a promise resolves, is not in their result. For
+such a handler, drive the connection step by step: `Testing.create`, then
+`Testing.feed t bytes`, run your scheduler until the handler has responded,
+then `Testing.output t` returns the bytes written since the last call.
+`Testing.feed_eof t` ends the input, and `Testing.is_closed t` tells when
+the connection has closed. The handler itself must return without
+blocking, as with every runtime.
 
 ## Testing
 
@@ -489,8 +803,8 @@ it is out of scope:
 
 | RFC | Requirements | Tested | Out of scope |
 |---|---|---|---|
-| 9110 | 445 | 93 | 352 |
-| 9112 | 173 | 115 | 58 |
+| 9110 | 445 | 101 | 344 |
+| 9112 | 174 | 117 | 57 |
 
 No test is marked as a known failure (`lib/test/rfc/KNOWN_FAILURES*.md`). The
 README check makes sure that the code in the three runtime pages is the same
@@ -500,6 +814,72 @@ as the compiled examples.
 requests against Eio, Lwt and Miou echo servers. On 2026-11-16, h1spec at
 `f0a5650` (under Node 22 with `conformance/deno_shim.mjs`) passed 33 of 33
 checks on all three servers.
+
+`conformance/autobahn.sh` runs the
+[Autobahn test suite](https://github.com/crossbario/autobahn-testsuite)
+(fuzzingclient, Docker image pinned by digest, `--network host`, so Linux
+only) against the WebSocket echo of `conformance/ws_echo.ml` with a
+`max_message_size` of 16 MiB. It skips cases 12 and 13, which test
+permessage-deflate: ache negotiates no extension. Run it from an opam
+environment with Docker and Node:
+
+```sh
+RUNTIME=lwt sh conformance/autobahn.sh   # RUNTIME=eio (default), lwt or miou
+```
+
+The report goes to `_build/autobahn/<runtime>/index.html`. The script fails
+when a case does worse than `conformance/autobahn-expected.txt` allows. On
+2026-11-25 all three servers passed 298 of the 301 cases, and 3 were
+informational (7.1.6, 7.13.1, 7.13.2), which Autobahn does not grade.
+
+`conformance/wpt.sh` runs `conformance/wpt/ache.any.js` in a browser with
+[web-platform-tests](https://github.com/web-platform-tests/wpt). It is not
+run in CI. The test uses `fetch` for a GET with a JSON body, a UTF-8 POST
+body, HEAD, a redirect, a simple and a preflighted CORS request and 20
+concurrent requests, and a browser `WebSocket` for a text and a binary echo
+and a close that the server starts. The script copies the test into the WPT
+checkout, starts the server on `ACHE_PORT` (default 8090), runs `wpt run`,
+then stops the server and removes the copy. With `WPT_BROWSER=chromium`, the
+default, it runs the Chromium on `PATH` as wpt's `chrome` product, which
+needs no WPT hosts in `/etc/hosts`; give it a ChromeDriver of the same major
+version:
+
+```sh
+git clone --depth 1 https://github.com/web-platform-tests/wpt /tmp/wpt
+WPT_ROOT=/tmp/wpt RUNTIME=eio sh conformance/wpt.sh \
+  --webdriver-binary /path/to/chromedriver --headless
+```
+
+Other arguments go to `wpt run`. On 2026-11-25, with Chromium 156, the 10
+subtests passed on the three servers.
+
+`lib/test/llhttp` runs the request and response cases of the
+[llhttp](https://github.com/nodejs/llhttp) test corpus (`5aa5ac1`, MIT)
+through `Server_connection` and `Client_connection`, at every split of the
+input, and compares accept or reject, complete messages and body bytes with
+llhttp's log. An HTTP/1.1 request without `Host` gets `Host: a`; a
+`*-lenient-*` case must be rejected; pause and finish cases are not run. On
+2026-11-25, 162 of 192 strict and 35 of 40 lenient cases agreed.
+`lib/test/llhttp/expected-differences.txt` gives each difference its reason,
+and the test fails on a difference not listed there.
+
+`lib/test/fuzz` generates inputs with
+[QCheck](https://github.com/c-cube/qcheck): requests, responses, chunked
+bodies and WebSocket frames, from the grammar corpus, the oracle inputs and
+mutations of both. It checks properties, not fixed outputs: a server or
+client connection gives the same handler calls, body bytes, errors and output
+for every split of its input, and raises nothing; what ache writes, with
+partial writes, ache reads back the same; the chunk-size, Content-Length,
+field value and trailer parsers agree with their grammar; a WebSocket text
+message is delivered when it is valid UTF-8. `dune test` runs a fixed seed in
+about 2 seconds. For a longer run:
+
+```sh
+ACHE_FUZZ_SEED=7 ACHE_FUZZ_SCALE=10 dune exec lib/test/fuzz/fuzz.exe
+```
+
+`lib/test/fuzz/known_bugs.ml` lists the bugs it found that are not fixed
+(none now), and runs the minimal input of each fixed one.
 
 ## License
 

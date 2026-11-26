@@ -75,11 +75,113 @@ module Deadline = struct
   let stop t = Option.iter Miou.cancel t.timer
 end
 
+let sleep_until at =
+  let rec loop () =
+    let left = at -. Unix.gettimeofday () in
+    if left > 0.
+    then (
+      Miou_unix.sleep (Float.min Deadline.longest_sleep left);
+      loop ())
+  in
+  loop ()
+
+(* [await_stop stop] returns when [stop] is resolved, returned or cancelled.
+   When the calling task is cancelled first, it raises [Miou.Cancelled]. *)
+let await_stop stop =
+  match Miou.Computation.await stop with
+  | Error (exn, bt) when Miou.Computation.is_running stop ->
+    Printexc.raise_with_backtrace exn bt
+  | Ok () | Error _ -> ()
+
+module Sessions = struct
+  type t =
+    { mutable pending : (unit -> unit) list
+    ; mutable running : unit Miou.t list
+    ; mutable live : int
+    ; mutable aborted : bool
+    ; added : Signal.t
+    }
+
+  let create () =
+    { pending = []
+    ; running = []
+    ; live = 0
+    ; aborted = false
+    ; added = Signal.create ()
+    }
+
+  type _ Effect.t += Current : t Effect.t
+
+  (* [with_current t] runs request handlers with [t] as their sessions. The
+     handler record is made once for each connection, not for each request. *)
+  let with_current (t : t) : (unit -> unit) -> unit =
+    let effc : type a.
+      a Effect.t -> ((a, unit) Effect.Deep.continuation -> unit) option
+      = function
+      | Current -> Some (fun k -> Effect.Deep.continue k t)
+      | _ -> None
+    in
+    let handler = { Effect.Deep.retc = Fun.id; exnc = raise; effc } in
+    fun f -> Effect.Deep.match_with f () handler
+
+  let current () =
+    match Effect.perform Current with
+    | t -> Some t
+    | exception Effect.Unhandled _ -> None
+
+  let add t session =
+    t.pending <- session :: t.pending;
+    Signal.wake t.added
+
+  let start t ~on_exn =
+    List.iter
+      (fun session ->
+         t.live <- t.live + 1;
+         t.running <-
+           Miou.async (fun () ->
+             Fun.protect
+               ~finally:(fun () ->
+                 t.live <- t.live - 1;
+                 Signal.wake t.added)
+               (fun () ->
+                  match session () with
+                  | () -> ()
+                  | exception (Miou.Cancelled as exn) -> raise exn
+                  | exception exn -> on_exn exn (Printexc.get_raw_backtrace ())))
+           :: t.running)
+      (List.rev t.pending);
+    t.pending <- []
+
+  let rec serve t ~stopped ~on_exn =
+    Signal.wait_until t.added (fun () ->
+      t.pending <> [] || not (Miou.Computation.is_running stopped));
+    start t ~on_exn;
+    if Miou.Computation.is_running stopped
+    then serve t ~stopped ~on_exn
+    else await_or_raise stopped
+
+  let finish t ~on_exn ~shutdown =
+    start t ~on_exn;
+    if t.running <> []
+    then (
+      shutdown ();
+      Signal.wait_until t.added (fun () -> t.live = 0 || t.aborted);
+      if t.aborted then List.iter Miou.cancel t.running;
+      let (_ : (unit, exn) result list) = Miou.await_all t.running in
+      t.running <- [])
+end
+
 module type IO = Ache_miou_intf.IO
 module type Server = Ache_miou_intf.Server
 module type Client = Ache_miou_intf.Client
 
-module Make (Io : IO) = struct
+module Make_with_idle_check
+    (Io : IO)
+    (Idle : sig
+       (* Response bytes or the end of input wait on the socket. *)
+       val input_waiting : Io.socket -> bool
+     end) =
+struct
   module IO_loop = struct
     let writev = Io.writev
 
@@ -95,24 +197,32 @@ module Make (Io : IO) = struct
 
     let shutdown = Io.shutdown
 
-    type body_read =
-      { stop : unit -> (unit -> unit) option
-      ; wait : float
-      ; linger : float
-      }
+    (* The body and write clocks restart after this many bytes, so that a
+       trickle of bytes cannot keep a connection alive. *)
+    let progress_bytes = 2048
 
-    let no_body_read = { stop = (fun () -> None); wait = 0.; linger = 0. }
+    type graceful =
+      { stop : unit Miou.Computation.t
+      ; grace : float option
+      ; drain : unit -> unit
+      }
 
     let start : type t.
       (module Ache.Runtime.ENGINE with type t = t)
       -> read_buffer_size:int
       -> read_closed:Read_closed.t
-      -> interruptible:bool
+      -> interruptible:(unit -> bool)
+      -> ?retimed:bool ref
       -> timeout:
            ([ `Read | `Linger ]
-            -> ([ `Idle | `Head ] * float * (unit -> unit)) option)
-      -> linger:bool
-      -> ?body_read:body_read
+            -> ([ `Idle | `Head | `Body of float -> int -> unit | `Close ]
+               * float
+               * (unit -> unit))
+                 option)
+      -> linger:(unit -> bool)
+      -> ?write_timeout:float
+      -> ?sessions:Sessions.t
+      -> ?graceful:graceful
       -> stopped:[ `Done | `Abort ] Miou.Computation.t
       -> t
       -> Io.socket
@@ -122,9 +232,12 @@ module Make (Io : IO) = struct
        ~read_buffer_size
        ~read_closed
        ~interruptible
+       ?(retimed = ref false)
        ~timeout
        ~linger:lingers
-       ?(body_read = no_body_read)
+       ?write_timeout
+       ?sessions
+       ?graceful
        ~stopped
        t
        socket ->
@@ -152,9 +265,13 @@ module Make (Io : IO) = struct
         | false, true -> shutdown socket SHUTDOWN_SEND
         | false, false -> ()
       in
-      let abort () =
-        ignore (Miou.Computation.try_return stopped `Abort : bool)
+      let complete outcome =
+        ignore (Miou.Computation.try_return stopped outcome : bool);
+        Option.iter
+          (fun sessions -> Signal.wake sessions.Sessions.added)
+          sessions
       in
+      let abort () = complete `Abort in
       let report_exn exn =
         match Runtime.report_exn t exn with
         | () -> true
@@ -179,76 +296,8 @@ module Make (Io : IO) = struct
       in
       let read_buffer = Buffer.create read_buffer_size in
       let idle_deadline = Deadline.create ()
-      and head_deadline = Deadline.create () in
-      let direct_reads = ref 0
-      and direct_pending = ref false
-      and stop_armed = ref 0
-      and stop_at = ref None
-      and stop_failure = ref None
-      and body_stop = Signal.create () in
-      let live read = !direct_pending && !direct_reads = read in
-      let stop read = function
-        | `Linger ->
-          shutdown_once SHUTDOWN_RECEIVE;
-          None
-        | `Body ->
-          (match body_read.stop () with
-          | None -> None
-          | Some on_timeout ->
-            (match on_timeout () with
-            | () when lingers ->
-              Some (read, Unix.gettimeofday () +. body_read.linger, `Linger)
-            | () ->
-              shutdown_once SHUTDOWN_RECEIVE;
-              None
-            | exception (Miou.Cancelled as exn) -> raise exn
-            | exception exn ->
-              stop_failure := Some exn;
-              shutdown_once SHUTDOWN_RECEIVE;
-              None))
-      in
-      let stopper =
-        if lingers
-        then
-          Some
-            (Miou.async (fun () ->
-               let rec loop () =
-                 Signal.wait_until body_stop (fun () -> Option.is_some !stop_at);
-                 (match !stop_at with
-                 | Some (read, _, _) when not (live read) -> stop_at := None
-                 | Some (read, at, stage) ->
-                   let left = at -. Unix.gettimeofday () in
-                   if left > 0.
-                   then Miou_unix.sleep (Float.min Deadline.longest_sleep left)
-                   else stop_at := stop read stage
-                 | None -> ());
-                 loop ()
-               in
-               loop ()))
-        else None
-      in
-      let stop_body_read () =
-        if
-          !direct_pending
-          && !stop_armed <> !direct_reads
-          && Option.is_some (body_read.stop ())
-        then (
-          let read = !direct_reads in
-          stop_armed := read;
-          match stopper with
-          | Some _ ->
-            stop_at := Some (read, Unix.gettimeofday () +. body_read.wait, `Body);
-            Signal.wake body_stop
-          | None -> ignore (stop read `Body : _ option))
-      in
-      let direct_read_ended () =
-        direct_pending := false;
-        match !stop_failure with
-        | None -> ()
-        | Some exn ->
-          stop_failure := None;
-          raise exn
-      in
+      and head_deadline = Deadline.create ()
+      and close_deadline = Deadline.create () in
       let pending_read = ref false
       and read_requested = ref false
       and read_result = ref None
@@ -273,57 +322,82 @@ module Make (Io : IO) = struct
                  in
                  loop ()))
       in
-      let timed_read limit =
-        if (not interruptible) && Option.is_none limit && not !pending_read
-        then (
-          incr direct_reads;
-          direct_pending := true;
-          match read socket read_buffer with
-          | n ->
-            direct_read_ended ();
-            Ok n
-          | exception exn ->
-            direct_read_ended ();
-            raise exn)
-        else (
-          if Option.is_none !read_result
-          then (
-            if read_closed.closed then raise End_of_file;
-            if not !pending_read
-            then (
-              pending_read := true;
-              read_requested := true;
-              start_reader ();
-              Signal.wake request_read);
+      (* [timed_read get_limit] reads with the limit that [get_limit] gives.
+         When [retimed] is set while the read waits, the limit may have changed
+         (a WebSocket started its closing handshake): the wait asks again. *)
+      let timed_read get_limit =
+        let limit = get_limit () in
+        retimed := false;
+        if (not (interruptible ())) && Option.is_none limit && not !pending_read
+        then Ok (read socket read_buffer)
+        else
+          let started = Unix.gettimeofday () in
+          let waited limit n =
+            match limit with
+            | Some (`Body progress, _, _) ->
+              progress (Unix.gettimeofday () -. started) n
+            | Some ((`Idle | `Head | `Close), _, _) | None -> ()
+          in
+          let rec wait limit =
             let deadline =
-              Option.bind limit (fun (kind, at, _) ->
-                let deadline =
-                  match kind with
-                  | `Idle -> Some idle_deadline
-                  | `Head -> Some head_deadline
-                in
-                Option.iter
-                  (fun deadline ->
-                     Deadline.set deadline at ~expired:read_closed.ready)
-                  deadline;
-                deadline)
+              Option.map
+                (fun (kind, at, _) ->
+                   let deadline =
+                     match kind with
+                     | `Idle | `Body _ -> idle_deadline
+                     | `Head -> head_deadline
+                     | `Close -> close_deadline
+                   in
+                   Deadline.set deadline at ~expired:read_closed.ready;
+                   deadline)
+                limit
             in
             Signal.wait_until read_closed.ready (fun () ->
               Option.is_some !read_result
               || read_closed.closed
-              || Option.fold ~none:false ~some:Deadline.passed deadline));
+              || !retimed
+              || Option.fold ~none:false ~some:Deadline.passed deadline);
+            if
+              !retimed
+              && Option.is_none !read_result
+              && (not read_closed.closed)
+              && not (Option.fold ~none:false ~some:Deadline.passed deadline)
+            then (
+              let limit = get_limit () in
+              retimed := false;
+              wait limit)
+            else limit
+          in
+          let limit =
+            if Option.is_none !read_result
+            then (
+              if read_closed.closed then raise End_of_file;
+              if not !pending_read
+              then (
+                pending_read := true;
+                read_requested := true;
+                start_reader ();
+                Signal.wake request_read);
+              wait limit)
+            else limit
+          in
           match !read_result with
           | Some result ->
             read_result := None;
             pending_read := false;
-            (match result with Ok n -> Ok n | Error exn -> raise exn)
+            (match result with
+            | Ok n ->
+              waited limit n;
+              Ok n
+            | Error exn -> raise exn)
           | None when read_closed.closed -> raise End_of_file
           | None ->
+            waited limit 0;
             Option.iter (fun (_, _, on_timeout) -> on_timeout ()) limit;
-            Error `Timeout)
+            Error `Timeout
       in
       let rec linger limit =
-        match timed_read limit with
+        match timed_read (fun () -> limit) with
         | Ok (_ : int) ->
           let (_ : int) =
             Buffer.get read_buffer ~f:(fun _ ~off:_ ~len -> len)
@@ -338,7 +412,7 @@ module Make (Io : IO) = struct
           (match
              if Buffer.unread read_buffer
              then Ok 0
-             else timed_read (timeout `Read)
+             else timed_read (fun () -> timeout `Read)
            with
           | Ok (_ : int) ->
             let (_ : int) = Buffer.get read_buffer ~f:(Runtime.read t) in
@@ -358,22 +432,66 @@ module Make (Io : IO) = struct
         | `Close ->
           if not read_closed.closed
           then (
-            if lingers then linger (timeout `Linger);
+            if lingers () then linger (timeout `Linger);
             shutdown_once SHUTDOWN_RECEIVE;
             Read_closed.close read_closed)
+      in
+      (* The write clock runs while output waits to be written. It restarts when
+         all of it is written, and after each [progress_bytes] bytes written. *)
+      let write_clock = ref false
+      and write_deadline = ref 0.
+      and written = ref 0
+      and in_writev = ref false
+      and write_armed = Signal.create () in
+      let restart_write_clock limit =
+        write_deadline := Unix.gettimeofday () +. limit;
+        written := 0
       in
       let rec write_loop () =
         match Runtime.next_write_operation t with
         | `Write io_vectors ->
-          Runtime.report_write_result t (writev socket io_vectors);
+          (match write_timeout with
+          | Some limit when not !write_clock ->
+            write_clock := true;
+            restart_write_clock limit;
+            Signal.wake write_armed
+          | Some _ | None -> ());
+          in_writev := true;
+          let result = writev socket io_vectors in
+          in_writev := false;
+          (match write_timeout, result with
+          | Some limit, `Ok n ->
+            written := !written + n;
+            if !written >= progress_bytes then restart_write_clock limit
+          | _ -> ());
+          Runtime.report_write_result t result;
           write_loop ()
         | `Yield ->
-          stop_body_read ();
+          write_clock := false;
           yield Runtime.yield_writer;
           write_loop ()
         | `Close _ ->
-          stop_body_read ();
+          write_clock := false;
           shutdown_once SHUTDOWN_SEND
+      in
+      let write_watchdog =
+        Option.map
+          (fun (_ : float) ->
+             Miou.async (fun () ->
+               let rec loop () =
+                 Signal.wait_until write_armed (fun () -> !write_clock);
+                 let rec sleep () =
+                   let left = !write_deadline -. Unix.gettimeofday () in
+                   if left > 0.
+                   then (
+                     Miou_unix.sleep (Float.min Deadline.longest_sleep left);
+                     sleep ())
+                 in
+                 sleep ();
+                 if !write_clock then abort () else loop ()
+               in
+               loop ()))
+          write_timeout
       in
       let read_task () =
         (match read_loop () with
@@ -386,14 +504,14 @@ module Make (Io : IO) = struct
             Read_closed.close read_closed));
         Option.iter Miou.cancel !reader;
         Deadline.stop idle_deadline;
-        Deadline.stop head_deadline
+        Deadline.stop head_deadline;
+        Deadline.stop close_deadline
       and write_task () =
         match write_loop () with () -> () | exception exn -> fail exn
       in
       let stop () =
         decr running;
-        if !running = 0
-        then ignore (Miou.Computation.try_return stopped `Done : bool)
+        if !running = 0 then complete `Done
       in
       let reading =
         Miou.async (fun () ->
@@ -404,17 +522,66 @@ module Make (Io : IO) = struct
           write_task ();
           stop ())
       in
-      (match await_or_raise stopped with
+      let watcher =
+        Option.map
+          (fun { stop; grace; drain } ->
+             Miou.async (fun () ->
+               await_stop stop;
+               (match drain () with
+               | () ->
+                 (* An idle connection is closed now: end the read that
+                    waits. *)
+                 if Runtime.is_closed t then shutdown_once SHUTDOWN_RECEIVE
+               | exception (Miou.Cancelled as exn) -> raise exn
+               | exception exn -> fail exn);
+               Option.iter
+                 (fun grace ->
+                    sleep_until (Unix.gettimeofday () +. grace);
+                    Option.iter
+                      (fun sessions -> sessions.Sessions.aborted <- true)
+                      sessions;
+                    abort ())
+                 grace))
+          graceful
+      in
+      let session_failed exn bt =
+        if Option.is_none !unreported then unreported := Some (exn, bt)
+      in
+      (match
+         match sessions with
+         | None -> await_or_raise stopped
+         | Some sessions ->
+           Sessions.serve sessions ~stopped ~on_exn:session_failed
+       with
       | `Abort ->
         Miou.cancel reading;
         Miou.cancel writing;
+        (* A write that was cancelled before it returned is lost: tell the core,
+           so that the flushes that wait for it get [`Closed]. *)
+        if !in_writev
+        then (
+          in_writev := false;
+          match Runtime.report_write_result t `Closed with
+          | () -> ()
+          | exception (Miou.Cancelled as exn) -> raise exn
+          | exception exn ->
+            let (_ : bool) = report_exn exn in
+            ());
         shutdown_once SHUTDOWN_ALL
       | `Done ->
         let (_ : (unit, exn) result list) =
           Miou.await_all [ reading; writing ]
         in
         ());
-      Option.iter Miou.cancel stopper;
+      Option.iter
+        (fun sessions ->
+           Sessions.finish sessions ~on_exn:session_failed ~shutdown:(fun () ->
+             try Runtime.shutdown t with
+             | Miou.Cancelled as exn -> raise exn
+             | _ -> ()))
+        sessions;
+      Option.iter Miou.cancel write_watchdog;
+      Option.iter Miou.cancel watcher;
       Option.iter
         (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
         !unreported
@@ -424,6 +591,12 @@ module Make (Io : IO) = struct
     type socket = Io.socket
 
     let linger_without_idle_timeout = 2.0
+    let default_idle_timeout = Some 60.
+    let default_head_timeout = Some 30.
+    let default_body_timeout = Some 60.
+    let default_write_timeout = Some 60.
+    let default_close_timeout = Some 10.
+    let current_date = Ache.Ache_private.Http_date.now
 
     let check_timeout name = function
       | Some seconds when not (seconds > 0.) ->
@@ -435,19 +608,48 @@ module Make (Io : IO) = struct
 
     let create_connection_handler
           ?(config = Ache.Config.default)
-          ?idle_timeout
-          ?head_timeout
+          ?(idle_timeout = default_idle_timeout)
+          ?(head_timeout = default_head_timeout)
+          ?(body_timeout = default_body_timeout)
+          ?(write_timeout = default_write_timeout)
+          ?(close_timeout = default_close_timeout)
+          ?(date = true)
+          ?stop
+          ?grace
           ~request_handler
           ~error_handler
       =
       check_timeout "idle_timeout" idle_timeout;
       check_timeout "head_timeout" head_timeout;
+      check_timeout "body_timeout" body_timeout;
+      check_timeout "write_timeout" write_timeout;
+      check_timeout "close_timeout" close_timeout;
+      check_timeout "grace" grace;
       let untimed =
         Option.is_none idle_timeout && Option.is_none head_timeout
       in
-      fun socket client_addr ->
+      (* With an idle timeout of at least 1 s, persistent responses announce it
+         in [Keep-Alive: timeout=n], and the idle timer between requests runs 1
+         s longer, so that a client that trusts the hint does not write into a
+         connection that is closing. *)
+      let keep_alive_timeout =
+        match idle_timeout with
+        | Some seconds when seconds >= 1. -> Some (int_of_float seconds)
+        | Some _ | None -> None
+      in
+      let serve socket client_addr =
         let head_deadline = ref None
-        and error_handler_failure = ref None in
+        and close_deadline = ref None
+        and retimed = ref false
+        and close_aborted = ref false
+        and websocket = ref None
+        and read_closed = Read_closed.create ()
+        and last_request = ref None
+        and body_spent = ref 0.
+        and body_received = ref 0
+        and error_handler_failure = ref None
+        and sessions = Sessions.create () in
+        let with_sessions = Sessions.with_current sessions in
         let error_handler ?request error start_response =
           try error_handler client_addr ?request error start_response with
           | Miou.Cancelled as exn -> raise exn
@@ -458,19 +660,91 @@ module Make (Io : IO) = struct
             Printexc.raise_with_backtrace exn bt
         in
         let connection =
-          Ache.Server_connection.create ~config ~error_handler (fun reqd ->
-            head_deadline := None;
-            request_handler client_addr reqd)
+          Ache.Server_connection.create
+            ~config
+            ~error_handler
+            ?date:(if date then Some current_date else None)
+            ?keep_alive_timeout
+            (fun reqd ->
+               head_deadline := None;
+               last_request := Some reqd;
+               websocket := None;
+               body_spent := 0.;
+               body_received := 0;
+               with_sessions (fun () -> request_handler client_addr reqd))
+        in
+        (* [`Idle] after a [101] is the idle timeout of a WebSocket. *)
+        let upgraded () =
+          match Option.bind !last_request Ache.Request_descriptor.response with
+          | Some { status = `Switching_protocols; _ } -> true
+          | Some _ | None -> false
+        in
+        (* [is_websocket ()] is [true] after the [101] of
+           [Ache.Websocket.upgrade]. The answer is kept once the response of the
+           request is known, so plain HTTP and other upgrades check it once. *)
+        let is_websocket () =
+          match !websocket with
+          | Some answer -> answer
+          | None ->
+            (match
+               Option.bind !last_request Ache.Request_descriptor.response
+             with
+            | None -> false
+            | Some { status = `Switching_protocols; headers; _ } ->
+              let answer =
+                match Ache.Headers.get headers "upgrade" with
+                | Some value -> String.lowercase_ascii value = "websocket"
+                | None -> false
+              in
+              websocket := Some answer;
+              answer
+            | Some _ ->
+              websocket := Some false;
+              false)
+        in
+        (* The close deadline is set the first time the connection is seen
+           waiting for the client's close frame, and never moves after. *)
+        let watch_close =
+          match close_timeout with
+          | None -> fun () -> false
+          | Some _ ->
+            fun () -> Option.is_none !close_deadline && is_websocket ()
+        in
+        let start_close () =
+          match close_timeout, !close_deadline with
+          | Some seconds, None ->
+            close_deadline := Some (Unix.gettimeofday () +. seconds);
+            retimed := true;
+            Signal.wake read_closed.ready
+          | Some _, Some _ | None, _ -> ()
         in
         let observe () =
-          match head_timeout with
-          | None -> ()
-          | Some seconds ->
-            (match Ache.Server_connection.read_timeout connection with
+          if Option.is_some head_timeout || watch_close ()
+          then
+            match Ache.Server_connection.read_timeout connection with
             | Some (`Head, _) ->
-              if Option.is_none !head_deadline
-              then head_deadline := Some (Unix.gettimeofday () +. seconds)
-            | Some ((`Idle | `Body), _) | None -> head_deadline := None)
+              (match head_timeout with
+              | Some seconds when Option.is_none !head_deadline ->
+                head_deadline := Some (Unix.gettimeofday () +. seconds)
+              | Some _ | None -> ())
+            | Some (`Close, _) ->
+              head_deadline := None;
+              start_close ()
+            | Some ((`Idle | `Body), _) | None -> head_deadline := None
+        in
+        (* The close clock starts when the server's close frame is queued,
+           whatever queued it ({!Ache.Websocket.close} from the session, or the
+           close at the end of the session). The read task may wait with the
+           idle limit then, so the write task, which the frame wakes, sets the
+           deadline and wakes the read. Drain and the idle timeout close through
+           the core's [fail], which stops reading: the connection ends at once,
+           without a close deadline. *)
+        let observe_write () =
+          if watch_close ()
+          then
+            match Ache.Server_connection.read_timeout connection with
+            | Some (`Close, _) -> start_close ()
+            | Some ((`Idle | `Head | `Body), _) | None -> ()
         in
         let module Observed = struct
           include Ache.Server_connection
@@ -484,6 +758,11 @@ module Make (Io : IO) = struct
             let n = read_eof t bs ~off ~len in
             observe ();
             n
+
+          let next_write_operation t =
+            let operation = next_write_operation t in
+            observe_write ();
+            operation
         end
         in
         let timeout = function
@@ -499,44 +778,86 @@ module Make (Io : IO) = struct
             observe ();
             (match Ache.Server_connection.read_timeout connection with
             | Some (`Idle, on_timeout) ->
+              (* The idle timeout of a WebSocket announces nothing. *)
+              let upgraded = upgraded () in
               Option.map
                 (fun seconds ->
+                   let seconds =
+                     if Option.is_some keep_alive_timeout && not upgraded
+                     then seconds +. 1.
+                     else seconds
+                   in
                    `Idle, Unix.gettimeofday () +. seconds, on_timeout)
                 idle_timeout
             | Some (`Head, on_timeout) ->
               Option.map
                 (fun deadline -> `Head, deadline, on_timeout)
                 !head_deadline
-            | Some (`Body, on_timeout) ->
-              Some
-                ( `Idle
-                , Unix.gettimeofday () +. Option.value idle_timeout ~default:0.
-                , on_timeout )
+            | Some (`Body, _) ->
+              (* The body clock counts only the time spent waiting for body
+                 bytes, and restarts after [progress_bytes] bytes. *)
+              Option.map
+                (fun limit ->
+                   let progress elapsed n =
+                     body_spent := !body_spent +. elapsed;
+                     body_received := !body_received + n;
+                     if !body_received >= IO_loop.progress_bytes
+                     then (
+                       body_spent := 0.;
+                       body_received := 0)
+                   and expire () =
+                     body_spent := 0.;
+                     body_received := 0;
+                     match Ache.Server_connection.read_timeout connection with
+                     | Some (`Body, expire) -> expire ()
+                     | Some ((`Idle | `Head | `Close), _) | None -> ()
+                   in
+                   ( `Body progress
+                   , Unix.gettimeofday () +. limit -. !body_spent
+                   , expire ))
+                body_timeout
+            | Some (`Close, _) ->
+              let expire () =
+                match Ache.Server_connection.read_timeout connection with
+                | Some (`Close, abort) ->
+                  (* Our close frame is written: close without lingering. *)
+                  close_aborted := true;
+                  abort ()
+                | Some ((`Idle | `Head | `Body), _) | None -> ()
+              in
+              Option.map (fun at -> `Close, at, expire) !close_deadline
             | None -> None)
         in
         IO_loop.start
           (module Observed)
           ~read_buffer_size:config.read_buffer_size
-          ~read_closed:(Read_closed.create ())
-          ~interruptible:false
+          ~read_closed
+          ~interruptible:(fun () ->
+            Option.is_some close_timeout && is_websocket ())
+          ~retimed
           ~timeout
-          ~linger:(not untimed)
-          ~body_read:
-            { stop =
-                (fun () ->
-                  match Ache.Server_connection.read_timeout connection with
-                  | Some (`Body, on_timeout) -> Some on_timeout
-                  | Some ((`Idle | `Head), _) | None -> None)
-            ; wait = Option.value idle_timeout ~default:0.
-            ; linger =
-                Option.value idle_timeout ~default:linger_without_idle_timeout
-            }
+          ~linger:(fun () -> (not untimed) && not !close_aborted)
+          ?write_timeout
+          ~sessions
+          ?graceful:
+            (Option.map
+               (fun stop ->
+                  { IO_loop.stop
+                  ; grace
+                  ; drain = (fun () -> Ache.Server_connection.drain connection)
+                  })
+               stop)
           ~stopped:(Miou.Computation.create ())
           connection
           socket;
         Option.iter
           (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
           !error_handler_failure
+      in
+      fun socket client_addr ->
+        match stop with
+        | Some stop when not (Miou.Computation.is_running stop) -> ()
+        | _ -> serve socket client_addr
   end
 
   module Client = struct
@@ -549,7 +870,22 @@ module Make (Io : IO) = struct
       ; stopped : [ `Done | `Abort ] Miou.Computation.t
       ; task : unit Miou.t
       ; mutable awaited : bool
+      ; socket : socket
+      ; reuse : reuse
       }
+
+    (* The connection is not reused after [deadline]: the server announced with
+       [Keep-Alive: timeout=n] that it may close it then. *)
+    and reuse =
+      { mutable deadline : float option
+      ; mutable upgraded : bool
+      }
+
+    (* [close_idle] closes the connection as {!shutdown} does, from any task of
+       the connection, without waiting for its task. *)
+    let close_idle runtime read_closed =
+      Read_closed.close read_closed;
+      Upgradable.shutdown runtime
 
     let create_connection ?(config = Ache.Config.default) socket =
       let connection = Ache.Client_connection.create ~config () in
@@ -558,23 +894,89 @@ module Make (Io : IO) = struct
           (Ache.Runtime.make (module Ache.Client_connection) connection)
       in
       let read_closed = Read_closed.create ()
-      and stopped = Miou.Computation.create () in
+      and stopped = Miou.Computation.create ()
+      and reuse = { deadline = None; upgraded = false } in
+      (* Before each read, arm the reuse deadline once a response has given a
+         hint; the read then waits at most until the deadline. *)
+      let timeout = function
+        | `Linger -> None
+        | `Read when reuse.upgraded -> None
+        | `Read ->
+          (match Ache.Client_connection.reuse_timeout connection with
+          | None -> None
+          | Some seconds ->
+            let deadline =
+              match reuse.deadline with
+              | Some deadline -> deadline
+              | None ->
+                let deadline = Unix.gettimeofday () +. seconds in
+                reuse.deadline <- Some deadline;
+                deadline
+            in
+            let expire () =
+              match reuse.deadline with
+              | Some current
+                when current = deadline
+                     && Option.is_some
+                          (Ache.Client_connection.reuse_timeout connection) ->
+                close_idle runtime read_closed
+              | Some _ | None -> ()
+            in
+            Some (`Idle, deadline, expire))
+      in
       let task =
         Miou.async (fun () ->
           IO_loop.start
             (module Upgradable)
             ~read_buffer_size:config.read_buffer_size
             ~read_closed
-            ~interruptible:true
-            ~timeout:(fun _ -> None)
-            ~linger:true
+            ~interruptible:(fun () -> true)
+            ~timeout
+            ~linger:(fun () -> true)
             ~stopped
             runtime
             socket)
       in
-      { connection; runtime; read_closed; stopped; task; awaited = false }
+      { connection
+      ; runtime
+      ; read_closed
+      ; stopped
+      ; task
+      ; awaited = false
+      ; socket
+      ; reuse
+      }
 
-    let request t = Ache.Client_connection.request t.connection
+    let request
+          t
+          ?flush_headers_immediately
+          request
+          ~error_handler
+          ~response_handler
+      =
+      (* Past the [Keep-Alive] deadline, the request gets [`Connection_closed]
+         and nothing is written. *)
+      (match t.reuse.deadline with
+      | Some deadline when deadline <= Unix.gettimeofday () ->
+        close_idle t.runtime t.read_closed
+      | Some _ | None -> ());
+      t.reuse.deadline <- None;
+      (* Response bytes that wait on an idle connection would be taken as the
+         response to this request (undici GHSA-35p6-xmwp-9g52): close the
+         connection instead. The read loop gives the bytes of a read to the
+         connection before it yields, so the socket holds all of them. *)
+      if
+        Ache.Ache_private.Client_connection.is_waiting t.connection
+        && Idle.input_waiting t.socket
+      then (
+        Read_closed.close t.read_closed;
+        Upgradable.shutdown t.runtime);
+      Ache.Client_connection.request
+        t.connection
+        ?flush_headers_immediately
+        request
+        ~error_handler
+        ~response_handler
 
     let shutdown t =
       Read_closed.close t.read_closed;
@@ -587,7 +989,11 @@ module Make (Io : IO) = struct
         ())
 
     let is_closed t = Upgradable.is_closed t.runtime
-    let upgrade t impl = Upgradable.upgrade t.runtime impl
+
+    let upgrade t impl =
+      t.reuse.upgraded <- true;
+      t.reuse.deadline <- None;
+      Upgradable.upgrade t.runtime impl
   end
 end
 
@@ -639,7 +1045,37 @@ module Io = struct
     | Unix.Unix_error _ -> ()
 end
 
-include Make (Io)
+(* Bytes other than empty lines, or the end of input, that wait on [fd], without
+   blocking. *)
+let input_waiting fd =
+  match Unix.select [ fd ] [] [] 0. with
+  | [], _, _ -> false
+  | _ :: _, _, _ ->
+    let buf = Bytes.create 64 in
+    (match Unix.recv fd buf 0 (Bytes.length buf) [ Unix.MSG_PEEK ] with
+    | n ->
+      n = 0
+      || Bytes.exists
+           (function '\r' | '\n' -> false | _ -> true)
+           (Bytes.sub buf 0 n)
+    | exception Unix.Unix_error ((ECONNRESET | ECONNABORTED | EPIPE), _, _) ->
+      true
+    | exception Unix.Unix_error _ -> false)
+  | exception Unix.Unix_error _ -> false
+
+module Make (Io : IO) =
+  Make_with_idle_check
+    (Io)
+    (struct
+      let input_waiting _ = false
+    end)
+
+include
+  Make_with_idle_check
+    (Io)
+    (struct
+      let input_waiting socket = input_waiting (Miou_unix.to_file_descr socket)
+    end)
 
 module Server = struct
   include Server
@@ -651,15 +1087,55 @@ module Server = struct
       let (_ : (unit, exn) result) = Miou.await connection in
       clean_up orphans
 
+  (* [await_orphans orphans] awaits the tasks of [orphans]; they have all
+     returned or are about to. *)
+  let rec await_orphans orphans =
+    match Miou.care orphans with
+    | None -> ()
+    | Some None ->
+      Miou.yield ();
+      await_orphans orphans
+    | Some (Some connection) ->
+      let (_ : (unit, exn) result) = Miou.await connection in
+      await_orphans orphans
+
+  (* [accept_until stop listening] accepts a connection, or returns [None] once
+     [stop] is resolved. *)
+  let accept_until stop listening =
+    let fd = Miou_unix.to_file_descr listening in
+    let rec go () =
+      if not (Miou.Computation.is_running stop)
+      then None
+      else
+        match Unix.accept fd with
+        | client, client_addr ->
+          Some (Miou_unix.of_file_descr ~non_blocking:true client, client_addr)
+        | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK | EINTR), _, _) ->
+          let (_ : (unit, exn) result) =
+            Miou.await_first
+              [ Miou.async (fun () -> Miou_unix.blocking_read fd)
+              ; Miou.async (fun () -> await_stop stop)
+              ]
+          in
+          go ()
+    in
+    go ()
+
   let accept_pause = 0.1
 
   let run
         ?config
         ?idle_timeout
         ?head_timeout
+        ?body_timeout
+        ?write_timeout
+        ?close_timeout
+        ?date
         ?domains
         ?(backlog = 128)
         ?(tcp_nodelay = false)
+        ?stop
+        ?grace
         ~on_error
         ~request_handler
         ~error_handler
@@ -693,6 +1169,12 @@ module Server = struct
         ?config
         ?idle_timeout
         ?head_timeout
+        ?body_timeout
+        ?write_timeout
+        ?close_timeout
+        ?date
+        ?stop
+        ?grace
         ~request_handler
         ~error_handler
     in
@@ -705,19 +1187,34 @@ module Server = struct
       else handler
     in
     let failed = Miou.Computation.create () in
+    let next_client =
+      match stop with
+      | None -> fun listening -> Some (Miou_unix.accept listening)
+      | Some stop -> accept_until stop
+    in
     let serve () =
       let listening = socket () in
-      Fun.protect ~finally:(fun () -> Miou_unix.close listening) @@ fun () ->
+      let closed = ref false in
+      let close () =
+        if not !closed
+        then (
+          closed := true;
+          Miou_unix.close listening)
+      in
+      Fun.protect ~finally:close @@ fun () ->
       Miou_unix.bind_and_listen
         ~backlog
         ~reuseaddr:true
         ~reuseport:true
         listening
         addr;
-      let orphans = Miou.orphans () in
+      let orphans = Miou.orphans ()
+      and live = ref 0
+      and ended = Signal.create () in
       let rec accept () =
         clean_up orphans;
-        match Miou_unix.accept listening with
+        match next_client listening with
+        | None -> ()
         | exception
             (Unix.Unix_error ((EMFILE | ENFILE | ENOBUFS | ENOMEM), _, _) as exn)
           ->
@@ -732,11 +1229,15 @@ module Server = struct
                , _ ) as exn) ->
           on_error exn;
           accept ()
-        | client, client_addr ->
+        | Some (client, client_addr) ->
+          incr live;
           ignore
             (Miou.async ~orphans (fun () ->
                Fun.protect
-                 ~finally:(fun () -> Miou_unix.close client)
+                 ~finally:(fun () ->
+                   Miou_unix.close client;
+                   decr live;
+                   Signal.wake ended)
                  (fun () ->
                     match handler client client_addr with
                     | () -> ()
@@ -750,14 +1251,187 @@ module Server = struct
              : unit Miou.t);
           accept ()
       in
-      accept ()
+      accept ();
+      close ();
+      Signal.wait_until ended (fun () -> !live = 0);
+      await_orphans orphans
     in
-    let loops =
-      Miou.async (fun () -> Miou.Computation.await_exn failed)
-      :: Miou.async serve
-      :: List.map
-           (fun pin -> Miou.call ~pin serve)
-           (List.filteri (fun i _ -> i < domains - 1) others)
+    let serve () =
+      match serve () with
+      | () -> ()
+      | exception (Miou.Cancelled as exn) -> raise exn
+      | exception exn ->
+        let bt = Printexc.get_raw_backtrace () in
+        ignore (Miou.Computation.try_cancel failed (exn, bt) : bool)
     in
-    match Miou.await_first loops with Ok () -> () | Error exn -> raise exn
+    let loops () =
+      let (_ : (unit, exn) result list) =
+        Miou.await_all
+          (Miou.async serve
+          :: List.map
+               (fun pin -> Miou.call ~pin serve)
+               (List.filteri (fun i _ -> i < domains - 1) others))
+      in
+      ()
+    in
+    match
+      Miou.await_first
+        [ Miou.async (fun () -> Miou.Computation.await_exn failed)
+        ; Miou.async loops
+        ]
+    with
+    | Ok () -> ()
+    | Error exn -> raise exn
+end
+
+module Websocket = struct
+  type t =
+    { connection : Ache.Websocket.t
+    ; messages : Ache.Websocket.message Queue.t
+    ; receivers : unit Miou.Computation.t Queue.t
+    ; pingers : unit Miou.Computation.t Queue.t
+    ; mutable ended : bool
+    ; mutable client_close : Ache.Websocket.close option
+    ; closed : unit Miou.Computation.t
+    }
+
+  exception Closed
+
+  let max_queued_messages = 8
+
+  let rec wake_one waiters =
+    match Queue.take_opt waiters with
+    | Some waiter ->
+      if not (Miou.Computation.try_return waiter ()) then wake_one waiters
+    | None -> ()
+
+  let end_all waiters result =
+    Queue.iter
+      (fun waiter ->
+         ignore
+           ((match result with
+            | Ok () -> Miou.Computation.try_return waiter ()
+            | Error error -> Miou.Computation.try_cancel waiter error)
+            : bool))
+      waiters;
+    Queue.clear waiters
+
+  let wait waiters =
+    let pending = Queue.of_seq (Queue.to_seq waiters) in
+    Queue.clear waiters;
+    Queue.iter
+      (fun waiter ->
+         if Miou.Computation.is_running waiter then Queue.push waiter waiters)
+      pending;
+    let waiter = Miou.Computation.create () in
+    Queue.push waiter waiters;
+    let fail exn bt =
+      ignore (Miou.Computation.try_cancel waiter (exn, bt) : bool);
+      Printexc.raise_with_backtrace exn bt
+    in
+    match Miou.Computation.await waiter with
+    | Ok () -> ()
+    | Error (exn, bt) -> fail exn bt
+    | exception exn -> fail exn (Printexc.get_raw_backtrace ())
+
+  let upgrade ?max_message_size ?headers reqd session =
+    let sessions =
+      match Sessions.current () with
+      | Some sessions -> sessions
+      | None ->
+        invalid_arg
+          "Ache_miou.Websocket.upgrade: call it from the request handler of an \
+           Ache_miou server"
+    in
+    let messages = Queue.create ()
+    and receivers = Queue.create ()
+    and pingers = Queue.create ()
+    and closed = Miou.Computation.create () in
+    let t = ref None in
+    match
+      Ache.Websocket.upgrade ?max_message_size ?headers reqd (fun connection ->
+        let ws =
+          { connection
+          ; messages
+          ; receivers
+          ; pingers
+          ; ended = false
+          ; client_close = None
+          ; closed
+          }
+        in
+        t := Some ws;
+        { on_message =
+            (fun message ->
+              Queue.push message messages;
+              if Queue.length messages >= max_queued_messages
+              then Ache.Websocket.pause_reading connection;
+              wake_one receivers)
+        ; on_pong = (fun (_ : string) -> end_all pingers (Ok ()))
+        ; on_close =
+            (fun close ->
+              ws.ended <- true;
+              ws.client_close <- close;
+              end_all receivers (Ok ());
+              end_all pingers (Error (Closed, Printexc.get_callstack 0));
+              ignore (Miou.Computation.try_return closed () : bool))
+        })
+    with
+    | Error _ as error -> error
+    | Ok () ->
+      let t = Option.get !t in
+      Sessions.add sessions (fun () ->
+        match session t with
+        | () | (exception Closed) ->
+          (* Nothing reads the messages any more: close, unless the connection
+             already ended. *)
+          Ache.Websocket.close t.connection ~code:1000
+        | exception (Miou.Cancelled as exn) -> raise exn
+        | exception exn ->
+          let bt = Printexc.get_raw_backtrace () in
+          Ache.Websocket.close t.connection ~code:1011;
+          Printexc.raise_with_backtrace exn bt);
+      Ok ()
+
+  let written t =
+    let flushed = Miou.Computation.create () in
+    Ache.Websocket.flush t.connection (fun result ->
+      ignore (Miou.Computation.try_return flushed result : bool));
+    match await_or_raise flushed with `Written -> () | `Closed -> raise Closed
+
+  let send_text t message =
+    Ache.Websocket.send_text t.connection message;
+    written t
+
+  let send_binary t message =
+    Ache.Websocket.send_binary t.connection message;
+    written t
+
+  let rec receive t =
+    match Queue.take_opt t.messages with
+    | Some message ->
+      if Queue.length t.messages < max_queued_messages
+      then Ache.Websocket.resume_reading t.connection;
+      Some message
+    | None when t.ended -> None
+    | None ->
+      Ache.Websocket.resume_reading t.connection;
+      (match wait t.receivers with
+      | () -> ()
+      | exception exn ->
+        let bt = Printexc.get_raw_backtrace () in
+        if not (Queue.is_empty t.messages) then wake_one t.receivers;
+        Printexc.raise_with_backtrace exn bt);
+      receive t
+
+  let ping t payload =
+    Ache.Websocket.ping t.connection payload;
+    if t.ended then raise Closed;
+    wait t.pingers
+
+  let client_close t = t.client_close
+
+  let close ?reason t code =
+    Ache.Websocket.close ?reason t.connection ~code;
+    await_or_raise t.closed
 end

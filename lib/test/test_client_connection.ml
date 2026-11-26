@@ -100,6 +100,7 @@ let default_response_handler
   Body.Reader.schedule_read body ~on_read ~on_eof ~on_error
 
 let no_error_handler _ = assert false
+let pipelining = { Config.default with max_pipelined_requests = 16 }
 
 let test_commit_parse_after_every_header () =
   let request' = Request.create `GET "/" in
@@ -373,7 +374,7 @@ let test_persistent_connection_requests_pipelining () =
   let response =
     Response.create ~headers:(Headers.of_list [ "content-length", "0" ]) `OK
   in
-  let t = create () in
+  let t = create ~config:pipelining () in
   let body =
     request
       t
@@ -411,7 +412,7 @@ let test_persistent_connection_requests_pipelining_send_body () =
   let response =
     Response.create ~headers:(Headers.of_list [ "content-length", "0" ]) `OK
   in
-  let t = create () in
+  let t = create ~config:pipelining () in
   let body =
     request
       t
@@ -1302,8 +1303,8 @@ let test_failed_response_parse () =
   in
 
   test
-    "HTTP/1.1 200\r\n\r\n"
-    16
+    "HTTP/1.1 200\rOK\r\n\r\n"
+    19
     (`Malformed_response "unexpected '\\r' in status-line");
 
   let response = Response.create `OK ~headers:(Headers.encoding_fixed (-1)) in
@@ -1526,7 +1527,7 @@ let test_multiple_responses_in_single_read () =
   let response =
     Response.create ~headers:(Headers.of_list [ "content-length", "0" ]) `OK
   in
-  let t = create () in
+  let t = create ~config:pipelining () in
   let response_handler _response _body = res_handled := !res_handled + 1 in
   let body =
     request
@@ -1762,7 +1763,7 @@ let test_pipelining_no_immediate_flush () =
   let response =
     Response.create ~headers:(Headers.of_list [ "content-length", "0" ]) `OK
   in
-  let t = create () in
+  let t = create ~config:pipelining () in
   let body =
     request
       t
@@ -1840,7 +1841,7 @@ let test_request_pipelining_async () =
   let response =
     Response.create ~headers:(Headers.of_list [ "content-length", "5" ]) `OK
   in
-  let t = create () in
+  let t = create ~config:pipelining () in
   let body =
     request
       t
@@ -1901,7 +1902,7 @@ let test_request_pipelining_single_read () =
       ~on_eof
   in
 
-  let t = create () in
+  let t = create ~config:pipelining () in
   let body =
     request t request' ~response_handler ~error_handler:no_error_handler
   in
@@ -2109,6 +2110,384 @@ let test_invalid_request_head_writes_nothing () =
     | `Write _ -> false
     | `Yield | `Close _ -> true)
 
+(* Connection reuse rules: pipelining limit, 204/304 framing, request checks,
+   unsolicited bytes. *)
+
+type exchange =
+  { mutable statuses : int list
+  ; mutable body : string
+  ; mutable errors : string list
+  }
+
+let error_name = function
+  | `Malformed_response _ -> "Malformed_response"
+  | `Invalid_response_body_length _ -> "Invalid_response_body_length"
+  | `Connection_closed -> "Connection_closed"
+  | `Exn _ -> "Exn"
+
+let send ?(meth = `GET) ?(headers = []) ?body t target =
+  let ex = { statuses = []; body = ""; errors = [] } in
+  let writer =
+    request
+      t
+      ~flush_headers_immediately:true
+      (Request.create ~headers:(Headers.of_list headers) meth target)
+      ~error_handler:(fun error ->
+        ex.errors <- ex.errors @ [ error_name error ])
+      ~response_handler:(fun response reader ->
+        ex.statuses <- ex.statuses @ [ Status.to_code response.status ];
+        let rec loop () =
+          Body.Reader.schedule_read
+            reader
+            ~on_error:ignore
+            ~on_eof:ignore
+            ~on_read:(fun bs ~off ~len ->
+              ex.body <- ex.body ^ Bigstring.substring bs ~off ~len;
+              loop ())
+        in
+        loop ())
+  in
+  Option.iter (Body.Writer.write_string writer) body;
+  Body.Writer.close writer;
+  ex
+
+(* Everything the connection writes now. *)
+let rec drain_output t =
+  match next_write_operation t with
+  | `Write iovecs ->
+    let s = Write_operation.iovecs_to_string iovecs in
+    report_write_result t (`Ok (String.length s));
+    s ^ drain_output t
+  | `Yield | `Close _ -> ""
+
+(* Reads [input], then runs the read side to its next stop. *)
+let respond t input =
+  if input <> ""
+  then
+    match next_read_operation t with
+    | `Read -> read_string t input
+    | `Yield | `Close -> Alcotest.fail "the connection does not read"
+  else ();
+  ignore (next_read_operation t : [ `Read | `Yield | `Close ])
+
+let check_exchange msg ?(statuses = []) ?(body = "") ?(errors = []) ex =
+  Alcotest.(check (list int)) (msg ^ ": statuses") statuses ex.statuses;
+  Alcotest.(check string) (msg ^ ": body") body ex.body;
+  Alcotest.(check (list string)) (msg ^ ": errors") errors ex.errors
+
+let get target = Printf.sprintf "GET %s HTTP/1.1\r\n\r\n" target
+
+let ok body =
+  Printf.sprintf
+    "HTTP/1.1 200 OK\r\ncontent-length: %d\r\n\r\n%s"
+    (String.length body)
+    body
+
+let test_no_pipelining_by_default () =
+  let t = create () in
+  let a = send t "/a" in
+  let b = send t "/b" in
+  Alcotest.(check string) "only the first request" (get "/a") (drain_output t);
+  respond t (ok "r1");
+  check_exchange "first" ~statuses:[ 200 ] ~body:"r1" a;
+  Alcotest.(check string)
+    "second written after the first response"
+    (get "/b")
+    (drain_output t);
+  respond t (ok "r2");
+  check_exchange "second" ~statuses:[ 200 ] ~body:"r2" b
+
+let test_pipelining_limit () =
+  let config = { Config.default with max_pipelined_requests = 2 } in
+  let t = create ~config () in
+  let a = send t "/a" in
+  let b = send t "/b" in
+  let c = send t "/c" in
+  Alcotest.(check string)
+    "two requests wait for a response"
+    (get "/a" ^ get "/b")
+    (drain_output t);
+  respond t (ok "r1");
+  check_exchange "first" ~statuses:[ 200 ] ~body:"r1" a;
+  Alcotest.(check string)
+    "third after the first response"
+    (get "/c")
+    (drain_output t);
+  respond t (ok "r2" ^ ok "r3");
+  check_exchange "second" ~statuses:[ 200 ] ~body:"r2" b;
+  check_exchange "third" ~statuses:[ 200 ] ~body:"r3" c
+
+let test_pipelining_16_gets () =
+  let t = create ~config:pipelining () in
+  let targets = List.init 16 (Printf.sprintf "/%d") in
+  let exs = List.map (send t) targets in
+  Alcotest.(check string)
+    "16 requests written before any response"
+    (String.concat "" (List.map get targets))
+    (drain_output t);
+  respond t (String.concat "" (List.map ok targets));
+  List.iter2
+    (fun target ex -> check_exchange target ~statuses:[ 200 ] ~body:target ex)
+    targets
+    exs;
+  Alcotest.(check bool) "open" false (is_closed t)
+
+let test_pipelining_added_one_at_a_time () =
+  let t = create ~config:pipelining () in
+  let targets = [ "/1"; "/2"; "/3" ] in
+  let exs =
+    List.map
+      (fun target ->
+         let ex = send t target in
+         Alcotest.(check string) target (get target) (drain_output t);
+         ex)
+      targets
+  in
+  respond t (String.concat "" (List.map ok targets));
+  List.iter2
+    (fun target ex -> check_exchange target ~statuses:[ 200 ] ~body:target ex)
+    targets
+    exs
+
+let test_no_pipelining_of_non_idempotent () =
+  let t = create ~config:pipelining () in
+  let a = send t "/a" in
+  let b =
+    send ~meth:`POST ~headers:[ "content-length", "3" ] ~body:"abc" t "/b"
+  in
+  let c = send t "/c" in
+  Alcotest.(check string)
+    "the POST waits for the pending response"
+    (get "/a")
+    (drain_output t);
+  respond t (ok "r1");
+  check_exchange "GET" ~statuses:[ 200 ] ~body:"r1" a;
+  Alcotest.(check string)
+    "the POST, alone"
+    "POST /b HTTP/1.1\r\ncontent-length: 3\r\n\r\nabc"
+    (drain_output t);
+  respond t (ok "r2");
+  check_exchange "POST" ~statuses:[ 200 ] ~body:"r2" b;
+  Alcotest.(check string) "then the GET" (get "/c") (drain_output t);
+  respond t (ok "r3");
+  check_exchange "last GET" ~statuses:[ 200 ] ~body:"r3" c
+
+let test_no_pipelining_of_upgrade () =
+  let t = create ~config:pipelining () in
+  let a = send t "/a" in
+  let _b =
+    send ~headers:[ "connection", "upgrade"; "upgrade", "websocket" ] t "/b"
+  in
+  Alcotest.(check string)
+    "the Upgrade request waits for the pending response"
+    (get "/a")
+    (drain_output t);
+  respond t (ok "r1");
+  check_exchange "GET" ~statuses:[ 200 ] ~body:"r1" a;
+  Alcotest.(check string)
+    "the Upgrade request after the response"
+    "GET /b HTTP/1.1\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n"
+    (drain_output t)
+
+let test_no_content_with_framing_closes () =
+  let cases =
+    [ "GET", "HTTP/1.1 204 No Content\r\ncontent-length: 5\r\n\r\n", true
+    ; "GET", "HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\n", true
+    ; ( "GET"
+      , "HTTP/1.1 204 No Content\r\ntransfer-encoding: chunked\r\n\r\n"
+      , true )
+    ; ( "GET"
+      , "HTTP/1.1 304 Not Modified\r\ntransfer-encoding: chunked\r\n\r\n"
+      , true )
+    ; "GET", "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n", false
+    ; "GET", "HTTP/1.1 304 Not Modified\r\n\r\n", false
+    ; "HEAD", "HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\n", false
+    ]
+  in
+  List.iter
+    (fun (meth, head, closes) ->
+       let msg = String.escaped head in
+       let t = create ~config:pipelining () in
+       let a = send ~meth:(Method.of_string meth) t "/a" in
+       let b = send t "/b" in
+       ignore (drain_output t : string);
+       respond t (head ^ ok "r2");
+       Alcotest.(check (list int))
+         (msg ^ ": first status")
+         [ int_of_string (String.sub head 9 3) ]
+         a.statuses;
+       Alcotest.(check (list string)) (msg ^ ": first errors") [] a.errors;
+       if closes
+       then (
+         check_exchange (msg ^ ": second") ~errors:[ "Connection_closed" ] b;
+         Alcotest.(check bool) (msg ^ ": closed") true (is_closed t))
+       else (
+         check_exchange (msg ^ ": second") ~statuses:[ 200 ] ~body:"r2" b;
+         Alcotest.(check bool) (msg ^ ": open") false (is_closed t)))
+    cases
+
+let test_request_framing_rejected () =
+  let cases =
+    [ ( [ "Host", "a"; "host", "b" ]
+      , Invalid_argument "ache: more than one host field" )
+    ; ( [ "content-length", "3"; "transfer-encoding", "chunked" ]
+      , Invalid_argument
+          "ache: content-length and transfer-encoding are both set" )
+    ; ( [ "content-length", "3"; "content-length", "4" ]
+      , Invalid_argument "ache: invalid content-length \"3, 4\"" )
+    ; ( [ "content-length", "+3" ]
+      , Invalid_argument "ache: invalid content-length \"+3\"" )
+    ; ( [ "transfer-encoding", "gzip" ]
+      , Invalid_argument "ache: transfer-encoding does not end with chunked" )
+    ]
+  in
+  List.iter
+    (fun (headers, exn) ->
+       let t = create () in
+       Alcotest.check_raises
+         (String.concat ", " (List.map snd headers))
+         exn
+         (fun () -> ignore (send ~meth:`POST ~headers t "/" : exchange));
+       Alcotest.(check string) "nothing written" "" (drain_output t);
+       let ex = send t "/next" in
+       Alcotest.(check string)
+         "next request written"
+         (get "/next")
+         (drain_output t);
+       respond t (ok "r");
+       check_exchange "next request" ~statuses:[ 200 ] ~body:"r" ex)
+    cases
+
+let test_stray_bytes_when_idle () =
+  List.iter
+    (fun stray ->
+       let msg = String.escaped stray in
+       let t = create () in
+       let a = send t "/a" in
+       ignore (drain_output t : string);
+       respond t (ok "r1");
+       check_exchange (msg ^ ": first") ~statuses:[ 200 ] ~body:"r1" a;
+       (* An unsolicited response is not read to its end. *)
+       ignore (feed_string t stray : int);
+       ignore (next_read_operation t : [ `Read | `Yield | `Close ]);
+       Alcotest.(check bool) (msg ^ ": closed") true (is_closed t);
+       let b = send t "/b" in
+       Alcotest.(check string) (msg ^ ": nothing written") "" (drain_output t);
+       check_exchange (msg ^ ": next request") ~errors:[ "Connection_closed" ] b)
+    [ "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nevil"
+    ; "HTTP/1.1 200 OK\r\n"
+    ; "H"
+    ; "\r\nHTTP"
+    ]
+
+let test_crlf_when_idle () =
+  let t = create () in
+  let a = send t "/a" in
+  ignore (drain_output t : string);
+  respond t (ok "r1");
+  check_exchange "first" ~statuses:[ 200 ] ~body:"r1" a;
+  respond t "\r\n";
+  Alcotest.(check bool) "open" false (is_closed t);
+  let b = send t "/b" in
+  Alcotest.(check string) "next request written" (get "/b") (drain_output t);
+  respond t (ok "r2");
+  check_exchange "next request" ~statuses:[ 200 ] ~body:"r2" b
+
+(* Reads [chunks] one after the other, as the read side asks for them. *)
+let read_chunks t chunks =
+  let pending = ref "" in
+  let rec pump () =
+    ignore (drain_output t : string);
+    match next_read_operation t with
+    | `Read when !pending <> "" ->
+      let n = feed_string t !pending in
+      pending := String.sub !pending n (String.length !pending - n);
+      if n > 0 then pump ()
+    | `Read | `Yield | `Close -> ()
+  in
+  List.iter
+    (fun chunk ->
+       pending := !pending ^ chunk;
+       pump ())
+    chunks
+
+let all_splits s =
+  let len = String.length s in
+  [ s ]
+  :: List.init len (fun i -> String.make 1 s.[i])
+  :: List.init (len + 1) (fun i ->
+    [ String.sub s 0 i; String.sub s i (len - i) ])
+
+let test_stray_bytes_after_response () =
+  let config = { Config.default with max_pipelined_requests = 4 } in
+  List.iter
+    (fun (requests, input, errors) ->
+       List.iter
+         (fun chunks ->
+            let msg =
+              Printf.sprintf
+                "%d requests, reads [%s]"
+                requests
+                (String.concat "," (List.map String.escaped chunks))
+            in
+            let t = create ~config () in
+            let exchanges = List.init requests (fun _ -> send t "/") in
+            read_chunks t chunks;
+            Alcotest.(check (list (list string)))
+              (msg ^ ": errors")
+              errors
+              (List.map (fun ex -> ex.errors) exchanges);
+            Alcotest.(check (list int))
+              (msg ^ ": first response")
+              [ 200 ]
+              (List.hd exchanges).statuses;
+            Alcotest.(check bool) (msg ^ ": closed") true (is_closed t))
+         (all_splits input))
+    [ (* With no request waiting, the bytes are unsolicited. *)
+      1, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n\n", [ [] ]
+    ; ( 3
+      , "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n\n"
+      , [ []; [ "Malformed_response" ]; [ "Connection_closed" ] ] )
+    ; (* After a response that closes the connection, no request is answered. *)
+      ( 3
+      , "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n\n"
+      , [ []; [ "Connection_closed" ]; [ "Connection_closed" ] ] )
+    ]
+
+let reuse_tests =
+  [ "no pipelining by default", `Quick, test_no_pipelining_by_default
+  ; ( "max_pipelined_requests limits pending responses"
+    , `Quick
+    , test_pipelining_limit )
+  ; ( "16 GETs pipeline with max_pipelined_requests = 16"
+    , `Quick
+    , test_pipelining_16_gets )
+  ; ( "requests added one at a time pipeline"
+    , `Quick
+    , test_pipelining_added_one_at_a_time )
+  ; ( "a POST is never written while a response is pending"
+    , `Quick
+    , test_no_pipelining_of_non_idempotent )
+  ; ( "an Upgrade request is never written while a response is pending"
+    , `Quick
+    , test_no_pipelining_of_upgrade )
+  ; ( "204 or 304 with a length or a coding closes the connection"
+    , `Quick
+    , test_no_content_with_framing_closes )
+  ; ( "two Host fields or bad framing raise Invalid_argument"
+    , `Quick
+    , test_request_framing_rejected )
+  ; ( "response bytes on an idle connection close it"
+    , `Quick
+    , test_stray_bytes_when_idle )
+  ; ( "an empty line on an idle connection is ignored"
+    , `Quick
+    , test_crlf_when_idle )
+  ; ( "bytes after a complete response, at every split"
+    , `Quick
+    , test_stray_bytes_after_response )
+  ]
+
 let tests =
   [ ( "commit parse after every header line"
     , `Quick
@@ -2225,3 +2604,4 @@ let tests =
     , `Quick
     , test_invalid_request_head_writes_nothing )
   ]
+  @ reuse_tests

@@ -14,7 +14,7 @@ let request_to_string ?body (r : Request.t) =
 let trace fmt = Format.ksprintf (Format.printf "%s\n%!") fmt
 
 let request_error_pp_hum fmt = function
-  | `Bad_request -> Format.fprintf fmt "Bad_request"
+  | `Bad_request reason -> Format.fprintf fmt "Bad_request %S" reason
   | `Not_implemented -> Format.fprintf fmt "Not_implemented"
   | `Http_version_not_supported ->
     Format.fprintf fmt "Http_version_not_supported"
@@ -917,7 +917,10 @@ let test_chunked_encoding () =
 let test_chunked_encoding_for_error () =
   let error_handler ?request error start_response =
     Alcotest.(check (option request)) "No parsed request" None request;
-    Alcotest.(check request_error) "Request error" `Bad_request error;
+    Alcotest.(check request_error)
+      "Request error"
+      (`Bad_request "unexpected ' ' in request-line")
+      error;
     let body = start_response Headers.encoding_chunked in
     Body.Writer.write_string body "Bad";
     Body.Writer.flush body (function
@@ -1687,7 +1690,10 @@ let test_failed_request_parse () =
   let error_handler ?request error start_response =
     error_handler_fired := true;
     Alcotest.(check (option request)) "No parsed request" None request;
-    Alcotest.(check request_error) "Request error" `Bad_request error;
+    Alcotest.(check request_error)
+      "Request error"
+      (`Bad_request "unexpected ' ' in field line")
+      error;
     start_response Headers.empty |> Body.Writer.close
   in
   let request_handler _reqd = assert false in
@@ -1718,7 +1724,10 @@ let test_bad_request () =
   let error_handler ?request:request' error start_response =
     error_handler_fired := true;
     Alcotest.(check (option request)) "Parsed request" (Some request) request';
-    Alcotest.(check request_error) "Request error" `Bad_request error;
+    Alcotest.(check request_error)
+      "Request error"
+      (`Bad_request "invalid Content-Length")
+      error;
     start_response Headers.empty |> Body.Writer.close
   in
   let request_handler _reqd = assert false in
@@ -2174,7 +2183,11 @@ let test_parse_failure_after_checkpoint () =
   reader_closed t;
   match !error_queue with
   | None -> Alcotest.fail "Expected error"
-  | Some error -> Alcotest.(check request_error) "Error" error `Bad_request
+  | Some error ->
+    Alcotest.(check request_error)
+      "Error"
+      (`Bad_request "unexpected ' ' in field line")
+      error
 
 let test_parse_failure_at_eof () =
   let error_queue = ref None in
@@ -2198,7 +2211,11 @@ let test_parse_failure_at_eof () =
   reader_closed t;
   (match !error_queue with
   | None -> Alcotest.fail "Expected error"
-  | Some error -> Alcotest.(check request_error) "Error" error `Bad_request);
+  | Some error ->
+    Alcotest.(check request_error)
+      "Error"
+      (`Bad_request "unexpected ' ' in field line")
+      error);
   !continue ();
   write_response
     t
@@ -2839,8 +2856,8 @@ module Raw = struct
     ; out : Buffer.t
     }
 
-  let create ?config ?(error_handler = error_handler) handler =
-    { conn = Server_connection.create ?config ~error_handler handler
+  let create ?config ?(error_handler = error_handler) ?date handler =
+    { conn = Server_connection.create ?config ~error_handler ?date handler
     ; pending = ""
     ; out = Buffer.create 256
     }
@@ -2997,10 +3014,12 @@ let test_incomplete_request_body_not_complete () =
               (label ^ ": bytes received")
               received
               events.received;
-            Alcotest.(check (option request_error))
+            Alcotest.(check bool)
               (label ^ ": error code")
-              (Some `Bad_request)
-              (Request_descriptor.error_code (Option.get events.reqd)))
+              true
+              (match Request_descriptor.error_code (Option.get events.reqd) with
+              | Some (`Bad_request _) -> true
+              | _ -> false))
          [ "content-length: 5\r\n", "ab", true, "ab"
          ; "transfer-encoding: chunked\r\n", "3\r\nab", true, "ab"
          ; "transfer-encoding: chunked\r\n", "3\r\nabc\r\n", true, "abc"
@@ -3102,10 +3121,267 @@ let test_unread_body_discarded_after_response () =
                 !held
                 (min chunk size))
          [ "content-length", fixed size; "chunked", chunked size ])
-    [ "one read", max_int, 0x100000
-    ; "4096-byte reads", 0x1000, 0x100000
+    [ "one read", max_int, 100 * 1024
+    ; "4096-byte reads", 0x1000, 100 * 1024
     ; "one byte per read", 1, 0x2000
     ]
+
+let post_head n =
+  Printf.sprintf "POST / HTTP/1.1\r\nHost: a\r\ncontent-length: %d\r\n\r\n" n
+
+let drain_splits =
+  [ "one read", max_int; "7-byte reads", 7; "one byte per read", 1 ]
+
+let early_response ?(status = `OK) reqd =
+  Request_descriptor.respond_with_string reqd (Response.create status) "no"
+
+(* Feeds [head] and [body_bytes] bytes of body, the response is sent before the
+   body is read. *)
+let drain
+      ?config
+      ?(handler = early_response ?status:None)
+      ~chunk
+      ~head
+      ~body_bytes
+      ()
+  =
+  let t = Raw.create ?config handler in
+  Raw.feed ~chunk t head;
+  let response =
+    Raw.take_output t
+    ^
+    (ignore (Raw.write_all t);
+     Raw.take_output t)
+  in
+  Raw.feed ~chunk t (String.make body_bytes 'x');
+  t, response
+
+let check_drain_closed label t ~unread =
+  Alcotest.(check int)
+    (label ^ ": body bytes left unread")
+    unread
+    (String.length t.Raw.pending);
+  Alcotest.check
+    read_operation
+    (label ^ ": reader closed")
+    `Close
+    (Raw.read_op t);
+  Alcotest.(check bool)
+    (label ^ ": writer closed")
+    true
+    (Raw.write_all t = `Close);
+  Alcotest.(check bool)
+    (label ^ ": connection closed")
+    true
+    (Server_connection.is_closed t.conn)
+
+let test_unread_body_drain_limit () =
+  List.iter
+    (fun (split, chunk) ->
+       let config = { Config.default with max_discard_body = 1000 } in
+       let label = "content-length 1001, " ^ split in
+       let t, response =
+         drain ~config ~chunk ~head:(post_head 1001) ~body_bytes:1001 ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response closes")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nno"
+         response;
+       check_drain_closed label t ~unread:1;
+       let label = "content-length 1000, " ^ split in
+       let t, response =
+         drain ~config ~chunk ~head:(post_head 1000) ~body_bytes:1000 ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response keeps the connection")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         response;
+       Raw.feed ~chunk t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         (label ^ ": next request served")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         (Raw.take_output t);
+       let label = "chunked, " ^ split in
+       let t, response =
+         drain
+           ~config
+           ~chunk
+           ~head:
+             "POST / HTTP/1.1\r\nHost: a\r\ntransfer-encoding: chunked\r\n\r\n"
+           ~body_bytes:0
+           ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response keeps the connection")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         response;
+       let chunks =
+         String.concat
+           ""
+           (List.init 20 (fun _ -> "64\r\n" ^ String.make 100 'x' ^ "\r\n"))
+         ^ "0\r\n\r\n"
+       in
+       Raw.feed ~chunk t chunks;
+       check_drain_closed label t ~unread:(String.length chunks - 1000))
+    drain_splits
+
+let test_unread_body_413_default_limit () =
+  List.iter
+    (fun (split, chunk) ->
+       let t = Raw.create (early_response ~status:`Content_too_large) in
+       Raw.feed ~chunk t (post_head 10_000_000);
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         (split ^ ": 413 closes")
+         "HTTP/1.1 413 Content Too Large\r\n\
+          content-length: 2\r\n\
+          connection: close\r\n\
+          \r\n\
+          no"
+         (Raw.take_output t);
+       Raw.feed ~chunk t (String.make 0x50000 'x');
+       check_drain_closed split t ~unread:(0x50000 - 0x40000))
+    [ "one read", max_int; "4096-byte reads", 4096 ]
+
+(* The application closes the body instead of reading it: the server drops it
+   within the same budget. *)
+let close_body_and_respond ?status reqd =
+  Body.Reader.close (Request_descriptor.request_body reqd);
+  early_response ?status reqd
+
+let test_closed_body_drain_limit () =
+  List.iter
+    (fun (split, chunk) ->
+       let config = { Config.default with max_discard_body = 1000 } in
+       let handler = close_body_and_respond ?status:None in
+       let label = "closed, content-length 1001, " ^ split in
+       let t, response =
+         drain
+           ~config
+           ~handler
+           ~chunk
+           ~head:(post_head 1001)
+           ~body_bytes:1001
+           ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response closes")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nno"
+         response;
+       check_drain_closed label t ~unread:1001;
+       let label = "closed, content-length 1000, " ^ split in
+       let t, response =
+         drain
+           ~config
+           ~handler
+           ~chunk
+           ~head:(post_head 1000)
+           ~body_bytes:1000
+           ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response keeps the connection")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         response;
+       Raw.feed ~chunk t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         (label ^ ": next request served")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         (Raw.take_output t);
+       let chunked_head =
+         "POST / HTTP/1.1\r\nHost: a\r\ntransfer-encoding: chunked\r\n\r\n"
+       in
+       let chunks n =
+         String.concat
+           ""
+           (List.init n (fun _ -> "64\r\n" ^ String.make 100 'x' ^ "\r\n"))
+         ^ "0\r\n\r\n"
+       in
+       let label = "closed, chunked within the limit, " ^ split in
+       let t, response =
+         drain ~config ~handler ~chunk ~head:chunked_head ~body_bytes:0 ()
+       in
+       Alcotest.(check string)
+         (label ^ ": response keeps the connection")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         response;
+       Raw.feed ~chunk t (chunks 5 ^ "GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         (label ^ ": next request served")
+         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+         (Raw.take_output t);
+       let label = "closed, chunked past the limit, " ^ split in
+       let t, _ =
+         drain ~config ~handler ~chunk ~head:chunked_head ~body_bytes:0 ()
+       in
+       let chunks = chunks 20 in
+       Raw.feed ~chunk t chunks;
+       check_drain_closed label t ~unread:(String.length chunks - 1000))
+    drain_splits
+
+let test_closed_body_413_default_limit () =
+  List.iter
+    (fun (split, chunk) ->
+       let t = Raw.create (close_body_and_respond ~status:`Content_too_large) in
+       Raw.feed ~chunk t (post_head 10_000_000_000);
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         (split ^ ": 413 closes")
+         "HTTP/1.1 413 Content Too Large\r\n\
+          content-length: 2\r\n\
+          connection: close\r\n\
+          \r\n\
+          no"
+         (Raw.take_output t);
+       Raw.feed ~chunk t (String.make 0x50000 'x');
+       check_drain_closed split t ~unread:0x50000)
+    [ "one read", max_int; "4096-byte reads", 4096 ]
+
+(* A read that ends the input and holds more than the drain budget: the bytes
+   past the budget are offered again, so a pipelined request after a body at the
+   limit is served. *)
+let test_drain_budget_read_eof () =
+  List.iter
+    (fun (split, chunk) ->
+       List.iter
+         (fun (case, config, size) ->
+            let label = case ^ ", " ^ split in
+            let t, response =
+              drain ?config ~chunk ~head:(post_head size) ~body_bytes:0 ()
+            in
+            Alcotest.(check string)
+              (label ^ ": response keeps the connection")
+              "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+              response;
+            Raw.feed
+              ~eof:true
+              ~chunk
+              t
+              (String.make size 'x' ^ "GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+            if Raw.read_op t = `Read then ignore (Raw.read t ~eof:true 0 : int);
+            ignore (Raw.write_all t);
+            Alcotest.(check string)
+              (label ^ ": pipelined request served")
+              "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno"
+              (Raw.take_output t);
+            Alcotest.(check int)
+              (label ^ ": all input read")
+              0
+              (String.length t.Raw.pending);
+            Alcotest.check
+              read_operation
+              (label ^ ": reader closed")
+              `Close
+              (Raw.read_op t))
+         [ ( "limit 1000"
+           , Some { Config.default with max_discard_body = 1000 }
+           , 1000 )
+         ; "default limit", None, 262144
+         ])
+    drain_splits
 
 let test_eof_in_discarded_body () =
   List.iter
@@ -3203,6 +3479,17 @@ let switching_requests =
        Upgrade: echo\r\n\
        \r\n" )
   ; "CONNECT", "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n\r\n"
+    (* Decision 0016: a CONNECT request has no body, whatever its framing fields
+       say. *)
+  ; ( "CONNECT with Content-Length"
+    , "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\nContent-Length: 5\r\n\r\n" )
+  ; ( "CONNECT with Transfer-Encoding"
+    , "CONNECT a:443 HTTP/1.1\r\n\
+       Host: a:443\r\n\
+       Transfer-Encoding: chunked\r\n\
+       \r\n" )
+  ; ( "CONNECT with an invalid Content-Length"
+    , "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\nContent-Length: x\r\n\r\n" )
   ]
 
 let upgrade_response_for request =
@@ -3282,7 +3569,16 @@ let test_bytes_after_upgrade_request_parsed_after_other_response () =
     Raw.feed ~chunk t "";
     ignore (Raw.write_all t);
     let output = first ^ Raw.take_output t in
-    let response = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n" in
+    let connect = String.starts_with ~prefix:"CONNECT" request in
+    let response =
+      if connect
+      then
+        "HTTP/1.1 404 Not Found\r\n\
+         content-length: 0\r\n\
+         connection: close\r\n\
+         \r\n"
+      else "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"
+    in
     Alcotest.(check bool)
       (label ^ ": 404 first")
       true
@@ -3293,7 +3589,21 @@ let test_bytes_after_upgrade_request_parsed_after_other_response () =
         (String.length response)
         (String.length output - String.length response)
     in
-    if trailing = "ping"
+    if connect
+    then (
+      (* A CONNECT not tunnelled closes: the bytes after it may be tunnel
+         data. *)
+      Alcotest.(check string) (label ^ ": nothing more written") "" rest;
+      Alcotest.check
+        read_operation
+        (label ^ ": reader closed")
+        `Close
+        (Raw.read_op t);
+      Alcotest.(check bool)
+        (label ^ ": writer closed")
+        true
+        (Raw.write_all t = `Close))
+    else if trailing = "ping"
     then (
       Alcotest.(check string)
         (label ^ ": incomplete head consumed")
@@ -3511,7 +3821,7 @@ let test_head_timeout_is_408 () =
        Raw.feed ~chunk t "GET / HTTP/1.1\r\nHo";
        (match Server_connection.read_timeout t.conn with
        | Some (`Head, reject) -> reject ()
-       | Some ((`Idle | `Body), _) | None ->
+       | Some ((`Idle | `Body | `Close), _) | None ->
          Alcotest.fail "expected a head timeout");
        Alcotest.(check (list request_error))
          (split ^ ": error")
@@ -3801,6 +4111,119 @@ let test_error_handler_respond_twice () =
     "one response"
     "HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n"
     (Raw.take_output t)
+
+let bad_request_inputs =
+  [ ( "bare LF"
+    , "GET / HTTP/1.1\nHost: a\r\n\r\n"
+    , "unexpected '\\n' in request-line" )
+  ; ( "obs-fold"
+    , "GET / HTTP/1.1\r\nHost: a\r\nX: b\r\n c\r\n\r\n"
+    , "unexpected ' ' in field line" )
+  ; ( "bad Content-Length"
+    , "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1x\r\n\r\n"
+    , "invalid Content-Length" )
+  ; ( "bad target"
+    , "GET index.html HTTP/1.1\r\nHost: a\r\n\r\n"
+    , "request-target does not fit the method" )
+  ; ( "userinfo in the target"
+    , "GET http://u:p@a/ HTTP/1.1\r\nHost: a\r\n\r\n"
+    , "userinfo or an empty host in the request-target" )
+  ]
+
+let test_chunk_overhead_reason () =
+  let errors = ref [] in
+  let t =
+    Raw.create
+      ~error_handler:(fun ?request:_ error respond ->
+        errors := error :: !errors;
+        Body.Writer.close (respond Headers.empty))
+      (fun reqd ->
+         let body = Request_descriptor.request_body reqd in
+         let rec read () =
+           Body.Reader.schedule_read
+             body
+             ~on_eof:ignore
+             ~on_error:ignore
+             ~on_read:(fun _ ~off:_ ~len:_ -> read ())
+         in
+         read ())
+  in
+  Raw.feed
+    ~chunk:max_int
+    t
+    ("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+    ^ String.concat
+        ""
+        (List.init 2000 (fun _ -> "1;" ^ String.make 64 'e' ^ "\r\nx\r\n")));
+  ignore (Raw.write_all t);
+  Alcotest.(check (list request_error))
+    "reason"
+    [ `Bad_request "chunked encoding contains too much non-data" ]
+    !errors
+
+let test_bad_request_reasons () =
+  let reasons =
+    List.map
+      (fun (case, input, expected) ->
+         let errors = ref [] in
+         let t =
+           Raw.create
+             ~error_handler:(fun ?request:_ error respond ->
+               errors := error :: !errors;
+               Body.Writer.close (respond Headers.empty))
+             (fun _ -> Alcotest.fail "request handler called")
+         in
+         Raw.feed ~chunk:max_int t input;
+         ignore (Raw.write_all t);
+         Alcotest.(check (list request_error))
+           case
+           [ `Bad_request expected ]
+           !errors;
+         expected)
+      bad_request_inputs
+  in
+  Alcotest.(check int)
+    "distinct reasons"
+    (List.length reasons)
+    (List.length (List.sort_uniq String.compare reasons))
+
+let test_default_error_handler_hides_reason () =
+  List.iter
+    (fun (case, input, _) ->
+       let t =
+         { Raw.conn =
+             Server_connection.create (fun _ ->
+               Alcotest.fail "request handler called")
+         ; pending = ""
+         ; out = Buffer.create 256
+         }
+       in
+       Raw.feed ~chunk:max_int t input;
+       ignore (Raw.write_all t);
+       Alcotest.(check string)
+         case
+         "HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n400"
+         (Raw.take_output t))
+    bad_request_inputs
+
+(* Decision 0018. *)
+let test_error_status () =
+  List.iter
+    (fun (case, error, code) ->
+       Alcotest.(check int)
+         case
+         code
+         (Status.to_code (Server_connection.error_status error)))
+    [ "Bad_request", `Bad_request "invalid Content-Length", 400
+    ; "Not_implemented", `Not_implemented, 501
+    ; "Http_version_not_supported", `Http_version_not_supported, 505
+    ; "Uri_too_long", `Uri_too_long, 414
+    ; "Bad_gateway", `Bad_gateway, 502
+    ; "Internal_server_error", `Internal_server_error, 500
+    ; "Request_header_fields_too_large", `Request_header_fields_too_large, 431
+    ; "Request_timeout", `Request_timeout, 408
+    ; "Exn", `Exn Exit, 500
+    ]
 
 let test_error_handler_flush_then_raise () =
   List.iter
@@ -4165,15 +4588,13 @@ let test_pipelined_handler_exception () =
          (Raw.read_op t))
     splits
 
-let post_head n =
-  Printf.sprintf "POST / HTTP/1.1\r\nHost: a\r\ncontent-length: %d\r\n\r\n" n
-
 let read_timeout_kind conn =
   match Server_connection.read_timeout conn with
   | None -> "none"
   | Some (`Idle, _) -> "idle"
   | Some (`Head, _) -> "head"
   | Some (`Body, _) -> "body"
+  | Some (`Close, _) -> "close"
 
 let test_body_delivered_after_closing_response () =
   List.iter
@@ -4281,16 +4702,97 @@ let test_unread_body_after_response_is_timed () =
          ])
     splits
 
-let test_body_timeout_only_after_response () =
+let test_body_timeout_before_response () =
+  let events = ref [] in
   let t =
     Raw.create (fun reqd ->
-      record_body (ref []) (Request_descriptor.request_body reqd))
+      record_body events (Request_descriptor.request_body reqd))
   in
   Raw.feed ~chunk:max_int t (post_head 10 ^ "01234");
+  (match Server_connection.read_timeout t.conn with
+  | Some (`Body, expire) -> expire ()
+  | _ ->
+    Alcotest.failf
+      "expected a body timeout while a body read waits, got %s"
+      (read_timeout_kind t.conn));
+  check_one_ending "body read" "error" events;
+  let output = ref "" in
+  let rec write () =
+    match Server_connection.next_write_operation t.conn with
+    | `Write iovecs ->
+      let s = Write_operation.iovecs_to_string iovecs in
+      output := !output ^ s;
+      Server_connection.report_write_result t.conn (`Ok (String.length s));
+      write ()
+    | `Yield | `Close _ -> ()
+  in
+  write ();
   Alcotest.(check string)
-    "no timeout while the response is pending"
+    "408 response"
+    "HTTP/1.1 408"
+    (String.sub !output 0 (min 12 (String.length !output)));
+  Alcotest.check read_operation "reader closed" `Close (Raw.read_op t);
+  Alcotest.(check bool)
+    "connection closed"
+    true
+    (Server_connection.is_closed t.conn)
+
+let test_eof_in_unread_body_after_response_closes () =
+  let t =
+    Raw.create (fun reqd ->
+      Request_descriptor.respond_with_string
+        reqd
+        (Response.create `Content_too_large)
+        "no")
+  in
+  Raw.feed ~chunk:max_int t (post_head 100000 ^ "abc");
+  Alcotest.(check bool) "writer waits" true (Raw.write_all t = `Yield);
+  let woken = ref false in
+  Server_connection.yield_writer t.conn (fun () -> woken := true);
+  Alcotest.check read_operation "reads the rest" `Read (Raw.read_op t);
+  Raw.feed ~eof:true ~chunk:max_int t "";
+  Alcotest.check read_operation "reader closed" `Close (Raw.read_op t);
+  Alcotest.(check bool) "writer woken" true !woken;
+  Alcotest.(check bool) "writer closed" true (Raw.write_all t = `Close);
+  Alcotest.(check bool)
+    "connection closed"
+    true
+    (Server_connection.is_closed t.conn)
+
+let test_no_body_timeout_while_the_handler_runs () =
+  let t = Raw.create (fun (_ : Request_descriptor.t) -> ()) in
+  Raw.feed ~chunk:max_int t (post_head 10 ^ "01234");
+  Alcotest.(check string)
+    "no timeout while no body read waits"
+    "none"
+    (read_timeout_kind t.conn);
+  let t = Raw.create (fun (_ : Request_descriptor.t) -> ()) in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  Alcotest.(check string)
+    "no timeout while a GET is handled"
     "none"
     (read_timeout_kind t.conn)
+
+let test_body_timeout_after_response_started () =
+  let events = ref [] in
+  let t =
+    Raw.create (fun reqd ->
+      record_body events (Request_descriptor.request_body reqd);
+      let body =
+        Request_descriptor.respond_with_streaming
+          ~flush_headers_immediately:true
+          reqd
+          (Response.create `OK)
+      in
+      Body.Writer.write_string body "x")
+  in
+  Raw.feed ~chunk:max_int t (post_head 10 ^ "01234");
+  (match Server_connection.read_timeout t.conn with
+  | Some (`Body, expire) -> expire ()
+  | _ ->
+    Alcotest.failf "expected a body timeout, got %s" (read_timeout_kind t.conn));
+  check_one_ending "body read" "error" events;
+  Alcotest.check read_operation "reader closed" `Close (Raw.read_op t)
 
 let test_connect_upgrade_status () =
   let impl () =
@@ -4342,9 +4844,155 @@ let test_connect_upgrade_status () =
     ]
     (List.rev !raised)
 
+let fixed_date = "Sun, 06 Nov 1994 08:49:37 GMT"
+
+let date_lines output =
+  String.split_on_char '\n' output
+  |> List.filter (fun line ->
+    String.length line >= 5
+    && String.lowercase_ascii (String.sub line 0 5) = "date:")
+
+let test_date_added () =
+  let t =
+    Raw.create
+      ~date:(fun () -> fixed_date)
+      (fun reqd ->
+         Request_descriptor.respond_with_string reqd (Response.create `OK) "")
+  in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  ignore (Raw.write_all t);
+  Alcotest.(check string)
+    "Date after the other fields"
+    ("HTTP/1.1 200 OK\r\ncontent-length: 0\r\nDate: " ^ fixed_date ^ "\r\n\r\n")
+    (Raw.take_output t)
+
+let test_date_kept_from_application () =
+  let calls = ref 0 in
+  let t =
+    Raw.create
+      ~date:(fun () ->
+        incr calls;
+        fixed_date)
+      (fun reqd ->
+         Request_descriptor.respond_with_string
+           reqd
+           (Response.create
+              ~headers:
+                (Headers.of_list [ "date", "Mon, 07 Nov 1994 00:00:00 GMT" ])
+              `OK)
+           "")
+  in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  ignore (Raw.write_all t);
+  Alcotest.(check (list string))
+    "only the application's date"
+    [ "date: Mon, 07 Nov 1994 00:00:00 GMT\r" ]
+    (date_lines (Raw.take_output t));
+  Alcotest.(check int) "date function not called" 0 !calls
+
+let test_date_not_on_informational () =
+  let t =
+    Raw.create
+      ~date:(fun () -> fixed_date)
+      (fun reqd ->
+         match (Request_descriptor.request reqd).target with
+         | "/upgrade" ->
+           Request_descriptor.respond_with_upgrade
+             reqd
+             (Headers.of_list [ "upgrade", "test" ])
+             (Ache.Runtime.make
+                (module Recorder)
+                { Recorder.got = ""; eof = false })
+         | _ ->
+           Request_descriptor.respond_with_informational
+             reqd
+             (Response.create `Continue);
+           Request_descriptor.respond_with_string reqd (Response.create `OK) "")
+  in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  ignore (Raw.write_all t);
+  Alcotest.(check string)
+    "100 without Date, 200 with Date"
+    ("HTTP/1.1 100 Continue\r\n\
+      \r\n\
+      HTTP/1.1 200 OK\r\n\
+      content-length: 0\r\n\
+      Date: "
+    ^ fixed_date
+    ^ "\r\n\r\n")
+    (Raw.take_output t);
+  Raw.feed
+    ~chunk:max_int
+    t
+    "GET /upgrade HTTP/1.1\r\n\
+     Host: a\r\n\
+     Connection: upgrade\r\n\
+     Upgrade: test\r\n\
+     \r\n";
+  ignore (Raw.write_all t);
+  Alcotest.(check string)
+    "101 without Date"
+    "HTTP/1.1 101 Switching Protocols\r\nupgrade: test\r\n\r\n"
+    (Raw.take_output t)
+
+let test_date_on_error_response () =
+  let t = Raw.create ~date:(fun () -> fixed_date) default_request_handler in
+  Raw.feed
+    ~chunk:max_int
+    t
+    "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n";
+  ignore (Raw.write_all t);
+  let output = Raw.take_output t in
+  Alcotest.(check bool)
+    "a 400"
+    true
+    (String.starts_with ~prefix:"HTTP/1.1 400" output);
+  Alcotest.(check (list string))
+    "one Date"
+    [ "Date: " ^ fixed_date ^ "\r" ]
+    (date_lines output)
+
+let test_no_date_by_default () =
+  let t =
+    Raw.create (fun reqd ->
+      Request_descriptor.respond_with_string reqd (Response.create `OK) "")
+  in
+  Raw.feed ~chunk:max_int t "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+  Raw.feed
+    ~chunk:max_int
+    t
+    "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n";
+  ignore (Raw.write_all t);
+  Alcotest.(check (list string)) "no Date" [] (date_lines (Raw.take_output t))
+
+let test_imf_fixdate () =
+  List.iter
+    (fun (seconds, expected) ->
+       Alcotest.(check string)
+         (string_of_int seconds)
+         expected
+         (Ache.Ache_private.Http_date.imf_fixdate seconds);
+       Alcotest.(check string)
+         (string_of_int seconds ^ " cached")
+         expected
+         (Ache.Ache_private.Http_date.cached seconds))
+    [ 784111777, "Sun, 06 Nov 1994 08:49:37 GMT"
+    ; 0, "Thu, 01 Jan 1970 00:00:00 GMT"
+    ; 951782400, "Tue, 29 Feb 2000 00:00:00 GMT"
+    ; 951868799, "Tue, 29 Feb 2000 23:59:59 GMT"
+    ; 2147483648, "Tue, 19 Jan 2038 03:14:08 GMT"
+    ; 4102444800, "Fri, 01 Jan 2100 00:00:00 GMT"
+    ]
+
 let tests =
   [ "initial reader state", `Quick, test_initial_reader_state
   ; "shutdown reader closed", `Quick, test_reader_is_closed_after_eof
+  ; "Date added with ?date", `Quick, test_date_added
+  ; "Date from the application kept", `Quick, test_date_kept_from_application
+  ; "no Date on 1xx", `Quick, test_date_not_on_informational
+  ; "Date on an error response", `Quick, test_date_on_error_response
+  ; "no Date without ?date", `Quick, test_no_date_by_default
+  ; "Http_date.imf_fixdate", `Quick, test_imf_fixdate
   ; ( "commit parse after every header line"
     , `Quick
     , test_commit_parse_after_every_header )
@@ -4546,6 +5194,21 @@ let tests =
     , `Quick
     , test_unread_body_discarded_after_response )
   ; "EOF in a discarded request body", `Quick, test_eof_in_discarded_body
+  ; ( "unread body: drain limit -1, at, +1, chunked past it"
+    , `Quick
+    , test_unread_body_drain_limit )
+  ; ( "closed body: drain limit, at, chunked within and past it"
+    , `Quick
+    , test_closed_body_drain_limit )
+  ; ( "closed body: 413 to a 10 GB upload reads none of it"
+    , `Quick
+    , test_closed_body_413_default_limit )
+  ; ( "drain budget: read_eof past it serves a pipelined request"
+    , `Quick
+    , test_drain_budget_read_eof )
+  ; ( "unread body: 413 to a 10 MB body reads 256 KiB, then closes"
+    , `Quick
+    , test_unread_body_413_default_limit )
   ; ( "error handler with invalid headers closes the connection"
     , `Quick
     , test_error_handler_invalid_headers_closes )
@@ -4580,6 +5243,12 @@ let tests =
   ; ( "error handler flushes then raises"
     , `Quick
     , test_error_handler_flush_then_raise )
+  ; "bad request reasons", `Quick, test_bad_request_reasons
+  ; "chunk overhead reason", `Quick, test_chunk_overhead_reason
+  ; ( "default error handler does not send the reason"
+    , `Quick
+    , test_default_error_handler_hides_reason )
+  ; "error_status: the status of each error", `Quick, test_error_status
   ; ( "report_exn while the error handler has not responded"
     , `Quick
     , test_report_exn_while_error_handler_pending )
@@ -4614,9 +5283,18 @@ let tests =
   ; ( "unread body after the response has a timeout"
     , `Quick
     , test_unread_body_after_response_is_timed )
-  ; ( "no body timeout before the response"
+  ; ( "body timeout before the response: on_error, then 408"
     , `Quick
-    , test_body_timeout_only_after_response )
+    , test_body_timeout_before_response )
+  ; ( "end of input in an unread body after the response closes"
+    , `Quick
+    , test_eof_in_unread_body_after_response_closes )
+  ; ( "no body timeout while the handler runs"
+    , `Quick
+    , test_no_body_timeout_while_the_handler_runs )
+  ; ( "body timeout after the response started closes"
+    , `Quick
+    , test_body_timeout_after_response_started )
   ]
 
 (* https://httpwg.org/specs/rfc9110.html For example, a CONNECT request (Section

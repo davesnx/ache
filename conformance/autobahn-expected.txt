@@ -1,0 +1,9 @@
+# Autobahn cases that do not pass on ache today. One per line:
+#   <case id> <worst behavior allowed: NON-STRICT or FAILED> # <reason>
+# autobahn.sh fails when a case is worse than its line allows (a case not
+# listed must be OK, INFORMATIONAL or UNIMPLEMENTED), and when a listed case
+# is not in the report.
+#
+# No case is listed: on 2026-11-25 (image digest in autobahn.sh) eio, lwt and
+# miou passed 298 of 301 cases. 7.1.6, 7.13.1 and 7.13.2 are INFORMATIONAL,
+# which passes.

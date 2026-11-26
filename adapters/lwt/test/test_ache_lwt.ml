@@ -95,22 +95,48 @@ let end_ws result =
   Option.iter (fun u -> Lwt.wakeup_later u result) !ws_ended;
   ws_ended := None
 
+let text_of = function Ache.Websocket.Text s -> s | Binary s -> "binary:" ^ s
+
+let receive_text ws =
+  Lwt.map (Option.map text_of) (Ache_lwt.Websocket.receive ws)
+
+exception Ws_session_failed
+
 let ws_echo ws =
   let rec loop () =
     Lwt.bind (Ache_lwt.Websocket.receive ws) (function
-      | Some "close-me" ->
+      | Some (Text "close-me") ->
         Lwt.bind (Ache_lwt.Websocket.close ws 1001) (fun () ->
           Lwt.map
             (fun next ->
                end_ws
                  (Ok
-                    (match next with
-                    | None -> "closed, receive None"
-                    | Some m -> "received " ^ m)))
+                    (match next, Ache_lwt.Websocket.client_close ws with
+                    | None, None -> "closed, no client close"
+                    | None, Some { code; reason } ->
+                      Printf.sprintf "closed, client close %d %S" code reason
+                    | Some m, _ -> "received " ^ text_of m)))
             (Ache_lwt.Websocket.receive ws))
-      | Some message -> Lwt.bind (Ache_lwt.Websocket.send ws message) loop
+      | Some (Text "ping-me") ->
+        Lwt.bind (Ache_lwt.Websocket.ping ws "are you there") (fun () ->
+          Lwt.bind (Ache_lwt.Websocket.send_text ws "pong seen") loop)
+      | Some (Text "bye-reason") ->
+        Lwt.bind
+          (Ache_lwt.Websocket.close ~reason:"done here" ws 4000)
+          (fun () ->
+             end_ws (Ok "closed with a reason");
+             Lwt.return_unit)
+      | Some (Text message) ->
+        Lwt.bind (Ache_lwt.Websocket.send_text ws message) loop
+      | Some (Binary message) ->
+        Lwt.bind (Ache_lwt.Websocket.send_binary ws message) loop
       | None ->
-        end_ws (Ok "receive None");
+        end_ws
+          (Ok
+             (match Ache_lwt.Websocket.client_close ws with
+             | None -> "receive None"
+             | Some { code; reason } ->
+               Printf.sprintf "receive None, client close %d %S" code reason));
         Lwt.return_unit)
   in
   loop ()
@@ -119,7 +145,7 @@ let ws_flood ws =
   let chunk = String.make 4096 'x' in
   let rec loop () =
     incr ws_flood_sends;
-    Lwt.bind (Ache_lwt.Websocket.send ws chunk) loop
+    Lwt.bind (Ache_lwt.Websocket.send_text ws chunk) loop
   in
   Lwt.catch loop (fun exn ->
     Lwt.map
@@ -135,6 +161,8 @@ exception Respond_later
 let late_error_response : (unit -> unit) option ref = ref None
 let pending_response : Request_descriptor.t option ref = ref None
 let pending_body_failed = ref false
+let slow_reqd : Request_descriptor.t option ref = ref None
+let body_cut = ref false
 
 let request_handler (_ : Unix.sockaddr) reqd =
   incr requests_seen;
@@ -178,11 +206,42 @@ let request_handler (_ : Unix.sockaddr) reqd =
       reqd
       (Headers.of_list [ "connection", "upgrade"; "upgrade", "echo" ])
       (echo_server ())
+  | `GET, "/ws-return" ->
+    (match
+       Ache_lwt.Websocket.upgrade reqd (fun ws ->
+         Ache_lwt.Websocket.send_text ws "hi")
+     with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
+  | `GET, "/ws-raise" ->
+    (match
+       Ache_lwt.Websocket.upgrade reqd (fun _ -> Lwt.fail Ws_session_failed)
+     with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
+  | `GET, "/ws-callback-close" ->
+    (* The callback API: the first message closes the connection with 1000. *)
+    (match
+       Ache.Websocket.upgrade reqd (fun ws ->
+         { Ache.Websocket.on_message =
+             (fun _ -> Ache.Websocket.close ws ~code:1000)
+         ; on_pong = ignore
+         ; on_close =
+             (function
+               | None -> end_ws (Ok "on_close None")
+               | Some { code; _ } ->
+                 end_ws (Ok (Printf.sprintf "on_close %d" code)))
+         })
+     with
+    | Ok () -> ()
+    | Error _ -> Alcotest.fail "handshake rejected")
   | `GET, ("/ws-echo" | "/ws-flood") ->
-    (match Ache_lwt.Websocket.upgrade reqd with
-    | Ok ws ->
-      Lwt.async (fun () ->
-        if request.target = "/ws-echo" then ws_echo ws else ws_flood ws)
+    (match
+       Ache_lwt.Websocket.upgrade
+         reqd
+         (if request.target = "/ws-echo" then ws_echo else ws_flood)
+     with
+    | Ok () -> ()
     | Error _ ->
       Request_descriptor.respond_with_string
         reqd
@@ -204,6 +263,42 @@ let request_handler (_ : Unix.sockaddr) reqd =
                 reqd
                 (Response.create `OK)))
         !stream_start)
+  | `GET, "/slow" ->
+    Body.Reader.close body;
+    slow_reqd := Some reqd
+  | `POST, "/slow-noread" -> slow_reqd := Some reqd
+  | `POST, ("/count" | "/count-started") ->
+    let response_body =
+      if request.target = "/count-started"
+      then (
+        let w =
+          Request_descriptor.respond_with_streaming reqd (Response.create `OK)
+        in
+        Body.Writer.flush w ignore;
+        Some w)
+      else None
+    in
+    let total = ref 0 in
+    let rec on_read _ ~off:_ ~len =
+      total := !total + len;
+      Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+    and on_eof () =
+      let text = string_of_int !total in
+      match response_body with
+      | Some w ->
+        Body.Writer.write_string w text;
+        Body.Writer.close w
+      | None ->
+        Request_descriptor.respond_with_string
+          reqd
+          (Response.create
+             ~headers:
+               (Headers.of_list
+                  [ "content-length", string_of_int (String.length text) ])
+             `OK)
+          text
+    and on_error () = body_cut := true in
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
   | `GET, "/raise" -> failwith "handler failed"
   | `GET, "/raise-later" -> raise Respond_later
   | `POST, "/early-close" ->
@@ -254,13 +349,27 @@ let run f = Lwt_main.run (Lwt_unix.with_timeout 10.0 f)
 let server_sockets : Lwt_unix.file_descr list ref = ref []
 
 let with_server
+      ?config
       ?idle_timeout
       ?head_timeout
+      ?body_timeout
+      ?write_timeout
+      ?close_timeout
+      ?(date = false)
+      ?stop
+      ?grace
       ?(connection_handler =
         fun ~request_handler ~error_handler addr socket ->
           Ache_lwt.Server.create_connection_handler
-            ?idle_timeout
-            ?head_timeout
+            ?config
+            ~date
+            ~idle_timeout
+            ~head_timeout
+            ~body_timeout
+            ~write_timeout
+            ~close_timeout
+            ?stop
+            ?grace
             ~request_handler
             ~error_handler
             addr
@@ -363,6 +472,77 @@ let test_get () =
     Alcotest.(check int) "status" 200 (Status.to_code response.status);
     Alcotest.(check string) "body" "hello world" body;
     Ache_lwt.Client.shutdown client)
+
+(* [value] is an IMF-fixdate (RFC 9110 §5.6.7) within a few seconds of now. *)
+let check_date_value value =
+  let digits from len =
+    String.for_all
+      (function '0' .. '9' -> true | _ -> false)
+      (String.sub value from len)
+  in
+  let one_of from names = List.mem (String.sub value from 3) names in
+  let format_ok =
+    String.length value = 29
+    && one_of 0 [ "Mon"; "Tue"; "Wed"; "Thu"; "Fri"; "Sat"; "Sun" ]
+    && String.sub value 3 2 = ", "
+    && digits 5 2
+    && value.[7] = ' '
+    && one_of
+         8
+         [ "Jan"
+         ; "Feb"
+         ; "Mar"
+         ; "Apr"
+         ; "May"
+         ; "Jun"
+         ; "Jul"
+         ; "Aug"
+         ; "Sep"
+         ; "Oct"
+         ; "Nov"
+         ; "Dec"
+         ]
+    && value.[11] = ' '
+    && digits 12 4
+    && value.[16] = ' '
+    && digits 17 2
+    && value.[19] = ':'
+    && digits 20 2
+    && value.[22] = ':'
+    && digits 23 2
+    && String.sub value 25 4 = " GMT"
+  in
+  if not format_ok then Alcotest.failf "Date %S is not an IMF-fixdate" value;
+  let now = int_of_float (Unix.gettimeofday ()) in
+  let near =
+    List.init 11 (fun i ->
+      Ache.Ache_private.Http_date.imf_fixdate (now - 5 + i))
+  in
+  if not (List.mem value near)
+  then Alcotest.failf "Date %S is not within 5 s of now" value
+
+let test_date_header () =
+  List.iter
+    (fun date ->
+       with_server ~date (fun connect ->
+         connect () >>= Ache_lwt.Client.create_connection >>= fun client ->
+         request
+           client
+           (Request.create
+              ~headers:(Headers.of_list [ "host", "localhost" ])
+              `GET
+              "/hello")
+         >>= fun (response, _) ->
+         (match date, Headers.get_multi response.headers "date" with
+         | true, [ value ] -> check_date_value value
+         | false, [] -> ()
+         | _, values ->
+           Alcotest.failf
+             "date:%b: Date fields %s"
+             date
+             (String.concat ", " values));
+         Ache_lwt.Client.shutdown client))
+    [ true; false ]
 
 let test_post_echo () =
   with_server (fun connect ->
@@ -533,6 +713,10 @@ module Test_io = struct
         iovecs;
       Lwt_unix.writev socket vectors >|= fun n -> `Ok n
 
+  let shutdown_send socket =
+    try Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND with
+    | Unix.Unix_error _ -> ()
+
   let shutdown_receive socket =
     if !fail_shutdown
     then failwith "shutdown failed"
@@ -558,6 +742,7 @@ let with_failing_io ~read ~write =
   with_server
     ~connection_handler:(fun ~request_handler ~error_handler addr socket ->
       Test_server.create_connection_handler
+        ~date:false
         ~request_handler
         ~error_handler
         addr
@@ -606,6 +791,7 @@ let test_handler_exception () =
   with_server
     ~connection_handler:(fun ~request_handler ~error_handler addr socket ->
       Test_server.create_connection_handler
+        ~date:false
         ~request_handler
         ~error_handler
         addr
@@ -641,7 +827,7 @@ let test_eof_mid_body () =
     read_all socket >>= fun (_ : string) -> Lwt_unix.close socket);
   Alcotest.(check bool) "request body cut" true !partial_body_cut;
   match !server_errors with
-  | [ `Bad_request ] -> ()
+  | [ `Bad_request _ ] -> ()
   | _ ->
     Alcotest.failf
       "expected one Bad_request, got %d errors"
@@ -760,11 +946,13 @@ let test_websocket_echo () =
     >>= fun () ->
     read_ws_frame socket >>= fun second ->
     read_ws_frame socket >>= fun third ->
+    write_all socket (ws_frame 0x2 "\x00\xff") >>= fun () ->
+    read_ws_frame socket >>= fun fourth ->
     Alcotest.(check (list (pair int string)))
-      "echo, pong, echo of the fragmented message"
-      [ 0x81, "hello"; 0x8a, "ping"; 0x81, "w\xc3\xb6rld" ]
-      [ first; second; third ];
-    write_all socket (ws_frame 0x8 "\x03\xe8") >>= fun () ->
+      "echo, pong, echo of the fragmented message, binary echo"
+      [ 0x81, "hello"; 0x8a, "ping"; 0x81, "w\xc3\xb6rld"; 0x82, "\x00\xff" ]
+      [ first; second; third; fourth ];
+    write_all socket (ws_frame 0x8 "\x03\xe8bye") >>= fun () ->
     read_ws_frame socket >>= fun close ->
     Alcotest.(check (pair int string)) "close echoed" (0x88, "\x03\xe8") close;
     read_all socket >>= fun rest ->
@@ -772,7 +960,7 @@ let test_websocket_echo () =
     ended >>= fun result ->
     Alcotest.(check (result string reject))
       "server loop"
-      (Ok "receive None")
+      (Ok "receive None, client close 1000 \"bye\"")
       result;
     Lwt_unix.close socket);
   check_server_sockets_closed ()
@@ -787,12 +975,312 @@ let test_websocket_server_close () =
     write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
     read_ws_frame socket >>= fun close ->
     Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    (* The server waits for the client's close frame and drops the message
+       before it. *)
+    write_all socket (ws_frame 0x1 "dropped" ^ ws_frame 0x8 "\x0f\xa0done")
+    >>= fun () ->
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "close resolved with the client's close frame"
+      (Ok "closed, client close 4000 \"done\"")
+      result;
+    read_all socket >>= fun rest ->
+    Alcotest.(check string) "then end of input" "" rest;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+(* A client that never answers the server's close frame, and keeps sending
+   messages, which do not extend the close timeout. *)
+let test_websocket_close_timeout () =
+  let ended = wait_ws_end () in
+  with_server ~close_timeout:0.2 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    let started = Unix.gettimeofday () in
+    let sending = ref true in
+    (* A message every 50 ms for up to 3 s, much longer than the timeout. *)
+    let rec send () =
+      if !sending && Unix.gettimeofday () -. started < 3.
+      then
+        Lwt.catch
+          (fun () ->
+             write_all socket (ws_frame 0x1 "dropped") >>= fun () ->
+             Lwt_unix.sleep 0.05 >>= send)
+          (function
+            | Unix.Unix_error ((ECONNRESET | EPIPE), _, _) -> Lwt.return_unit
+            | exn -> Lwt.fail exn)
+      else Lwt.return_unit
+    in
+    let sender = send () in
+    Lwt.catch
+      (fun () -> read_all socket)
+      (function
+        | Unix.Unix_error (ECONNRESET, _, _) -> Lwt.return ""
+        | exn -> Lwt.fail exn)
+    >>= fun rest ->
+    let elapsed = Unix.gettimeofday () -. started in
+    sending := false;
+    Alcotest.(check string) "then end of input" "" rest;
+    if elapsed > 2.
+    then
+      Alcotest.failf "end of input after %.2f s, expected about 0.2 s" elapsed;
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "close resolved without the client's close frame"
+      (Ok "closed, no client close")
+      result;
+    sender >>= fun () -> Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+(* The read that waits when the session closes has no idle limit: the close
+   timeout must still apply to a client that then sends nothing. *)
+let test_websocket_close_timeout_silent_client ?idle_timeout () =
+  let ended = wait_ws_end () in
+  with_server ?idle_timeout ~close_timeout:0.2 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    let started = Unix.gettimeofday () in
+    Lwt.pick
+      [ (read_all socket >|= fun rest -> Some rest)
+      ; (Lwt_unix.sleep 2.5 >|= fun () -> None)
+      ]
+    >>= fun rest ->
+    Alcotest.(check (option string))
+      (Printf.sprintf
+         "end of input within 2.5 s (after %.2f s)"
+         (Unix.gettimeofday () -. started))
+      (Some "")
+      rest;
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "close resolved without the client's close frame"
+      (Ok "closed, no client close")
+      result;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+(* After the server's close frame, a ping from the client still gets a pong; the
+   client then sends nothing and keeps its socket open, and the close timeout
+   ends the connection. *)
+let test_websocket_close_timeout_pong_then_silent () =
+  let ended = wait_ws_end () in
+  with_server ~idle_timeout:30. ~close_timeout:0.2 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    let started = Unix.gettimeofday () in
+    write_all socket (ws_frame 0x9 "p") >>= fun () ->
+    read_ws_frame socket >>= fun pong ->
+    Alcotest.(check (pair int string)) "pong after close" (0x8a, "p") pong;
+    Lwt.pick
+      [ (read_all socket >|= fun rest -> Some rest)
+      ; (Lwt_unix.sleep 2.5 >|= fun () -> None)
+      ]
+    >>= fun rest ->
+    Alcotest.(check (option string))
+      (Printf.sprintf
+         "end of input within 2.5 s (after %.2f s)"
+         (Unix.gettimeofday () -. started))
+      (Some "")
+      rest;
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "close resolved without the client's close frame"
+      (Ok "closed, no client close")
+      result;
+    check_server_sockets_closed ();
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+(* A client that never answers, keeps sending and never closes its socket: after
+   the close timeout the server closes its socket and the connection promise
+   resolves. *)
+let test_websocket_close_timeout_server_closes () =
+  let ended = wait_ws_end () in
+  let served = ref [] in
+  let connection_handler ~request_handler ~error_handler addr socket =
+    let p =
+      Ache_lwt.Server.create_connection_handler
+        ~idle_timeout:None
+        ~close_timeout:(Some 0.2)
+        ~request_handler
+        ~error_handler
+        addr
+        socket
+    in
+    served := p :: !served;
+    p
+  in
+  with_server ~connection_handler (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "close-me") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    let started = Unix.gettimeofday () in
+    let sending = ref true in
+    let rec send () =
+      if !sending
+      then
+        Lwt.catch
+          (fun () ->
+             write_all socket (ws_frame 0x1 "dropped") >>= fun () ->
+             Lwt_unix.sleep 0.05 >>= send)
+          (function
+            | Unix.Unix_error ((ECONNRESET | EPIPE), _, _) -> Lwt.return_unit
+            | exn -> Lwt.fail exn)
+      else Lwt.return_unit
+    in
+    let sender = send () in
+    Lwt.pick
+      [ (Lwt.join !served >|= fun () -> true)
+      ; (Lwt_unix.sleep 2.5 >|= fun () -> false)
+      ]
+    >>= fun resolved ->
+    let elapsed = Unix.gettimeofday () -. started in
+    Alcotest.(check bool)
+      (Printf.sprintf
+         "connection promise resolved within 2.5 s (%.2f s)"
+         elapsed)
+      true
+      resolved;
+    check_server_sockets_closed ();
+    sending := false;
+    sender >>= fun () ->
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "close resolved without the client's close frame"
+      (Ok "closed, no client close")
+      result;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+(* As above, with the callback API of the core: the close frame of
+   [Ache.Websocket.close] starts the close timeout. *)
+let test_websocket_close_timeout_callback_api () =
+  let ended = wait_ws_end () in
+  with_server ~close_timeout:0.2 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-callback-close") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "close") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1000" (0x88, "\x03\xe8") close;
+    let started = Unix.gettimeofday () in
+    Lwt.pick
+      [ (read_all socket >|= fun rest -> Some rest)
+      ; (Lwt_unix.sleep 2.5 >|= fun () -> None)
+      ]
+    >>= fun rest ->
+    Alcotest.(check (option string))
+      (Printf.sprintf
+         "end of input within 2.5 s (after %.2f s)"
+         (Unix.gettimeofday () -. started))
+      (Some "")
+      rest;
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "on_close without the client's close frame"
+      (Ok "on_close None")
+      result;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+let test_websocket_ping () =
+  let ended = wait_ws_end () in
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    write_all socket (ws_frame 0x1 "ping-me") >>= fun () ->
+    read_ws_frame socket >>= fun ping ->
+    Alcotest.(check (pair int string))
+      "server ping"
+      (0x89, "are you there")
+      ping;
+    write_all socket (ws_frame 0xA "are you there") >>= fun () ->
+    read_ws_frame socket >>= fun after ->
+    Alcotest.(check (pair int string))
+      "ping resolved by the pong"
+      (0x81, "pong seen")
+      after;
+    write_all socket (ws_frame 0x1 "bye-reason") >>= fun () ->
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string))
+      "close with a reason"
+      (0x88, "\x0f\xa0done here")
+      close;
+    write_all socket (ws_frame 0x8 "\x0f\xa0") >>= fun () ->
     ended >>= fun result ->
     Alcotest.(check (result string reject))
       "close resolved"
-      (Ok "closed, receive None")
+      (Ok "closed with a reason")
       result;
-    write_all socket (ws_frame 0x8 "\x03\xe9") >>= fun () ->
+    read_all socket >>= fun rest ->
+    Alcotest.(check string) "then end of input" "" rest;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+let test_websocket_session_exception () =
+  let hooked = ref [] in
+  let previous = !Lwt.async_exception_hook in
+  (Lwt.async_exception_hook := fun exn -> hooked := exn :: !hooked);
+  Fun.protect
+    ~finally:(fun () -> Lwt.async_exception_hook := previous)
+    (fun () ->
+       with_server (fun connect ->
+         connect () >>= fun socket ->
+         write_all socket (ws_handshake "/ws-raise") >>= fun () ->
+         read_head socket >>= fun head ->
+         Alcotest.(check string) "101" ws_101 head;
+         read_ws_frame socket >>= fun close ->
+         Alcotest.(check (pair int string))
+           "close 1011"
+           (0x88, "\x03\xf3")
+           close;
+         write_all socket (ws_frame 0x8 "\x03\xf3") >>= fun () ->
+         read_all socket >>= fun rest ->
+         Alcotest.(check string) "then end of input" "" rest;
+         Lwt_unix.close socket);
+       Alcotest.(check bool)
+         "the hook got the exception"
+         true
+         (!hooked = [ Ws_session_failed ]));
+  check_server_sockets_closed ()
+
+let test_websocket_session_return_closes () =
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-return") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    read_ws_frame socket >>= fun hi ->
+    Alcotest.(check (pair int string)) "hi" (0x81, "hi") hi;
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string))
+      "close 1000 when the session returns"
+      (0x88, "\x03\xe8")
+      close;
+    write_all socket (ws_frame 0x1 "unread" ^ ws_frame 0x8 "\x03\xe8")
+    >>= fun () ->
     read_all socket >>= fun rest ->
     Alcotest.(check string) "then end of input" "" rest;
     Lwt_unix.close socket);
@@ -802,8 +1290,12 @@ let test_websocket_receive_backpressure () =
   let ws = ref None in
   let server =
     Server_connection.create (fun reqd ->
-      match Ache_lwt.Websocket.upgrade reqd with
-      | Ok t -> ws := Some t
+      match
+        Ache_lwt.Websocket.upgrade reqd (fun t ->
+          ws := Some t;
+          fst (Lwt.wait ()))
+      with
+      | Ok () -> ()
       | Error _ -> Alcotest.fail "handshake rejected")
   in
   let feed s =
@@ -847,7 +1339,7 @@ let test_websocket_receive_backpressure () =
   Alcotest.(check int) "after 8 unconsumed messages" 8 !fed;
   let woken = ref false in
   Server_connection.yield_reader server (fun () -> woken := true);
-  let first = Lwt_main.run (Ache_lwt.Websocket.receive ws) in
+  let first = Lwt_main.run (receive_text ws) in
   Alcotest.(check (option string)) "first message" (Some "0") first;
   Alcotest.(check bool) "receive wakes the reader" true !woken;
   Alcotest.(check string) "reads again" "`Read" (read_operation ());
@@ -856,16 +1348,18 @@ let test_websocket_receive_backpressure () =
     "the rest, in order"
     (List.init 8 (fun i -> Some (string_of_int (i + 1))))
     (Lwt_main.run
-       (Lwt_list.map_s
-          (fun () -> Ache_lwt.Websocket.receive ws)
-          (List.init 8 ignore)))
+       (Lwt_list.map_s (fun () -> receive_text ws) (List.init 8 ignore)))
 
 let ws_sans_io () =
   let ws = ref None in
   let server =
     Server_connection.create (fun reqd ->
-      match Ache_lwt.Websocket.upgrade reqd with
-      | Ok t -> ws := Some t
+      match
+        Ache_lwt.Websocket.upgrade reqd (fun t ->
+          ws := Some t;
+          fst (Lwt.wait ()))
+      with
+      | Ok () -> ()
       | Error _ -> Alcotest.fail "handshake rejected")
   in
   let feed s =
@@ -894,9 +1388,7 @@ let ws_sans_io () =
 
 let receive_within seconds ws =
   Lwt.pick
-    [ Ache_lwt.Websocket.receive ws
-    ; (Lwt_unix.sleep seconds >|= fun () -> Some "<timeout>")
-    ]
+    [ receive_text ws; (Lwt_unix.sleep seconds >|= fun () -> Some "<timeout>") ]
 
 let test_websocket_cancelled_receive () =
   let ws, feed, (_ : unit -> unit) = ws_sans_io () in
@@ -962,6 +1454,41 @@ let test_websocket_cancelled_receives_bounded () =
     (Some "after")
     (Lwt_main.run (receive_within 0.5 ws))
 
+let test_websocket_ping_timeout () =
+  let ws, feed, drain = ws_sans_io () in
+  let timed_out =
+    Lwt_main.run
+      (Lwt.catch
+         (fun () ->
+            Lwt_unix.with_timeout 0.01 (fun () -> Ache_lwt.Websocket.ping ws "")
+            >|= fun () -> false)
+         (function Lwt_unix.Timeout -> Lwt.return true | exn -> Lwt.fail exn))
+  in
+  Alcotest.(check bool) "no pong: with_timeout fires" true timed_out;
+  let answered = Ache_lwt.Websocket.ping ws "x" in
+  feed (ws_frame 0xA "x");
+  Alcotest.(check bool)
+    "a pong resolves the ping"
+    true
+    (Lwt.state answered = Lwt.Return ());
+  let pending = Ache_lwt.Websocket.ping ws "y" in
+  feed (ws_frame 0x8 "\x03\xe8");
+  drain ();
+  Alcotest.(check bool)
+    "close fails the ping with Closed"
+    true
+    (Lwt.state pending = Lwt.Fail Ache_lwt.Websocket.Closed);
+  Alcotest.(check bool)
+    "client_close"
+    true
+    (Ache_lwt.Websocket.client_close ws
+    = Some { Ache.Websocket.code = 1000; reason = "" });
+  Alcotest.(check bool)
+    "ping after close fails"
+    true
+    (Lwt.state (Ache_lwt.Websocket.ping ws "")
+    = Lwt.Fail Ache_lwt.Websocket.Closed)
+
 let test_websocket_peer_reset () =
   let ended = wait_ws_end () in
   ws_flood_sends := 0;
@@ -993,6 +1520,17 @@ let test_websocket_peer_reset () =
 
 let get_hello = "GET /hello HTTP/1.1\r\nhost: localhost\r\n\r\n"
 let hello_response = "HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nhello world"
+
+(* [hello_response] with the [Keep-Alive] hint of an idle timeout of
+   [seconds]. *)
+let hello_with_hint seconds =
+  Printf.sprintf
+    "HTTP/1.1 200 OK\r\n\
+     content-length: 11\r\n\
+     Keep-Alive: timeout=%d\r\n\
+     \r\n\
+     hello world"
+    seconds
 
 let check_elapsed name ~since ~at_least =
   let elapsed = Unix.gettimeofday () -. since in
@@ -1131,36 +1669,104 @@ let early_close_response =
 let early_413_response =
   "HTTP/1.1 413 Content Too Large\r\ncontent-length: 2\r\n\r\nno"
 
-let test_unread_body_without_idle_timeout () =
+(* A 413 keeps the connection: the body is read until [body_timeout], then the
+   connection closes. A [Connection: close] response ends the output at once
+   (the server still reads the body, which the close does not reset). *)
+let test_unread_body_body_timeout () =
   List.iter
-    (fun (target, response) ->
-       with_server (fun connect ->
+    (fun (target, response, closes_at_timeout) ->
+       with_server ?idle_timeout:None ~body_timeout:0.3 (fun connect ->
          connect () >>= fun socket ->
          write_all socket (unread_body_request target) >>= fun () ->
-         read_all socket >>= fun output ->
-         Alcotest.(check string)
-           (target ^ ": response, then the connection closes")
-           response
-           output;
+         read_exactly socket (String.length response) >>= fun first ->
+         Alcotest.(check string) (target ^ ": response") response first;
+         let since = Unix.gettimeofday () in
+         read_all socket >>= fun rest ->
+         if closes_at_timeout
+         then check_elapsed (target ^ ": body timeout") ~since ~at_least:0.25
+         else
+           Alcotest.(check bool)
+             (target ^ ": at once")
+             true
+             (Unix.gettimeofday () -. since < 0.2);
+         Alcotest.(check string) (target ^ ": then closed") "" rest;
          Lwt_unix.close socket))
-    [ "/early-close", early_close_response; "/early-413", early_413_response ]
+    [ "/early-close", early_close_response, false
+    ; "/early-413", early_413_response, true
+    ]
 
-let test_unread_body_idle_timeout () =
-  with_server ~idle_timeout:0.3 (fun connect ->
+(* Decision 0010: the server drains at most 256 KiB of an unread body. *)
+let large_413_head =
+  "POST /early-413 HTTP/1.1\r\n\
+   host: localhost\r\n\
+   content-length: 10000000\r\n\
+   \r\n"
+
+let large_413_response =
+  "HTTP/1.1 413 Content Too Large\r\n\
+   content-length: 2\r\n\
+   connection: close\r\n\
+   \r\n\
+   no"
+
+let test_unread_body_drain_limit () =
+  with_server ~idle_timeout:5.0 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket large_413_head >>= fun () ->
+    read_exactly socket (String.length large_413_response) >>= fun response ->
+    Alcotest.(check string) "413 closes" large_413_response response;
+    let since = Unix.gettimeofday () in
+    Lwt.catch
+      (fun () -> write_all socket (String.make 0x50000 'x'))
+      (fun _ -> Lwt.return_unit)
+    >>= fun () ->
+    Lwt.catch
+      (fun () -> read_all socket)
+      (function
+        | Unix.Unix_error (Unix.ECONNRESET, _, _) -> Lwt.return ""
+        | exn -> Lwt.fail exn)
+    >>= fun rest ->
+    Alcotest.(check string) "then closed" "" rest;
+    if Unix.gettimeofday () -. since > 2.0
+    then Alcotest.fail "closed by the idle timeout, not after 256 KiB";
+    Lwt_unix.close socket)
+
+(* [read_all], with a reset or a refused write read as the end of input. *)
+let read_all_or_reset socket =
+  Lwt.catch
+    (fun () -> read_all socket)
+    (function
+      | Unix.Unix_error ((ECONNRESET | EPIPE), _, _) -> Lwt.return ""
+      | exn -> Lwt.fail exn)
+
+(* [true] when [socket] is still open, with nothing to read, after [seconds]. *)
+let still_open socket seconds =
+  let chunk = Bytes.create 16 in
+  Lwt.pick
+    [ (Lwt_unix.read socket chunk 0 16 >|= fun _ -> false)
+    ; (Lwt_unix.sleep seconds >|= fun () -> true)
+    ]
+
+let test_unread_body_without_body_timeout () =
+  with_server ~idle_timeout:0.2 (fun connect ->
     connect () >>= fun socket ->
     write_all socket (unread_body_request "/early-413") >>= fun () ->
     read_exactly socket (String.length early_413_response) >>= fun first ->
     Alcotest.(check string) "response" early_413_response first;
-    let since = Unix.gettimeofday () in
+    still_open socket 0.5 >>= fun still ->
+    Alcotest.(check bool) "idle_timeout does not apply to a body" true still;
+    (* The rest of the body ends the request; then the idle timeout closes the
+       connection. *)
+    write_all socket (String.make (100_000 - 3) 'b') >>= fun () ->
     read_all socket >>= fun rest ->
-    check_elapsed "closed at the idle timeout" ~since ~at_least:0.25;
-    Alcotest.(check string) "then closed" "" rest;
+    Alcotest.(check string) "then closed at the idle timeout" "" rest;
     Lwt_unix.close socket)
 
-let respond_while_body_read_pending ?idle_timeout ~at_least () =
+let respond_while_body_read_pending ?body_timeout ~expect_close () =
   pending_response := None;
   pending_body_failed := false;
-  with_server ?idle_timeout (fun connect ->
+  let stop, stop_now = Lwt.wait () in
+  with_server ?body_timeout ~stop ~grace:0.1 (fun connect ->
     connect () >>= fun socket ->
     write_all socket (unread_body_request "/respond-later") >>= fun () ->
     let rec respond () =
@@ -1174,18 +1780,29 @@ let respond_while_body_read_pending ?idle_timeout ~at_least () =
     let response = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nlate" in
     read_exactly socket (String.length response) >>= fun first ->
     Alcotest.(check string) "response" response first;
-    let since = Unix.gettimeofday () in
-    read_all socket >>= fun rest ->
-    check_elapsed "closed" ~since ~at_least;
-    Alcotest.(check string) "then closed" "" rest;
-    Lwt_unix.close socket);
-  Alcotest.(check bool) "request body failed" true !pending_body_failed
+    (if expect_close
+     then (
+       let since = Unix.gettimeofday () in
+       read_all socket >|= fun rest ->
+       check_elapsed "closed" ~since ~at_least:0.25;
+       Alcotest.(check string) "then closed" "" rest)
+     else
+       still_open socket 0.5 >>= fun still ->
+       Alcotest.(check bool) "body not timed" true still;
+       Alcotest.(check bool) "body still pending" false !pending_body_failed;
+       (* A graceful stop ends the connection. *)
+       Lwt.wakeup_later stop_now ();
+       read_all_or_reset socket >|= fun rest ->
+       Alcotest.(check string) "closed by the stop" "" rest)
+    >>= fun () -> Lwt_unix.close socket);
+  if expect_close
+  then Alcotest.(check bool) "request body failed" true !pending_body_failed
 
 let test_respond_while_body_read_pending () =
-  respond_while_body_read_pending ~at_least:0. ()
+  respond_while_body_read_pending ~body_timeout:0.3 ~expect_close:true ()
 
-let test_respond_while_body_read_pending_idle_timeout () =
-  respond_while_body_read_pending ~idle_timeout:0.3 ~at_least:0.25 ()
+let test_respond_while_body_read_pending_untimed () =
+  respond_while_body_read_pending ~expect_close:false ()
 
 let test_no_timeout_configured () =
   with_server (fun connect ->
@@ -1203,7 +1820,8 @@ let test_timeout_must_be_positive () =
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   (match
      Ache_lwt.Server.create_connection_handler
-       ~idle_timeout:0.
+       ~date:false
+       ~idle_timeout:(Some 0.)
        ~request_handler
        ~error_handler
        (Unix.ADDR_INET (Unix.inet_addr_loopback, 0))
@@ -1223,9 +1841,10 @@ let test_timeout_check_timing () =
   in
   let bound =
     Ache_lwt.Server.create_connection_handler
+      ~date:false
       ~config:Ache.Config.default
-      ~idle_timeout:0.
-      ~head_timeout:1.
+      ~idle_timeout:(Some 0.)
+      ~head_timeout:(Some 1.)
       ~request_handler
       ~error_handler
   in
@@ -1237,7 +1856,8 @@ let test_timeout_check_timing () =
   let inline =
     take
       (Ache_lwt.Server.create_connection_handler
-         ~idle_timeout:0.
+         ~date:false
+         ~idle_timeout:(Some 0.)
          ~request_handler
          ~error_handler)
   in
@@ -1288,40 +1908,57 @@ let live_words () =
   Gc.full_major ();
   (Gc.stat ()).live_words
 
-let check_timers_bounded ?idle_timeout ?head_timeout ~requests send =
+let check_timers_bounded
+      ?idle_timeout
+      ?head_timeout
+      ?body_timeout
+      ?write_timeout
+      ?stop
+      ?(response = hello_response)
+      ~requests
+      send
+  =
   let previous = Lwt_engine.get () in
   Lwt_engine.set ~destroy:false (new Lwt_engine.select);
   let growth = ref 0 in
   Fun.protect
     ~finally:(fun () -> Lwt_engine.set previous)
     (fun () ->
-       with_server ?idle_timeout ?head_timeout (fun connect ->
-         let earlier_live_sleeper = Lwt_unix.sleep 20. in
-         connect () >>= fun socket ->
-         Lwt_unix.setsockopt socket Unix.TCP_NODELAY true;
-         let rec get_hellos n =
-           if n = 0
-           then Lwt.return_unit
-           else
-             send socket >>= fun () ->
-             read_exactly socket (String.length hello_response)
-             >>= fun response ->
-             if response <> hello_response
-             then Alcotest.failf "unexpected response %S" response;
-             get_hellos (n - 1)
-         in
-         get_hellos (requests / 10) >>= fun () ->
-         let before = live_words () in
-         get_hellos requests >>= fun () ->
-         growth := live_words () - before;
-         Lwt.cancel earlier_live_sleeper;
-         Lwt_unix.close socket));
+       with_server
+         ?idle_timeout
+         ?head_timeout
+         ?body_timeout
+         ?write_timeout
+         ?stop
+         (fun connect ->
+            let earlier_live_sleeper = Lwt_unix.sleep 20. in
+            connect () >>= fun socket ->
+            Lwt_unix.setsockopt socket Unix.TCP_NODELAY true;
+            let rec get_hellos n =
+              if n = 0
+              then Lwt.return_unit
+              else
+                send socket >>= fun () ->
+                read_exactly socket (String.length response) >>= fun got ->
+                if got <> response
+                then Alcotest.failf "unexpected response %S" got;
+                get_hellos (n - 1)
+            in
+            get_hellos (requests / 10) >>= fun () ->
+            let before = live_words () in
+            get_hellos requests >>= fun () ->
+            growth := live_words () - before;
+            Lwt.cancel earlier_live_sleeper;
+            Lwt_unix.close socket));
   if !growth > requests
   then Alcotest.failf "heap grew by %d words over %d requests" !growth requests
 
 let test_idle_timer_bounded () =
-  check_timers_bounded ~idle_timeout:30. ~requests:10_000 (fun socket ->
-    write_all socket get_hello)
+  check_timers_bounded
+    ~idle_timeout:30.
+    ~response:(hello_with_hint 30)
+    ~requests:10_000
+    (fun socket -> write_all socket get_hello)
 
 let test_head_timer_bounded () =
   check_timers_bounded ~head_timeout:30. ~requests:500 (fun socket ->
@@ -1329,7 +1966,20 @@ let test_head_timer_bounded () =
     Lwt_unix.sleep 0.001 >>= fun () ->
     write_all socket "host: localhost\r\n\r\n")
 
-let check_connection_timers_bounded ~connections exchange =
+let test_body_write_timers_bounded () =
+  check_timers_bounded
+    ~body_timeout:30.
+    ~write_timeout:30.
+    ~response:"HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n5"
+    ~requests:500
+    (fun socket ->
+       write_all
+         socket
+         "POST /count HTTP/1.1\r\nhost: localhost\r\ncontent-length: 5\r\n\r\n"
+       >>= fun () ->
+       Lwt_unix.sleep 0.001 >>= fun () -> write_all socket "hello")
+
+let check_connection_timers_bounded ?stop ~connections exchange =
   let previous = Lwt_engine.get () in
   Lwt_engine.set ~destroy:false (new Lwt_engine.select);
   let growth = ref 0 in
@@ -1349,8 +1999,10 @@ let check_connection_timers_bounded ~connections exchange =
            incr open_connections;
            Lwt.async (fun () ->
              Ache_lwt.Server.create_connection_handler
-               ~idle_timeout:30.
-               ~head_timeout:30.
+               ~date:false
+               ~idle_timeout:(Some 30.)
+               ~head_timeout:(Some 30.)
+               ?stop
                ~request_handler
                ~error_handler
                client_addr
@@ -1409,8 +2061,19 @@ let test_closed_connection_timers_bounded () =
 let test_idle_connection_timers_bounded () =
   check_connection_timers_bounded ~connections:1000 (fun socket ->
     write_all socket get_hello >>= fun () ->
-    read_exactly socket (String.length hello_response) >|= fun response ->
-    Alcotest.(check string) "response" hello_response response)
+    let expected = hello_with_hint 30 in
+    read_exactly socket (String.length expected) >|= fun response ->
+    Alcotest.(check string) "response" expected response)
+
+let test_pending_stop_bounded () =
+  let stop, (_ : unit Lwt.u) = Lwt.wait () in
+  check_connection_timers_bounded ~stop ~connections:1000 (fun socket ->
+    write_all socket get_hello >>= fun () ->
+    let expected = hello_with_hint 30 in
+    read_exactly socket (String.length expected) >|= fun response ->
+    Alcotest.(check string) "response" expected response);
+  check_timers_bounded ~stop ~requests:10_000 (fun socket ->
+    write_all socket get_hello)
 
 let test_failing_shutdown_and_close () =
   fail_read := false;
@@ -1423,6 +2086,7 @@ let test_failing_shutdown_and_close () =
        with_server
          ~connection_handler:(fun ~request_handler ~error_handler addr socket ->
            Test_server.create_connection_handler
+             ~date:false
              ~request_handler
              ~error_handler
              addr
@@ -1639,12 +2303,659 @@ let test_timeout_create_must_be_positive () =
        | exception Invalid_argument _ -> ())
     [ 0.; -1.; Float.nan ]
 
+(* Client: response bytes on an idle connection (undici GHSA-35p6-xmwp-9g52).
+   The server runs in another domain with blocking sockets, so that the client
+   domain can block while the stray bytes arrive. For each of [strays], it
+   accepts a connection, answers the first request, sends the stray bytes 50 ms
+   later, and answers a second request if one comes within 1 s. The domain
+   returns the second requests. *)
+let stray_server strays =
+  let listening = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Unix.setsockopt listening Unix.SO_REUSEADDR true;
+  Unix.bind listening (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.listen listening 1;
+  let port =
+    match Unix.getsockname listening with
+    | Unix.ADDR_INET (_, port) -> port
+    | Unix.ADDR_UNIX _ -> assert false
+  in
+  let serve stray =
+    let socket, _ = Unix.accept listening in
+    let write s =
+      try ignore (Unix.write_substring socket s 0 (String.length s) : int) with
+      | Unix.Unix_error _ -> ()
+    in
+    let buf = Bytes.create 4096 in
+    let rec read_head acc =
+      let rec has_end i =
+        i + 4 <= String.length acc
+        && (String.sub acc i 4 = "\r\n\r\n" || has_end (i + 1))
+      in
+      if has_end 0
+      then acc
+      else
+        match Unix.read socket buf 0 (Bytes.length buf) with
+        | 0 -> acc
+        | n -> read_head (acc ^ Bytes.sub_string buf 0 n)
+        | exception Unix.Unix_error _ -> acc
+    in
+    ignore (read_head "" : string);
+    write "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    Unix.sleepf 0.05;
+    write stray;
+    Unix.setsockopt_float socket Unix.SO_RCVTIMEO 1.0;
+    let second = read_head "" in
+    if second <> ""
+    then write "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal";
+    Unix.close socket;
+    second
+  in
+  ( port
+  , Domain.spawn (fun () ->
+      Fun.protect
+        ~finally:(fun () -> Unix.close listening)
+        (fun () -> List.map serve strays)) )
+
+let stray_cases =
+  [ "a response", "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nevil"
+  ; "part of a head", "HTTP/1.1 200 OK\r\n"
+  ]
+
+let stray_outcome client =
+  let result, resolve = Lwt.wait () in
+  let finish r = if Lwt.is_sleeping result then Lwt.wakeup_later resolve r in
+  let writer =
+    Ache_lwt.Client.request
+      client
+      (Ache.Request.create
+         ~headers:(Ache.Headers.of_list [ "host", "localhost" ])
+         `GET
+         "/")
+      ~error_handler:(function
+        | `Connection_closed -> finish "Connection_closed"
+        | `Malformed_response _ -> finish "Malformed_response"
+        | `Invalid_response_body_length _ ->
+          finish "Invalid_response_body_length"
+        | `Exn exn -> finish (Printexc.to_string exn))
+      ~response_handler:(fun response reader ->
+        let body = Stdlib.Buffer.create 16 in
+        let rec loop () =
+          Ache.Body.Reader.schedule_read
+            reader
+            ~on_error:(fun () -> finish "body error")
+            ~on_eof:(fun () ->
+              finish
+                (Printf.sprintf
+                   "%d %s"
+                   (Ache.Status.to_code response.status)
+                   (Stdlib.Buffer.contents body)))
+            ~on_read:(fun bs ~off ~len ->
+              Stdlib.Buffer.add_string
+                body
+                (Ache.Bigstring.substring bs ~off ~len);
+              loop ())
+        in
+        loop ())
+  in
+  Ache.Body.Writer.close writer;
+  result
+
+let test_stray_bytes_on_idle_connection () =
+  let port, server = stray_server (List.map snd stray_cases) in
+  List.iter
+    (fun (name, _) ->
+       Lwt_main.run
+         (Lwt_unix.with_timeout 10.0 (fun () ->
+            let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+            Lwt.bind
+              (Lwt_unix.connect
+                 socket
+                 (Unix.ADDR_INET (Unix.inet_addr_loopback, port)))
+              (fun () ->
+                 Lwt.bind (Ache_lwt.Client.create_connection socket)
+                 @@ fun client ->
+                 Lwt.bind (stray_outcome client) @@ fun first ->
+                 Alcotest.(check string) (name ^ ": first") "200 ok" first;
+                 (* The stray bytes arrive while this thread does not run the
+                    read loop. *)
+                 Unix.sleepf 0.2;
+                 Lwt.bind (stray_outcome client) @@ fun second ->
+                 Alcotest.(check string)
+                   (name ^ ": second")
+                   "Connection_closed"
+                   second;
+                 Ache_lwt.Client.shutdown client)));
+       ())
+    stray_cases;
+  Alcotest.(check (list string))
+    "second requests not sent"
+    (List.map (fun _ -> "") stray_cases)
+    (Domain.join server)
+
+let slow_request = "GET /slow HTTP/1.1\r\nhost: localhost\r\n\r\n"
+
+let rec until_slow () =
+  match !slow_reqd with
+  | Some reqd -> Lwt.return reqd
+  | None -> Lwt_unix.sleep 0.005 >>= until_slow
+
+let respond_done reqd =
+  Request_descriptor.respond_with_string
+    reqd
+    (Response.create ~headers:(Headers.of_list [ "content-length", "4" ]) `OK)
+    "done"
+
+let check_within name ~since ~min ~max =
+  let elapsed = Unix.gettimeofday () -. since in
+  if elapsed < min || elapsed > max
+  then
+    Alcotest.failf
+      "%s: after %.3f s, expected %.3f to %.3f s"
+      name
+      elapsed
+      min
+      max
+
+let test_drain_finishes_request () =
+  slow_reqd := None;
+  let stop, stop_now = Lwt.wait () in
+  with_server ~stop ~grace:5. (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (slow_request ^ get_hello) >>= until_slow >>= fun reqd ->
+    Lwt.wakeup_later stop_now ();
+    Lwt_unix.sleep 0.1 >>= fun () ->
+    respond_done reqd;
+    read_all socket >>= fun output ->
+    Alcotest.(check bool)
+      "connection: close"
+      true
+      (contains output "\r\nconnection: close\r\n");
+    Alcotest.(check bool)
+      "200 with its body, then end of input"
+      true
+      (String.starts_with ~prefix:"HTTP/1.1 200 OK\r\n" output
+      && String.ends_with ~suffix:"\r\n\r\ndone" output);
+    Lwt_unix.close socket);
+  Alcotest.(check int) "pipelined request not served" 1 !requests_seen;
+  check_server_sockets_closed ()
+
+let test_drain_idle () =
+  let stop, stop_now = Lwt.wait () in
+  with_server ~stop (fun connect ->
+    connect () >>= fun fresh ->
+    connect () >>= fun used ->
+    write_all used get_hello >>= fun () ->
+    read_exactly used (String.length hello_response) >>= fun first ->
+    Alcotest.(check string) "keep-alive response" hello_response first;
+    Lwt_unix.sleep 0.05 >>= fun () ->
+    let since = Unix.gettimeofday () in
+    Lwt.wakeup_later stop_now ();
+    read_all fresh >>= fun fresh_output ->
+    read_all used >>= fun used_output ->
+    check_within "idle connections closed" ~since ~min:0. ~max:0.3;
+    Alcotest.(check string) "new connection: nothing written" "" fresh_output;
+    Alcotest.(check string) "keep-alive: nothing more" "" used_output;
+    Lwt_unix.close fresh >>= fun () -> Lwt_unix.close used);
+  Alcotest.(check int) "no error" 0 (List.length !server_errors);
+  check_server_sockets_closed ()
+
+let test_drain_grace_cancels () =
+  slow_reqd := None;
+  let stop, stop_now = Lwt.wait () in
+  let started = Unix.gettimeofday () in
+  with_server ~stop ~grace:0.2 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket slow_request >>= until_slow
+    >>= fun (_ : Request_descriptor.t) ->
+    let since = Unix.gettimeofday () in
+    Lwt.wakeup_later stop_now ();
+    read_all_or_reset socket >>= fun output ->
+    check_within "closed at the grace" ~since ~min:0.15 ~max:1.0;
+    Alcotest.(check string) "no response" "" output;
+    Lwt_unix.close socket);
+  check_within "server ended" ~since:started ~min:0. ~max:2.0;
+  check_server_sockets_closed ();
+  (* The handler responds after the connection was cancelled. *)
+  respond_done (Option.get !slow_reqd)
+
+let test_handler_after_stop () =
+  with_server ~stop:Lwt.return_unit (fun connect ->
+    connect () >>= fun socket ->
+    Lwt.catch
+      (fun () -> write_all socket get_hello)
+      (fun (_ : exn) -> Lwt.return_unit)
+    >>= fun () ->
+    read_all_or_reset socket >>= fun output ->
+    Alcotest.(check string) "no response" "" output;
+    Lwt_unix.close socket);
+  Alcotest.(check int) "request handler not called" 0 !requests_seen;
+  check_server_sockets_closed ()
+
+let test_drain_websocket () =
+  let ended = wait_ws_end () in
+  let stop, stop_now = Lwt.wait () in
+  with_server ~stop ~grace:5. (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    Lwt.wakeup_later stop_now ();
+    read_ws_frame socket >>= fun close ->
+    Alcotest.(check (pair int string)) "close 1001" (0x88, "\x03\xe9") close;
+    (* A drain closes at once, without waiting for the client's close frame:
+       sending one could meet a closed socket and a reset. *)
+    Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND;
+    read_all socket >>= fun rest ->
+    Alcotest.(check string) "then end of input" "" rest;
+    ended >>= fun (_ : (string, exn) result) -> Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+let test_grace_must_be_positive () =
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  (match
+     Ache_lwt.Server.create_connection_handler
+       ~grace:0.
+       ~request_handler
+       ~error_handler
+       (Unix.ADDR_INET (Unix.inet_addr_loopback, 0))
+       socket
+   with
+  | (_ : unit Lwt.t) -> Alcotest.fail "expected Invalid_argument"
+  | exception Invalid_argument _ -> ());
+  Lwt_main.run (Lwt_unix.close socket)
+
+let count_request ?(target = "/count") length =
+  Printf.sprintf
+    "POST %s HTTP/1.1\r\n\
+     host: localhost\r\n\
+     connection: close\r\n\
+     content-length: %d\r\n\
+     \r\n"
+    target
+    length
+
+(* Writes [chunks] of [size] bytes, [gap] seconds apart, and stops at the first
+   failed write (the server closed). *)
+let trickle socket ~chunks ~size ~gap =
+  let chunk = String.make size 'b' in
+  let rec go n =
+    if n = 0
+    then Lwt.return_unit
+    else
+      Lwt_unix.sleep gap >>= fun () ->
+      Lwt.try_bind
+        (fun () -> write_all socket chunk)
+        (fun () -> go (n - 1))
+        (fun (_ : exn) -> Lwt.return_unit)
+  in
+  go chunks
+
+(* The server lingers after its response (RFC 9112 9.6): the trickle does not
+   make it reset the connection, so the response always arrives. *)
+let test_body_trickle_times_out () =
+  List.iter
+    (fun (target, expected) ->
+       body_cut := false;
+       with_server ~body_timeout:0.3 (fun connect ->
+         connect () >>= fun socket ->
+         write_all socket (count_request ~target 100) >>= fun () ->
+         let since = Unix.gettimeofday () in
+         let writer = trickle socket ~chunks:20 ~size:1 ~gap:0.2 in
+         read_all socket >>= fun output ->
+         check_within (target ^ ": timed out") ~since ~min:0.3 ~max:1.0;
+         Alcotest.(check bool)
+           (target ^ ": " ^ expected)
+           true
+           (String.starts_with ~prefix:expected output);
+         Lwt.cancel writer;
+         Lwt_unix.close socket);
+       Alcotest.(check bool) (target ^ ": on_error") true !body_cut)
+    [ "/count", "HTTP/1.1 408 Request Timeout\r\n"
+    ; "/count-started", "HTTP/1.1 200 OK\r\n"
+    ]
+
+let response_408 = "HTTP/1.1 408 Request Timeout\r\nconnection: close\r\n\r\n"
+
+(* A client that keeps sending after the 408 reads all of it, then the end of
+   input. Without [idle_timeout] the server lingers 2 s after its output ends,
+   then closes, though the client still sends. *)
+let test_body_timeout_linger () =
+  body_cut := false;
+  with_server ~body_timeout:0.3 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (count_request 100_000_000) >>= fun () ->
+    (* One byte every 50 ms until past [body_timeout], then 1 KiB every 10
+       ms. *)
+    let rec send n =
+      let chunk = if n < 10 then "b" else String.make 1024 'b' in
+      Lwt_unix.sleep (if n < 10 then 0.05 else 0.01) >>= fun () ->
+      write_all socket chunk >>= fun () -> send (n + 1)
+    in
+    let writer =
+      Lwt.catch (fun () -> send 0) (fun (_ : exn) -> Lwt.return_unit)
+    in
+    read_all socket >>= fun output ->
+    Alcotest.(check string) "408, then the end of input" response_408 output;
+    let since = Unix.gettimeofday () in
+    Alcotest.(check bool) "client still sends" true (Lwt.is_sleeping writer);
+    writer >>= fun () ->
+    check_within "server closes after the linger" ~since ~min:1.5 ~max:3.0;
+    check_server_sockets_closed ();
+    Lwt_unix.close socket);
+  Alcotest.(check bool) "on_error" true !body_cut
+
+let test_body_progress_not_timed_out () =
+  body_cut := false;
+  with_server ~body_timeout:0.3 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (count_request 12_600) >>= fun () ->
+    let since = Unix.gettimeofday () in
+    trickle socket ~chunks:6 ~size:2_100 ~gap:0.15 >>= fun () ->
+    read_all_or_reset socket >>= fun output ->
+    check_within "longer than body_timeout" ~since ~min:0.6 ~max:2.0;
+    Alcotest.(check bool)
+      "200 with the byte count"
+      true
+      (String.starts_with ~prefix:"HTTP/1.1 200 OK\r\n" output
+      && String.ends_with ~suffix:"\r\n\r\n12600" output);
+    Lwt_unix.close socket);
+  Alcotest.(check bool) "no on_error" false !body_cut
+
+let test_write_timeout () =
+  let flushed, resolve_flushed = Lwt.wait () in
+  stream_flush_closed := Some resolve_flushed;
+  with_server ~write_timeout:0.3 (fun connect ->
+    connect () >>= fun socket ->
+    Lwt_unix.setsockopt_int socket Unix.SO_RCVBUF 4096;
+    write_all socket "GET /stream HTTP/1.1\r\nhost: localhost\r\n\r\n"
+    >>= fun () ->
+    let since = Unix.gettimeofday () in
+    flushed >>= fun () ->
+    check_within "flush gets `Closed" ~since ~min:0.3 ~max:1.5;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+let test_slow_handler_not_timed_out () =
+  slow_reqd := None;
+  with_server
+    ~idle_timeout:0.3
+    ~head_timeout:0.3
+    ~body_timeout:0.3
+    ~write_timeout:0.3
+    (fun connect ->
+       connect () >>= fun socket ->
+       write_all socket (count_request ~target:"/slow-noread" 5 ^ "hello")
+       >>= until_slow
+       >>= fun reqd ->
+       Lwt_unix.sleep 1.0 >>= fun () ->
+       Body.Reader.close (Request_descriptor.request_body reqd);
+       respond_done reqd;
+       read_all socket >>= fun output ->
+       Alcotest.(check string)
+         "response after 1 s"
+         "HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\ndone"
+         output;
+       Lwt_unix.close socket);
+  Alcotest.(check int) "no error" 0 (List.length !server_errors)
+
+let websocket_idle_timeout ~idle_timeout () =
+  let ended = wait_ws_end () in
+  with_server ~idle_timeout (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (ws_handshake "/ws-echo") >>= fun () ->
+    read_head socket >>= fun head ->
+    Alcotest.(check string) "101" ws_101 head;
+    let since = Unix.gettimeofday () in
+    read_exactly socket 4 >>= fun close ->
+    check_within
+      "idle close"
+      ~since
+      ~min:(idle_timeout -. 0.05)
+      ~max:(idle_timeout +. 0.5);
+    Alcotest.(check string) "close 1001" "\x88\x02\x03\xe9" close;
+    ended >>= fun result ->
+    Alcotest.(check (result string reject))
+      "session sees the end"
+      (Ok "receive None")
+      result;
+    read_all_or_reset socket >>= fun rest ->
+    Alcotest.(check string) "then end of input" "" rest;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
+let test_websocket_idle_timeout = websocket_idle_timeout ~idle_timeout:0.3
+
+(* With a [Keep-Alive] hint, the timer between requests runs 1 s longer, but a
+   WebSocket keeps [idle_timeout], and the 101 gets no hint. *)
+let test_websocket_idle_with_hint = websocket_idle_timeout ~idle_timeout:1.0
+
+let test_timeouts_off () =
+  with_server (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket "GET /hello HTTP/1.1\r\n" >>= fun () ->
+    still_open socket 0.5 >>= fun still ->
+    Alcotest.(check bool) "partial head, every timeout None" true still;
+    Lwt_unix.close socket)
+
+let hello_head ?(extra = "") () =
+  "HTTP/1.1 200 OK\r\ncontent-length: 11\r\n" ^ extra ^ "\r\nhello world"
+
+let test_keep_alive_hint () =
+  with_server ~idle_timeout:3.5 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket get_hello >>= fun () ->
+    let expected = hello_with_hint 3 in
+    read_exactly socket (String.length expected) >>= fun output ->
+    Alcotest.(check string) "timeout=3 for 3.5 s" expected output;
+    Lwt_unix.close socket);
+  with_server ?idle_timeout:None (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket get_hello >>= fun () ->
+    read_exactly socket (String.length hello_response) >>= fun output ->
+    Alcotest.(check string) "no hint without idle_timeout" hello_response output;
+    Lwt_unix.close socket);
+  with_server ~idle_timeout:0.5 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket get_hello >>= fun () ->
+    read_exactly socket (String.length hello_response) >>= fun output ->
+    Alcotest.(check string) "no hint under 1 s" hello_response output;
+    Lwt_unix.close socket)
+
+let test_keep_alive_hint_max () =
+  let config =
+    { Ache.Config.default with max_requests_per_connection = Some 3 }
+  in
+  with_server ~config ~idle_timeout:3.5 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (get_hello ^ get_hello ^ get_hello) >>= fun () ->
+    read_all socket >>= fun output ->
+    Alcotest.(check string)
+      "max counts down, then connection: close without a hint"
+      (hello_head ~extra:"Keep-Alive: timeout=3, max=2\r\n" ()
+      ^ hello_head ~extra:"Keep-Alive: timeout=3, max=1\r\n" ()
+      ^ hello_head ~extra:"connection: close\r\n" ())
+      output;
+    Lwt_unix.close socket)
+
+let test_keep_alive_idle_timer_longer () =
+  with_server ~idle_timeout:1. (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket get_hello >>= fun () ->
+    let expected = hello_with_hint 1 in
+    read_exactly socket (String.length expected) >>= fun output ->
+    Alcotest.(check string) "timeout=1" expected output;
+    let since = Unix.gettimeofday () in
+    still_open socket 1.4 >>= fun still ->
+    Alcotest.(check bool) "open 1.4 s after the response" true still;
+    read_all socket >>= fun rest ->
+    check_within "closed at 2 s" ~since ~min:1.9 ~max:2.5;
+    Alcotest.(check string) "nothing more" "" rest;
+    Lwt_unix.close socket)
+
+(* [Ok body] or the client error of a request. *)
+let request_result client target =
+  let p, u = Lwt.wait () in
+  let body =
+    Ache_lwt.Client.request
+      client
+      (Request.create
+         ~headers:(Headers.of_list [ "host", "localhost" ])
+         `GET
+         target)
+      ~error_handler:(fun error ->
+        if Lwt.is_sleeping p then Lwt.wakeup_later u (Error error))
+      ~response_handler:(fun _ response_body ->
+        Lwt.async (fun () ->
+          read_body response_body >|= fun body ->
+          if Lwt.is_sleeping p then Lwt.wakeup_later u (Ok body)))
+  in
+  Body.Writer.close body;
+  p
+
+let check_hello name = function
+  | Ok body -> Alcotest.(check string) name "hello world" body
+  | Error _ -> Alcotest.failf "%s: request failed" name
+
+let test_client_reuse_deadline () =
+  with_server ~idle_timeout:3.5 (fun connect ->
+    connect () >>= Ache_lwt.Client.create_connection >>= fun client ->
+    request_result client "/hello" >>= fun first ->
+    check_hello "first" first;
+    Lwt_unix.sleep 0.3 >>= fun () ->
+    request_result client "/hello" >>= fun second ->
+    check_hello "reused within the deadline" second;
+    Alcotest.(check int) "one connection" 1 (List.length !server_sockets);
+    Alcotest.(check bool) "open" false (Ache_lwt.Client.is_closed client);
+    Lwt_unix.sleep 1.2 >>= fun () ->
+    Alcotest.(check bool)
+      "closed 1 s (3 - 2) after the response"
+      true
+      (Ache_lwt.Client.is_closed client);
+    request_result client "/hello" >>= fun third ->
+    (match third with
+    | Error `Connection_closed -> ()
+    | Ok _ -> Alcotest.fail "request after the deadline served"
+    | Error _ -> Alcotest.fail "unexpected error");
+    Lwt_unix.sleep 0.05);
+  Alcotest.(check int)
+    "the late request never reached the server"
+    2
+    !requests_seen
+
+let test_client_deadline_before_timer () =
+  with_server ~idle_timeout:2.5 (fun connect ->
+    connect () >>= Ache_lwt.Client.create_connection >>= fun client ->
+    request_result client "/hello" >>= fun first ->
+    check_hello "first" first;
+    (* timeout=2: s = 0, the connection is not reusable at once. *)
+    request_result client "/hello" >>= fun second ->
+    (match second with
+    | Error `Connection_closed -> ()
+    | Ok _ -> Alcotest.fail "reused with timeout=2"
+    | Error _ -> Alcotest.fail "unexpected error");
+    Ache_lwt.Client.shutdown client);
+  Alcotest.(check int) "one request served" 1 !requests_seen
+
+let test_client_deadline_timer_late () =
+  with_server ~idle_timeout:3.5 (fun connect ->
+    connect () >>= Ache_lwt.Client.create_connection >>= fun client ->
+    request_result client "/hello" >>= fun first ->
+    check_hello "first" first;
+    Lwt_unix.sleep 0.05 >>= fun () ->
+    (* Block the event loop past the deadline, so its timer has not run. *)
+    Unix.sleepf 1.1;
+    request_result client "/hello" >>= fun second ->
+    (match second with
+    | Error `Connection_closed -> ()
+    | Ok _ -> Alcotest.fail "reused past the deadline"
+    | Error _ -> Alcotest.fail "unexpected error");
+    Ache_lwt.Client.shutdown client);
+  Alcotest.(check int) "one request served" 1 !requests_seen
+
+let test_client_without_hint () =
+  with_server ?idle_timeout:None (fun connect ->
+    connect () >>= Ache_lwt.Client.create_connection >>= fun client ->
+    request_result client "/hello" >>= fun first ->
+    check_hello "first" first;
+    Lwt_unix.sleep 1.2 >>= fun () ->
+    Alcotest.(check bool) "open" false (Ache_lwt.Client.is_closed client);
+    request_result client "/hello" >>= fun second ->
+    check_hello "reused after 1.2 s" second;
+    Ache_lwt.Client.shutdown client)
+
+let continue_size = 2 * 1024 * 1024
+
+let continue_request =
+  Printf.sprintf
+    "POST /upload HTTP/1.1\r\n\
+     host: localhost\r\n\
+     expect: 100-continue\r\n\
+     content-length: %d\r\n\
+     \r\n"
+    continue_size
+
+let continue_100 = "HTTP/1.1 100 Continue\r\n\r\n"
+
+let continue_final =
+  Printf.sprintf "HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\n%d" continue_size
+
+let continue_handler _ reqd =
+  let body = Request_descriptor.request_body reqd in
+  let received = ref 0 in
+  let rec on_read _ ~off:_ ~len =
+    received := !received + len;
+    Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+  and on_eof () =
+    let s = string_of_int !received in
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create
+         ~headers:
+           (Headers.of_list
+              [ "content-length", string_of_int (String.length s) ])
+         `OK)
+      s
+  and on_error () = () in
+  Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+
+let auto_continue = { Config.default with auto_continue = true }
+
+let test_auto_continue_upload () =
+  with_server
+    ~connection_handler:(fun ~request_handler:_ ~error_handler addr socket ->
+      Ache_lwt.Server.create_connection_handler
+        ~config:auto_continue
+        ~date:false
+        ~idle_timeout:None
+        ~request_handler:continue_handler
+        ~error_handler
+        addr
+        socket)
+    (fun connect ->
+       connect () >>= fun socket ->
+       write_all socket continue_request >>= fun () ->
+       Lwt_unix.with_timeout 0.5 (fun () ->
+         read_exactly socket (String.length continue_100))
+       >>= fun interim ->
+       Alcotest.(check string) "100 Continue within 0.5 s" continue_100 interim;
+       write_all socket (String.make continue_size 'x') >>= fun () ->
+       read_exactly socket (String.length continue_final) >>= fun final ->
+       Alcotest.(check string) "the whole body was read" continue_final final;
+       Lwt_unix.close socket)
+
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Alcotest.run
     "ache-lwt loopback"
     [ ( "loopback"
       , [ "GET", `Quick, test_get
+        ; ( "client: response bytes on an idle connection are not a response"
+          , `Quick
+          , test_stray_bytes_on_idle_connection )
+        ; "Date header from the runtime", `Quick, test_date_header
+        ; ( "Expect: 100-continue upload with auto_continue"
+          , `Quick
+          , test_auto_continue_upload )
         ; "POST echo larger than the read buffer", `Quick, test_post_echo
         ; "two pipelined requests", `Quick, test_pipelined
         ; ( "a flooding client does not block the event loop"
@@ -1660,6 +2971,36 @@ let () =
           , test_upgrade_incomplete_token_reaches_new_protocol )
         ; "WebSocket echo and close", `Quick, test_websocket_echo
         ; "WebSocket server close", `Quick, test_websocket_server_close
+        ; ( "WebSocket close timeout for a client that does not answer"
+          , `Quick
+          , test_websocket_close_timeout )
+        ; ( "WebSocket close timeout for a silent client and no idle timeout"
+          , `Quick
+          , test_websocket_close_timeout_silent_client ?idle_timeout:None )
+        ; ( "WebSocket close timeout for a silent client and an idle timeout"
+          , `Quick
+          , test_websocket_close_timeout_silent_client ~idle_timeout:30. )
+        ; ( "WebSocket close timeout after a pong to a client that then stays \
+             silent"
+          , `Quick
+          , test_websocket_close_timeout_pong_then_silent )
+        ; ( "WebSocket close timeout closes the server socket of a client that \
+             keeps sending"
+          , `Quick
+          , test_websocket_close_timeout_server_closes )
+        ; ( "WebSocket close timeout with the callback API"
+          , `Quick
+          , test_websocket_close_timeout_callback_api )
+        ; "WebSocket ping, pong and close reason", `Quick, test_websocket_ping
+        ; ( "WebSocket session that returns closes 1000"
+          , `Quick
+          , test_websocket_session_return_closes )
+        ; ( "WebSocket session exception closes 1011"
+          , `Quick
+          , test_websocket_session_exception )
+        ; ( "WebSocket ping timeout and Closed"
+          , `Quick
+          , test_websocket_ping_timeout )
         ; ( "WebSocket receive queue pauses reading"
           , `Quick
           , test_websocket_receive_backpressure )
@@ -1711,18 +3052,21 @@ let () =
           , test_head_deadline )
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
-        ; ( "unread body after the response, no idle_timeout: closes"
+        ; ( "unread body after the response: body_timeout"
           , `Quick
-          , test_unread_body_without_idle_timeout )
-        ; ( "unread body after the response: idle_timeout"
+          , test_unread_body_body_timeout )
+        ; ( "unread body after the response, no body_timeout: stays open"
           , `Quick
-          , test_unread_body_idle_timeout )
-        ; ( "response while a body read waits, no idle_timeout: closes"
+          , test_unread_body_without_body_timeout )
+        ; ( "unread body past 256 KiB closes the connection"
+          , `Quick
+          , test_unread_body_drain_limit )
+        ; ( "response while a body read waits: body_timeout"
           , `Quick
           , test_respond_while_body_read_pending )
-        ; ( "response while a body read waits: idle_timeout"
+        ; ( "response while a body read waits, no body_timeout: stays open"
           , `Quick
-          , test_respond_while_body_read_pending_idle_timeout )
+          , test_respond_while_body_read_pending_untimed )
         ; "a timeout must be positive", `Quick, test_timeout_must_be_positive
         ; ( "when the timeout arguments are checked"
           , `Quick
@@ -1739,12 +3083,79 @@ let () =
         ; ( "requests with split heads do not pile up head timers"
           , `Quick
           , test_head_timer_bounded )
+        ; ( "requests with body and write clocks do not pile up timers"
+          , `Quick
+          , test_body_write_timers_bounded )
         ; ( "closed connections do not pile up timers"
           , `Quick
           , test_closed_connection_timers_bounded )
         ; ( "keep-alive connections closed while idle do not pile up timers"
           , `Quick
           , test_idle_connection_timers_bounded )
+        ] )
+    ; ( "drain"
+      , [ ( "a request in flight finishes with connection: close"
+          , `Quick
+          , test_drain_finishes_request )
+        ; "idle connections close at once", `Quick, test_drain_idle
+        ; ( "a request still running at the grace is cancelled"
+          , `Quick
+          , test_drain_grace_cancels )
+        ; ( "a connection handled after stop is closed unread"
+          , `Quick
+          , test_handler_after_stop )
+        ; "WebSocket gets close 1001", `Quick, test_drain_websocket
+        ; "grace must be positive", `Quick, test_grace_must_be_positive
+        ; ( "a pending stop does not grow with connections or requests"
+          , `Quick
+          , test_pending_stop_bounded )
+        ] )
+    ; ( "in-progress timeouts"
+      , [ ( "a body trickle times out though each gap is shorter"
+          , `Quick
+          , test_body_trickle_times_out )
+        ; ( "a client that sends after a 408 reads it, then the end of input"
+          , `Quick
+          , test_body_timeout_linger )
+        ; ( "a body that makes progress is not timed out"
+          , `Quick
+          , test_body_progress_not_timed_out )
+        ; ( "a client that stops reading is closed at write_timeout"
+          , `Quick
+          , test_write_timeout )
+        ; ( "a slow handler that reads no body is not timed out"
+          , `Quick
+          , test_slow_handler_not_timed_out )
+        ; ( "an idle WebSocket closes with 1001"
+          , `Quick
+          , test_websocket_idle_timeout )
+        ; "None turns every timeout off", `Quick, test_timeouts_off
+        ] )
+    ; ( "keep-alive hints"
+      , [ ( "the server sends timeout= with an idle timeout of 1 s or more"
+          , `Quick
+          , test_keep_alive_hint )
+        ; ( "max= counts down, no hint on the closing response"
+          , `Quick
+          , test_keep_alive_hint_max )
+        ; ( "the idle timer runs 1 s longer than the hint"
+          , `Quick
+          , test_keep_alive_idle_timer_longer )
+        ; ( "a WebSocket keeps idle_timeout and the 101 has no hint"
+          , `Quick
+          , test_websocket_idle_with_hint )
+        ; ( "the client closes a connection past its reuse deadline"
+          , `Quick
+          , test_client_reuse_deadline )
+        ; ( "timeout=2 makes a connection not reusable at once"
+          , `Quick
+          , test_client_deadline_before_timer )
+        ; ( "a request past the deadline fails before its timer runs"
+          , `Quick
+          , test_client_deadline_timer_late )
+        ; ( "without a hint the client keeps the connection"
+          , `Quick
+          , test_client_without_hint )
         ] )
     ; ( "Timeout"
       , [ "expires after its deadline", `Quick, test_timeout_expires

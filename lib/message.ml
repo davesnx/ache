@@ -74,6 +74,39 @@ let rec has_member values token =
   | [] -> false
   | value :: values -> has_member_from value token 0 || has_member values token
 
+(* Go's net/http badTrailer list. *)
+let forbidden_trailers =
+  [ "authorization"
+  ; "cache-control"
+  ; "connection"
+  ; "content-encoding"
+  ; "content-length"
+  ; "content-range"
+  ; "content-type"
+  ; "expect"
+  ; "host"
+  ; "keep-alive"
+  ; "max-forwards"
+  ; "pragma"
+  ; "proxy-authenticate"
+  ; "proxy-authorization"
+  ; "proxy-connection"
+  ; "range"
+  ; "realm"
+  ; "te"
+  ; "trailer"
+  ; "transfer-encoding"
+  ; "www-authenticate"
+  ]
+
+let is_forbidden_trailer name =
+  List.exists
+    (fun forbidden -> Headers.ci_equal name forbidden)
+    forbidden_trailers
+
+let accepts_trailers headers =
+  has_member (Headers.get_multi headers "te") "trailers"
+
 let at_least_v1_1 ({ major; minor } : Version.t) =
   major > 1 || (major = 1 && minor >= 1)
 

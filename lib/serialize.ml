@@ -109,15 +109,35 @@ let write_headers t headers =
   write_fields t (Headers.to_list headers);
   write_crlf t
 
-let check_request { Request.meth; target; headers; _ } =
+let check_request_head { Request.meth; target; headers; _ } =
   let meth = Method.to_string meth in
   if not (is_token meth) then invalid_argf "ache: invalid method %S" meth;
   if has_cr_lf_nul_space target 0
   then invalid_argf "ache: invalid request target %S" target;
   check_headers headers
 
+(* RFC 9110 §7.2: one Host field. RFC 9112 §6.1-6.3: a body length the recipient
+   can read. *)
+let check_request ({ Request.headers; _ } as request) =
+  check_request_head request;
+  (match Headers.get_multi headers "host" with
+  | _ :: _ :: _ -> invalid_arg "ache: more than one host field"
+  | [] | [ _ ] -> ());
+  match Request.body_length request with
+  | `Fixed _ | `Chunked -> ()
+  | `Error `Bad_request ->
+    if Headers.mem headers "content-length"
+    then
+      if Headers.mem headers "transfer-encoding"
+      then invalid_arg "ache: content-length and transfer-encoding are both set"
+      else
+        invalid_argf
+          "ache: invalid content-length %S"
+          (String.concat ", " (Headers.get_multi headers "content-length"))
+    else invalid_arg "ache: transfer-encoding does not end with chunked"
+
 let write_request t ({ Request.meth; target; version; headers } as request) =
-  check_request request;
+  check_request_head request;
   write_string t (Method.to_string meth);
   write_space t;
   write_string t target;
@@ -141,6 +161,35 @@ let write_response t ({ Response.version; status; reason; headers } as response)
   write_string t reason;
   write_crlf t;
   write_headers t headers
+
+let check_date date =
+  if has_cr_lf_nul date 0 then invalid_argf "ache: invalid date %S" date
+
+let write_response_with
+      t
+      ({ Response.version; status; reason; headers } as response)
+      ~date
+      ~keep_alive
+  =
+  check_response response;
+  write_version t version;
+  write_space t;
+  write_status t status;
+  write_space t;
+  write_string t reason;
+  write_crlf t;
+  write_fields t (Headers.to_list headers);
+  if date <> ""
+  then (
+    write_string t "Date: ";
+    write_string t date;
+    write_crlf t);
+  if keep_alive <> ""
+  then (
+    write_string t "Keep-Alive: ";
+    write_string t keep_alive;
+    write_crlf t);
+  write_crlf t
 
 let rec write_hex_digits t len shift =
   if shift >= 0
@@ -206,6 +255,10 @@ module Writer = struct
   let encoder t = t.encoder
   let write_request t request = write_request t.encoder request
   let write_response t response = write_response t.encoder response
+
+  let write_response_with t response ~date ~keep_alive =
+    write_response_with t.encoder response ~date ~keep_alive
+
   let write_string t ?off ?len string = write_string t.encoder ?off ?len string
 
   let write_bigstring t ?off ?len bigstring =
@@ -224,6 +277,10 @@ module Writer = struct
     write_chunk_length t.encoder length;
     schedule_fixed t iovecs;
     write_crlf t.encoder
+
+  let write_last_chunk t trailers =
+    write_chunk_length t.encoder 0;
+    write_headers t.encoder trailers
 
   let on_wakeup t k =
     if Encoder.is_closed t.encoder

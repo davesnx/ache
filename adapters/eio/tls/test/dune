@@ -6,9 +6,11 @@
   ache-eio
   ache-eio-tls
   ache_test_certs
+  ache_test_tls_stray
   alcotest
   domain-name
   ipaddr
   eio
   eio_main
+  tls
   tls-eio))

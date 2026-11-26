@@ -1,0 +1,43 @@
+# llhttp corpus cases where ache and llhttp differ. One per line:
+#   <file>:<line of the http fence> | <by design | harness | ticket: ...> | <note>
+# test_llhttp fails on a difference not listed here, and on a listed case
+# that agrees (then delete its line).
+
+# ache by design
+request/sample.md:317 | by design | HTTP/0.9 request line (no version): 400
+request/method.md:138 | by design | M-SEARCH *: asterisk-form only with OPTIONS
+request/method.md:375 | by design | ICE/1.0 protocol: 400
+request/method.md:405 | by design | RTSP/1.0 protocol: 400
+request/method.md:433 | by design | RTSP/1.0 protocol: 400
+request/method.md:461 | by design | PRI * HTTP/2.0 preface: 400, no HTTP/2
+request/transfer-encoding.md:838 | by design | gzip, chunked: 501, no coding but chunked
+request/transfer-encoding.md:880 | by design | gzip, chunked: 501, no coding but chunked
+response/sample.md:43 | by design | RTSP/1.0 response
+response/sample.md:63 | by design | ICE/1.0 response
+response/sample.md:648 | by design | HTTP/0.9 response
+response/transfer-encoding.md:451 | by design | Transfer-Encoding "chunked abc" (obs-fold) does not end in chunked: close-delimited body (RFC 9112 §6.3)
+request/uri.md:7 | by design | decision 0007: '"' in the target: 400
+request/uri.md:105 | by design | decision 0007: '|' in the target: 400
+request/uri.md:168 | by design | decision 0007: '#' (fragment) in the target: 400
+request/uri.md:225 | by design | decision 0007: userinfo in an absolute-form target: 400
+response/connection.md:495 | by design | task 14 (undici a287effc): a 304 with Content-Length closes the connection, the next response is not read
+response/connection.md:540 | by design | task 14 (undici a287effc): a 304 with Transfer-Encoding closes the connection, the next response is not read
+
+# llhttp by design
+request/invalid.md:69 | by design | llhttp: ANNOUNCE only with RTSP; ache: any token method
+request/invalid.md:359 | by design | llhttp: fixed method list (MKCOLA); ache: any token method
+request/connection.md:84 | by design | llhttp: data after Connection: close is an error; ache stops reading
+request/connection.md:297 | by design | llhttp: data after Connection: close is an error; ache stops reading
+request/connection.md:347 | by design | llhttp: data after Connection: close is an error; ache stops reading
+request/connection.md:113 | by design | lenient-keep-alive: ache stops reading after Connection: close
+request/connection.md:397 | by design | lenient-keep-alive: ache stops reading after Connection: close
+response/connection.md:167 | by design | llhttp: data after Connection: close is an error; ache stops reading
+response/connection.md:230 | by design | llhttp: data after Connection: close is an error; ache stops reading
+response/connection.md:196 | by design | lenient-data-after-close: ache stops reading after Connection: close
+response/connection.md:263 | by design | lenient-keep-alive: ache stops reading after Connection: close
+
+# harness
+request/content-length.md:78 | harness | input ends inside the head; llhttp fails at the field value, ache at the end of the head
+request/content-length.md:103 | harness | input ends inside the head; llhttp fails at the field, ache at the end of the head
+request/content-length.md:447 | harness | skipBody: llhttp skips the body of a request, ache cannot
+request/invalid.md:493 | harness | input ends inside the request line; llhttp fails at the version, ache at the line end

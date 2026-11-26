@@ -504,7 +504,11 @@ let client_tests =
   [ test
       "§9.2 client MUST: pipelined responses matched to requests in order"
       (fun () ->
-         let c = Client.create () in
+         let c =
+           Client.create
+             ~config:{ Config.default with max_pipelined_requests = 16 }
+             ()
+         in
          let ex1 = client_send c "/1" in
          let ex2 = client_send c "/2" in
          Alcotest.(check string)
@@ -633,7 +637,11 @@ let client_tests =
       "§9.3.2 client SHOULD: unanswered pipelined request reported when the \
        connection closes"
       (fun () ->
-         let c = Client.create () in
+         let c =
+           Client.create
+             ~config:{ Config.default with max_pipelined_requests = 16 }
+             ()
+         in
          let _ex1 = client_send c "/1" in
          let ex2 = client_send c "/2" in
          Alcotest.(check string)
@@ -810,7 +818,7 @@ let timeout_tests =
          ignore (Server.take_output s);
          (match timeout_action s with
          | Some (`Idle, close) -> close ()
-         | Some ((`Head | `Body), _) ->
+         | Some ((`Head | `Body | `Close), _) ->
            Alcotest.fail "head timeout between requests"
          | None -> Alcotest.fail "no timeout between requests");
          Server.pump s;
@@ -823,21 +831,28 @@ let timeout_tests =
          let s = Server.run "GET / HTTP/1.1\r\nHo" in
          (match timeout_action s with
          | Some (`Head, reject) -> reject ()
-         | Some ((`Idle | `Body), _) ->
+         | Some ((`Idle | `Body | `Close), _) ->
            Alcotest.fail "idle timeout inside a head"
          | None -> Alcotest.fail "no timeout inside a head");
          Server.pump s;
          check_rejected ~allowed:[ 408 ] s)
-  ; test "§9.5 server SHOULD: no read timeout while a body is read" (fun () ->
-      let s =
-        Server.run
-          ~handler:(fun ex -> Server.read_body ex ~on_complete:ignore)
-          "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nab"
-      in
-      Alcotest.(check bool)
-        "no timeout"
-        true
-        (Option.is_none (timeout_action s)))
+  ; test
+      "§9.5 server SHOULD: body timeout while a body is read answers 408 and \
+       closes"
+      (fun () ->
+         let s =
+           Server.run
+             ~handler:(fun ex -> Server.read_body ex ~on_complete:ignore)
+             "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nab"
+         in
+         (match timeout_action s with
+         | Some (`Body, expire) -> expire ()
+         | Some ((`Idle | `Head | `Close), _) ->
+           Alcotest.fail "idle or head timeout inside a body"
+         | None -> Alcotest.fail "no timeout while a body is read");
+         Server.pump s;
+         check_status "408 after the handler" [ 408 ] s;
+         check_closed "connection closed" s)
   ]
 
 let tests =

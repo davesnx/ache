@@ -49,9 +49,18 @@ module type ENGINE = sig
   val shutdown : t -> unit
 end
 
-type impl = Impl : (module ENGINE with type t = 't) * 't -> impl
+type 't hooks =
+  { drain : 't -> unit
+  ; read_timeout : 't -> ([ `Idle | `Close ] * (unit -> unit)) option
+  }
 
-let make runtime t = Impl (runtime, t)
+type impl = Impl : (module ENGINE with type t = 't) * 't * 't hooks -> impl
+
+let no_hooks = { drain = (fun _ -> ()); read_timeout = (fun _ -> None) }
+let make runtime t = Impl (runtime, t, no_hooks)
+let make_with_hooks runtime t hooks = Impl (runtime, t, hooks)
+let drain (Impl (_, t, hooks)) = hooks.drain t
+let read_timeout (Impl (_, t, hooks)) = hooks.read_timeout t
 
 module Upgradable = struct
   type t = { mutable impl : impl }
@@ -59,37 +68,37 @@ module Upgradable = struct
   let create impl = { impl }
 
   let upgrade t impl' =
-    let (Impl ((module Engine), engine)) = t.impl in
+    let (Impl ((module Engine), engine, _)) = t.impl in
     t.impl <- impl';
     Engine.shutdown engine
 
-  let next_read_operation { impl = Impl ((module Engine), engine) } =
+  let next_read_operation { impl = Impl ((module Engine), engine, _) } =
     Engine.next_read_operation engine
 
-  let read { impl = Impl ((module Engine), engine) } = Engine.read engine
+  let read { impl = Impl ((module Engine), engine, _) } = Engine.read engine
 
-  let read_eof { impl = Impl ((module Engine), engine) } =
+  let read_eof { impl = Impl ((module Engine), engine, _) } =
     Engine.read_eof engine
 
-  let yield_reader { impl = Impl ((module Engine), engine) } =
+  let yield_reader { impl = Impl ((module Engine), engine, _) } =
     Engine.yield_reader engine
 
-  let next_write_operation { impl = Impl ((module Engine), engine) } =
+  let next_write_operation { impl = Impl ((module Engine), engine, _) } =
     Engine.next_write_operation engine
 
-  let report_write_result { impl = Impl ((module Engine), engine) } =
+  let report_write_result { impl = Impl ((module Engine), engine, _) } =
     Engine.report_write_result engine
 
-  let yield_writer { impl = Impl ((module Engine), engine) } =
+  let yield_writer { impl = Impl ((module Engine), engine, _) } =
     Engine.yield_writer engine
 
-  let report_exn { impl = Impl ((module Engine), engine) } =
+  let report_exn { impl = Impl ((module Engine), engine, _) } =
     Engine.report_exn engine
 
-  let is_closed { impl = Impl ((module Engine), engine) } =
+  let is_closed { impl = Impl ((module Engine), engine, _) } =
     Engine.is_closed engine
 
-  let shutdown { impl = Impl ((module Engine), engine) } =
+  let shutdown { impl = Impl ((module Engine), engine, _) } =
     Engine.shutdown engine
 end
 

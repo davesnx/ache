@@ -21,6 +21,9 @@
   test_status
   test_framing
   test_server_connection
+  test_drain
   test_version
-  test_websocket)
+  test_websocket
+  test_testing
+  test_trailers)
  (name test_ache))

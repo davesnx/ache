@@ -58,3 +58,16 @@ value ache_bigstring_memchr_byte(value bs, value off, value chr, value len)
   return Val_long(ache_bigstring_memchr(bs, Long_val(off), Long_val(chr),
                                         Long_val(len)));
 }
+
+#include <time.h>
+
+intnat ache_time_seconds(value unit)
+{
+  (void)unit;
+  return (intnat)time(NULL);
+}
+
+value ache_time_seconds_byte(value unit)
+{
+  return Val_long(ache_time_seconds(unit));
+}

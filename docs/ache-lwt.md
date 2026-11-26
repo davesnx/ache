@@ -27,8 +27,10 @@ let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
   (match error with
   | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
-  | #Status.standard as status ->
-    Body.Writer.write_string body (Status.default_reason_phrase status));
+  | error ->
+    Body.Writer.write_string
+      body
+      (Status.to_string (Server_connection.error_status error)));
   Body.Writer.close body
 
 let () =
@@ -119,21 +121,32 @@ let rec echo ws =
   let* message = Ache_lwt.Websocket.receive ws in
   match message with
   | None -> Lwt.return_unit
-  | Some "bye" -> Ache_lwt.Websocket.close ws 1000
-  | Some message ->
-    let* () = Ache_lwt.Websocket.send ws message in
+  | Some (Text "bye") -> Ache_lwt.Websocket.close ~reason:"bye" ws 1000
+  | Some (Text message) ->
+    let* () = Ache_lwt.Websocket.send_text ws message in
+    echo ws
+  | Some (Binary message) ->
+    let* () = Ache_lwt.Websocket.send_binary ws message in
     echo ws
 
 let request_handler _client_address reqd =
-  match Ache_lwt.Websocket.upgrade reqd with
-  | Ok ws ->
-    Lwt.async (fun () ->
-      Lwt.catch
-        (fun () -> echo ws)
-        (function
-          | Ache_lwt.Websocket.Closed -> Lwt.return_unit
-          | exn -> Lwt.reraise exn))
-  | Error _ ->
+  match Ache_lwt.Websocket.upgrade reqd echo with
+  | Ok () -> ()
+  | Error `Unsupported_version ->
+    (* RFC 6455 §4.4: name the version this server speaks. *)
+    let headers =
+      Headers.of_list
+        [ "sec-websocket-version", "13"
+        ; "upgrade", "websocket"
+        ; "connection", "upgrade"
+        ; "content-length", "0"
+        ]
+    in
+    Request_descriptor.respond_with_string
+      reqd
+      (Response.create ~headers `Upgrade_required)
+      ""
+  | Error (`Not_get | `Not_websocket | `Invalid_key) ->
     let headers = Headers.of_list [ "content-length", "0" ] in
     Request_descriptor.respond_with_string
       reqd
@@ -141,22 +154,44 @@ let request_handler _client_address reqd =
       ""
 ```
 
-- `upgrade` checks the handshake and responds with `101`, as
-  `Ache.Websocket.upgrade` does. On `Error _` it responds nothing: send the
-  response yourself, for example `426` with `Sec-WebSocket-Version: 13` for
-  `` Error `Unsupported_version ``.
-- `receive` resolves with the next whole text message. Once the connection
-  has ended and no message waits, it resolves with `None`. The connection
-  ends after the client's close frame, the end of the input, a reset, a
-  protocol error, or your `close`.
-- `send` resolves when the frame is written. It fails with
-  `Ache_lwt.Websocket.Closed` when the connection is gone, also when it was
-  gone before the call, so a send loop ends when the client leaves.
-- `close ws code` sends a close frame and resolves when the frame is written
-  or the connection has ended. It raises `Invalid_argument` at once for a
-  code that an endpoint may not send. The socket closes when the read in
-  progress ends too: when the client answers with its close frame or closes
-  the connection. There is no timeout for a client that does neither.
+- `upgrade ?max_message_size ?headers reqd session` checks the handshake and
+  responds with `101`, as `Ache.Websocket.upgrade` does (`headers` answers a
+  subprotocol, see [Choose a subprotocol](ache.md#choose-a-subprotocol)),
+  then runs `session ws` like `Lwt.async`.
+  When the session resolves, or fails with `Ache_lwt.Websocket.Closed`, the
+  connection closes with code 1000, unless it has already ended: a session
+  ends quietly when a send finds the client gone. Another exception sends a
+  close frame with code 1011, then goes to `Lwt.async_exception_hook`, whose
+  default exits the program: set your own. On `Error _` it responds nothing and the
+  session does not run: send the response yourself, for example `426` with
+  `Sec-WebSocket-Version: 13` for `` Error `Unsupported_version ``.
+- `receive` resolves with the next whole message, `Text s` or `Binary s`.
+  Once the connection has ended and no message waits, it resolves with
+  `None`. The connection ends after the client's close frame, the end of the
+  input, a reset, a protocol error, or your `close`. `client_close ws` gives
+  the client's close code and reason once the connection has ended, if it
+  sent a valid close frame; `None` does not tell an end of input, a reset or
+  a protocol error apart.
+- `send_text` and `send_binary` resolve when the frame is written. They fail
+  with `Ache_lwt.Websocket.Closed` when the connection is gone, also when it
+  was gone before the call, so a send loop ends when the client leaves.
+- `ping ws payload` sends a ping and resolves when the next pong arrives, or
+  fails with `Closed` when the connection ends first. To find a client that
+  is gone: `Lwt_unix.with_timeout 30. (fun () -> Ache_lwt.Websocket.ping ws
+  "")`, and `close` on `Lwt_unix.Timeout`. A client that is gone does not
+  answer the close frame: the connection waits for it at most
+  `close_timeout` (10 s by default). The pong comes after the
+  messages the client sent before it, so keep calling `receive` meanwhile:
+  while 8 messages wait, reading is paused and the pong is not seen.
+- `close ?reason ws code` sends a close frame and resolves when the
+  connection has ended: the client answered with its close frame (then in
+  `client_close`), closed the connection, or the connection failed.
+  Messages that arrive meanwhile are dropped. The connection waits at most
+  `close_timeout` (10 s by default) for the client's close frame, then
+  closes without it, and `client_close` is `None`. Messages that arrive
+  meanwhile do not extend the wait. It raises `Invalid_argument` at once for a code
+  that an endpoint may not send, or a reason that is not UTF-8 or longer
+  than 123 bytes.
 - Messages that you have not received wait in a queue. When 8 messages wait,
   the connection stops reading from the client until `receive` takes one.
   Frames that one read already holds still join the queue.
@@ -193,6 +228,7 @@ It creates the core connection and starts the two loops:
   │                            (Lwt.pick with a timer when a timeout applies)
   ├─ write loop (Lwt.async) ── Lwt_unix.writev, one call for all buffers
   └─ Lwt.choose [ both loops ended ; failed ] ─► close the socket once
+     (a server read loop lingers first; the write loop shuts the send side)
 ```
 
 - **Waiting.** On `Yield`, a loop gives the core a function that starts the
@@ -216,11 +252,18 @@ It creates the core connection and starts the two loops:
   for each record. With the default 4 KiB buffer, each record takes 4
   writes.
 - **Timeouts.** A timed read is `Lwt.pick` of the socket read and
-  `Ache_lwt.Timeout.expired`. See [Timeouts](#timeouts) for why the timers
-  are shared. A read of a request body before its response is complete is
-  `Lwt.pick` of the socket read and a wait for the write loop, which
-  then gives the limit for the rest of the body (see
-  [Timeouts](ache.md#timeouts)).
+  `Ache_lwt.Timeout.expired`; a timed write is `Lwt.pick` of the `writev`
+  and the write timer. See [Timeouts](#timeouts) for which timer applies
+  and why the timers are shared.
+- **Lingering close.** When a server connection stops reading before the
+  end of input (a closing response, a 408 or 413 while the client still
+  sends a body, a timeout), the read loop reads and drops input until the
+  end of input, or until the write loop has shut the send side and
+  `idle_timeout` (2 s when it is `None`) has passed (RFC 9112 §9.6). Closing
+  with unread input would make the kernel send a reset, and the client could
+  lose the response. The timer is made only then, and stops with the
+  connection. After the end of input, and when a WebSocket closes at
+  `close_timeout`, there is no linger.
 - **Errors.** If a write fails, or the core raises in `report_exn`, the
   connection resolves `failed`, and `Lwt.choose` closes the socket.
 
@@ -231,11 +274,60 @@ The application must ignore `SIGPIPE`. `Ache_lwt.Server` and
 socket. For another socket type, implement `Ache_lwt.IO` and apply
 `Ache_lwt.Make`: `read`
 fails with `End_of_file` at the end of the input or when the peer is gone,
-and `writev` returns `` `Closed `` when the peer is gone. The `Ache_lwt.IO`
-documentation has the full contract. The Lwt server does not wait for the
-peer to close after the last response.
+`writev` returns `` `Closed `` when the peer is gone, and `shutdown_send`
+ends the output. The `Ache_lwt.IO` documentation has the full contract.
+
+The server adds a `Date` field with the current time to each response that
+is not 1xx and has none (RFC 9110 §6.6.1). The text is formatted once per
+second in each domain. `~date:false` on `create_connection_handler` or the
+TLS handler turns it off.
 
 ### Timeouts
+
+The server timeouts are on by default; `~idle_timeout:None` (and so on)
+turns one off. The TLS handler takes the same arguments.
+
+| Argument | Default | Applies while |
+|---|---|---|
+| `?idle_timeout` | `Some 60.` | no request is in progress, or a WebSocket waits for a frame (it closes with 1001) |
+| `?head_timeout` | `Some 30.` | a request head is partly read (408) |
+| `?body_timeout` | `Some 60.` | the connection waits for request body bytes (408 if no response started, else close) |
+| `?write_timeout` | `Some 60.` | output waits to be written, for example to a client that stopped reading (close) |
+| `?close_timeout` | `Some 10.` | a WebSocket queued its close frame and waits for the client's (close without it) |
+
+The close clock starts when the server's close frame is queued, by
+`Ache_lwt.Websocket.close`, the end of a session or `Ache.Websocket.close`.
+Messages from the client do not restart it. The close frames of
+`idle_timeout` and of a drain end the connection at once, without waiting
+for the client's close frame.
+
+With `?idle_timeout:(Some x)` and `x >= 1.`, a response after which the
+connection stays open gets `Keep-Alive: timeout=n`, with `n` the whole
+seconds of `x` (and `, max=m` when `Config.max_requests_per_connection` is
+set), unless the application set `Keep-Alive`. The timer between requests
+then runs `x + 1` seconds, so that a client that trusts the hint never
+writes into a connection that is closing. A WebSocket keeps `x`.
+
+The client reads the hint: `Client_connection.reuse_timeout` gives `s`,
+`timeout` (at most 600) minus 2 seconds. `s` seconds after it sees the end
+of the response, an idle `Ache_lwt.Client` connection shuts down, and a
+`request` made after that time gets `` `Connection_closed `` without
+writing anything, also when the timer has not run yet. The TLS client does
+the same.
+
+Before each read, the server asks the core which timeout applies
+(`Server_connection.read_timeout`). While the request handler runs and the
+connection waits for nothing from the client, no timeout applies.
+
+The body and write timeouts measure progress, not single reads or writes:
+their clock restarts only after 2048 bytes, so a client that sends or reads
+one byte at a time cannot keep a connection. The body clock counts only
+while a read waits for body bytes. It counts ticks of a tenth of
+`body_timeout`, so all connections with the same `body_timeout` share one
+timer queue, and the timeout can end up to a tenth late. The write clock
+runs while output is pending and restarts when all of it is written. When
+it runs out, the server closes the socket and ends the connection, and
+pending `Body.Writer.flush` callbacks get `` `Closed ``.
 
 With Lwt's `select` and `poll` engines, a cancelled `Lwt_unix.sleep` stays in
 memory until no other sleep ends before it. A server that starts one sleep
@@ -246,8 +338,8 @@ frees a cancelled sleep at once.
 `Ache_lwt.Timeout` avoids this. All timeouts of one length share one queue,
 in deadline order, and one sleep for the front of the queue that is never
 cancelled. `set` and `stop` only move an entry in the queue. The servers of
-`ache-lwt` and `ache-lwt-tls` use it for `?idle_timeout`, `?head_timeout` and
-the TLS handshake. An application can use it for its own timeouts:
+`ache-lwt` and `ache-lwt-tls` use it for each server timeout and the TLS
+handshake. An application can use it for its own timeouts:
 
 ```ocaml
 let read_with_timeout timeout read =
@@ -266,6 +358,69 @@ let read_with_timeout timeout read =
 Create the timeout once, for example with `Ache_lwt.Timeout.create 30.`, and
 reuse it for each read. Cancelling the `expired` promise, as `Lwt.pick` does,
 does not change the timeout.
+
+### Graceful stop
+
+`create_connection_handler` takes `?stop:unit Lwt.t` and `?grace:float`.
+Give the same `stop` promise to every connection. When it resolves, each
+connection calls `Ache.Server_connection.drain`:
+
+1. An idle connection closes at once.
+2. A connection with a request in progress serves it, with
+   `Connection: close` if its head is not written yet, and then closes.
+   Requests pipelined after it are not served.
+3. A WebSocket connection sends a close frame with code 1001 and closes at
+   once.
+4. `grace` seconds after `stop`, a connection that is still open is
+   cancelled: its socket closes, and the promise of the connection
+   resolves without waiting for the request handler. Without `grace` there
+   is no limit.
+
+A connection handler applied after `stop` resolved closes the socket
+without reading a request. With `ache-lwt-tls`, a handshake in progress at
+`stop` is closed. The handler does not stop the accept loop; the server
+does that and waits for its connections:
+
+```ocaml
+let serve listen_address =
+  let open Lwt.Syntax in
+  let stop, stop_now = Lwt.wait () in
+  let (_ : Lwt_unix.signal_handler_id) =
+    Lwt_unix.on_signal Sys.sigterm (fun _ ->
+      if Lwt.is_sleeping stop then Lwt.wakeup_later stop_now ())
+  in
+  let open_connections = ref 0
+  and closed = Lwt_condition.create () in
+  let* server =
+    Lwt_io.establish_server_with_client_socket listen_address (fun addr fd ->
+      incr open_connections;
+      Lwt.finalize
+        (fun () ->
+          Ache_lwt.Server.create_connection_handler
+            ~stop
+            ~grace:10.
+            ~request_handler
+            ~error_handler
+            addr
+            fd)
+        (fun () ->
+          decr open_connections;
+          Lwt_condition.broadcast closed ();
+          Lwt.return_unit))
+  in
+  let* () = stop in
+  let* () = Lwt_io.shutdown_server server in
+  let rec all_closed () =
+    if !open_connections = 0
+    then Lwt.return_unit
+    else Lwt.bind (Lwt_condition.wait closed) all_closed
+  in
+  all_closed ()
+```
+
+The callback that each connection puts on `stop` is removed when the
+connection ends, so a `stop` that stays pending for the life of the server
+does not grow with the number of connections served.
 
 ## TLS
 
@@ -292,8 +447,10 @@ let error_handler _client_address ?request:_ error start_response =
   let body = start_response Headers.empty in
   (match error with
   | `Exn exn -> Body.Writer.write_string body (Printexc.to_string exn)
-  | #Status.standard as status ->
-    Body.Writer.write_string body (Status.default_reason_phrase status));
+  | error ->
+    Body.Writer.write_string
+      body
+      (Status.to_string (Server_connection.error_status error)));
   Body.Writer.close body
 
 let () =
