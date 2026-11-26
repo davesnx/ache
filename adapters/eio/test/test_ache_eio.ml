@@ -988,6 +988,43 @@ let test_head_timeout_408 () =
     "HTTP/1.1 408 Request Timeout"
     (status_line (head_timeout ()))
 
+(* The read that the head timeout ends still drops input, until the linger
+   deadline. *)
+let test_head_timeout_lingers () =
+  let clock = Eio_mock.Clock.make () in
+  Failing_flow.shutdowns := [];
+  with_server
+    ~flow:counting_flow
+    ~clock
+    ~head_timeout:0.1
+    ~idle_timeout:0.5
+    (fun ~sw ~net addr ->
+       let socket = Eio.Net.connect ~sw net addr in
+       let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+       Eio.Flow.copy_string "GET /hello HTTP/1.1\r\nHo" socket;
+       !real_sleep 0.05;
+       advance clock;
+       Alcotest.(check (float 0.))
+         "fired at the head timeout"
+         0.1
+         (Eio.Time.now clock);
+       Alcotest.(check string)
+         "status line"
+         "HTTP/1.1 408 Request Timeout"
+         (Eio.Buf_read.line reader);
+       Eio.Flow.copy_string "st: localhost\r\n\r\n" socket;
+       !real_sleep 0.05;
+       advance clock;
+       Alcotest.(check (float 0.))
+         "lingers for idle_timeout after the 408"
+         0.6
+         (Eio.Time.now clock);
+       ignore (Eio.Buf_read.take_all reader : string);
+       Eio.Flow.close socket;
+       Eio.Stream.take connections_done);
+  Alcotest.(check int) "request handler not called" 0 !requests_seen;
+  check_shutdowns ()
+
 let test_head_deadline () =
   let clock = Eio_mock.Clock.make () in
   with_server ~clock ~head_timeout:0.1 (fun ~sw ~net addr ->
@@ -2451,6 +2488,25 @@ let test_websocket_server_close () =
     Eio.Flow.close socket;
     Eio.Stream.take connections_done)
 
+(* The idle deadline of the read that was waiting when the session called
+   [close] passes: the server goes on reading the client's close frame. *)
+let test_websocket_server_close_past_idle_deadline () =
+  let clock = Eio_mock.Clock.make () in
+  with_server ~clock ~idle_timeout:0.1 (fun ~sw ~net addr ->
+    let socket, reader = ws_connect ~sw ~net addr "/ws-echo" in
+    Eio.Flow.copy_string (ws_frame 0x1 "close-me") socket;
+    Alcotest.check frame "close 1001" (0x88, "\x03\xe9") (read_ws_frame reader);
+    !real_sleep 0.05;
+    Eio_mock.Clock.set_time clock 0.2;
+    !real_sleep 0.05;
+    Eio.Flow.copy_string (ws_frame 0x8 "\x0f\xa0done") socket;
+    Alcotest.(check string)
+      "close returned with the client's close frame"
+      "closed, client close 4000 \"done\""
+      (Eio.Stream.take ws_reports);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done)
+
 let test_websocket_ping () =
   with_server (fun ~sw ~net addr ->
     let socket, reader = ws_connect ~sw ~net addr "/ws-echo" in
@@ -3792,6 +3848,9 @@ let () =
     ; ( "websocket"
       , [ "echo through Ache_eio.Websocket", `Quick, test_websocket_echo
         ; "server close", `Quick, test_websocket_server_close
+        ; ( "server close outlives the idle deadline of the read"
+          , `Quick
+          , test_websocket_server_close_past_idle_deadline )
         ; ( "ping returns on the pong, close with a reason"
           , `Quick
           , test_websocket_ping )
@@ -3841,6 +3900,9 @@ let () =
         ; ( "incomplete head gets 408 Request Timeout"
           , `Quick
           , test_head_timeout_408 )
+        ; ( "after a head timeout, input is dropped until the linger ends"
+          , `Quick
+          , test_head_timeout_lingers )
         ; ( "head timeout counts from the first byte of the head"
           , `Quick
           , test_head_deadline )

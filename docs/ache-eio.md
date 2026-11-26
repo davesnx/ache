@@ -406,13 +406,11 @@ creates the core connection and runs the two loops in one switch:
         ▼
  Switch.run
   ├─ Fiber.first ─┬─ Fiber.both ─┬─ read loop  ── Eio.Flow.single_read
-  │               │              │     │           into the read buffer
-  │               │              │     └─ timed read ─► reader fiber
-  │               │              │                     (daemon)
+  │               │              │                 into the read buffer
   │               │              └─ write loop ── Eio.Flow.write
   │               │                                (one writev)
   │               └─ waits for [failed] ─► shut down the socket
-  └─ when the switch ends: the reader fiber is cancelled
+  └─ watchdog fiber (daemon): the deadlines of the read and the write
 ```
 
 - **Waiting.** On `Yield`, a loop creates a promise, gives the core a
@@ -441,21 +439,12 @@ creates the core connection and runs the two loops in one switch:
 
 ### The reader fiber
 
-Each connection also starts a reader fiber, which reads the socket when the
+The client reads through a reader fiber, which reads the socket when the
 read loop asks it to, and keeps the result until the read loop takes it.
-
-- A read with a timeout goes through the reader fiber. When the timeout
-  fires, the read loop stops waiting, but the read goes on: tls-eio treats
-  a cancelled read as a permanent error, and every later operation on that
-  connection fails.
-- The client always reads through the reader fiber, so `Client.shutdown` can
-  stop the wait without cancelling the read.
-- With `?stop`, a read that waits for a new request goes through the
-  reader fiber, also without `idle_timeout`, so that the drain at `stop`
-  can end the wait.
-- Every other read is direct: the read loop calls `single_read` itself, for
-  example with all four timeouts off, in a tunnel after `CONNECT`, or after
-  an error response.
+`Client.shutdown` can then stop the wait without cancelling the read:
+tls-eio treats a cancelled read as a permanent error, and every later
+operation on that connection fails. The server has no reader fiber: its
+read loop calls `single_read` itself, with a timeout or without.
 
 A direct read saves two fiber switches and an `Eio.Condition` handoff for
 each read, and the objects of one read die young. In alternating runs of a
@@ -466,15 +455,45 @@ faster on one core and about 27 % faster on 4 domains.
 
 A timer for each read or write would cost a fiber and a timer each time.
 Instead, each connection has one watchdog fiber that sleeps until the
-nearest deadline of its read or its write. A read or write that ends in
-time only clears its deadline; a deadline that moves later does not wake
-the watchdog, which sleeps again when it wakes and finds no deadline
-passed. On a keep-alive connection it wakes about once per `idle_timeout`.
-When a read deadline passes, the watchdog wakes the read loop, which calls
-the core's timeout action. When a write deadline passes, it cancels the
-write (`Eio.Cancel`), and the connection closes. On one core, a hello-world
-server with the default timeouts serves about 25 % fewer requests per
-second than with all four off, mostly for the reader fiber.
+nearest deadline of its read or its write. Setting a deadline stores a
+float, and a read or write that ends in time only clears it. A deadline
+that moves later does not wake the watchdog, which sleeps again when it
+wakes and finds no deadline passed. On a keep-alive connection it wakes
+about once per `idle_timeout`.
+
+- **Reads.** When a read starts, the server asks the core which timeout
+  applies (`read_timeout`) and sets the deadline of that phase. When the
+  deadline passes, the watchdog runs the action that the core gives for
+  that phase at that moment: close an idle connection, answer 408 to a
+  slow head, fail a slow body, or close a WebSocket with 1001. Each action
+  ends reading for good, so the read loop does not need to stop waiting.
+  When the phase changed while the read waited, nothing runs, and the read
+  gets the deadline of the phase that applies now. While none applies, for
+  example to a WebSocket that waits for its output to drain, the watchdog
+  looks again every second.
+- **The read is not cancelled.** tls-eio would keep a cancelled read as an
+  error. The read becomes the first read of the linger: the input it gets
+  is dropped. At the linger deadline the watchdog shuts down the receive
+  side (``Eio.Flow.shutdown flow `Receive``), and the read ends with the end
+  of input, which the read loop does not give to the core. `Ache_eio_tls`
+  shuts down the TCP socket for `Receive`, under TLS, so the TLS session
+  can still send the response and `close_notify`. A flow of your own must
+  end a waiting read when it is shut down for `Receive`.
+- **Late input.** When a read ends after the watchdog's timer fired but
+  before the watchdog ran, the read loop runs the action itself and drops
+  the input.
+- **Drain.** A drain that closes an idle connection ends its read the same
+  way.
+- **Writes.** The write loop runs in one `Eio.Cancel` context for the
+  whole connection. When a write deadline passes, the watchdog cancels it,
+  and the connection closes. A write reads the clock when it starts, and
+  again only after each 2048 bytes written, to restart its deadline.
+
+On one core, a hello-world server with the default timeouts serves about
+3 % fewer requests per second than with all four off
+(`benchmarks/vs/server_ache_eio.exe --timeouts off`), and allocates about
+18 more words per request. Part of the difference is the `Keep-Alive`
+header that the idle timeout adds to each response.
 
 A write that tls-eio was in the middle of leaves the TLS session in an
 error state. The connection then sends no `close_notify`, and later reads
