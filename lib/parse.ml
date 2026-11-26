@@ -1101,6 +1101,11 @@ module Reader = struct
     | Fail _ -> (match t.failed_in with Some b -> b == body | None -> false)
     | Done | Head | Head_done | Cancelled_parse -> false
 
+  let between_messages t =
+    match t.state with
+    | Done -> true
+    | Head | Head_done | Body _ | Fail _ | Cancelled_parse -> false
+
   let next t =
     match t.state with
     | Fail failure -> `Error failure

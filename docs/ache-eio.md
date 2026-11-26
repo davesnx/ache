@@ -234,8 +234,8 @@ Ache_eio.Server.run
    returns. Without `grace` there is no limit.
 4. `run` returns when every connection in every domain has ended.
 
-A connection that closes still lingers as after any closing response (see
-[Linger](#linger)): it drops input until the peer closes, for at most
+A connection that closes still lingers as after any closing response when
+the client may still be sending (see [Linger](#linger)): it drops input until the peer closes, for at most
 `idle_timeout` (2 s without one), and `grace` cuts that short too. A handler
 applied after `stop` was resolved closes the connection without reading a
 request, and the TLS handler starts no handshake; a TLS handshake in
@@ -511,10 +511,14 @@ end as the end of input.
 ### Linger
 
 When the read loop gets `Close` (after a response that closes the
-connection), it does not close at once. It reads and drops input until
+connection) and the client may still be sending
+(`Server_connection.lingers`: a request partly read, or input left after the
+last one), it does not close at once. It reads and drops input until
 the peer closes, for at most `idle_timeout` (2 s without one). If the server
 closed with unread input, the kernel would reset the connection, and the
-peer could lose the response.
+peer could lose the response. When every request was read whole, or after
+a completed WebSocket close handshake, it closes at once (decisions 0023,
+0024).
 
 The time limit is set once, when the linger starts: input from the peer
 does not extend it. If the limit ends while the response is still being

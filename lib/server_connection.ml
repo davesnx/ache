@@ -75,6 +75,9 @@ type t =
   ; date : (unit -> string) option
   ; mutable requests : int
   ; mutable draining : bool
+  ; mutable unread_input : bool
+    (* The last read left bytes that the connection did not take. *)
+  ; mutable input_ended : bool (* A linger would read nothing. *)
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
@@ -246,6 +249,8 @@ let create
     ; date
     ; requests = 0
     ; draining = false
+    ; unread_input = false
+    ; input_ended = false
     }
   in
   self := Some (t, upgrade t);
@@ -462,6 +467,7 @@ let read_with_more t bs ~off ~len more =
           (Request_descriptor.discard_budget reqd)
       else None
     in
+    let offered = len in
     let len, more =
       match discarding with
       | Some (_, budget) when budget < len ->
@@ -471,6 +477,7 @@ let read_with_more t bs ~off ~len more =
       | Some _ | None -> len, more
     in
     let consumed = Reader.read_with_more t.reader bs ~off ~len more in
+    t.unread_input <- consumed < offered;
     (match discarding with
     | Some (reqd, _) -> Request_descriptor.add_discarded reqd consumed
     | None -> ());
@@ -577,6 +584,7 @@ let read t bs ~off ~len =
     Engine.read engine bs ~off ~len
 
 let read_eof t bs ~off ~len =
+  t.input_ended <- true;
   match t.upgraded with
   | None -> read_eof t bs ~off ~len
   | Some (Runtime.Impl ((module Engine), engine, _)) ->
@@ -652,6 +660,20 @@ let read_timeout t =
     (Runtime.read_timeout impl
       :> ([ `Idle | `Head | `Body | `Close ] * (unit -> unit)) option)
   | None, Error _ -> None
+
+(* Decision 0023: the client may still be sending when a message is partly read
+   (an unread or dropped body, a parse error, an error response before the
+   request ended), when input is left after the last request, or when it
+   pipelined requests past the one that closes the connection. *)
+let lingers t =
+  (not t.input_ended)
+  &&
+  match t.upgraded with
+  | Some impl -> Runtime.lingers impl
+  | None ->
+    t.unread_input
+    || Queue.length t.request_queue > 1
+    || not (Reader.between_messages t.reader)
 
 let upgrade_state t =
   match t.upgraded with

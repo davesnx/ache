@@ -90,17 +90,18 @@ module type Server = sig
       once per second in each domain. With [~date:false] no [Date] is added.
 
       Closing: when the connection stops reading (after a response with
-      [Connection: close], an error response, or a timeout), it reads and
-      discards input until the peer stops sending, so that unread input does
-      not make the kernel reset the connection before the peer has read the
-      response (RFC 9112 §9.6). With [idle_timeout] or [head_timeout] (the
-      default), it
-      waits at most [idle_timeout], or {!linger_without_idle_timeout} without
-      [idle_timeout], after it stops reading or after its last write,
-      whichever is later. Input that arrives does not extend this limit. When
-      the peer stops sending, the response in progress is still written.
-      Without a timeout it does not wait: it shuts down reading at once, and
-      the handler returns.
+      [Connection: close], an error response, or a timeout) while the peer
+      may still be sending ({!Ache.Server_connection.lingers}: a request
+      partly read, or input left after the last one), it reads and discards
+      input until the peer stops sending, so that unread input does not make
+      the kernel reset the connection before the peer has read the response
+      (RFC 9112 §9.6). It waits at most [idle_timeout], or
+      {!linger_without_idle_timeout} without [idle_timeout], after it stops
+      reading or after its last write, whichever is later. Input that arrives
+      does not extend this limit. When the peer stops sending, the response
+      in progress is still written. When every request was read whole, or
+      after a completed WebSocket close handshake, it does not wait: it shuts
+      down reading at once.
 
       When [error_handler] raises, or the connection gets an exception that
       it cannot give to [error_handler], the connection closes and the
