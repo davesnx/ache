@@ -325,7 +325,8 @@ one byte at a time cannot keep a connection. The body clock counts only
 while a read waits for body bytes. It counts ticks of a tenth of
 `body_timeout`, so all connections with the same `body_timeout` share one
 timer queue, and the timeout can end up to a tenth late. The write clock
-runs while output is pending and restarts when all of it is written. When
+starts when a write waits (a write that completes at once does not start
+it), runs while output is pending, and restarts when all of it is written. When
 it runs out, the server closes the socket and ends the connection, and
 pending `Body.Writer.flush` callbacks get `` `Closed ``.
 
