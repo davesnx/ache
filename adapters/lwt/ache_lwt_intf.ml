@@ -34,6 +34,7 @@ module type IO = sig
     -> [ `Closed | `Ok of int ] Lwt.t
 
   val shutdown_receive : socket -> unit
+  val shutdown_send : socket -> unit
   val close : socket -> unit Lwt.t
 end
 

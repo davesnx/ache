@@ -713,6 +713,10 @@ module Test_io = struct
         iovecs;
       Lwt_unix.writev socket vectors >|= fun n -> `Ok n
 
+  let shutdown_send socket =
+    try Lwt_unix.shutdown socket Unix.SHUTDOWN_SEND with
+    | Unix.Unix_error _ -> ()
+
   let shutdown_receive socket =
     if !fail_shutdown
     then failwith "shutdown failed"
@@ -1665,9 +1669,12 @@ let early_close_response =
 let early_413_response =
   "HTTP/1.1 413 Content Too Large\r\ncontent-length: 2\r\n\r\nno"
 
+(* A 413 keeps the connection: the body is read until [body_timeout], then the
+   connection closes. A [Connection: close] response ends the output at once
+   (the server still reads the body, which the close does not reset). *)
 let test_unread_body_body_timeout () =
   List.iter
-    (fun (target, response) ->
+    (fun (target, response, closes_at_timeout) ->
        with_server ?idle_timeout:None ~body_timeout:0.3 (fun connect ->
          connect () >>= fun socket ->
          write_all socket (unread_body_request target) >>= fun () ->
@@ -1675,10 +1682,18 @@ let test_unread_body_body_timeout () =
          Alcotest.(check string) (target ^ ": response") response first;
          let since = Unix.gettimeofday () in
          read_all socket >>= fun rest ->
-         check_elapsed (target ^ ": body timeout") ~since ~at_least:0.25;
+         if closes_at_timeout
+         then check_elapsed (target ^ ": body timeout") ~since ~at_least:0.25
+         else
+           Alcotest.(check bool)
+             (target ^ ": at once")
+             true
+             (Unix.gettimeofday () -. since < 0.2);
          Alcotest.(check string) (target ^ ": then closed") "" rest;
          Lwt_unix.close socket))
-    [ "/early-close", early_close_response; "/early-413", early_413_response ]
+    [ "/early-close", early_close_response, false
+    ; "/early-413", early_413_response, true
+    ]
 
 (* Decision 0010: the server drains at most 256 KiB of an unread body. *)
 let large_413_head =
@@ -2575,6 +2590,8 @@ let trickle socket ~chunks ~size ~gap =
   in
   go chunks
 
+(* The server lingers after its response (RFC 9112 9.6): the trickle does not
+   make it reset the connection, so the response always arrives. *)
 let test_body_trickle_times_out () =
   List.iter
     (fun (target, expected) ->
@@ -2584,7 +2601,7 @@ let test_body_trickle_times_out () =
          write_all socket (count_request ~target 100) >>= fun () ->
          let since = Unix.gettimeofday () in
          let writer = trickle socket ~chunks:20 ~size:1 ~gap:0.2 in
-         read_all_or_reset socket >>= fun output ->
+         read_all socket >>= fun output ->
          check_within (target ^ ": timed out") ~since ~min:0.3 ~max:1.0;
          Alcotest.(check bool)
            (target ^ ": " ^ expected)
@@ -2596,6 +2613,36 @@ let test_body_trickle_times_out () =
     [ "/count", "HTTP/1.1 408 Request Timeout\r\n"
     ; "/count-started", "HTTP/1.1 200 OK\r\n"
     ]
+
+let response_408 = "HTTP/1.1 408 Request Timeout\r\nconnection: close\r\n\r\n"
+
+(* A client that keeps sending after the 408 reads all of it, then the end of
+   input. Without [idle_timeout] the server lingers 2 s after its output ends,
+   then closes, though the client still sends. *)
+let test_body_timeout_linger () =
+  body_cut := false;
+  with_server ~body_timeout:0.3 (fun connect ->
+    connect () >>= fun socket ->
+    write_all socket (count_request 100_000_000) >>= fun () ->
+    (* One byte every 50 ms until past [body_timeout], then 1 KiB every 10
+       ms. *)
+    let rec send n =
+      let chunk = if n < 10 then "b" else String.make 1024 'b' in
+      Lwt_unix.sleep (if n < 10 then 0.05 else 0.01) >>= fun () ->
+      write_all socket chunk >>= fun () -> send (n + 1)
+    in
+    let writer =
+      Lwt.catch (fun () -> send 0) (fun (_ : exn) -> Lwt.return_unit)
+    in
+    read_all socket >>= fun output ->
+    Alcotest.(check string) "408, then the end of input" response_408 output;
+    let since = Unix.gettimeofday () in
+    Alcotest.(check bool) "client still sends" true (Lwt.is_sleeping writer);
+    writer >>= fun () ->
+    check_within "server closes after the linger" ~since ~min:1.5 ~max:3.0;
+    check_server_sockets_closed ();
+    Lwt_unix.close socket);
+  Alcotest.(check bool) "on_error" true !body_cut
 
 let test_body_progress_not_timed_out () =
   body_cut := false;
@@ -3067,6 +3114,9 @@ let () =
       , [ ( "a body trickle times out though each gap is shorter"
           , `Quick
           , test_body_trickle_times_out )
+        ; ( "a client that sends after a 408 reads it, then the end of input"
+          , `Quick
+          , test_body_timeout_linger )
         ; ( "a body that makes progress is not timed out"
           , `Quick
           , test_body_progress_not_timed_out )

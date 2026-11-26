@@ -49,6 +49,11 @@ module type IO = Ache_lwt_intf.IO
       the connection through the error path.
     - [shutdown_receive socket] is called once, when the connection stops
       reading. An exception from it is ignored.
+    - [shutdown_send socket] is called once by a server connection, when it
+      has written its last bytes: it ends the output (for a TCP socket, a
+      [SHUTDOWN_SEND]; for TLS, close_notify first), so that the peer reads
+      the end of input while the connection still reads. An exception from it
+      is ignored.
     - [close socket] is called once per socket, when both directions are
       done, also when [Client.shutdown] closes it first. A failure of the
       returned promise is ignored. *)
@@ -315,11 +320,15 @@ end
     A [stop] that is never resolved holds no memory for connections that
     ended.
 
-    Closing: when the connection stops reading it calls [shutdown_receive]
-    and does not wait for the peer to close; it closes the socket once the
-    response is written. Input that the peer sent and the connection did not
-    read can make the kernel reset the connection. [Ache_eio] with a clock
-    instead reads and discards input for a bounded time first.
+    Closing (lingering close, RFC 9112 9.6): once the last response is
+    written the connection calls [shutdown_send]. When it stops reading
+    before the end of input (a [Connection: close] response, a 408 or 413
+    while the client still sends a body, a timeout), it reads and drops input
+    until the end of input, or until [idle_timeout] (2 s when [None]) after
+    [shutdown_send], so that the close does not reset the connection under
+    unread input and the client can read the response. Then it calls
+    [shutdown_receive] and closes the socket. After the end of input, and
+    when a WebSocket closes at [close_timeout], it closes at once.
 
     [create_connection_handler] raises [Invalid_argument] when applied to a
     socket if a timeout or [grace] is not positive.
