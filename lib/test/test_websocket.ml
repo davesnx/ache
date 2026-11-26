@@ -377,6 +377,80 @@ let bare_conn server =
 let no_handler _ =
   { Websocket.on_message = ignore; on_pong = ignore; on_close = ignore }
 
+let upgrade_state =
+  Alcotest.testable
+    (fun fmt state ->
+       Format.pp_print_string
+         fmt
+         (match state with
+         | `None -> "`None"
+         | `Websocket -> "`Websocket"
+         | `Other -> "`Other"))
+    ( = )
+
+let check_upgrade_state msg expected c =
+  Alcotest.check
+    upgrade_state
+    msg
+    expected
+    (Server_connection.upgrade_state c.server)
+
+let test_upgrade_state () =
+  let c = connect () in
+  check_upgrade_state "not upgraded before the 101 is written" `None c;
+  check_output ~msg:"101" c response_101 `Yield;
+  check_upgrade_state "WebSocket after the 101" `Websocket c;
+  feed c (client_frame 0x8 (close_payload 1000));
+  check_upgrade_state "WebSocket while closing" `Websocket c
+
+let test_upgrade_state_rejected () =
+  let server =
+    Server_connection.create (fun reqd ->
+      (match Websocket.upgrade reqd no_handler with
+      | Ok () -> Alcotest.fail "handshake accepted"
+      | Error _ -> ());
+      Request_descriptor.respond_with_string
+        reqd
+        (Response.create
+           ~headers:(Headers.of_list [ "content-length", "0" ])
+           `Bad_request)
+        "")
+  in
+  let c = bare_conn server in
+  feed c (request_string (remove "sec-websocket-version"));
+  let (_ : string * [ `Yield | `Close ]) = drain c in
+  check_upgrade_state "a failed handshake does not upgrade" `None c
+
+let test_upgrade_state_other_websocket () =
+  (* A 101 that names websocket but is not sent by [Websocket.upgrade] runs
+     another protocol. *)
+  let server =
+    Server_connection.create (fun reqd ->
+      Request_descriptor.respond_with_upgrade
+        reqd
+        (Headers.of_list [ "upgrade", "websocket"; "connection", "Upgrade" ])
+        (Runtime.make
+           (module struct
+             type t = unit
+
+             let next_read_operation () = `Yield
+             let read () _ ~off:_ ~len:_ = 0
+             let read_eof () _ ~off:_ ~len:_ = 0
+             let yield_reader () _ = ()
+             let next_write_operation () = `Yield
+             let report_write_result () _ = ()
+             let yield_writer () _ = ()
+             let report_exn () _ = ()
+             let is_closed () = false
+             let shutdown () = ()
+           end)
+           ()))
+  in
+  let c = bare_conn server in
+  feed c (request_string handshake_headers);
+  let (_ : string * [ `Yield | `Close ]) = drain c in
+  check_upgrade_state "another protocol" `Other c
+
 let test_upgrade_adds_headers () =
   let offered = ref [] in
   let server =
@@ -998,6 +1072,11 @@ let test_idle_timeout () =
 
 let tests =
   [ "accept key", `Quick, test_accept_key
+  ; "upgrade state", `Quick, test_upgrade_state
+  ; "a failed handshake does not upgrade", `Quick, test_upgrade_state_rejected
+  ; ( "a 101 from respond_with_upgrade is another protocol"
+    , `Quick
+    , test_upgrade_state_other_websocket )
   ; "idle timeout closes with 1001", `Quick, test_idle_timeout
   ; "close timeout aborts the closing handshake", `Quick, test_close_timeout
   ; ( "a pause after close still reads the close frame"

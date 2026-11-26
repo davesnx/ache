@@ -990,16 +990,37 @@ let upgrade_handler upgraded reqd =
     Headers.empty
     (Ache.Runtime.make (module Upgraded) upgraded)
 
+let upgrade_state =
+  Alcotest.testable
+    (fun fmt state ->
+       Format.pp_print_string
+         fmt
+         (match state with
+         | `None -> "`None"
+         | `Websocket -> "`Websocket"
+         | `Other -> "`Other"))
+    ( = )
+
+let check_upgrade_state msg expected t =
+  Alcotest.check
+    upgrade_state
+    msg
+    expected
+    (with_server_connection t Server_connection.upgrade_state)
+
 let test_respond_with_upgrade () =
   let upgraded = { Upgraded.driven = false } in
   let t = create ~error_handler (upgrade_handler upgraded) in
+  check_upgrade_state "no upgrade before a request" `None t;
   read_request t (Request.create `GET "/");
   Alcotest.(check bool) "Not upgraded before the response" false upgraded.driven;
+  check_upgrade_state "no upgrade before the 101 is written" `None t;
   write_response
     ~msg:"Upgrade response written"
     t
     (Response.create `Switching_protocols);
   Alcotest.(check bool) "Upgraded protocol was called" true upgraded.driven;
+  check_upgrade_state "upgraded after the 101" `Other t;
   reader_yielded t
 
 let test_upgrade_write_closed () =
@@ -1008,6 +1029,7 @@ let test_upgrade_write_closed () =
   read_request t (Request.create `GET "/");
   write_eof t;
   Alcotest.(check bool) "Upgraded protocol was not called" false upgraded.driven;
+  check_upgrade_state "not upgraded when the 101 is not written" `None t;
   connection_is_closed t;
   reader_closed t;
   writer_closed
@@ -2765,8 +2787,10 @@ let test_connect_method () =
        ~headers:(Headers.of_list [ "host", "example.com:80" ])
        `CONNECT
        "example.com:80");
+  check_upgrade_state "no tunnel before the 200" `None t;
   write_response ~msg:"200 written, no 101" t (Response.create `OK);
   Alcotest.(check bool) "Upgraded protocol was called" true upgraded.driven;
+  check_upgrade_state "tunnel after the 200" `Other t;
   reader_yielded t
 
 let test_invalid_response_head_writes_nothing () =

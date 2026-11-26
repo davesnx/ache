@@ -749,6 +749,19 @@ module Server_connection : sig
         response is being written, the connection is closing), or the
         connection was upgraded to another protocol. No timeout applies.
         A runtime asks again before each read. *)
+
+  val upgrade_state : t -> [ `None | `Websocket | `Other ]
+  (** [upgrade_state t] tells a runtime which protocol runs on [t].
+      - [`None]: HTTP/1.1. This includes a request whose
+        {!Websocket.upgrade} failed the handshake, and an upgrade response
+        that is not written yet or that the connection could not write.
+      - [`Websocket]: the [101] response of {!Websocket.upgrade} is written,
+        and {!Websocket} runs on the connection.
+      - [`Other]: the response of {!Request_descriptor.respond_with_upgrade}
+        is written (a [101], or the [2xx] that opens a [CONNECT] tunnel), and
+        the protocol given to it runs on the connection.
+
+      It changes once at most, from [`None], and never back. *)
 end
 
 (** {2 WebSocket Server} *)
