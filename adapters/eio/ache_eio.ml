@@ -159,10 +159,25 @@ module IO_loop = struct
     | Some time -> Time.current time
     | None -> Float.infinity
 
-  let shutdown flow cmd =
-    try Eio.Flow.shutdown flow cmd with
-    | Eio.Cancel.Cancelled _ as exn -> raise exn
-    | _ -> ()
+  (* A socket shuts down with the system call: eio_linux hands a shutdown to an
+     io_uring worker thread, which costs more than the shutdown itself. *)
+  let shutdown flow fd cmd =
+    match fd with
+    | Some fd ->
+      Eio_unix.Fd.use fd ~if_closed:ignore (fun fd ->
+        try
+          Unix.shutdown
+            fd
+            (match cmd with
+            | `Receive -> Unix.SHUTDOWN_RECEIVE
+            | `Send -> Unix.SHUTDOWN_SEND
+            | `All -> Unix.SHUTDOWN_ALL)
+        with
+        | Unix.Unix_error _ -> ())
+    | None ->
+      (try Eio.Flow.shutdown flow cmd with
+      | Eio.Cancel.Cancelled _ as exn -> raise exn
+      | _ -> ())
 
   let start : type t.
     (module Ache.Runtime.ENGINE with type t = t)
@@ -200,7 +215,8 @@ module IO_loop = struct
     and read_cancel = ref None
     and loop_cancel = ref None
     and write_cancel = ref None
-    and unreported = ref None in
+    and unreported = ref None
+    and fd = Eio_unix.Resource.fd_opt socket in
     let shutdown_once cmd =
       let receive =
         (match cmd with `Receive | `All -> true | `Send -> false)
@@ -212,9 +228,9 @@ module IO_loop = struct
       if receive then receive_shut := true;
       if send then send_shut := true;
       match receive, send with
-      | true, true -> shutdown socket `All
-      | true, false -> shutdown socket `Receive
-      | false, true -> shutdown socket `Send
+      | true, true -> shutdown socket fd `All
+      | true, false -> shutdown socket fd `Receive
+      | false, true -> shutdown socket fd `Send
       | false, false -> ()
     in
     let cancel cc =
