@@ -4818,6 +4818,79 @@ let test_body_timeout_after_response_started () =
   check_one_ending "body read" "error" events;
   Alcotest.check read_operation "reader closed" `Close (Raw.read_op t)
 
+(* Decision 0025: the bytes given to [on_read] are the body's buffer, valid
+   until [on_read] returns. A write while [on_read] runs (here, a read from
+   inside it) must not overwrite them; a later read may. *)
+let test_on_read_bytes_valid_until_return () =
+  let conn = ref None in
+  let calls = ref 0 in
+  let first = ref None in
+  let check_first msg expected =
+    match !first with
+    | None -> Alcotest.fail "no first on_read"
+    | Some (bs, off) ->
+      Alcotest.(check string)
+        msg
+        expected
+        (Ache.Bigstring.substring bs ~off ~len:4)
+  in
+  let request_handler reqd =
+    let body = Request_descriptor.request_body reqd in
+    let rec on_read bs ~off ~len =
+      incr calls;
+      match !calls with
+      | 1 ->
+        Alcotest.(check string)
+          "first bytes"
+          "aaaa"
+          (Ache.Bigstring.substring bs ~off ~len);
+        first := Some (bs, off);
+        force_read_string (Option.get !conn) "bbbb";
+        check_first "intact after a write during on_read" "aaaa";
+        schedule ();
+        check_first "intact after a nested on_read" "aaaa"
+      | 2 ->
+        Alcotest.(check string)
+          "nested bytes"
+          "bbbb"
+          (Ache.Bigstring.substring bs ~off ~len);
+        check_first "intact in a nested on_read" "aaaa";
+        schedule ()
+      | _ ->
+        Alcotest.(check string)
+          "later bytes"
+          "cccc"
+          (Ache.Bigstring.substring bs ~off ~len);
+        let bs', off' = Option.get !first in
+        Alcotest.(check bool) "same buffer" true (bs == bs');
+        Alcotest.(check int) "same offset" off' off;
+        schedule ()
+    and on_eof () =
+      Request_descriptor.respond_with_string reqd (Response.create `OK) ""
+    and schedule () =
+      Body.Reader.schedule_read
+        body
+        ~on_error:(Helpers.body_must_complete __LOC__)
+        ~on_eof
+        ~on_read
+    in
+    schedule ()
+  in
+  let t = create request_handler in
+  conn := Some t;
+  read_request
+    t
+    (Request.create
+       `POST
+       "/"
+       ~headers:(Headers.of_list [ "content-length", "12" ]));
+  read_string t "aaaa";
+  check_first "kept after on_read returned" "aaaa";
+  Alcotest.(check int) "two reads" 2 !calls;
+  read_string t "cccc";
+  Alcotest.(check int) "three reads" 3 !calls;
+  check_first "a later read overwrote it" "cccc"
+
 let test_connect_upgrade_status () =
   let impl () =
     Ache.Runtime.make (module Recorder) { Recorder.got = ""; eof = false }
@@ -5479,6 +5552,9 @@ let tests =
   ; ( "body timeout after the response started closes"
     , `Quick
     , test_body_timeout_after_response_started )
+  ; ( "on_read bytes are valid until it returns"
+    , `Quick
+    , test_on_read_bytes_valid_until_return )
   ]
 
 (* https://httpwg.org/specs/rfc9110.html For example, a CONNECT request (Section

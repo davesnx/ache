@@ -105,8 +105,9 @@ module Body : sig
         calls. Bytes received before the end are given to [on_read] first.
 
         [on_read] receives every byte available at the time of the call. The
-        library does not reuse the bytes it passes to [on_read], so the
-        application may keep them after [on_read] returns.
+        bytes are valid only until [on_read] returns: the reader then writes
+        later input over them, on request and response bodies alike. Copy
+        the bytes to keep them ({!Bigstring.substring}, {!Bigstring.blit}).
 
         With {!Config.auto_continue}, the first call on a server request body
         may send [100 Continue]. *)

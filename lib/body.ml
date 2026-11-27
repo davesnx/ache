@@ -45,6 +45,7 @@ module Reader = struct
     ; when_ready_to_read : Optional_thunk.t
     ; mutable on_first_read : Optional_thunk.t
     ; mutable trailers : Headers.t
+    ; mutable in_on_read : bool
     }
 
   let default_on_eof = Sys.opaque_identity (fun () -> ())
@@ -66,6 +67,7 @@ module Reader = struct
     ; when_ready_to_read
     ; on_first_read = Optional_thunk.none
     ; trailers = Headers.empty
+    ; in_on_read = false
     }
 
   let create_empty () =
@@ -79,10 +81,13 @@ module Reader = struct
   let set_on_first_read t f = t.on_first_read <- f
   let ready_to_read t = Optional_thunk.call_if_some t.when_ready_to_read
 
-  (* The application may keep bytes passed to [on_read]: never reuse them. *)
+  (* Bytes passed to [on_read] are valid until it returns (decision 0025): a
+     drained buffer is written from its start again, except while an [on_read]
+     runs (a write from inside it must not overwrite its bytes). *)
   let write t bs ~off ~len =
     if (not t.closed) && (not t.discarding) && len > 0
     then (
+      if t.len = 0 && not t.in_on_read then t.off <- 0;
       if Bigstring.length t.buffer - (t.off + t.len) < len
       then (
         let buffer = Bigstring.create (Int.max 0x1000 ((2 * t.len) + len)) in
@@ -106,7 +111,10 @@ module Reader = struct
       and len = t.len in
       t.off <- off + len;
       t.len <- 0;
+      let in_on_read = t.in_on_read in
+      t.in_on_read <- true;
       on_read t.buffer ~off ~len;
+      t.in_on_read <- in_on_read;
       execute_read t)
     else if t.closed
     then (

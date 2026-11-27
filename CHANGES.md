@@ -18,6 +18,10 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   replaces gluten, and `Ache.Bigstring.t` replaces `Bigstringaf.t` (the same
   type).
 - `Body.Reader.schedule_read` takes a required `~on_error`.
+- The bytes given to `Body.Reader.schedule_read`'s `on_read` are valid only
+  until it returns, on request and response bodies: the reader writes later
+  input over them. Copy bytes to keep them. This is httpun's rule; earlier
+  ache never reused them and allocated a buffer per read of a body.
 - `Reqd` is `Request_descriptor`.
 - `Request_descriptor.respond_with_upgrade` and `Client.upgrade` take a
   `Runtime.impl`.

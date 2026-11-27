@@ -173,8 +173,10 @@ not check them. The bytes after the head belong to the tunnel.
   `on_error`, not `on_eof`; exactly one of the two ends a body. httpun called
   `on_eof`, as for a complete body.
 - `on_read` gets all the bytes that are available in one call, so a body of
-  many small chunks is delivered in linear time. ache does not reuse the
-  bytes it gives to `on_read`.
+  many small chunks is delivered in linear time. The bytes are valid only
+  until `on_read` returns: the reader then writes later input over them, so
+  copy what you keep (`Bigstring.substring`, `Bigstring.blit`). httpun has
+  the same rule.
 - When the response is complete, the server reads and drops the rest of a
   request body that the application did not read or closed, within the
   body timeout (see [Timeouts](#timeouts)), and reads at most

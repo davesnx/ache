@@ -759,12 +759,10 @@ let test_unread_body_backpressure () =
     "reader yields while the body is unread"
     true
     (Server_connection.next_read_operation conn = `Yield);
-  let held = ref [] in
   let received = Buffer.create 16 in
   let eof = ref false in
   let body_reader = Option.get !request_body in
   let on_read bs ~off ~len =
-    held := (bs, off, len, Ache.Bigstring.substring bs ~off ~len) :: !held;
     Buffer.add_string received (Ache.Bigstring.substring bs ~off ~len)
   and on_eof () = eof := true in
   let rec loop rounds =
@@ -782,14 +780,7 @@ let test_unread_body_backpressure () =
       loop (rounds + 1))
   in
   loop 0;
-  Alcotest.(check string) "bytes" body (Buffer.contents received);
-  List.iter
-    (fun (bs, off, len, copy) ->
-       Alcotest.(check bool)
-         "delivered bytes are not overwritten"
-         true
-         (String.equal copy (Ache.Bigstring.substring bs ~off ~len)))
-    !held
+  Alcotest.(check string) "bytes" body (Buffer.contents received)
 
 module Reader = Ache_private.Parse.Reader
 
