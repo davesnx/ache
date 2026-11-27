@@ -647,10 +647,10 @@ after a completed WebSocket close handshake: nothing may follow the
 client's close frame (RFC 6455 §5.5.1). Go's `net/http` also waits after
 its FIN only when the request body was not read to its end.
 
-ache-eio and ache-miou linger only when `lingers` is `true`; a request
-read whole and answered with `Connection: close` closes the socket at
-once. ache-lwt lingers after every close, except after the end of input
-and when a WebSocket closes at `close_timeout`.
+Every runtime lingers only when `lingers` is `true`; a request read whole
+and answered with `Connection: close` closes the socket at once. No
+runtime lingers after the end of input, or when a WebSocket closes at
+`close_timeout`.
 
 ### Keep-Alive
 

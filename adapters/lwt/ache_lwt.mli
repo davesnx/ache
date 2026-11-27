@@ -322,8 +322,10 @@ end
 
     Closing (lingering close, RFC 9112 9.6): once the last response is
     written the connection calls [shutdown_send]. When it stops reading
-    before the end of input (a [Connection: close] response, a 408 or 413
-    while the client still sends a body, a timeout), it reads and drops input
+    while the client may still be sending
+    ({!Ache.Server_connection.lingers}: a 408 or 413 while the client still
+    sends a body, input left after the last request, a WebSocket closed
+    without the client's close frame), it reads and drops input
     until the end of input, or until [idle_timeout] (2 s when [None]) after
     [shutdown_send], so that the close does not reset the connection under
     unread input and the client can read the response. Then it calls

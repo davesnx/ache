@@ -259,9 +259,10 @@ It creates the core connection and starts the two loops:
   timed write is `Lwt.pick` of the `writev` and the write timer. See
   [Timeouts](#timeouts) for which timer applies and why the timers are
   shared.
-- **Lingering close.** When a server connection stops reading before the
-  end of input (a closing response, a 408 or 413 while the client still
-  sends a body, a timeout), the read loop reads and drops input until the
+- **Lingering close.** When a server connection stops reading while the
+  client may still be sending (`Server_connection.lingers`: a body not read
+  to its end, input left after the last request, a WebSocket closed without
+  the client's close frame), the read loop reads and drops input until the
   end of input, or until the write loop has shut the send side and
   `idle_timeout` (2 s when it is `None`) has passed (RFC 9112 §9.6). Closing
   with unread input would make the kernel send a reset, and the client could
