@@ -1288,13 +1288,15 @@ let test_websocket_close_handshake_fin ~server_first () =
       (Printf.sprintf "end of input within 100 ms (%.3f s)" elapsed)
       true
       (elapsed < 0.1);
+    (* Nothing may follow the client's close frame: the server does not linger
+       (decision 0024), and the connection ends without the client's FIN. *)
     Lwt.pick
       [ (Lwt.join !served >|= fun () -> true)
       ; (Lwt_unix.sleep 0.5 >|= fun () -> false)
       ]
     >>= fun resolved ->
-    if resolved
-    then Alcotest.fail "the connection no longer lingers: assert that instead";
+    if not resolved
+    then Alcotest.fail "the connection lingers after the close handshake";
     Lwt_unix.close socket >>= fun () ->
     Lwt.join !served >>= fun () ->
     ended >|= fun result ->
@@ -2836,6 +2838,46 @@ let test_linger_ends_at_idle_timeout () =
     check_server_sockets_closed ();
     Lwt_unix.close socket)
 
+(* A [Connection: close] request read whole leaves nothing the client may still
+   send: the server does not linger (decision 0023). The connection ends though
+   the client keeps its socket open, long before [idle_timeout]. *)
+let test_no_linger_after_whole_request () =
+  let served = ref [] in
+  let connection_handler ~request_handler ~error_handler addr socket =
+    let p =
+      Ache_lwt.Server.create_connection_handler
+        ~idle_timeout:(Some 30.)
+        ~request_handler
+        ~error_handler
+        addr
+        socket
+    in
+    served := p :: !served;
+    p
+  in
+  with_server ~connection_handler (fun connect ->
+    connect () >>= fun socket ->
+    write_all
+      socket
+      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+    >>= fun () ->
+    read_all socket >>= fun output ->
+    Alcotest.(check bool)
+      "200, then the end of input"
+      true
+      (String.starts_with ~prefix:"HTTP/1.1 200 OK\r\n" output);
+    Lwt.pick
+      [ (Lwt.join !served >|= fun () -> true)
+      ; (Lwt_unix.sleep 1.0 >|= fun () -> false)
+      ]
+    >>= fun resolved ->
+    Alcotest.(check bool)
+      "the connection ends without the client's FIN"
+      true
+      resolved;
+    Lwt_unix.close socket);
+  check_server_sockets_closed ()
+
 (* A client that reads a closing response and then ends its output ends the
    linger at once, long before [idle_timeout]. *)
 let test_linger_ends_at_end_of_input () =
@@ -3439,6 +3481,9 @@ let () =
         ; ( "the linger ends at the client's end of input"
           , `Quick
           , test_linger_ends_at_end_of_input )
+        ; ( "a Connection: close request read whole closes at once"
+          , `Quick
+          , test_no_linger_after_whole_request )
         ; ( "a body that makes progress is not timed out"
           , `Quick
           , test_body_progress_not_timed_out )

@@ -1118,12 +1118,17 @@ struct
     end
 
     (* Lingering close: after the send side is shut, input is read and dropped
-       for at most [idle_timeout] (or [linger_without_idle_timeout]) more. Not
+       for at most [idle_timeout] (or [linger_without_idle_timeout]) more, when
+       the client may still be sending ({!Ache.Server_connection.lingers}). Not
        after the close timeout of a WebSocket: that client already had its
        time. *)
-    let linger t () =
+    let linger c () =
+      let t = c.timers in
       match t.websocket with
       | Some { close_expired = true; _ } -> None
+      | (Some { close_expired = false; _ } | None)
+        when not (Ache.Server_connection.lingers c.connection) ->
+        None
       | Some { close_expired = false; _ } | None ->
         Some
           (fun on_expire ->
@@ -1302,7 +1307,7 @@ struct
           ~timing:(timing c)
           ~close:(close timers)
           ~writer_waits:(stop_write_clock timers)
-          ~linger:(linger timers)
+          ~linger:(linger c)
           ?writev:(Option.map (writev c) write_timeout)
           socket;
         (* [Lwt.choose] removes its callback from [stop] when [ended] resolves
