@@ -30,6 +30,30 @@ module Http = struct
   let flush = Body.Writer.flush
   let close_writer writer = Body.Writer.close writer
   let writer_is_closed = Body.Writer.is_closed
+
+  let echo ws =
+    { Websocket.on_message =
+        (fun message ->
+          incr Vs.requests;
+          match message with
+          | Text s -> Websocket.send_text ws s
+          | Binary s -> Websocket.send_binary ws s)
+    ; on_pong = ignore
+    ; on_close = ignore
+    }
+
+  let websocket_echo =
+    Some
+      (fun reqd ->
+        match Websocket.upgrade reqd echo with
+        | Ok () -> ()
+        | Error _ ->
+          Request_descriptor.respond_with_string
+            reqd
+            (Response.create
+               ~headers:(Headers.of_list [ "content-length", "0" ])
+               `Bad_request)
+            "")
 end
 
 module Handler = Vs.Make (Http)

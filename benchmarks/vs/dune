@@ -75,3 +75,20 @@
  (modules server_httpcats_miou)
  (optional)
  (libraries h1 h2 httpcats logs miou miou.unix unix vs))
+
+(executable
+ (name ws_load)
+ (modules ws_load)
+ (libraries threads.posix unix))
+
+(executable
+ (name server_ache_eio_tls)
+ (modules server_ache_eio_tls)
+ (optional)
+ (libraries ache-eio-tls ache_test_certs vs vs_ache vs_eio))
+
+(executable
+ (name server_ache_miou_tls)
+ (modules server_ache_miou_tls)
+ (optional)
+ (libraries ache-miou-tls ache_test_certs miou miou.unix unix vs vs_ache))

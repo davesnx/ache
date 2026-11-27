@@ -25,6 +25,10 @@ module type HTTP = sig
   val flush : writer -> (flushed -> unit) -> unit
   val close_writer : writer -> unit
   val writer_is_closed : writer -> bool
+
+  (* Upgrades [GET /ws] to a WebSocket that echoes each message and counts it in
+     [requests]; [None] where the library has no WebSocket. *)
+  val websocket_echo : (reqd -> unit) option
 end
 
 (* Requests the handler has started, for [cost.sh]. *)
@@ -85,7 +89,8 @@ let settings () =
     (fun arg -> raise (Arg.Bad arg))
     "Benchmark server. Routes: GET /fixed/<bytes>, GET /string/<bytes>, GET \
      /close/<bytes>, GET /stream/<chunk>/<count>, GET \
-     /streamcl/<chunk>/<count>, POST /sink, POST /echo, GET /gc.";
+     /streamcl/<chunk>/<count>, POST /sink, POST /echo, GET /gc, GET /ws \
+     (WebSocket echo).";
   { port = !port
   ; read_buffer_size = !read_buffer_size
   ; request_body_buffer_size = !request_body_buffer_size
@@ -138,6 +143,7 @@ module Make (Http : HTTP) = struct
     | Sink
     | Echo
     | Gc_stat
+    | Websocket of (Http.reqd -> unit)
     | Missing
 
   let with_length n = Http.response `OK [ "content-length", string_of_int n ]
@@ -183,6 +189,8 @@ module Make (Http : HTTP) = struct
     | [ ""; "sink" ] -> Sink
     | [ ""; "echo" ] -> Echo
     | [ ""; "gc" ] -> Gc_stat
+    | [ ""; "ws" ] ->
+      (match Http.websocket_echo with Some f -> Websocket f | None -> Missing)
     | _ -> Missing
 
   let actions : action String_table.t = String_table.create 64
@@ -238,5 +246,6 @@ module Make (Http : HTTP) = struct
     | Gc_stat ->
       let s = gc_json () in
       Http.respond_with_string reqd (with_length (String.length s)) s
+    | Websocket upgrade -> upgrade reqd
     | Missing -> Http.respond_with_string reqd not_found ""
 end

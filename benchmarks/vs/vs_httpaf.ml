@@ -24,6 +24,7 @@ module Http = struct
   let flush = Body.flush
   let close_writer = Body.close_writer
   let writer_is_closed = Body.is_closed
+  let websocket_echo = None
 end
 
 module Handler = Vs.Make (Http)
