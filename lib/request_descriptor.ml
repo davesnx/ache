@@ -94,6 +94,9 @@ type t =
   ; proxy : bool
   ; date : (unit -> string) option
   ; keep_alive : string
+  ; mutable may_switch_protocols : int
+    (* [Reader.may_switch_protocols request], once known: -1 before, else 0 or
+       1. *)
   }
 
 let continue_response = Response.create `Continue
@@ -135,6 +138,7 @@ let create
     ; upgrade
     ; max_discard_body
     ; discarded = 0
+    ; may_switch_protocols = -1
     ; persistent = Request.persistent_connection request
     ; response_state = Waiting
     ; error_code = `Ok
@@ -508,14 +512,21 @@ let drops_closed_body t =
   && (not (Reader.is_closed t.reader))
   && Reader.in_body t.reader t.request_body
 
+let may_switch_protocols t =
+  if t.may_switch_protocols < 0
+  then
+    t.may_switch_protocols <-
+      Bool.to_int (Reader.may_switch_protocols t.request);
+  t.may_switch_protocols = 1
+
 let input_state t : Io_state.t =
   match t.response_state, t.request.meth with
   | Upgrade _, _ when Reader.is_closed t.reader -> Complete
   | Upgrade _, _ -> Wait
   | Waiting, _
-    when Reader.may_switch_protocols t.request
-         && Body.Reader.is_closed t.request_body
-         && not (Reader.is_closed t.reader) ->
+    when Body.Reader.is_closed t.request_body
+         && (not (Reader.is_closed t.reader))
+         && may_switch_protocols t ->
     Wait
   | _ ->
     if Body.Reader.is_closed t.request_body

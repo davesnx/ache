@@ -332,6 +332,17 @@ module Writer = struct
 
   let requires_output t = (not (is_closed t)) || has_pending_output t
 
+  let write_final_chunk t =
+    match t.encoding with
+    | Identity | Fixed _ | Discard -> ()
+    | Chunked ({ written_final_chunk; trailers; _ } as chunked) ->
+      if not written_final_chunk
+      then (
+        chunked.written_final_chunk <- true;
+        match Headers.to_rev_list trailers with
+        | [] -> Serialize.Writer.schedule_chunk t.writer []
+        | _ :: _ -> Serialize.Writer.write_last_chunk t.writer trailers)
+
   let transfer_to_writer t =
     let encoder = t.encoder in
     if Serialize.Writer.is_closed t.writer
@@ -339,16 +350,7 @@ module Writer = struct
     else
       match Encoder.operation encoder with
       | `Yield -> ()
-      | `Close ->
-        (match t.encoding with
-        | Identity | Fixed _ | Discard -> ()
-        | Chunked ({ written_final_chunk; trailers; _ } as chunked) ->
-          if not written_final_chunk
-          then (
-            chunked.written_final_chunk <- true;
-            match Headers.to_rev_list trailers with
-            | [] -> Serialize.Writer.schedule_chunk t.writer []
-            | _ :: _ -> Serialize.Writer.write_last_chunk t.writer trailers))
+      | `Close -> write_final_chunk t
       | `Writev iovecs when t.encoding = Discard ->
         Encoder.shift encoder (IOVec.lengthv iovecs)
       | `Writev iovecs ->
@@ -365,5 +367,8 @@ module Writer = struct
             | `Closed -> close_and_drain t
             | `Written ->
               Encoder.shift encoder lengthv;
-              t.buffered_bytes <- t.buffered_bytes - lengthv))
+              t.buffered_bytes <- t.buffered_bytes - lengthv));
+        (* A closed encoder takes no more bytes: the final chunk can follow its
+           last ones in the same write. *)
+        if Encoder.is_closed encoder then write_final_chunk t
 end

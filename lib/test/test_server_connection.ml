@@ -910,8 +910,7 @@ let test_chunked_encoding () =
     ~msg:"First chunk written"
     ~body:"b\r\nFirst chunk\r\n"
     (Response.create `OK ~headers:Headers.encoding_chunked);
-  write_string t ~msg:"Second chunk" "c\r\nSecond chunk\r\n";
-  write_string t ~msg:"Final chunk written" "0\r\n\r\n";
+  write_string t ~msg:"Second and final chunk" "c\r\nSecond chunk\r\n0\r\n\r\n";
   reader_ready ~msg:"Keep-alive" t
 
 let test_chunked_encoding_for_error () =
@@ -938,8 +937,7 @@ let test_chunked_encoding_for_error () =
        `Bad_request
        ~headers:Headers.(encoding_chunked @ connection_close));
   write_string t "3\r\nBad\r\n";
-  write_string t "8\r\n request\r\n";
-  write_string t "0\r\n\r\n";
+  write_string t "8\r\n request\r\n0\r\n\r\n";
   connection_is_shutdown t
 
 let test_blocked_write_on_chunked_encoding () =
@@ -1276,8 +1274,7 @@ let test_malformed_request_chunked_error_response () =
   !continue_error ();
   write_string t ~msg:"Second chunk" "8\r\nchunk 2\n\r\n";
   !continue_error ();
-  write_string t ~msg:"Second chunk" "8\r\nchunk 3\n\r\n";
-  write_string t ~msg:"Final chunk written" "0\r\n\r\n";
+  write_string t ~msg:"Third and final chunk" "8\r\nchunk 3\n\r\n0\r\n\r\n";
   Alcotest.(check bool)
     "Writer woken up once more input is available"
     true
@@ -2382,8 +2379,27 @@ let test_flush_response_before_shutdown () =
   !continue ();
   shutdown t;
 
-  write_string t "b\r\nhello world\r\n";
+  write_string t "b\r\nhello world\r\n0\r\n\r\n";
   connection_is_shutdown t
+
+(* A streamed response whose body ends before the writer runs goes out in one
+   write: its last chunk and the final chunk (runtime-cost-2 G4). *)
+let test_streaming_response_ended_in_one_write () =
+  let response = Response.create `OK ~headers:Headers.encoding_chunked in
+  let request_handler reqd =
+    let request_body = Request_descriptor.request_body reqd in
+    let body = Request_descriptor.respond_with_streaming reqd response in
+    let rec on_read bs ~off ~len =
+      Body.Writer.write_bigstring body bs ~off ~len;
+      Body.Reader.schedule_read request_body ~on_eof ~on_error:ignore ~on_read
+    and on_eof () = Body.Writer.close body in
+    Body.Reader.schedule_read request_body ~on_eof ~on_error:ignore ~on_read
+  in
+  let t = create request_handler in
+  read_string t "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello";
+  write_response ~body:"5\r\nhello\r\n0\r\n\r\n" t response;
+  writer_yielded t;
+  reader_ready t
 
 let test_schedule_read_with_data_available () =
   let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
@@ -5405,6 +5421,9 @@ let tests =
   ; ( "flush response before shutdown"
     , `Quick
     , test_flush_response_before_shutdown )
+  ; ( "streaming response ended in one write"
+    , `Quick
+    , test_streaming_response_ended_in_one_write )
   ; ( "schedule read with data available"
     , `Quick
     , test_schedule_read_with_data_available )

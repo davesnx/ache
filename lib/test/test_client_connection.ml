@@ -306,8 +306,7 @@ let test_send_streaming_body () =
   write_string t "5\r\nhello\r\n";
   Body.Writer.write_string body "world";
   Body.Writer.close body;
-  write_string t "5\r\nworld\r\n";
-  write_string t "0\r\n\r\n";
+  write_string t "5\r\nworld\r\n0\r\n\r\n";
   writer_yielded t
 
 let test_response_eof () =
