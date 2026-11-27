@@ -107,6 +107,42 @@ let is_forbidden_trailer name =
 let accepts_trailers headers =
   has_member (Headers.get_multi headers "te") "trailers"
 
+(* Which of the fields that framing and connection management read a received
+   head has, as bits, whatever the case of their names: the parser records them,
+   so that the server skips the walk over the fields for one that is absent. *)
+module Seen = struct
+  let host = 1
+  let hosts = 2 (* A second Host field. *)
+  let content_length = 4
+  let transfer_encoding = 8
+  let connection = 16
+  let upgrade = 32
+  let expect = 64
+  let te = 128
+  let framing = content_length lor transfer_encoding
+
+  (* The bits above. *)
+  let all = 255
+
+  (* The bit of a field name, compared case-insensitively. *)
+  let of_name name =
+    match String.length name with
+    | 2 when Headers.ci_equal name "te" -> te
+    | 4 when Headers.ci_equal name "host" -> host
+    | 6 when Headers.ci_equal name "expect" -> expect
+    | 7 when Headers.ci_equal name "upgrade" -> upgrade
+    | 10 when Headers.ci_equal name "connection" -> connection
+    | 14 when Headers.ci_equal name "content-length" -> content_length
+    | 17 when Headers.ci_equal name "transfer-encoding" -> transfer_encoding
+    | _ -> 0
+
+  (* [seen] after a field whose name has [bit]. *)
+  let[@inline] add seen bit =
+    if bit = host && seen land host <> 0 then seen lor hosts else seen lor bit
+
+  let[@inline] has seen bit = seen land bit <> 0
+end
+
 let at_least_v1_1 ({ major; minor } : Version.t) =
   major > 1 || (major = 1 && minor >= 1)
 

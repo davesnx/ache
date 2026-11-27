@@ -326,9 +326,22 @@ let rec scan_fields t fields ~hosts ~host ~has_transfer_encoding content_lengths
     | _ ->
       scan_fields t fields ~hosts ~host ~has_transfer_encoding content_lengths)
 
-let received_body_length ({ version; headers; _ } as t) =
+(* [seen] holds the [Message.Seen] bits of [t]'s fields and [host] the value of
+   its last Host field, as the parser recorded them. Without Content-Length and
+   Transfer-Encoding, they answer without a walk over the fields. *)
+let received_body_length ~seen ~host ({ version; headers; _ } as t) =
   if version.major <> 1
   then Error `Http_version_not_supported
+  else if not (Message.Seen.has seen Message.Seen.framing)
+  then
+    let hosts =
+      if Message.Seen.has seen Message.Seen.hosts
+      then 2
+      else if Message.Seen.has seen Message.Seen.host
+      then 1
+      else 0
+    in
+    check_received t ~hosts ~host ~has_transfer_encoding:false []
   else
     scan_fields
       t
