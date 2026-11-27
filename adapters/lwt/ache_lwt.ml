@@ -41,11 +41,14 @@ module IO_loop = struct
   exception Interrupted
 
   (* The read of the read loop. A timer or a drain ends a read that waits with
-     [interrupt]; the socket read stays, as [left]. *)
+     [interrupt]; the socket read stays, as [left]. The read loop has at most
+     one socket read at a time: its result goes to [reading] while that waits,
+     else to [left]. *)
   type reader =
     { mutable reading : int Lwt.t
     ; mutable resolver : int Lwt.u
-    ; (* The socket read of an interrupted read, while it waits. *)
+    ; (* The socket read of an interrupted read, until the read loop or the
+         linger takes it. It may have ended. *)
       mutable left : (int Lwt.t * int Lwt.u) option
     }
 
@@ -79,6 +82,21 @@ module IO_loop = struct
     | Some (left, _) when Lwt.is_sleeping left -> Some left
     | Some _ | None -> None
 
+  (* Takes the socket read of an interrupted read as the next read of the read
+     loop. One that still waits becomes [reading], which [interrupt] ends and
+     the timers watch. One that ended while the loop yielded gives its result
+     (its bytes are already in the read buffer). *)
+  let resume r =
+    match r.left with
+    | None -> None
+    | Some (left, u) ->
+      r.left <- None;
+      if Lwt.is_sleeping left
+      then (
+        r.reading <- left;
+        r.resolver <- u);
+      Some left
+
   let read (type fd) (module Io : IO with type socket = fd) socket read_buffer =
     let p, u = Lwt.wait () in
     Buffer.put
@@ -102,16 +120,18 @@ module IO_loop = struct
     let p, u = Lwt.wait () in
     r.reading <- p;
     r.resolver <- u;
+    (* The result goes where the read loop or the linger waits for it: [resume]
+       and [interrupt] move the socket read between [reading] and [left]. *)
     let finish n =
-      if Lwt.is_sleeping p
-      then Lwt.wakeup_later u n
+      if Lwt.is_sleeping r.reading
+      then Lwt.wakeup_later r.resolver n
       else
         match r.left with
         | Some (left, u) when Lwt.is_sleeping left -> Lwt.wakeup_later u n
         | Some _ | None -> ()
     and fail exn =
-      if Lwt.is_sleeping p
-      then Lwt.wakeup_later_exn u exn
+      if Lwt.is_sleeping r.reading
+      then Lwt.wakeup_later_exn r.resolver exn
       else
         match r.left with
         | Some (left, u) when Lwt.is_sleeping left -> Lwt.wakeup_later_exn u exn
@@ -216,10 +236,12 @@ module IO_loop = struct
                (if Buffer.unread read_buffer
                 then Lwt.return 0
                 else
-                  match pending_left reader with
-                  (* An interrupted read whose socket read still waits: its
-                     bytes are the next input. *)
-                  | Some left -> left
+                  match resume reader with
+                  (* An interrupted read: its bytes are the next input. *)
+                  | Some left ->
+                    timing.starts ();
+                    if Lwt.is_sleeping left then timing.waits ();
+                    left
                   | None ->
                     timing.starts ();
                     let reading =
