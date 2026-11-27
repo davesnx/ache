@@ -53,7 +53,12 @@ end
    A task must be cancelled by the task that started it, and a connection may
    end at any time, so the ticker is a child of the main task of one of the
    connections of the domain, the leader. When the leader ends, it cancels its
-   ticker and elects another connection that has a deadline.
+   ticker and elects another connection that has a deadline. A new leader starts
+   its ticker one round of the scheduler later: most connections end within that
+   round, and starting and cancelling a ticker costs more than the rest of the
+   timers of a short connection. The domain cannot wait for events meanwhile,
+   since the leader's main task is ready to run; while leaders keep ending
+   before they start a ticker, each leader that ends looks at the heap.
 
    A connection's key in the heap is a time at which to look at it again. A
    deadline that moves later does not change it: at the key, the connection runs
@@ -192,15 +197,19 @@ module Timers = struct
             leader.restart <- true;
             Signal.wake leader.main))
 
+  (* [expire t now] marks the connections whose key passed as [due]. *)
+  let expire t now =
+    while t.size > 0 && t.heap.(0).key <= now do
+      let e = t.heap.(0) in
+      remove t e;
+      e.due <- true;
+      Signal.wake e.main
+    done
+
   let tick t () =
     let rec loop () =
       let now = Unix.gettimeofday () in
-      while t.size > 0 && t.heap.(0).key <= now do
-        let e = t.heap.(0) in
-        remove t e;
-        e.due <- true;
-        Signal.wake e.main
-      done;
+      expire t now;
       (if t.size = 0
        then (
          t.target <- Float.infinity;
@@ -236,7 +245,10 @@ module Timers = struct
       e.restart <- false;
       t.leader <- None;
       t.target <- Float.infinity;
-      if t.size > 0 then elect t t.heap.(t.size - 1))
+      if t.size > 0
+      then (
+        expire t (Unix.gettimeofday ());
+        if t.size > 0 then elect t t.heap.(t.size - 1)))
 end
 
 let sleep_until at =
@@ -783,7 +795,17 @@ struct
         if entry.lead
         then
           match !ticker with
-          | None -> ticker := Some (Miou.async (Timers.tick timers))
+          | None ->
+            (* See [Timers]: the ticker starts a round later, if this connection
+               still leads then. *)
+            Miou.yield ();
+            if
+              entry.lead
+              && Option.is_none !ticker
+              && Miou.Computation.is_running stopped
+            then (
+              entry.restart <- false;
+              ticker := Some (Miou.async (Timers.tick timers)))
           | Some old when entry.restart ->
             entry.restart <- false;
             Miou.cancel old;

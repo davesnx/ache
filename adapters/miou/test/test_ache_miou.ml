@@ -2131,6 +2131,67 @@ let test_leader_ends_during_408 () =
          "HTTP/1.1 408 Request Timeout"
          (status_line (read_all slow_client)))
 
+(* Short connections keep ending on the domain, so the timers change leader
+   again and again: the head timeout of a slow connection still fires on
+   time. *)
+let test_head_timeout_among_short_connections () =
+  Miou_unix.run ~domains:0 (fun () ->
+    with_timeout 8.0 (fun () ->
+      let pair () =
+        let client, server = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+        Miou_unix.of_file_descr client, Miou_unix.of_file_descr server
+      in
+      let serve socket =
+        Miou.async (fun () ->
+          Fun.protect
+            ~finally:(fun () -> Miou_unix.close socket)
+            (fun () ->
+               Ache_miou.Server.create_connection_handler
+                 ~date:false
+                 ~idle_timeout:(Some 5.0)
+                 ~head_timeout:(Some 0.3)
+                 ~body_timeout:None
+                 ~write_timeout:None
+                 ~close_timeout:None
+                 ~request_handler
+                 ~error_handler
+                 socket
+                 (Unix.ADDR_UNIX "")))
+      in
+      let slow_client, slow_server = pair () in
+      let from = Unix.gettimeofday () in
+      let slow = serve slow_server in
+      send slow_client "GET /hello HTTP/1.1\r\n";
+      let answered = ref false in
+      let short =
+        Miou.async (fun () ->
+          let rec loop served =
+            if not !answered
+            then (
+              let client, server = pair () in
+              let connection = serve server in
+              send client "GET /hello HTTP/1.1\r\nconnection: close\r\n\r\n";
+              let (_ : string) = read_all client in
+              Miou_unix.close client;
+              let (_ : (unit, exn) result) = Miou.await connection in
+              loop (served + 1))
+            else served
+          in
+          loop 0)
+      in
+      let output = read_all slow_client in
+      answered := true;
+      check_elapsed "head timeout" ~from ~min:0.25 ~max:0.8;
+      Alcotest.(check string)
+        "status line"
+        "HTTP/1.1 408 Request Timeout"
+        (status_line output);
+      Miou_unix.close slow_client;
+      let served = Miou.await_exn short in
+      if served < 10 then Alcotest.failf "only %d short connections" served;
+      let (_ : (unit, exn) result) = Miou.await slow in
+      ()))
+
 let test_head_deadline () =
   with_server ~head_timeout:0.4 (fun addr ->
     let socket = connect addr in
@@ -3774,6 +3835,9 @@ let () =
         ; ( "the timer leader ending does not drop another 408"
           , `Quick
           , test_leader_ends_during_408 )
+        ; ( "a head timeout fires while short connections keep ending"
+          , `Quick
+          , test_head_timeout_among_short_connections )
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
         ; ( "unread body after a closing response: response, then the end"
