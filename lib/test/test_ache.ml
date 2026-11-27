@@ -22,6 +22,7 @@ let () =
     ; "websocket", Test_websocket.tests
     ; "testing", Test_testing.tests
     ; "trailers", Test_trailers.tests
+    ; "seen fields", Test_seen_fields.tests
     ; ( "bodies"
       , [ "no body expected to complete was cut", `Quick, Helpers.no_body_cut ]
       )

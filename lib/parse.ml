@@ -47,6 +47,11 @@ type out =
   ; mutable error : string
   ; mutable run : int
   ; mutable resume : int
+  ; mutable seen : int
+    (* [Message.Seen] bits of the fields of the head being read. *)
+  ; mutable host : string (* The value of its last Host field. *)
+  ; mutable bit : int
+    (* The [Message.Seen] bit of the last name [common_name] found. *)
   }
 
 let out () =
@@ -60,6 +65,9 @@ let out () =
   ; error = ""
   ; run = 0
   ; resume = 0
+  ; seen = 0
+  ; host = ""
+  ; bit = 0
   }
 
 let join_folds o =
@@ -481,20 +489,23 @@ let common_names =
 let[@inline] name_key len first middle last =
   ((len * 31) + (first * 7) + (middle * 3) + last) land 511
 
-let common_table =
+(* The common names by [name_key], and the [Message.Seen] bit of each. *)
+let common_table, common_bits =
   let table = Array.make 512 [||] in
+  let bits = Array.make 512 [||] in
   let add name =
     let len = String.length name in
     let code i = Char.code name.[i] in
     let key = name_key len (code 0) (code (len / 2)) (code (len - 1)) in
-    table.(key) <- Array.append table.(key) [| name |]
+    table.(key) <- Array.append table.(key) [| name |];
+    bits.(key) <- Array.append bits.(key) [| Message.Seen.of_name name |]
   in
   List.iter
     (fun name ->
        add name;
        add (String.lowercase_ascii name))
     common_names;
-  table
+  table, bits
 
 let colons = 0x3a3a3a3a3a3a3a3aL
 
@@ -514,15 +525,16 @@ let rec colon_from bs off stop i =
 
 let rec find_name bs off len names i =
   if i = Array.length names
-  then ""
+  then -1
   else
     let name = Array.unsafe_get names i in
     if String.length name = len && same_at bs off name
-    then name
+    then i
     else find_name bs off len names (i + 1)
 
-(* The common name that is followed by ':' at [off], or "". *)
-let common_name bs off stop =
+(* The common name that is followed by ':' at [off], or "". Its [Message.Seen]
+   bit goes to [o.bit]. *)
+let common_name o bs off stop =
   let len = colon_from bs off stop 0 in
   if len <= 0
   then ""
@@ -534,7 +546,13 @@ let common_name bs off stop =
         (Char.code (Bigstring.unsafe_get bs (off + (len / 2))))
         (Char.code (Bigstring.unsafe_get bs (off + len - 1)))
     in
-    find_name bs off len (Array.unsafe_get common_table key) 0
+    let names = Array.unsafe_get common_table key in
+    let i = find_name bs off len names 0 in
+    if i < 0
+    then ""
+    else (
+      o.bit <- Array.unsafe_get (Array.unsafe_get common_bits key) i;
+      Array.unsafe_get names i)
 
 (* RFC 9112 §5.2: a recipient of a response replaces each obs-fold with SP. *)
 let field_line ~eof ~obs_fold o bs off stop =
@@ -544,7 +562,7 @@ let field_line ~eof ~obs_fold o bs off stop =
     && (match o.fields with [] -> false | _ :: _ -> true)
     && is space (get bs stop off)
   in
-  let common = if fold then "" else common_name bs off stop in
+  let common = if fold then "" else common_name o bs off stop in
   let name_end =
     if fold
     then off
@@ -569,11 +587,17 @@ let field_line ~eof ~obs_fold o bs off stop =
        then o.folds <- value :: o.folds
        else (
          close_fold o;
-         let name =
+         let name, bit =
            if String.length common > 0
-           then common
-           else substring bs ~off ~len:(name_end - off)
+           then common, o.bit
+           else
+             let name = substring bs ~off ~len:(name_end - off) in
+             name, Message.Seen.of_name name
          in
+         if bit <> 0
+         then (
+           o.seen <- Message.Seen.add o.seen bit;
+           if bit = Message.Seen.host then o.host <- value);
          o.fields <- (name, value) :: o.fields));
     p
 
@@ -807,6 +831,7 @@ module Reader = struct
     ; mutable paused : bool
     ; mutable closed : bool
     ; mutable wakeup : Optional_thunk.t
+    ; mutable seen : int (* [Message.Seen] bits of the last head's fields. *)
     }
 
   type request = (Request.t, request_error) t
@@ -828,8 +853,10 @@ module Reader = struct
     ; paused = false
     ; closed = false
     ; wakeup = Optional_thunk.none
+    ; seen = 0
     }
 
+  let seen t = t.seen
   let is_closed t = t.closed
   let resume t = t.paused <- false
   let pause t = t.paused <- true
@@ -865,12 +892,25 @@ module Reader = struct
             (Headers.get_multi request.headers "connection")
             "upgrade")
 
+  let seen_may_switch_protocols seen (request : Request.t) =
+    request.meth = `CONNECT
+    || (Message.Seen.has seen Message.Seen.upgrade
+       && Message.Seen.has seen Message.Seen.connection
+       && Message.has_member
+            (Headers.get_multi request.headers "connection")
+            "upgrade")
+
   let request ~max_header_size handler =
     let on_head t =
-      let request = request_of t.out in
-      t.out.fields <- [];
-      t.paused <- may_switch_protocols request;
-      match Request.received_body_length request with
+      let o = t.out in
+      let request = request_of o in
+      o.fields <- [];
+      t.seen <- o.seen;
+      t.paused <- seen_may_switch_protocols o.seen request;
+      let host = o.host in
+      (* The reader outlives the head; its strings would be promoted. *)
+      o.host <- "";
+      match Request.received_body_length ~seen:o.seen ~host request with
       | Error error -> t.state <- Fail (`Invalid_request (request, error))
       | Ok (`Fixed 0L) ->
         handler request (Body.Reader.create_empty ());
@@ -957,7 +997,11 @@ module Reader = struct
         then request_line ~eof:false o bs p stop
         else status_line ~eof:false o bs p stop
       in
-      if q >= 0 then t.stage <- Fields;
+      if q >= 0
+      then (
+        t.stage <- Fields;
+        o.seen <- 0;
+        o.host <- "");
       q
     | (Fields | Trailer) when get bs stop p = '\r' ->
       let where =
