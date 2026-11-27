@@ -179,41 +179,14 @@ let[@inline] first_mark m =
   Int64.to_int
     (Int64.shift_right_logical (Int64.mul low 0x0001020304050607L) 56)
 
-(* [skip table] for a table that accepts every byte from [below] up, except DEL,
-   and possibly some bytes under [below]. Eight bytes at a time: a word with no
-   byte under [below] and no DEL is accepted whole; a flagged byte is looked up
-   in [table]. [below] is the byte repeated in each lane, at most 0x80. *)
-let[@inline] skip_word ~below table bs stop i =
-  let i = ref i
-  and found = ref (-1) in
-  if not Sys.big_endian
-  then
-    while !found < 0 && !i + 8 <= stop do
-      let x = Bigstring.unsafe_get_int64_ne bs !i in
-      let m =
-        Int64.logor
-          (Int64.logand
-             (Int64.logand (Int64.sub x below) (Int64.lognot x))
-             0x8080808080808080L)
-          (zero_bytes (Int64.logxor x 0x7f7f7f7f7f7f7f7fL))
-      in
-      if m = 0L
-      then i := !i + 8
-      else
-        let m = ref m in
-        while !found < 0 && !m <> 0L do
-          let j = !i + first_mark !m in
-          if is table (Bigstring.unsafe_get bs j)
-          then m := Int64.logand !m (Int64.sub !m 1L)
-          else found := j
-        done;
-        if !found < 0 then i := !i + 8
-    done;
-  if !found >= 0 then !found else skip table bs stop !i
-
 (* field-char: HTAB, SP to 0x7e, 0x80 to 0xff. *)
-let skip_field bs stop i =
-  skip_word ~below:0x2020202020202020L field_char bs stop i
+external skip_field :
+   Bigstring.t
+  -> (int[@untagged])
+  -> (int[@untagged])
+  -> (int[@untagged])
+  = "ache_field_end_byte" "ache_field_end"
+[@@noalloc]
 
 (* A line that stops inside a run of one class of bytes stays an unfinished
    valid line when more bytes of that class follow. [o.run] names that class (an
@@ -237,7 +210,7 @@ let[@inline] skip_run o run bs stop i =
   j
 
 let[@inline] skip_field_run o bs stop i =
-  let j = skip_field bs stop i in
+  let j = skip_field bs i stop in
   if j >= stop then o.run <- run_field;
   j
 
@@ -412,6 +385,157 @@ let rec trim_end bs off i =
   then trim_end bs off (i - 1)
   else i
 
+external string_get64 : string -> int -> int64 = "%caml_string_get64u"
+external string_get32 : string -> int -> int32 = "%caml_string_get32u"
+
+let rec same_words bs off s i last =
+  if i >= last
+  then
+    Int64.equal
+      (Bigstring.unsafe_get_int64_ne bs (off + last))
+      (string_get64 s last)
+  else
+    Int64.equal (Bigstring.unsafe_get_int64_ne bs (off + i)) (string_get64 s i)
+    && same_words bs off s (i + 8) last
+
+(* Whether the bytes at [off] are [s], exactly. *)
+let same_at bs off s =
+  let len = String.length s in
+  if len >= 8
+  then same_words bs off s 0 (len - 8)
+  else if len >= 4
+  then
+    Int32.equal (Bigstring.unsafe_get_int32_ne bs off) (string_get32 s 0)
+    && Int32.equal
+         (Bigstring.unsafe_get_int32_ne bs (off + len - 4))
+         (string_get32 s (len - 4))
+  else same bs off s 0
+
+(* Field names that most requests and responses carry, as clients spell them. A
+   name received in exactly this spelling is this shared string, so parsing it
+   neither scans it byte by byte nor allocates. *)
+let common_names =
+  [ "Accept"
+  ; "Accept-Charset"
+  ; "Accept-Encoding"
+  ; "Accept-Language"
+  ; "Accept-Ranges"
+  ; "Access-Control-Request-Headers"
+  ; "Access-Control-Request-Method"
+  ; "Age"
+  ; "Authorization"
+  ; "Cache-Control"
+  ; "Connection"
+  ; "Content-Encoding"
+  ; "Content-Length"
+  ; "Content-Type"
+  ; "Cookie"
+  ; "Date"
+  ; "DNT"
+  ; "ETag"
+  ; "Expect"
+  ; "Expires"
+  ; "Forwarded"
+  ; "Host"
+  ; "If-Match"
+  ; "If-Modified-Since"
+  ; "If-None-Match"
+  ; "If-Range"
+  ; "Keep-Alive"
+  ; "Last-Modified"
+  ; "Location"
+  ; "Origin"
+  ; "Pragma"
+  ; "Priority"
+  ; "Range"
+  ; "Referer"
+  ; "Sec-Ch-Ua"
+  ; "Sec-Ch-Ua-Mobile"
+  ; "Sec-Ch-Ua-Platform"
+  ; "Sec-Fetch-Dest"
+  ; "Sec-Fetch-Mode"
+  ; "Sec-Fetch-Site"
+  ; "Sec-Fetch-User"
+  ; "Sec-WebSocket-Extensions"
+  ; "Sec-WebSocket-Key"
+  ; "Sec-WebSocket-Protocol"
+  ; "Sec-WebSocket-Version"
+  ; "Server"
+  ; "Set-Cookie"
+  ; "TE"
+  ; "Trailer"
+  ; "Transfer-Encoding"
+  ; "Upgrade"
+  ; "Upgrade-Insecure-Requests"
+  ; "User-Agent"
+  ; "Vary"
+  ; "Via"
+  ; "X-Forwarded-For"
+  ; "X-Forwarded-Host"
+  ; "X-Forwarded-Proto"
+  ; "X-Real-IP"
+  ; "X-Request-ID"
+  ; "X-Requested-With"
+  ]
+
+let[@inline] name_key len first middle last =
+  ((len * 31) + (first * 7) + (middle * 3) + last) land 511
+
+let common_table =
+  let table = Array.make 512 [||] in
+  let add name =
+    let len = String.length name in
+    let code i = Char.code name.[i] in
+    let key = name_key len (code 0) (code (len / 2)) (code (len - 1)) in
+    table.(key) <- Array.append table.(key) [| name |]
+  in
+  List.iter
+    (fun name ->
+       add name;
+       add (String.lowercase_ascii name))
+    common_names;
+  table
+
+let colons = 0x3a3a3a3a3a3a3a3aL
+
+(* The offset of the first ':' in the 32 bytes from [off], or -1 when there is
+   none or the words to load reach past [stop]. *)
+let rec colon_from bs off stop i =
+  if Sys.big_endian || i >= 32 || off + i + 8 > stop
+  then -1
+  else
+    let m =
+      zero_bytes
+        (Int64.logxor (Bigstring.unsafe_get_int64_ne bs (off + i)) colons)
+    in
+    if Int64.equal m 0L
+    then colon_from bs off stop (i + 8)
+    else i + first_mark m
+
+let rec find_name bs off len names i =
+  if i = Array.length names
+  then ""
+  else
+    let name = Array.unsafe_get names i in
+    if String.length name = len && same_at bs off name
+    then name
+    else find_name bs off len names (i + 1)
+
+(* The common name that is followed by ':' at [off], or "". *)
+let common_name bs off stop =
+  let len = colon_from bs off stop 0 in
+  if len <= 0
+  then ""
+  else
+    let key =
+      name_key
+        len
+        (Char.code (Bigstring.unsafe_get bs off))
+        (Char.code (Bigstring.unsafe_get bs (off + (len / 2))))
+        (Char.code (Bigstring.unsafe_get bs (off + len - 1)))
+    in
+    find_name bs off len (Array.unsafe_get common_table key) 0
+
 (* RFC 9112 §5.2: a recipient of a response replaces each obs-fold with SP. *)
 let field_line ~eof ~obs_fold o bs off stop =
   let where = "field line" in
@@ -420,7 +544,14 @@ let field_line ~eof ~obs_fold o bs off stop =
     && (match o.fields with [] -> false | _ :: _ -> true)
     && is space (get bs stop off)
   in
-  let name_end = if fold then off else skip_run o run_tchar bs stop off in
+  let common = if fold then "" else common_name bs off stop in
+  let name_end =
+    if fold
+    then off
+    else if String.length common > 0
+    then off + String.length common
+    else skip_run o run_tchar bs stop off
+  in
   if (not fold) && (name_end = off || get bs stop name_end <> ':')
   then unexpected ~eof o bs stop name_end where
   else
@@ -438,8 +569,12 @@ let field_line ~eof ~obs_fold o bs off stop =
        then o.folds <- value :: o.folds
        else (
          close_fold o;
-         o.fields <-
-           (substring bs ~off ~len:(name_end - off), value) :: o.fields));
+         let name =
+           if String.length common > 0
+           then common
+           else substring bs ~off ~len:(name_end - off)
+         in
+         o.fields <- (name, value) :: o.fields));
     p
 
 let rec fields ~eof ~obs_fold o bs p stop where =
