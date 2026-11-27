@@ -60,8 +60,9 @@ module IO_loop = struct
      write, so that a peer that trickles bytes cannot keep it alive. *)
   let progress_bytes = 2048
 
-  (* The most that one timed write hands to the flow, so that a flow that writes
-     all it is given (tls-eio) shows progress. *)
+  (* The most that one timed write hands to a flow without a socket, so that a
+     flow that writes all it is given (tls-eio) shows progress. A socket's
+     [single_write] returns after a partial write, so it gets everything. *)
   let max_timed_write = 65536
 
   let rec take n = function
@@ -395,11 +396,12 @@ module IO_loop = struct
     (* Writes [bufs], [len] bytes, with a clock that counts while the write
        waits, and restarts after [progress_bytes] written. At the deadline the
        watchdog cancels [write_cancel], around the whole write loop. *)
+    let max_write = if Option.is_some fd then max_int else max_timed_write in
     let rec write_timed limit bufs len progress =
       let n =
         Eio.Flow.single_write
           socket
-          (if len <= max_timed_write then bufs else take max_timed_write bufs)
+          (if len <= max_write then bufs else take max_write bufs)
       in
       if n < len
       then
