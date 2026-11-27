@@ -78,7 +78,14 @@ intnat ache_field_end(value bs, intnat off, intnat stop)
     y = x & 0x7f7f7f7f7f7f7f7fULL;
     m = (~(y + 0x6060606060606060ULL) | (y + 0x0101010101010101ULL)) & ~x &
         0x8080808080808080ULL;
-    if (m != 0) break;
+    if (m != 0) {
+      /* A marked word may hold only HTABs: check its bytes, go on if so. */
+      intnat j;
+      for (j = i; j < i + 8; j++) {
+        unsigned char c = base[j];
+        if ((c < 0x20 && c != '\t') || c == 0x7f) return j;
+      }
+    }
     i += 8;
   }
 #endif

@@ -1,7 +1,6 @@
 (* Free bigstrings of a connection, per domain and by size, so that a closing
    connection hands its buffers to the next one. A bigstring is a custom block:
-   its memory paces major cycles, and a connection per request would start one
-   every few hundred connections (runtime-cost-2 H4).
+   its memory paces major cycles.
 
    A pool belongs to one domain ([Domain.DLS]); a buffer given back on another
    domain joins that domain's pool. Only the code that owns a buffer gives it

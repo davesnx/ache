@@ -198,7 +198,7 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   the body was closed could send it without the terminating `0\r\n\r\n`.
 - Less work on realistic requests, bodies, WebSocket messages and large
   responses: common field names are shared strings and field values are
-  scanned 16 bytes at a time; request body buffers are reused (see
+  scanned 8 or 16 bytes at a time; body buffers are reused (see
   Breaking); WebSocket payloads are unmasked a word at a time with one copy
   per frame; ache-eio and ache-miou servers keep connection buffers in a
   bounded per-domain pool; ache-eio shuts sockets down with the system call

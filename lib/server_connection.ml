@@ -81,7 +81,7 @@ type t =
   ; mutable unread_input : bool
     (* The last read left bytes that the connection did not take. *)
   ; mutable input_ended : bool (* A linger would read nothing. *)
-  ; mutable released : bool (* [release] gave the write buffer back. *)
+  ; mutable released : bool
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer

@@ -54,11 +54,10 @@ end
    end at any time, so the ticker is a child of the main task of one of the
    connections of the domain, the leader. When the leader ends, it cancels its
    ticker and elects another connection that has a deadline. A new leader starts
-   its ticker one round of the scheduler later: most connections end within that
-   round, and starting and cancelling a ticker costs more than the rest of the
-   timers of a short connection. The domain cannot wait for events meanwhile,
-   since the leader's main task is ready to run; while leaders keep ending
-   before they start a ticker, each leader that ends looks at the heap.
+   its ticker one round of the scheduler later. The domain cannot wait for
+   events meanwhile, since the leader's main task is ready to run; while leaders
+   keep ending before they start a ticker, each leader that ends looks at the
+   heap.
 
    A connection's key in the heap is a time at which to look at it again. A
    deadline that moves later does not change it: at the key, the connection runs
@@ -197,7 +196,6 @@ module Timers = struct
             leader.restart <- true;
             Signal.wake leader.main))
 
-  (* [expire t now] marks the connections whose key passed as [due]. *)
   let expire t now =
     while t.size > 0 && t.heap.(0).key <= now do
       let e = t.heap.(0) in
