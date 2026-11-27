@@ -115,16 +115,31 @@ end
 
 module Buffer = struct
   type t =
-    { buffer : Bigstring.t
+    { mutable buffer : Bigstring.t
     ; mutable off : int
     ; mutable len : int
-    ; cap : int
+    ; mutable cap : int
     ; mutable unread : bool
     }
 
   let create size =
     let buffer = Bigstring.create size in
     { buffer; off = 0; len = 0; cap = size; unread = false }
+
+  let acquire size =
+    let buffer = Buffer_pool.take size in
+    { buffer; off = 0; len = 0; cap = size; unread = false }
+
+  (* [t] keeps no bytes and no room: a read into it after [release] reads
+     nothing. *)
+  let release t =
+    let buffer = t.buffer in
+    t.buffer <- Bigstring.empty;
+    t.off <- 0;
+    t.len <- 0;
+    t.cap <- 0;
+    t.unread <- false;
+    Buffer_pool.give buffer
 
   let compress t =
     if t.len = 0

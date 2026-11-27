@@ -83,7 +83,7 @@ type t =
   ; request_body : Body.Reader.t
   ; reader : Reader.request
   ; writer : Writer.t
-  ; response_body_buffer : Bigstring.t
+  ; response_body_buffer : Bigstring.t Lazy.t
   ; error_handler : error_handler
   ; upgrade : Runtime.impl -> unit
   ; max_discard_body : int
@@ -352,7 +352,7 @@ let unsafe_respond_with_streaming ~flush_headers_immediately t response =
     let response_body =
       Body.Writer.create
         ~send_trailers
-        t.response_body_buffer
+        (Lazy.force t.response_body_buffer)
         ~encoding
         ~writer:t.writer
     in
