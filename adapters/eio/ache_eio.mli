@@ -208,6 +208,15 @@ module Server : sig
       same time. A connection's response bodies must be written from the
       domain that serves it.
 
+      In OCaml 5, each minor collection stops every domain. With the default
+      minor heap (256k words per domain), a keep-alive request costs 24%
+      more CPU at 8 domains than at 1; with [OCAMLRUNPARAM=s=4M] it costs 1%
+      more. [Gc.set] changes the minor heap of the calling domain only: the
+      domains that [run] starts begin with the size from [OCAMLRUNPARAM].
+      Each domain keeps the read and write buffers of ended connections for
+      its next connections: at most 4 sizes of up to 64 KiB, and at most 64
+      buffers and 256 KiB per size.
+
       When [tcp_nodelay] is [true], [run] sets [TCP_NODELAY] on each
       accepted socket before it is served, so that small writes are sent at
       once and are not held back by Nagle's algorithm.

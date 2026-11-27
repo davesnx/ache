@@ -581,6 +581,12 @@ same in all three runtimes.
 - `Close`: the loop ends. When both loops have ended, or one has failed, the
   runtime closes the socket once.
 
+The ache-eio and ache-miou servers take the read and write buffers of a
+connection from a pool of the domain, and give them back when the
+connection ends. Each pool is bounded: at most 4 buffer sizes of up to
+64 KiB, and at most 64 buffers and 256 KiB per size. The core does not
+clear a buffer it reuses: it reads only bytes that it wrote.
+
 ### One write for each read
 
 A client can send several requests in one packet (pipelining). While the core
