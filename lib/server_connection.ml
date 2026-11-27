@@ -63,9 +63,11 @@ type t =
   ; response_body_buffer : Bigstring.t
   ; request_handler : request_handler
   ; error_handler : error_handler
-  ; request_queue : Request_descriptor.t Queue.t
-    (* invariant: If [request_queue] is not empty, then the head of the queue
-       has already had [request_handler] called on it. *)
+  ; mutable current : Request_descriptor.t option
+    (* The head of the request queue, which has already had [request_handler]
+       called on it. *)
+  ; pipelined : Request_descriptor.t Queue.t
+    (* The requests after [current]; empty when [current] is [None]. *)
   ; mutable error_code : error_code
     (* Represents an unrecoverable error that will cause the connection to *
        shutdown. Holds on to the response body created by the error handler *
@@ -75,11 +77,16 @@ type t =
   ; date : (unit -> string) option
   ; mutable requests : int
   ; mutable draining : bool
+  ; mutable unread_input : bool
+    (* The last read left bytes that the connection did not take. *)
+  ; mutable input_ended : bool (* A linger would read nothing. *)
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
-let is_active t = not (Queue.is_empty t.request_queue)
-let current_reqd_exn t = Queue.peek t.request_queue
+let is_active t = Option.is_some t.current
+
+let current_reqd_exn t =
+  match t.current with Some reqd -> reqd | None -> raise Queue.Empty
 
 let yield_reader t k =
   if Reader.is_closed t.reader then k () else Reader.on_wakeup t.reader k
@@ -192,7 +199,6 @@ let create
       date
   in
   let writer = Writer.create ~buffer_size:response_buffer_size () in
-  let request_queue = Queue.create () in
   let response_body_buffer = Bigstring.create response_body_buffer_size in
   let self = ref None in
   let handler request request_body =
@@ -228,9 +234,11 @@ let create
         | Some n -> t.requests >= n
         | None -> false
       then Request_descriptor.close_after reqd;
-      let call_handler = Queue.is_empty request_queue in
-      Queue.push reqd request_queue;
-      if call_handler then request_handler reqd
+      (match t.current with
+      | None ->
+        t.current <- Some reqd;
+        request_handler reqd
+      | Some _ -> Queue.push reqd t.pipelined)
   in
   let t =
     { reader = Reader.request ~max_header_size:config.max_header_size handler
@@ -238,7 +246,8 @@ let create
     ; response_body_buffer
     ; request_handler
     ; error_handler
-    ; request_queue
+    ; current = None
+    ; pipelined = Queue.create ()
     ; error_code = No_error
     ; config
     ; upgraded = None
@@ -246,6 +255,8 @@ let create
     ; date
     ; requests = 0
     ; draining = false
+    ; unread_input = false
+    ; input_ended = false
     }
   in
   self := Some (t, upgrade t);
@@ -337,15 +348,15 @@ let set_error_and_handle ?request t error =
 let report_exn t exn = set_error_and_handle t (`Exn exn)
 
 let advance_request_queue t =
-  ignore (Queue.take t.request_queue);
-  if Queue.is_empty t.request_queue && not (Writer.is_closed t.writer)
-  then Reader.resume t.reader;
-  if not (Queue.is_empty t.request_queue)
-  then
-    let reqd = Queue.peek t.request_queue in
-    match t.request_handler reqd with
+  match Queue.take_opt t.pipelined with
+  | None ->
+    t.current <- None;
+    if not (Writer.is_closed t.writer) then Reader.resume t.reader
+  | Some reqd ->
+    t.current <- Some reqd;
+    (match t.request_handler reqd with
     | () -> ()
-    | exception exn -> Request_descriptor.report_exn reqd exn
+    | exception exn -> Request_descriptor.report_exn reqd exn)
 
 let at_request_start t =
   match Reader.next t.reader with
@@ -462,6 +473,7 @@ let read_with_more t bs ~off ~len more =
           (Request_descriptor.discard_budget reqd)
       else None
     in
+    let offered = len in
     let len, more =
       match discarding with
       | Some (_, budget) when budget < len ->
@@ -471,6 +483,7 @@ let read_with_more t bs ~off ~len more =
       | Some _ | None -> len, more
     in
     let consumed = Reader.read_with_more t.reader bs ~off ~len more in
+    t.unread_input <- consumed < offered;
     (match discarding with
     | Some (reqd, _) -> Request_descriptor.add_discarded reqd consumed
     | None -> ());
@@ -577,6 +590,7 @@ let read t bs ~off ~len =
     Engine.read engine bs ~off ~len
 
 let read_eof t bs ~off ~len =
+  t.input_ended <- true;
   match t.upgraded with
   | None -> read_eof t bs ~off ~len
   | Some (Runtime.Impl ((module Engine), engine, _)) ->
@@ -652,6 +666,20 @@ let read_timeout t =
     (Runtime.read_timeout impl
       :> ([ `Idle | `Head | `Body | `Close ] * (unit -> unit)) option)
   | None, Error _ -> None
+
+(* Decision 0023: the client may still be sending when a message is partly read
+   (an unread or dropped body, a parse error, an error response before the
+   request ended), when input is left after the last request, or when it
+   pipelined requests past the one that closes the connection. *)
+let lingers t =
+  (not t.input_ended)
+  &&
+  match t.upgraded with
+  | Some impl -> Runtime.lingers impl
+  | None ->
+    t.unread_input
+    || (not (Queue.is_empty t.pipelined))
+    || not (Reader.between_messages t.reader)
 
 let upgrade_state t =
   match t.upgraded with

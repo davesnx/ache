@@ -93,8 +93,19 @@ module IO_loop = struct
 
   exception Write_timeout
 
+  (* [wake] cancels the watchdog's sleep with it. *)
+  exception Rearm
+
+  type watchdog =
+    | Unstarted
+    | Awake
+    | Sleeping of Eio.Cancel.t
+
   (* The watchdog cancelled a write that had already ended. *)
   exception Late_cancel
+
+  (* A loop failed: the other one stops. *)
+  exception Failed
 
   (* While no timeout applies to a read that waits, the watchdog looks again
      this often, so that one that applies again later starts counting. *)
@@ -134,14 +145,15 @@ module IO_loop = struct
         | Eio.Io (Eio.Net.E (Connection_reset _), _) ) ->
       raise End_of_file
 
-  (* A deadline earlier than the one the watchdog sleeps to wakes it. *)
-  let[@inline] set_read deadlines rearm deadline =
+  (* A deadline earlier than the one the watchdog sleeps to wakes it (or starts
+     it). *)
+  let[@inline] set_read deadlines wake deadline =
     deadlines.read <- deadline;
-    if deadline < deadlines.watchdog then Eio.Condition.broadcast rearm
+    if deadline < deadlines.watchdog then wake ()
 
-  let[@inline] set_write deadlines rearm deadline =
+  let[@inline] set_write deadlines wake deadline =
     deadlines.write <- deadline;
-    if deadline < deadlines.watchdog then Eio.Condition.broadcast rearm
+    if deadline < deadlines.watchdog then wake ()
 
   let[@inline] now = function
     | Some time -> Time.current time
@@ -155,6 +167,7 @@ module IO_loop = struct
   let start : type t.
     (module Ache.Runtime.ENGINE with type t = t)
     -> read_buffer_size:int
+    -> sw:Switch.t
     -> ?read_closed:unit Promise.t * unit Promise.u
     -> ?time:Time.t
     -> timeout:timeouts
@@ -168,6 +181,7 @@ module IO_loop = struct
     =
    fun (module Runtime)
      ~read_buffer_size
+     ~sw
      ?read_closed
      ?time
      ~timeout
@@ -177,13 +191,15 @@ module IO_loop = struct
      ?(on_read = fun _ ~off:_ ~len:_ -> ())
      t
      socket ->
-    Switch.run @@ fun sw ->
     let interruptible = Option.is_some read_closed in
     let read_closed, resolve_read_closed =
       match read_closed with Some p -> p | None -> Promise.create ()
     and receive_shut = ref false
     and send_shut = ref false
-    and failed, resolve_failed = Promise.create ()
+    and failed = ref false
+    and read_cancel = ref None
+    and loop_cancel = ref None
+    and write_cancel = ref None
     and unreported = ref None in
     let shutdown_once cmd =
       let receive =
@@ -201,6 +217,24 @@ module IO_loop = struct
       | false, true -> shutdown socket `Send
       | false, false -> ()
     in
+    let cancel cc =
+      match !cc with
+      | Some c ->
+        cc := None;
+        Eio.Cancel.cancel c Failed
+      | None -> ()
+    in
+    (* Neither loop goes on: the socket shuts down and the loops that still run
+       are cancelled. *)
+    let fail_loops () =
+      if not !failed
+      then (
+        failed := true;
+        shutdown_once `All;
+        cancel read_cancel;
+        cancel write_cancel;
+        cancel loop_cancel)
+    in
     let report_exn exn =
       match Runtime.report_exn t exn with
       | () -> true
@@ -208,25 +242,41 @@ module IO_loop = struct
       | exception exn ->
         let bt = Printexc.get_raw_backtrace () in
         if Option.is_none !unreported then unreported := Some (exn, bt);
-        ignore (Promise.try_resolve resolve_failed () : bool);
+        fail_loops ();
         false
     in
     let fail = function
       | Eio.Cancel.Cancelled _ as exn -> raise exn
       | exn ->
         let (_ : bool) = report_exn exn in
-        ignore (Promise.try_resolve resolve_failed () : bool)
+        fail_loops ()
+    in
+    let cancellable cc f =
+      if !failed then raise (Eio.Cancel.Cancelled Failed);
+      match
+        Eio.Cancel.sub (fun c ->
+          cc := Some c;
+          f ())
+      with
+      | v ->
+        cc := None;
+        v
+      | exception exn ->
+        cc := None;
+        raise exn
     in
     let read_buffer = Buffer.create read_buffer_size in
     (* The watchdog: one fiber that sleeps until the nearest deadline, so that a
-       read or a write that ends in time costs no timer. A deadline that moves
-       later does not wake it; it sleeps again when it wakes. *)
+       read or a write that ends in time costs no timer. It starts with the
+       first finite deadline, so that a connection without one forks no fiber. A
+       deadline that moves later does not wake it; it sleeps again when it
+       wakes. *)
     let deadlines =
       { read = Float.infinity
       ; write = Float.infinity
       ; watchdog = Float.infinity
       }
-    and rearm = Eio.Condition.create ()
+    and watchdog = ref Unstarted
     (* [reading]: the read loop waits in a read. [lingering]: reading ended for
        good, and reads only drop input until it ends. *)
     and reading = ref false
@@ -234,82 +284,98 @@ module IO_loop = struct
     (* The watchdog's timer ended, and it has yet to run. *)
     and timer_fired = ref false
     and expire_failed = ref None
-    and write_cancel = ref None
-    and write_expired = ref false in
+    and write_expired = ref false
+    and stopped = ref false in
     (* Reading ended for good while a read waits: a timeout action ran, or a
        drain closed the connection. The read is not cancelled, which tls-eio
        would keep as an error: it and the reads after it drop their input, and
        the linger deadline ends them by shutting down the receive side. *)
-    let stop_reading () =
+    let rec stop_reading () =
       lingering := true;
       if lingers ()
-      then set_read deadlines rearm (timeout.deadline (now time) `Linger)
+      then set_read deadlines wake (timeout.deadline (now time) `Linger)
       else shutdown_once `Receive
+    and wake () =
+      match !watchdog, time with
+      | Sleeping cc, _ ->
+        watchdog := Awake;
+        Eio.Cancel.cancel cc Rearm
+      | Awake, _ | Unstarted, None -> ()
+      | Unstarted, Some _ when !stopped -> ()
+      | Unstarted, Some time ->
+        watchdog := Awake;
+        Fiber.fork_daemon ~sw (fun () -> watch time)
+    and sleep f =
+      match
+        Eio.Cancel.sub (fun cc ->
+          watchdog := Sleeping cc;
+          f ())
+      with
+      | () -> watchdog := Awake
+      | exception Eio.Cancel.Cancelled Rearm -> Fiber.check ()
+      | exception exn ->
+        (* The context is finished: [wake] must not cancel it. *)
+        watchdog := Awake;
+        raise exn
+    and watch time = if !stopped then `Stop_daemon else watch_once time
+    and watch_once time =
+      let deadline = Float.min deadlines.read deadlines.write in
+      deadlines.watchdog <- deadline;
+      (if deadline = Float.infinity
+       then sleep Fiber.await_cancel
+       else
+         let seconds = deadline -. time.Time.now () in
+         if seconds > 0.
+         then
+           sleep (fun () ->
+             time.sleep seconds;
+             timer_fired := true));
+      if !stopped then `Stop_daemon else watched time
+    and watched time =
+      deadlines.watchdog <- Float.infinity;
+      timer_fired := false;
+      let now = time.now () in
+      if deadlines.read <= now
+      then (
+        deadlines.read <- Float.infinity;
+        if !lingering
+        then
+          (* The linger ends, unless the response is still being written. *)
+          if !send_shut
+          then shutdown_once `Receive
+          else set_read deadlines wake (timeout.deadline now `Linger)
+        else
+          match
+            timeout.ended 0;
+            timeout.expire ()
+          with
+          | true -> stop_reading ()
+          | false ->
+            (* The phase changed while the read waited: the read goes on, with
+               the deadline of the phase now. *)
+            let deadline = timeout.deadline now `Read in
+            set_read
+              deadlines
+              wake
+              (if deadline = Float.infinity
+               then now +. phase_recheck
+               else deadline)
+          | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+          | exception exn ->
+            (* The read loop raises it when its read ends. *)
+            expire_failed := Some (exn, Printexc.get_raw_backtrace ());
+            lingering := true;
+            shutdown_once `Receive);
+      if deadlines.write <= now
+      then (
+        deadlines.write <- Float.infinity;
+        match !write_cancel with
+        | Some cc ->
+          write_expired := true;
+          Eio.Cancel.cancel cc Write_timeout
+        | None -> ());
+      watch time
     in
-    Option.iter
-      (fun time ->
-         Fiber.fork_daemon ~sw (fun () ->
-           let rec watch () =
-             let deadline = Float.min deadlines.read deadlines.write in
-             deadlines.watchdog <- deadline;
-             (if deadline = Float.infinity
-              then Eio.Condition.await_no_mutex rearm
-              else
-                let seconds = deadline -. time.Time.now () in
-                if seconds > 0.
-                then
-                  Fiber.first
-                    (fun () ->
-                       time.sleep seconds;
-                       timer_fired := true)
-                    (fun () -> Eio.Condition.await_no_mutex rearm));
-             deadlines.watchdog <- Float.infinity;
-             timer_fired := false;
-             let now = time.now () in
-             if deadlines.read <= now
-             then (
-               deadlines.read <- Float.infinity;
-               if !lingering
-               then
-                 (* The linger ends, unless the response is still being
-                    written. *)
-                 if !send_shut
-                 then shutdown_once `Receive
-                 else set_read deadlines rearm (timeout.deadline now `Linger)
-               else
-                 match
-                   timeout.ended 0;
-                   timeout.expire ()
-                 with
-                 | true -> stop_reading ()
-                 | false ->
-                   (* The phase changed while the read waited: the read goes on,
-                      with the deadline of the phase now. *)
-                   let deadline = timeout.deadline now `Read in
-                   set_read
-                     deadlines
-                     rearm
-                     (if deadline = Float.infinity
-                      then now +. phase_recheck
-                      else deadline)
-                 | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
-                 | exception exn ->
-                   (* The read loop raises it when its read ends. *)
-                   expire_failed := Some (exn, Printexc.get_raw_backtrace ());
-                   lingering := true;
-                   shutdown_once `Receive);
-             if deadlines.write <= now
-             then (
-               deadlines.write <- Float.infinity;
-               match !write_cancel with
-               | Some cc ->
-                 write_expired := true;
-                 Eio.Cancel.cancel cc Write_timeout
-               | None -> ());
-             watch ()
-           in
-           watch ()))
-      time;
     (* Writes [bufs], [len] bytes, with a clock that counts while the write
        waits, and restarts after [progress_bytes] written. At the deadline the
        watchdog cancels [write_cancel], around the whole write loop. *)
@@ -323,12 +389,12 @@ module IO_loop = struct
       then
         if progress + n >= progress_bytes
         then (
-          set_write deadlines rearm (now time +. limit);
+          set_write deadlines wake (now time +. limit);
           write_timed limit (Cstruct.shiftv bufs n) (len - n) 0)
         else write_timed limit (Cstruct.shiftv bufs n) (len - n) (progress + n)
     in
     let write_timed limit bufs len =
-      set_write deadlines rearm (now time +. limit);
+      set_write deadlines wake (now time +. limit);
       match write_timed limit bufs len 0 with
       | () -> deadlines.write <- Float.infinity
       | exception exn ->
@@ -397,7 +463,7 @@ module IO_loop = struct
                  then (
                    let now = now time in
                    timeout.ended 0;
-                   set_read deadlines rearm (timeout.deadline now `Read)))
+                   set_read deadlines wake (timeout.deadline now `Read)))
       interrupt;
     let read_loop =
       (* Waits for the reader fiber's result. *)
@@ -456,7 +522,7 @@ module IO_loop = struct
           let (_ : bool) = timeout.expire () in
           Error `Timeout)
         else (
-          if timed then set_read deadlines rearm deadline;
+          if timed then set_read deadlines wake deadline;
           reading := true;
           match read_input () with
           | n ->
@@ -499,7 +565,7 @@ module IO_loop = struct
         if not !lingering
         then (
           lingering := true;
-          set_read deadlines rearm (timeout.deadline (now time) `Linger));
+          set_read deadlines wake (timeout.deadline (now time) `Linger));
         let rec drop_input () =
           match read_input () with
           | (_ : int) ->
@@ -544,8 +610,9 @@ module IO_loop = struct
               shutdown_once `Receive;
               ignore (Promise.try_resolve resolve_read_closed () : bool))
         in
-        match read_loop_step () with
+        match cancellable read_cancel read_loop_step with
         | () -> ()
+        | exception Eio.Cancel.Cancelled _ when !failed -> ()
         | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
         | exception exn ->
           if report_exn exn
@@ -554,6 +621,16 @@ module IO_loop = struct
             ignore (Promise.try_resolve resolve_read_closed () : bool))
     in
     let write_loop () =
+      (* One waiter for all the yields of the connection: a promise each time
+         costs a broadcast, a trace id and their write barriers. The core wakes
+         the writer from this domain. *)
+      let waiter = Eio.Private.Single_waiter.create ()
+      and woken = ref false
+      and trace_id = Eio.Private.Trace.mint_id () in
+      let wake () =
+        woken := true;
+        Eio.Private.Single_waiter.wake_if_sleeping waiter
+      in
       let rec write_loop_step () =
         match Runtime.next_write_operation t with
         | `Write io_vectors ->
@@ -562,53 +639,54 @@ module IO_loop = struct
           if !write_expired then raise Late_cancel;
           write_loop_step ()
         | `Yield ->
-          let p, u = Promise.create () in
-          Runtime.yield_writer t (fun () -> Promise.resolve u ());
-          Promise.await p;
+          (* [yield_writer] calls [wake] at once when the writer is closed. *)
+          woken := false;
+          Runtime.yield_writer t wake;
+          if not !woken
+          then Eio.Private.Single_waiter.await waiter "ache.write" trace_id;
           write_loop_step ()
         | `Close _ -> shutdown_once `Send
       in
       (* One cancel context for all the writes, so that a write costs none. *)
       let rec timed_writes () =
-        match
-          Eio.Cancel.sub (fun cc ->
-            write_cancel := Some cc;
-            write_loop_step ())
-        with
-        | () -> write_cancel := None
+        match cancellable write_cancel write_loop_step with
+        | () -> ()
         | exception Late_cancel ->
           (* The context stays cancelled: go on in a new one. *)
-          write_cancel := None;
           write_expired := false;
           timed_writes ()
         | exception (Eio.Cancel.Cancelled _ as exn) ->
-          write_cancel := None;
           Fiber.check ();
-          if not !write_expired then raise exn;
+          if !failed || not !write_expired then raise exn;
           (* The write was cancelled, so nothing more is written: end the reads
              too. A TLS flow does not send close_notify after a cancelled
              write. *)
           Runtime.report_write_result t `Closed;
           shutdown_once `Receive;
           shutdown_once `Send;
-          write_loop_step ()
-        | exception exn ->
-          write_cancel := None;
-          raise exn
+          cancellable loop_cancel write_loop_step
       in
-      match
-        match write_timeout with
-        | None -> write_loop_step ()
-        | Some _ -> timed_writes ()
-      with
+      (* Without a write timeout, [write_cancel] is for [fail_loops] only. *)
+      match timed_writes () with
       | () -> ()
+      | exception Eio.Cancel.Cancelled _ when !failed -> ()
       | exception exn -> fail exn
     in
-    Fiber.first
-      (fun () -> Fiber.both read_loop write_loop)
-      (fun () ->
-         Promise.await failed;
-         shutdown_once `All);
+    let read_done, resolve_read_done = Promise.create () in
+    Fiber.fork ~sw (fun () ->
+      match read_loop () with
+      | () -> Promise.resolve resolve_read_done ()
+      | exception exn ->
+        Promise.resolve resolve_read_done ();
+        raise exn);
+    write_loop ();
+    Promise.await read_done;
+    stopped := true;
+    (match !watchdog with
+    | Sleeping cc ->
+      watchdog := Awake;
+      Eio.Cancel.cancel cc Rearm
+    | Awake | Unstarted -> ());
     Option.iter
       (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
       !unreported
@@ -744,6 +822,10 @@ end
 
 module Server = struct
   let linger_without_idle_timeout = 2.0
+
+  (* [grace] passed after [stop]: the connection's switch stops. *)
+  exception Grace_over
+
   let current_date = Ache.Ache_private.Http_date.now
 
   let check_timeout name = function
@@ -783,41 +865,6 @@ module Server = struct
       | Some _ | None -> None
     in
     fun socket client_addr ->
-      let last_reqd = ref None in
-      let upgraded () =
-        match !last_reqd with
-        | Some reqd ->
-          (* [response_exn], which does not allocate: this runs per request. *)
-          (match Ache.Request_descriptor.response_exn reqd with
-          | { Ache.Response.status = `Switching_protocols; _ } -> true
-          | _ -> false
-          | exception Failure _ -> false)
-        | None -> false
-      in
-      (* Only a WebSocket ([Ache.Websocket.upgrade]) reaches [`Close]: plain
-         HTTP and other protocols skip the close timeout. [checked_reqd] is the
-         last request whose response was looked at. *)
-      let websocket = ref false
-      and checked_reqd = ref None in
-      let is_websocket () =
-        !websocket
-        ||
-        match !last_reqd with
-        | Some reqd as last when last != !checked_reqd ->
-          (match Ache.Request_descriptor.response_exn reqd with
-          | { Ache.Response.status; headers; _ } ->
-            checked_reqd := last;
-            (websocket :=
-               status = `Switching_protocols
-               &&
-               match Ache.Headers.get headers "upgrade" with
-               | Some value ->
-                 String.lowercase_ascii (String.trim value) = "websocket"
-               | None -> false);
-            !websocket
-          | exception Failure _ -> false)
-        | Some _ | None -> false
-      in
       let head_deadline = ref None
       and close_deadline = ref None
       and close_expired = ref false
@@ -842,11 +889,21 @@ module Server = struct
           ?date:(if date then Some current_date else None)
           ?keep_alive_timeout
           (fun reqd ->
-             last_reqd := Some reqd;
-             head_deadline := None;
-             body_spent := 0.;
+             if Option.is_some !head_deadline then head_deadline := None;
+             if !body_spent <> 0. then body_spent := 0.;
              body_progress := 0;
              request_handler client_addr reqd)
+      in
+      let upgraded () =
+        match Ache.Server_connection.upgrade_state connection with
+        | `Websocket | `Other -> true
+        | `None -> false
+      (* Only a WebSocket ([Ache.Websocket.upgrade]) reaches [`Close]: plain
+         HTTP and other protocols skip the close timeout. *)
+      and is_websocket () =
+        match Ache.Server_connection.upgrade_state connection with
+        | `Websocket -> true
+        | `None | `Other -> false
       in
       (* The head clock starts when a read starts in the [`Head] phase, right
          after the read that brought the first bytes of a head. *)
@@ -979,9 +1036,22 @@ module Server = struct
             connection_context
             { sw; session_failed = record_failure }
             (fun () ->
+               Option.iter
+                 (fun stop ->
+                    Fiber.fork_daemon ~sw (fun () ->
+                      Promise.await stop;
+                      drain ();
+                      (match grace with
+                      | Some seconds ->
+                        time.sleep seconds;
+                        Switch.fail sw Grace_over
+                      | None -> Fiber.await_cancel ());
+                      `Stop_daemon))
+                 stop;
                IO_loop.start
                  (module Observed)
                  ~read_buffer_size:config.read_buffer_size
+                 ~sw
                  ~time
                  ~timeout:
                    { IO_loop.timed =
@@ -993,22 +1063,18 @@ module Server = struct
                    ; ended
                    ; expire
                    }
-                 ~linger:(fun () -> not !close_expired)
+                 ~linger:(fun () ->
+                   (not !close_expired)
+                   && Ache.Server_connection.lingers connection)
                  ?write_timeout
                  ~interrupt
                  connection
                  socket))
       in
       (match stop with
-      | None -> serve ()
-      | Some stop ->
-        if Promise.is_resolved stop then drain ();
-        Fiber.first serve (fun () ->
-          Promise.await stop;
-          drain ();
-          match grace with
-          | Some seconds -> time.sleep seconds
-          | None -> Fiber.await_cancel ()));
+      | Some stop when Promise.is_resolved stop -> drain ()
+      | Some _ | None -> ());
+      (match serve () with () -> () | exception Grace_over -> ());
       Option.iter
         (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
         !failure
@@ -1249,16 +1315,18 @@ module Client = struct
     Fiber.fork ~sw (fun () ->
       Fun.protect ~finally:(Promise.resolve shutdown_u) (fun () ->
         match
-          IO_loop.start
-            (module Observed)
-            ~read_buffer_size:config.read_buffer_size
-            ~read_closed
-            ~timeout:IO_loop.no_timeout
-            ~linger:(fun () -> true)
-            ~on_read:(fun buf ~off ~len ->
-              if has_response_byte buf off (off + len) then unread := true)
-            runtime
-            socket
+          Switch.run (fun sw ->
+            IO_loop.start
+              (module Observed)
+              ~read_buffer_size:config.read_buffer_size
+              ~sw
+              ~read_closed
+              ~timeout:IO_loop.no_timeout
+              ~linger:(fun () -> true)
+              ~on_read:(fun buf ~off ~len ->
+                if has_response_byte buf off (off + len) then unread := true)
+              runtime
+              socket)
         with
         | () -> ()
         | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn

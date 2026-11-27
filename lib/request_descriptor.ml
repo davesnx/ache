@@ -542,7 +542,9 @@ let discard_budget t =
   else None
 
 let add_discarded t n = t.discarded <- t.discarded + n
-let discard_budget_spent t = discard_budget t = Some 0
+
+let discard_budget_spent t =
+  match discard_budget t with Some 0 -> true | Some _ | None -> false
 
 let flush_request_body t =
   if Body.Reader.has_pending_output t.request_body

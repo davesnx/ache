@@ -250,7 +250,7 @@ let fail o message =
   o.error <- message;
   invalid
 
-let fail_at ~eof o stop p message =
+let fail_at ~eof o (stop : int) p message =
   if p >= stop && not eof then partial else fail o message
 
 let unexpected ~eof o bs stop p where =
@@ -296,14 +296,16 @@ let version ~eof o bs stop p where =
     then unexpected ~eof o bs stop (p + 1) where
     else if not (is digit minor)
     then unexpected ~eof o bs stop (p + 2) where
-    else (
-      o.version <-
-        (match major, minor with
+    else
+      let v =
+        match major, minor with
         | '1', '1' -> Version.v1_1
         | '1', '0' -> Version.v1_0
         | _ ->
-          { Version.major = Char.code major - 48; minor = Char.code minor - 48 });
-      p + 3)
+          { Version.major = Char.code major - 48; minor = Char.code minor - 48 }
+      in
+      if o.version != v then o.version <- v;
+      p + 3
 
 let rec same bs off s i =
   i = String.length s
@@ -341,7 +343,8 @@ let request_line ~eof o bs off stop =
       let p = if p < 0 then p else end_line ~eof o bs stop p where in
       if p >= 0
       then (
-        o.meth <- meth bs off (meth_end - off) methods;
+        (let m = meth bs off (meth_end - off) methods in
+         if o.meth != m then o.meth <- m);
         o.text <-
           substring bs ~off:(meth_end + 1) ~len:(target_end - meth_end - 1));
       p
@@ -1100,6 +1103,11 @@ module Reader = struct
     | Body (b, _) -> b == body
     | Fail _ -> (match t.failed_in with Some b -> b == body | None -> false)
     | Done | Head | Head_done | Cancelled_parse -> false
+
+  let between_messages t =
+    match t.state with
+    | Done -> true
+    | Head | Head_done | Body _ | Fail _ | Cancelled_parse -> false
 
   let next t =
     match t.state with

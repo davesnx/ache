@@ -67,7 +67,12 @@ end = struct
   let is_empty t = t.front = t.back
 
   let ensure_space t =
-    if t.back = Array.length t.elements - 1
+    if t.front = t.back && t.front > 0
+    then begin
+      t.front <- 0;
+      t.back <- 0
+    end
+    else if t.back = Array.length t.elements - 1
     then begin
       let len = t.back - t.front in
       if t.front > 0

@@ -110,8 +110,11 @@ module Server : sig
       once per second in each domain. With [~date:false] no [Date] is added.
 
       Closing: when the connection stops reading (after a response with
-      [Connection: close], an error response, or a timeout), it reads and
-      discards input until the peer closes, so that unread input does not
+      [Connection: close], an error response, or a timeout) while the peer
+      may still be sending ({!Ache.Server_connection.lingers}: a request
+      partly read, input or pipelined requests left after the last one, or
+      a WebSocket closed without the client's close frame), it reads and discards
+      input until the peer closes, so that unread input does not
       make the kernel reset the connection before the peer has read the
       response (RFC 9112 §9.6). It waits at most [idle_timeout], or
       {!linger_without_idle_timeout} without [idle_timeout], after its last
@@ -121,7 +124,9 @@ module Server : sig
       still waits with [Eio.Flow.shutdown flow `Receive]. A flow whose
       [`Receive] shutdown does not end a pending read, such as a plain
       [Tls_eio] flow, keeps that read until input arrives;
-      [Ache_eio_tls.Server] passes this shutdown to the TCP flow.
+      [Ache_eio_tls.Server] passes this shutdown to the TCP flow. When every
+      request was read whole, or after a completed WebSocket close
+      handshake, it closes at once.
 
       A [shutdown] of [flow] that raises is ignored, so a flow without
       half-close (for example some TLS flows) ends the connection normally.
@@ -200,7 +205,8 @@ module Server : sig
       [close_timeout], [body_timeout], [write_timeout], [date], [stop], [grace],
       [request_handler] and [error_handler].
       [request_handler] and [error_handler] run in several domains at the
-      same time.
+      same time. A connection's response bodies must be written from the
+      domain that serves it.
 
       When [tcp_nodelay] is [true], [run] sets [TCP_NODELAY] on each
       accepted socket before it is served, so that small writes are sent at

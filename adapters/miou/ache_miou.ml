@@ -42,37 +42,201 @@ module Read_closed = struct
       Signal.wake t.ready)
 end
 
-module Deadline = struct
-  type t =
-    { mutable at : float
-    ; moved : Signal.t
-    ; mutable timer : unit Miou.t option
+(* The timers of a domain: one heap of connection deadlines, and one task, the
+   ticker, that sleeps until the earliest and marks the connections whose
+   deadline passed as [due], and wakes their main task. So a domain has one
+   sleeper in Miou's timer heap, whatever its number of connections: Miou 0.10.2
+   walks that heap on each poll. The ticker never runs a connection's action
+   (which may call the user's [error_handler] and wait): each connection runs
+   its own, so a slow action delays only its connection.
+
+   A task must be cancelled by the task that started it, and a connection may
+   end at any time, so the ticker is a child of the main task of one of the
+   connections of the domain, the leader. When the leader ends, it cancels its
+   ticker and elects another connection that has a deadline.
+
+   A connection's key in the heap is a time at which to look at it again. A
+   deadline that moves later does not change it: at the key, the connection runs
+   the action of the deadlines that passed, then schedules itself again at the
+   earliest of its deadlines. *)
+module Timers = struct
+  type entry =
+    { mutable read : float
+    ; mutable write : float
+    ; mutable key : float (* [Float.infinity] when not in the heap *)
+    ; mutable index : int
+    ; mutable due : bool (* the key passed: the connection looks at it *)
+    ; main : Signal.t (* wakes the connection's main task *)
+    ; mutable lead : bool
+    ; mutable restart : bool (* the leader's ticker sleeps too long *)
+    ; mutable removed : bool
     }
 
+  type t =
+    { mutable heap : entry array
+    ; mutable size : int
+    ; mutable leader : entry option
+    ; mutable target : float (* the ticker sleeps until then *)
+    ; parked : Signal.t (* the ticker waits there while the heap is empty *)
+    }
+
+  (* A cancelled sleep stays in Miou's timer heap until it ends: the ticker
+     sleeps at most this long, so that one cancelled leaves the heap soon. *)
   let longest_sleep = 0.5
-  let create () = { at = 0.; moved = Signal.create (); timer = None }
-  let passed t = t.at <= Unix.gettimeofday ()
 
-  let set t at ~expired =
-    t.at <- at;
-    Signal.wake t.moved;
-    if Option.is_none t.timer
-    then
-      t.timer <-
-        Some
-          (Miou.async (fun () ->
-             let rec loop () =
-               Signal.wait_until t.moved (fun () -> not (passed t));
-               while not (passed t) do
-                 Miou_unix.sleep
-                   (Float.min longest_sleep (t.at -. Unix.gettimeofday ()))
-               done;
-               Signal.wake expired;
-               loop ()
-             in
-             loop ()))
+  let entry main =
+    { read = Float.infinity
+    ; write = Float.infinity
+    ; key = Float.infinity
+    ; index = -1
+    ; due = false
+    ; main
+    ; lead = false
+    ; restart = false
+    ; removed = false
+    }
 
-  let stop t = Option.iter Miou.cancel t.timer
+  let empty = entry (Signal.create ())
+
+  let domain =
+    Domain.DLS.new_key (fun () ->
+      { heap = [||]
+      ; size = 0
+      ; leader = None
+      ; target = Float.infinity
+      ; parked = Signal.create ()
+      })
+
+  let get () = Domain.DLS.get domain
+
+  let[@inline] place t i e =
+    t.heap.(i) <- e;
+    e.index <- i
+
+  let rec sift_up t i e =
+    if i = 0
+    then place t 0 e
+    else
+      let parent = (i - 1) / 2 in
+      let p = t.heap.(parent) in
+      if e.key < p.key
+      then (
+        place t i p;
+        sift_up t parent e)
+      else place t i e
+
+  let rec sift_down t i e =
+    let left = (2 * i) + 1 in
+    if left >= t.size
+    then place t i e
+    else
+      let right = left + 1 in
+      let child =
+        if right < t.size && t.heap.(right).key < t.heap.(left).key
+        then right
+        else left
+      in
+      let c = t.heap.(child) in
+      if c.key < e.key
+      then (
+        place t i c;
+        sift_down t child e)
+      else place t i e
+
+  let remove t e =
+    let i = e.index in
+    if i >= 0
+    then (
+      e.index <- -1;
+      e.key <- Float.infinity;
+      t.size <- t.size - 1;
+      let last = t.heap.(t.size) in
+      t.heap.(t.size) <- empty;
+      if i < t.size
+      then
+        if i > 0 && last.key < t.heap.((i - 1) / 2).key
+        then sift_up t i last
+        else sift_down t i last)
+
+  let elect t e =
+    t.leader <- Some e;
+    e.lead <- true;
+    Signal.wake e.main
+
+  (* [schedule t e at] makes sure that the ticker looks at [e] at [at] at the
+     latest. *)
+  let schedule t e at =
+    if at < e.key && not e.removed
+    then (
+      e.key <- at;
+      if e.index < 0
+      then (
+        if t.size = Array.length t.heap
+        then (
+          let heap = Array.make (Int.max 16 (2 * t.size)) empty in
+          Array.blit t.heap 0 heap 0 t.size;
+          t.heap <- heap);
+        t.size <- t.size + 1;
+        sift_up t (t.size - 1) e)
+      else sift_up t e.index e;
+      match t.leader with
+      | None -> elect t e
+      | Some leader ->
+        if at < t.target
+        then
+          if t.target = Float.infinity
+          then Signal.wake t.parked
+          else (
+            (* Only the leader can cancel the sleep of its ticker. *)
+            t.target <- Float.infinity;
+            leader.restart <- true;
+            Signal.wake leader.main))
+
+  let tick t () =
+    let rec loop () =
+      let now = Unix.gettimeofday () in
+      while t.size > 0 && t.heap.(0).key <= now do
+        let e = t.heap.(0) in
+        remove t e;
+        e.due <- true;
+        Signal.wake e.main
+      done;
+      (if t.size = 0
+       then (
+         t.target <- Float.infinity;
+         Signal.wait_until t.parked (fun () -> t.size > 0))
+       else
+         let target = Float.min t.heap.(0).key (now +. longest_sleep) in
+         t.target <- target;
+         Miou_unix.sleep (target -. now));
+      loop ()
+    in
+    match loop () with
+    | () -> ()
+    | exception (Miou.Cancelled as exn) ->
+      (* The leader cancelled it, and starts another one or abdicated. *)
+      raise exn
+    | exception exn ->
+      (* Not expected: the leader starts another ticker. *)
+      t.target <- Float.infinity;
+      (match t.leader with
+      | Some leader ->
+        leader.restart <- true;
+        Signal.wake leader.main
+      | None -> ());
+      raise exn
+
+  (* [abdicate t e]: the leader [e] no longer runs the ticker. Another
+     connection that has a deadline takes over: the last of the heap, a leaf,
+     which has one of the latest keys, so that it is not the next to end. *)
+  let abdicate t e =
+    if e.lead
+    then (
+      e.lead <- false;
+      e.restart <- false;
+      t.leader <- None;
+      t.target <- Float.infinity;
+      if t.size > 0 then elect t t.heap.(t.size - 1))
 end
 
 let sleep_until at =
@@ -80,7 +244,7 @@ let sleep_until at =
     let left = at -. Unix.gettimeofday () in
     if left > 0.
     then (
-      Miou_unix.sleep (Float.min Deadline.longest_sleep left);
+      Miou_unix.sleep (Float.min Timers.longest_sleep left);
       loop ())
   in
   loop ()
@@ -152,14 +316,6 @@ module Sessions = struct
       (List.rev t.pending);
     t.pending <- []
 
-  let rec serve t ~stopped ~on_exn =
-    Signal.wait_until t.added (fun () ->
-      t.pending <> [] || not (Miou.Computation.is_running stopped));
-    start t ~on_exn;
-    if Miou.Computation.is_running stopped
-    then serve t ~stopped ~on_exn
-    else await_or_raise stopped
-
   let finish t ~on_exn ~shutdown =
     start t ~on_exn;
     if t.running <> []
@@ -201,28 +357,42 @@ struct
        trickle of bytes cannot keep a connection alive. *)
     let progress_bytes = 2048
 
+    (* The time limits on reads, without allocation to set one. [deadline now
+       `Read] is the deadline of the read that starts at [now], [Float.infinity]
+       for none; it is not called when not [timed]. [ended n] runs when a timed
+       read ends, with the bytes read (0 when it timed out), and [expire] after
+       it when its deadline passed first: it runs the action for the phase that
+       the deadline was for, and is [false] when that phase no longer applies.
+       [deadline now `Linger] bounds the linger. *)
+    type timeouts =
+      { timed : bool
+      ; deadline : float -> [ `Read | `Linger ] -> float
+      ; ended : int -> unit
+      ; expire : unit -> bool
+      }
+
     type graceful =
       { stop : unit Miou.Computation.t
       ; grace : float option
       ; drain : unit -> unit
       }
 
+    (* The main task, which calls [start], waits on [main]: for the sessions to
+       start, for the end of both loops ([stopped]), and for the ticker of the
+       domain while the connection leads. Who resolves [stopped] wakes
+       [main]. *)
     let start : type t.
       (module Ache.Runtime.ENGINE with type t = t)
       -> read_buffer_size:int
       -> read_closed:Read_closed.t
-      -> interruptible:(unit -> bool)
-      -> ?retimed:bool ref
-      -> timeout:
-           ([ `Read | `Linger ]
-            -> ([ `Idle | `Head | `Body of float -> int -> unit | `Close ]
-               * float
-               * (unit -> unit))
-                 option)
+      -> interruptible:bool
+      -> timeout:timeouts
       -> linger:(unit -> bool)
       -> ?write_timeout:float
+      -> ?interrupt:(unit -> unit) ref
       -> ?sessions:Sessions.t
       -> ?graceful:graceful
+      -> main:Signal.t
       -> stopped:[ `Done | `Abort ] Miou.Computation.t
       -> t
       -> Io.socket
@@ -232,12 +402,13 @@ struct
        ~read_buffer_size
        ~read_closed
        ~interruptible
-       ?(retimed = ref false)
        ~timeout
        ~linger:lingers
        ?write_timeout
+       ?interrupt
        ?sessions
        ?graceful
+       ~main
        ~stopped
        t
        socket ->
@@ -267,9 +438,7 @@ struct
       in
       let complete outcome =
         ignore (Miou.Computation.try_return stopped outcome : bool);
-        Option.iter
-          (fun sessions -> Signal.wake sessions.Sessions.added)
-          sessions
+        Signal.wake main
       in
       let abort () = complete `Abort in
       let report_exn exn =
@@ -295,9 +464,72 @@ struct
         await_or_raise waker
       in
       let read_buffer = Buffer.create read_buffer_size in
-      let idle_deadline = Deadline.create ()
-      and head_deadline = Deadline.create ()
-      and close_deadline = Deadline.create () in
+      (* The read and write deadlines live in [entry], in the timers of the
+         domain. Setting one later than its key costs nothing: no task wakes. *)
+      let timers = Timers.get () in
+      let entry = Timers.entry main in
+      let set_read deadline =
+        entry.read <- deadline;
+        Timers.schedule timers entry deadline
+      and set_write deadline =
+        entry.write <- deadline;
+        Timers.schedule timers entry deadline
+      in
+      (* [reading]: the read loop waits in a read. [lingering]: reading ended
+         for good, and reads only drop input until it ends. *)
+      let reading = ref false
+      and lingering = ref false
+      and expire_failed = ref None in
+      (* Reading ended for good while a read waits: a timeout action ran. The
+         read is not cancelled, which a TLS read would keep as an error: it and
+         the reads after it drop their input, and the linger deadline ends them
+         by shutting down the receive side. *)
+      let stop_reading () =
+        lingering := true;
+        if lingers ()
+        then set_read (timeout.deadline (Unix.gettimeofday ()) `Linger)
+        else shutdown_once SHUTDOWN_RECEIVE
+      in
+      (* The write clock runs while output waits to be written. It restarts when
+         all of it is written, and after each [progress_bytes] bytes written. *)
+      let write_clock = ref false
+      and written = ref 0
+      and in_writev = ref false in
+      (* [fire now] runs the action of the deadlines that passed, in a task of
+         the connection (see [run_due]). *)
+      let fire now =
+        if entry.read <= now
+        then (
+          entry.read <- Float.infinity;
+          if !lingering
+          then
+            (* The linger ends, unless the response is still being written. *)
+            if !send_shut
+            then shutdown_once SHUTDOWN_RECEIVE
+            else set_read (timeout.deadline now `Linger)
+          else
+            match
+              timeout.ended 0;
+              timeout.expire ()
+            with
+            | true -> stop_reading ()
+            | false ->
+              (* The phase changed while the read waited: the read goes on, with
+                 the deadline of the phase now. *)
+              set_read (timeout.deadline now `Read)
+            | exception (Miou.Cancelled as exn) -> raise exn
+            | exception exn ->
+              (* The read loop raises it when its read ends. *)
+              expire_failed := Some (exn, Printexc.get_raw_backtrace ());
+              lingering := true;
+              shutdown_once SHUTDOWN_RECEIVE);
+        if entry.write <= now
+        then (
+          entry.write <- Float.infinity;
+          if !write_clock then abort ())
+      in
+      (* A read in a reader task, so that [read_closed] can end the wait for it
+         (the client). *)
       let pending_read = ref false
       and read_requested = ref false
       and read_result = ref None
@@ -322,98 +554,124 @@ struct
                  in
                  loop ()))
       in
-      (* [timed_read get_limit] reads with the limit that [get_limit] gives.
-         When [retimed] is set while the read waits, the limit may have changed
-         (a WebSocket started its closing handshake): the wait asks again. *)
-      let timed_read get_limit =
-        let limit = get_limit () in
-        retimed := false;
-        if (not (interruptible ())) && Option.is_none limit && not !pending_read
-        then Ok (read socket read_buffer)
-        else
-          let started = Unix.gettimeofday () in
-          let waited limit n =
-            match limit with
-            | Some (`Body progress, _, _) ->
-              progress (Unix.gettimeofday () -. started) n
-            | Some ((`Idle | `Head | `Close), _, _) | None -> ()
-          in
-          let rec wait limit =
-            let deadline =
-              Option.map
-                (fun (kind, at, _) ->
-                   let deadline =
-                     match kind with
-                     | `Idle | `Body _ -> idle_deadline
-                     | `Head -> head_deadline
-                     | `Close -> close_deadline
-                   in
-                   Deadline.set deadline at ~expired:read_closed.ready;
-                   deadline)
-                limit
-            in
-            Signal.wait_until read_closed.ready (fun () ->
-              Option.is_some !read_result
-              || read_closed.closed
-              || !retimed
-              || Option.fold ~none:false ~some:Deadline.passed deadline);
-            if
-              !retimed
-              && Option.is_none !read_result
-              && (not read_closed.closed)
-              && not (Option.fold ~none:false ~some:Deadline.passed deadline)
-            then (
-              let limit = get_limit () in
-              retimed := false;
-              wait limit)
-            else limit
-          in
-          let limit =
-            if Option.is_none !read_result
-            then (
-              if read_closed.closed then raise End_of_file;
-              if not !pending_read
-              then (
-                pending_read := true;
-                read_requested := true;
-                start_reader ();
-                Signal.wake request_read);
-              wait limit)
-            else limit
-          in
-          match !read_result with
-          | Some result ->
-            read_result := None;
-            pending_read := false;
-            (match result with
-            | Ok n ->
-              waited limit n;
-              Ok n
-            | Error exn -> raise exn)
-          | None when read_closed.closed -> raise End_of_file
-          | None ->
-            waited limit 0;
-            Option.iter (fun (_, _, on_timeout) -> on_timeout ()) limit;
-            Error `Timeout
+      let await_read () =
+        if Option.is_none !read_result
+        then (
+          if read_closed.closed then raise End_of_file;
+          if not !pending_read
+          then (
+            pending_read := true;
+            read_requested := true;
+            start_reader ();
+            Signal.wake request_read);
+          Signal.wait_until read_closed.ready (fun () ->
+            Option.is_some !read_result || read_closed.closed));
+        match !read_result with
+        | None -> raise End_of_file
+        | Some result ->
+          read_result := None;
+          pending_read := false;
+          (match result with Ok n -> n | Error exn -> raise exn)
       in
-      let rec linger limit =
-        match timed_read (fun () -> limit) with
-        | Ok (_ : int) ->
-          let (_ : int) =
-            Buffer.get read_buffer ~f:(fun _ ~off:_ ~len -> len)
-          in
-          linger limit
-        | Error `Timeout -> if not !send_shut then linger (timeout `Linger)
-        | exception End_of_file -> ()
+      let read_input () =
+        if interruptible then await_read () else read socket read_buffer
+      in
+      let drop () =
+        let (_ : int) = Buffer.get read_buffer ~f:(fun _ ~off:_ ~len -> len) in
+        ()
+      in
+      let raise_expire_failed () =
+        match !expire_failed with
+        | Some (exn, bt) ->
+          expire_failed := None;
+          Printexc.raise_with_backtrace exn bt
+        | None -> ()
+      in
+      Option.iter
+        (fun interrupt ->
+           interrupt :=
+             fun () ->
+               (* The core's read state changed while a read waits: a new phase
+                  (the server's close frame starts [`Close]) gives it its
+                  deadline at once. *)
+               if !reading && not !lingering
+               then
+                 match Runtime.next_read_operation t with
+                 | `Close ->
+                   entry.read <- Float.infinity;
+                   stop_reading ()
+                 | `Read | `Yield ->
+                   if timeout.timed
+                   then (
+                     let now = Unix.gettimeofday () in
+                     timeout.ended 0;
+                     entry.read <- Float.infinity;
+                     set_read (timeout.deadline now `Read)))
+        interrupt;
+      (* [Error `Timeout]: the read gave the core neither input nor its end. *)
+      let timed_read () =
+        (* The core reads again after a timeout action (none does): the reads
+           give it their input again. *)
+        if !lingering
+        then (
+          lingering := false;
+          entry.read <- Float.infinity);
+        if not timeout.timed
+        then Ok (read_input ())
+        else
+          let start = Unix.gettimeofday () in
+          let deadline = timeout.deadline start `Read in
+          if deadline <= start
+          then (
+            timeout.ended 0;
+            let (_ : bool) = timeout.expire () in
+            Error `Timeout)
+          else (
+            set_read deadline;
+            reading := true;
+            match read_input () with
+            | n ->
+              reading := false;
+              if !lingering
+              then (
+                raise_expire_failed ();
+                drop ();
+                Error `Timeout)
+              else (
+                entry.read <- Float.infinity;
+                timeout.ended n;
+                Ok n)
+            | exception exn ->
+              reading := false;
+              if !lingering
+              then (
+                raise_expire_failed ();
+                match exn with
+                | End_of_file -> Error `Timeout
+                | exn -> raise exn)
+              else (
+                entry.read <- Float.infinity;
+                raise exn))
+      in
+      let linger () =
+        if not !lingering
+        then (
+          lingering := true;
+          set_read (timeout.deadline (Unix.gettimeofday ()) `Linger));
+        let rec drop_input () =
+          match read_input () with
+          | (_ : int) ->
+            drop ();
+            drop_input ()
+          | exception End_of_file -> ()
+        in
+        if not !receive_shut then drop_input ();
+        entry.read <- Float.infinity
       in
       let rec read_loop () =
         match Runtime.next_read_operation t with
         | `Read ->
-          (match
-             if Buffer.unread read_buffer
-             then Ok 0
-             else timed_read (fun () -> timeout `Read)
-           with
+          (match if Buffer.unread read_buffer then Ok 0 else timed_read () with
           | Ok (_ : int) ->
             let (_ : int) = Buffer.get read_buffer ~f:(Runtime.read t) in
             ()
@@ -432,19 +690,12 @@ struct
         | `Close ->
           if not read_closed.closed
           then (
-            if lingers () then linger (timeout `Linger);
+            if lingers () then linger ();
             shutdown_once SHUTDOWN_RECEIVE;
             Read_closed.close read_closed)
       in
-      (* The write clock runs while output waits to be written. It restarts when
-         all of it is written, and after each [progress_bytes] bytes written. *)
-      let write_clock = ref false
-      and write_deadline = ref 0.
-      and written = ref 0
-      and in_writev = ref false
-      and write_armed = Signal.create () in
       let restart_write_clock limit =
-        write_deadline := Unix.gettimeofday () +. limit;
+        set_write (Unix.gettimeofday () +. limit);
         written := 0
       in
       let rec write_loop () =
@@ -453,8 +704,7 @@ struct
           (match write_timeout with
           | Some limit when not !write_clock ->
             write_clock := true;
-            restart_write_clock limit;
-            Signal.wake write_armed
+            restart_write_clock limit
           | Some _ | None -> ());
           in_writev := true;
           let result = writev socket io_vectors in
@@ -468,30 +718,13 @@ struct
           write_loop ()
         | `Yield ->
           write_clock := false;
+          entry.write <- Float.infinity;
           yield Runtime.yield_writer;
           write_loop ()
         | `Close _ ->
           write_clock := false;
+          entry.write <- Float.infinity;
           shutdown_once SHUTDOWN_SEND
-      in
-      let write_watchdog =
-        Option.map
-          (fun (_ : float) ->
-             Miou.async (fun () ->
-               let rec loop () =
-                 Signal.wait_until write_armed (fun () -> !write_clock);
-                 let rec sleep () =
-                   let left = !write_deadline -. Unix.gettimeofday () in
-                   if left > 0.
-                   then (
-                     Miou_unix.sleep (Float.min Deadline.longest_sleep left);
-                     sleep ())
-                 in
-                 sleep ();
-                 if !write_clock then abort () else loop ()
-               in
-               loop ()))
-          write_timeout
       in
       let read_task () =
         (match read_loop () with
@@ -502,10 +735,8 @@ struct
           then (
             shutdown_once SHUTDOWN_RECEIVE;
             Read_closed.close read_closed));
-        Option.iter Miou.cancel !reader;
-        Deadline.stop idle_deadline;
-        Deadline.stop head_deadline;
-        Deadline.stop close_deadline
+        entry.read <- Float.infinity;
+        Option.iter Miou.cancel !reader
       and write_task () =
         match write_loop () with () -> () | exception exn -> fail exn
       in
@@ -547,12 +778,75 @@ struct
       let session_failed exn bt =
         if Option.is_none !unreported then unreported := Some (exn, bt)
       in
-      (match
-         match sessions with
-         | None -> await_or_raise stopped
-         | Some sessions ->
-           Sessions.serve sessions ~stopped ~on_exn:session_failed
-       with
+      let ticker = ref None in
+      let lead () =
+        if entry.lead
+        then
+          match !ticker with
+          | None -> ticker := Some (Miou.async (Timers.tick timers))
+          | Some old when entry.restart ->
+            entry.restart <- false;
+            Miou.cancel old;
+            ticker := Some (Miou.async (Timers.tick timers))
+          | Some _ -> ()
+      in
+      (* The action of a deadline runs in its own task: it may wait (the
+         [error_handler] of a 408), while the main task goes on leading the
+         ticker and starting sessions. One runs at a time. *)
+      let action = ref None
+      and action_ended = ref false in
+      let reschedule () =
+        Timers.schedule timers entry (Float.min entry.read entry.write)
+      in
+      let run_due () =
+        (match !action with
+        | Some task when !action_ended ->
+          action := None;
+          action_ended := false;
+          let (_ : (unit, exn) result) = Miou.await task in
+          reschedule ()
+        | Some _ | None -> ());
+        if entry.due && Option.is_none !action
+        then (
+          entry.due <- false;
+          let now = Unix.gettimeofday () in
+          if entry.read <= now || entry.write <= now
+          then
+            action :=
+              Some
+                (Miou.async (fun () ->
+                   Fun.protect
+                     ~finally:(fun () ->
+                       action_ended := true;
+                       Signal.wake main)
+                     (fun () -> fire now)))
+          else reschedule ())
+      in
+      let rec serve () =
+        Signal.wait_until main (fun () ->
+          (not (Miou.Computation.is_running stopped))
+          || (match sessions with
+            | Some sessions -> sessions.Sessions.pending <> []
+            | None -> false)
+          || (entry.lead && (Option.is_none !ticker || entry.restart))
+          || (entry.due && Option.is_none !action)
+          || !action_ended);
+        Option.iter (Sessions.start ~on_exn:session_failed) sessions;
+        lead ();
+        run_due ();
+        if Miou.Computation.is_running stopped
+        then serve ()
+        else await_or_raise stopped
+      in
+      (* The connection leaves the timers of the domain before its socket is
+         closed. *)
+      let leave () =
+        entry.removed <- true;
+        Timers.remove timers entry;
+        Timers.abdicate timers entry
+      in
+      Fun.protect ~finally:leave @@ fun () ->
+      (match serve () with
       | `Abort ->
         Miou.cancel reading;
         Miou.cancel writing;
@@ -573,6 +867,11 @@ struct
           Miou.await_all [ reading; writing ]
         in
         ());
+      leave ();
+      Option.iter Miou.cancel !ticker;
+      ticker := None;
+      Option.iter Miou.cancel !action;
+      action := None;
       Option.iter
         (fun sessions ->
            Sessions.finish sessions ~on_exn:session_failed ~shutdown:(fun () ->
@@ -580,7 +879,6 @@ struct
              | Miou.Cancelled as exn -> raise exn
              | _ -> ()))
         sessions;
-      Option.iter Miou.cancel write_watchdog;
       Option.iter Miou.cancel watcher;
       Option.iter
         (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
@@ -625,9 +923,6 @@ struct
       check_timeout "write_timeout" write_timeout;
       check_timeout "close_timeout" close_timeout;
       check_timeout "grace" grace;
-      let untimed =
-        Option.is_none idle_timeout && Option.is_none head_timeout
-      in
       (* With an idle timeout of at least 1 s, persistent responses announce it
          in [Keep-Alive: timeout=n], and the idle timer between requests runs 1
          s longer, so that a client that trusts the hint does not write into a
@@ -637,16 +932,20 @@ struct
         | Some seconds when seconds >= 1. -> Some (int_of_float seconds)
         | Some _ | None -> None
       in
+      let timed =
+        Option.is_some idle_timeout
+        || Option.is_some head_timeout
+        || Option.is_some body_timeout
+        || Option.is_some close_timeout
+      in
       let serve socket client_addr =
         let head_deadline = ref None
         and close_deadline = ref None
-        and retimed = ref false
         and close_aborted = ref false
-        and websocket = ref None
         and read_closed = Read_closed.create ()
-        and last_request = ref None
         and body_spent = ref 0.
         and body_received = ref 0
+        and body_start = ref 0.
         and error_handler_failure = ref None
         and sessions = Sessions.create () in
         let with_sessions = Sessions.with_current sessions in
@@ -667,97 +966,52 @@ struct
             ?keep_alive_timeout
             (fun reqd ->
                head_deadline := None;
-               last_request := Some reqd;
-               websocket := None;
                body_spent := 0.;
                body_received := 0;
                with_sessions (fun () -> request_handler client_addr reqd))
         in
-        (* [`Idle] after a [101] is the idle timeout of a WebSocket. *)
+        (* [`Idle] after an upgrade is the idle timeout of a WebSocket or
+           another protocol, which announces nothing. *)
         let upgraded () =
-          match Option.bind !last_request Ache.Request_descriptor.response with
-          | Some { status = `Switching_protocols; _ } -> true
-          | Some _ | None -> false
+          match Ache.Server_connection.upgrade_state connection with
+          | `Websocket | `Other -> true
+          | `None -> false
+        (* Only a WebSocket ([Ache.Websocket.upgrade]) reaches [`Close]. *)
+        and is_websocket () =
+          match Ache.Server_connection.upgrade_state connection with
+          | `Websocket -> true
+          | `None | `Other -> false
         in
-        (* [is_websocket ()] is [true] after the [101] of
-           [Ache.Websocket.upgrade]. The answer is kept once the response of the
-           request is known, so plain HTTP and other upgrades check it once. *)
-        let is_websocket () =
-          match !websocket with
-          | Some answer -> answer
-          | None ->
-            (match
-               Option.bind !last_request Ache.Request_descriptor.response
-             with
-            | None -> false
-            | Some { status = `Switching_protocols; headers; _ } ->
-              let answer =
-                match Ache.Headers.get headers "upgrade" with
-                | Some value -> String.lowercase_ascii value = "websocket"
-                | None -> false
-              in
-              websocket := Some answer;
-              answer
-            | Some _ ->
-              websocket := Some false;
-              false)
-        in
+        let interrupt = ref ignore in
         (* The close deadline is set the first time the connection is seen
-           waiting for the client's close frame, and never moves after. *)
-        let watch_close =
-          match close_timeout with
-          | None -> fun () -> false
-          | Some _ ->
-            fun () -> Option.is_none !close_deadline && is_websocket ()
-        in
-        let start_close () =
+           waiting for the client's close frame, and never moves after. A read
+           that waits takes it at once. *)
+        let start_close now =
           match close_timeout, !close_deadline with
           | Some seconds, None ->
-            close_deadline := Some (Unix.gettimeofday () +. seconds);
-            retimed := true;
-            Signal.wake read_closed.ready
+            close_deadline := Some (now +. seconds);
+            !interrupt ()
           | Some _, Some _ | None, _ -> ()
-        in
-        let observe () =
-          if Option.is_some head_timeout || watch_close ()
-          then
-            match Ache.Server_connection.read_timeout connection with
-            | Some (`Head, _) ->
-              (match head_timeout with
-              | Some seconds when Option.is_none !head_deadline ->
-                head_deadline := Some (Unix.gettimeofday () +. seconds)
-              | Some _ | None -> ())
-            | Some (`Close, _) ->
-              head_deadline := None;
-              start_close ()
-            | Some ((`Idle | `Body), _) | None -> head_deadline := None
         in
         (* The close clock starts when the server's close frame is queued,
            whatever queued it ({!Ache.Websocket.close} from the session, or the
            close at the end of the session). The read task may wait with the
            idle limit then, so the write task, which the frame wakes, sets the
-           deadline and wakes the read. Drain and the idle timeout close through
-           the core's [fail], which stops reading: the connection ends at once,
-           without a close deadline. *)
+           deadline. Drain and the idle timeout close through the core's [fail],
+           which stops reading: the connection ends at once, without a close
+           deadline. *)
         let observe_write () =
-          if watch_close ()
+          if
+            Option.is_some close_timeout
+            && Option.is_none !close_deadline
+            && is_websocket ()
           then
             match Ache.Server_connection.read_timeout connection with
-            | Some (`Close, _) -> start_close ()
+            | Some (`Close, _) -> start_close (Unix.gettimeofday ())
             | Some ((`Idle | `Head | `Body), _) | None -> ()
         in
         let module Observed = struct
           include Ache.Server_connection
-
-          let read t bs ~off ~len =
-            let n = read t bs ~off ~len in
-            observe ();
-            n
-
-          let read_eof t bs ~off ~len =
-            let n = read_eof t bs ~off ~len in
-            observe ();
-            n
 
           let next_write_operation t =
             let operation = next_write_operation t in
@@ -765,80 +1019,101 @@ struct
             operation
         end
         in
-        let timeout = function
+        (* The phase whose deadline the read in progress has. Its action depends
+           on the state when the deadline passes. *)
+        let armed : [ `None | `Idle | `Head | `Body | `Close ] ref =
+          ref `None
+        in
+        let deadline now = function
           | `Linger ->
-            Some
-              ( `Idle
-              , Unix.gettimeofday ()
-                +. Option.value
-                     idle_timeout
-                     ~default:linger_without_idle_timeout
-              , ignore )
+            now
+            +. Option.value idle_timeout ~default:linger_without_idle_timeout
           | `Read ->
-            observe ();
-            (match Ache.Server_connection.read_timeout connection with
-            | Some (`Idle, on_timeout) ->
-              (* The idle timeout of a WebSocket announces nothing. *)
-              let upgraded = upgraded () in
-              Option.map
-                (fun seconds ->
-                   let seconds =
-                     if Option.is_some keep_alive_timeout && not upgraded
-                     then seconds +. 1.
-                     else seconds
-                   in
-                   `Idle, Unix.gettimeofday () +. seconds, on_timeout)
-                idle_timeout
-            | Some (`Head, on_timeout) ->
-              Option.map
-                (fun deadline -> `Head, deadline, on_timeout)
-                !head_deadline
+            let phase = Ache.Server_connection.read_timeout connection in
+            armed := `None;
+            (* The head clock starts when a read starts in the [`Head] phase,
+               right after the read that brought the first bytes of a head. *)
+            (match head_timeout, phase with
+            | Some seconds, Some (`Head, _) ->
+              if Option.is_none !head_deadline
+              then head_deadline := Some (now +. seconds)
+            | Some _, Some ((`Idle | `Body | `Close), _) | Some _, None ->
+              head_deadline := None
+            | None, _ -> ());
+            (match phase with
+            | Some (`Idle, _) ->
+              (match idle_timeout with
+              | Some seconds ->
+                armed := `Idle;
+                (* The idle timeout of a WebSocket announces nothing. *)
+                if Option.is_some keep_alive_timeout && not (upgraded ())
+                then now +. seconds +. 1.
+                else now +. seconds
+              | None -> Float.infinity)
+            | Some (`Head, _) ->
+              (match !head_deadline with
+              | Some deadline ->
+                armed := `Head;
+                deadline
+              | None -> Float.infinity)
             | Some (`Body, _) ->
               (* The body clock counts only the time spent waiting for body
                  bytes, and restarts after [progress_bytes] bytes. *)
-              Option.map
-                (fun limit ->
-                   let progress elapsed n =
-                     body_spent := !body_spent +. elapsed;
-                     body_received := !body_received + n;
-                     if !body_received >= IO_loop.progress_bytes
-                     then (
-                       body_spent := 0.;
-                       body_received := 0)
-                   and expire () =
-                     body_spent := 0.;
-                     body_received := 0;
-                     match Ache.Server_connection.read_timeout connection with
-                     | Some (`Body, expire) -> expire ()
-                     | Some ((`Idle | `Head | `Close), _) | None -> ()
-                   in
-                   ( `Body progress
-                   , Unix.gettimeofday () +. limit -. !body_spent
-                   , expire ))
-                body_timeout
+              (match body_timeout with
+              | Some limit ->
+                armed := `Body;
+                body_start := now;
+                now +. limit -. !body_spent
+              | None -> Float.infinity)
             | Some (`Close, _) ->
-              let expire () =
-                match Ache.Server_connection.read_timeout connection with
-                | Some (`Close, abort) ->
-                  (* Our close frame is written: close without lingering. *)
-                  close_aborted := true;
-                  abort ()
-                | Some ((`Idle | `Head | `Body), _) | None -> ()
-              in
-              Option.map (fun at -> `Close, at, expire) !close_deadline
-            | None -> None)
+              start_close now;
+              (match !close_deadline with
+              | Some deadline ->
+                armed := `Close;
+                deadline
+              | None -> Float.infinity)
+            | None -> Float.infinity)
+        in
+        let ended n =
+          match !armed with
+          | `Body ->
+            body_spent := !body_spent +. (Unix.gettimeofday () -. !body_start);
+            body_received := !body_received + n;
+            if !body_received >= IO_loop.progress_bytes
+            then (
+              body_spent := 0.;
+              body_received := 0)
+          | `Idle | `Head | `Close | `None -> ()
+        in
+        let expire () =
+          match Ache.Server_connection.read_timeout connection with
+          | Some (phase, action)
+            when (phase :> [ `None | `Idle | `Head | `Body | `Close ]) == !armed
+            ->
+            (match phase with
+            | `Body ->
+              body_spent := 0.;
+              body_received := 0
+            | `Close ->
+              (* Our close frame is written: close without lingering. *)
+              close_aborted := true
+            | `Idle | `Head -> ());
+            action ();
+            true
+          | Some _ | None -> false
         in
         IO_loop.start
           (module Observed)
           ~read_buffer_size:config.read_buffer_size
           ~read_closed
-          ~interruptible:(fun () ->
-            Option.is_some close_timeout && is_websocket ())
-          ~retimed
-          ~timeout
-          ~linger:(fun () -> (not untimed) && not !close_aborted)
+          ~interruptible:false
+          ~timeout:{ IO_loop.timed; deadline; ended; expire }
+          ~linger:(fun () ->
+            (not !close_aborted) && Ache.Server_connection.lingers connection)
           ?write_timeout
+          ~interrupt
           ~sessions
+          ~main:sessions.added
           ?graceful:
             (Option.map
                (fun stop ->
@@ -868,6 +1143,7 @@ struct
       ; runtime : Upgradable.t
       ; read_closed : Read_closed.t
       ; stopped : [ `Done | `Abort ] Miou.Computation.t
+      ; main : Signal.t
       ; task : unit Miou.t
       ; mutable awaited : bool
       ; socket : socket
@@ -895,34 +1171,38 @@ struct
       in
       let read_closed = Read_closed.create ()
       and stopped = Miou.Computation.create ()
+      and main = Signal.create ()
       and reuse = { deadline = None; upgraded = false } in
       (* Before each read, arm the reuse deadline once a response has given a
          hint; the read then waits at most until the deadline. *)
-      let timeout = function
-        | `Linger -> None
-        | `Read when reuse.upgraded -> None
+      let armed = ref Float.infinity in
+      let deadline now = function
+        | `Linger -> Float.infinity
+        | `Read when reuse.upgraded ->
+          armed := Float.infinity;
+          Float.infinity
         | `Read ->
+          armed := Float.infinity;
           (match Ache.Client_connection.reuse_timeout connection with
-          | None -> None
+          | None -> ()
           | Some seconds ->
-            let deadline =
-              match reuse.deadline with
-              | Some deadline -> deadline
-              | None ->
-                let deadline = Unix.gettimeofday () +. seconds in
-                reuse.deadline <- Some deadline;
-                deadline
-            in
-            let expire () =
-              match reuse.deadline with
-              | Some current
-                when current = deadline
-                     && Option.is_some
-                          (Ache.Client_connection.reuse_timeout connection) ->
-                close_idle runtime read_closed
-              | Some _ | None -> ()
-            in
-            Some (`Idle, deadline, expire))
+            armed :=
+              (match reuse.deadline with
+                | Some deadline -> deadline
+                | None ->
+                  let deadline = now +. seconds in
+                  reuse.deadline <- Some deadline;
+                  deadline));
+          !armed
+      and expire () =
+        match reuse.deadline with
+        | Some current
+          when Float.equal current !armed
+               && Option.is_some
+                    (Ache.Client_connection.reuse_timeout connection) ->
+          close_idle runtime read_closed;
+          true
+        | Some _ | None -> false
       in
       let task =
         Miou.async (fun () ->
@@ -930,9 +1210,10 @@ struct
             (module Upgradable)
             ~read_buffer_size:config.read_buffer_size
             ~read_closed
-            ~interruptible:(fun () -> true)
-            ~timeout
+            ~interruptible:true
+            ~timeout:{ IO_loop.timed = true; deadline; ended = ignore; expire }
             ~linger:(fun () -> true)
+            ~main
             ~stopped
             runtime
             socket)
@@ -941,6 +1222,7 @@ struct
       ; runtime
       ; read_closed
       ; stopped
+      ; main
       ; task
       ; awaited = false
       ; socket
@@ -982,6 +1264,7 @@ struct
       Read_closed.close t.read_closed;
       Upgradable.shutdown t.runtime;
       ignore (Miou.Computation.try_return t.stopped `Abort : bool);
+      Signal.wake t.main;
       if not t.awaited
       then (
         t.awaited <- true;

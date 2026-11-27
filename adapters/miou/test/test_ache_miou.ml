@@ -1064,6 +1064,49 @@ let test_websocket_close_timeout_no_linger () =
       (await ended);
     Miou_unix.close socket)
 
+(* After a completed close handshake the server ends the TCP connection first
+   (RFC 6455 7.1.1, decision 0019): the client, which keeps its socket open
+   without sending FIN, sees the end of input within 100 ms. [~server_first]:
+   the server sends the first close frame; otherwise the client does. *)
+let test_websocket_close_handshake_fin ~server_first () =
+  let ended = wait_ws_end () in
+  with_server ~idle_timeout:30. ~close_timeout:30. (fun addr ->
+    let socket = ws_connect addr "/ws-echo" in
+    let from =
+      if server_first
+      then (
+        send socket (ws_frame 0x1 "close-me");
+        Alcotest.(check (pair int string))
+          "close 1001"
+          (0x88, "\x03\xe9")
+          (read_ws_frame socket);
+        let from = Unix.gettimeofday () in
+        send socket (ws_frame 0x8 "\x03\xe8");
+        from)
+      else
+        let from = Unix.gettimeofday () in
+        send socket (ws_frame 0x8 "\x03\xe8bye");
+        Alcotest.(check (pair int string))
+          "close echoed"
+          (0x88, "\x03\xe8")
+          (read_ws_frame socket);
+        from
+    in
+    Alcotest.(check bool) "end of input" true (at_end_of_input socket);
+    check_elapsed "end of input" ~from ~min:0. ~max:0.1;
+    (* Nothing may follow the client's close frame (decision 0024): the
+       connection ends without waiting for the client's FIN. *)
+    with_timeout 2.0 wait_connection_done;
+    check_elapsed "connection ended" ~from ~min:0. ~max:0.1;
+    Miou_unix.close socket;
+    Alcotest.(check (result string reject))
+      "session"
+      (Ok
+         (if server_first
+          then "closed, client close 1000 \"\""
+          else "receive None, client close 1000 \"bye\""))
+      (await ended))
+
 let test_websocket_close_timeout_silent ?idle_timeout () =
   let ended = wait_ws_end () in
   with_server ?idle_timeout ~close_timeout:0.2 (fun addr ->
@@ -1632,29 +1675,52 @@ let test_cancel_is_not_an_error () =
     Miou_unix.close client);
   Alcotest.(check int) "no error reported" 0 (List.length !server_errors)
 
-let close_without_reading_eof ?idle_timeout ?head_timeout ~linger () =
+(* The client keeps its socket open after a [Connection: close] request.
+   [after]: bytes sent after the request, which make the server linger (decision
+   0023); without them it closes at once. *)
+let close_without_reading_eof
+      ?idle_timeout
+      ?head_timeout
+      ?(after = "")
+      ~linger
+      ()
+  =
   with_server ?idle_timeout ?head_timeout (fun addr ->
     let socket = connect addr in
     send
       socket
-      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n";
+      ("GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+      ^ after);
+    let from = Unix.gettimeofday () in
     Alcotest.(check string)
       "response"
       hello_response_close
       (take socket (String.length hello_response_close));
-    let from = Unix.gettimeofday () in
+    Alcotest.(check bool) "end of input" true (at_end_of_input socket);
     wait_connection_done ();
-    check_elapsed "linger" ~from ~min:(linger -. 0.05) ~max:(linger +. 0.5);
+    if linger = 0.
+    then check_elapsed "closed at once" ~from ~min:0. ~max:0.1
+    else check_elapsed "linger" ~from ~min:(linger -. 0.05) ~max:(linger +. 0.5);
     Miou_unix.close socket)
 
 let test_no_linger_without_timeouts () = close_without_reading_eof ~linger:0. ()
 
+let test_no_linger_with_idle_timeout () =
+  close_without_reading_eof ~idle_timeout:30. ~linger:0. ()
+
 let test_linger_bounded_by_idle_timeout () =
-  close_without_reading_eof ~idle_timeout:0.3 ~linger:0.3 ()
+  close_without_reading_eof ~idle_timeout:0.3 ~after:"GET /next" ~linger:0.3 ()
 
 let test_linger_bounded_without_idle_timeout () =
   close_without_reading_eof
     ~head_timeout:5.
+    ~after:"GET /next"
+    ~linger:Ache_miou.Server.linger_without_idle_timeout
+    ()
+
+let test_linger_bounded_without_timeouts () =
+  close_without_reading_eof
+    ~after:"GET /next"
     ~linger:Ache_miou.Server.linger_without_idle_timeout
     ()
 
@@ -1663,7 +1729,7 @@ let test_linger_ends_at_peer_close () =
     let socket = connect addr in
     send
       socket
-      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n";
+      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\nx";
     Alcotest.(check string)
       "response"
       hello_response_close
@@ -1710,7 +1776,7 @@ let test_linger_not_renewed_by_input () =
     let socket = connect addr in
     send
       socket
-      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n";
+      "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\nx";
     Alcotest.(check string)
       "response"
       hello_response_close
@@ -1935,7 +2001,8 @@ let test_idle_timeout () =
     Alcotest.(check string) "nothing written" "" (read_all socket);
     check_elapsed "closed at the idle timeout" ~from ~min:0.25 ~max:0.6;
     wait_connection_done ();
-    check_elapsed "stops waiting for the peer to close" ~from ~min:0.55 ~max:1.2;
+    (* No request is in flight: no linger (decision 0023). *)
+    check_elapsed "ends without a linger" ~from ~min:0.25 ~max:0.6;
     Miou_unix.close socket);
   Alcotest.(check int) "no error" 0 (List.length !server_errors)
 
@@ -1990,6 +2057,79 @@ let test_head_timeout () =
     "status line"
     "HTTP/1.1 408 Request Timeout"
     (status_line output)
+
+(* Two connections of one domain on socket pairs: [idle] first, so that it leads
+   the domain's timers, then [slow], which sends a partial head and whose
+   [error_handler] waits [error_delay] before it answers 408. *)
+let with_slow_error_handler ~idle_timeout ~error_delay f =
+  Miou_unix.run ~domains:0 (fun () ->
+    with_timeout 8.0 (fun () ->
+      let pair () =
+        let client, server = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+        Miou_unix.of_file_descr client, Miou_unix.of_file_descr server
+      in
+      let error_handler _ ?request:_ _ start_response =
+        Miou_unix.sleep error_delay;
+        Body.Writer.close (start_response Headers.empty)
+      in
+      let serve socket =
+        Miou.async (fun () ->
+          Fun.protect
+            ~finally:(fun () -> Miou_unix.close socket)
+            (fun () ->
+               Ache_miou.Server.create_connection_handler
+                 ~date:false
+                 ~idle_timeout:(Some idle_timeout)
+                 ~head_timeout:(Some 0.2)
+                 ~body_timeout:None
+                 ~write_timeout:None
+                 ~close_timeout:None
+                 ~request_handler
+                 ~error_handler
+                 socket
+                 (Unix.ADDR_UNIX "")))
+      in
+      let idle_client, idle_server = pair ()
+      and slow_client, slow_server = pair () in
+      let from = Unix.gettimeofday () in
+      let idle = serve idle_server in
+      Miou_unix.sleep 0.01;
+      let slow = serve slow_server in
+      send slow_client "GET /hello HTTP/1.1\r\n";
+      f ~from ~idle_client ~slow_client;
+      Miou_unix.close idle_client;
+      Miou_unix.close slow_client;
+      let (_ : (unit, exn) result list) = Miou.await_all [ idle; slow ] in
+      ()))
+
+(* The 408 of one connection waits in its [error_handler]: the idle timeout of
+   another connection of the domain still fires on time. *)
+let test_slow_error_handler_idle_timeout () =
+  with_slow_error_handler
+    ~idle_timeout:0.5
+    ~error_delay:2.0
+    (fun ~from ~idle_client ~slow_client ->
+       Alcotest.(check bool) "closed" true (at_end_of_input idle_client);
+       check_elapsed "idle timeout" ~from ~min:0.45 ~max:1.2;
+       Alcotest.(check string)
+         "status line"
+         "HTTP/1.1 408 Request Timeout"
+         (status_line (read_all slow_client)))
+
+(* The connection that leads the domain's timers ends while another connection's
+   [error_handler] waits: its 408 is still sent. *)
+let test_leader_ends_during_408 () =
+  with_slow_error_handler
+    ~idle_timeout:5.0
+    ~error_delay:0.5
+    (fun ~from:_ ~idle_client ~slow_client ->
+       Miou_unix.sleep 0.4;
+       shutdown_send idle_client;
+       Alcotest.(check bool) "closed" true (at_end_of_input idle_client);
+       Alcotest.(check string)
+         "status line"
+         "HTTP/1.1 408 Request Timeout"
+         (status_line (read_all slow_client)))
 
 let test_head_deadline () =
   with_server ~head_timeout:0.4 (fun addr ->
@@ -2370,8 +2510,13 @@ let test_idle_timeout_then_request () =
   with_server ~idle_timeout:0.1 (fun addr ->
     let socket = connect addr in
     Miou_unix.sleep 0.15;
-    send socket get_hello;
-    shutdown_send socket;
+    (* The idle close does not linger (decision 0023): the request may meet a
+       closed socket. *)
+    (try
+       send socket get_hello;
+       shutdown_send socket
+     with
+    | Unix.Unix_error ((EPIPE | ECONNRESET | ENOTCONN), _, _) -> ());
     Alcotest.(check string) "no response" "" (read_all socket);
     wait_connection_done ();
     Miou_unix.close socket);
@@ -3491,6 +3636,12 @@ let () =
         ; ( "WebSocket close timeout: no linger after it"
           , `Quick
           , test_websocket_close_timeout_no_linger )
+        ; ( "WebSocket close handshake from the client: FIN at once"
+          , `Quick
+          , test_websocket_close_handshake_fin ~server_first:false )
+        ; ( "WebSocket close handshake from the server: FIN at once"
+          , `Quick
+          , test_websocket_close_handshake_fin ~server_first:true )
         ; "WebSocket ping", `Quick, test_websocket_ping
         ; ( "WebSocket send loop to a reset peer ends"
           , `Quick
@@ -3531,9 +3682,15 @@ let () =
         ; ( "cancelling the connection task is not an error"
           , `Quick
           , test_cancel_is_not_an_error )
-        ; ( "without a timeout the handler returns while the peer stays open"
+        ; ( "a Connection: close request read whole closes at once"
           , `Quick
           , test_no_linger_without_timeouts )
+        ; ( "a request read whole closes at once with idle_timeout"
+          , `Quick
+          , test_no_linger_with_idle_timeout )
+        ; ( "without timeouts lingering is bounded"
+          , `Quick
+          , test_linger_bounded_without_timeouts )
         ; ( "lingering is bounded by idle_timeout"
           , `Quick
           , test_linger_bounded_by_idle_timeout )
@@ -3611,6 +3768,12 @@ let () =
         ; ( "head timeout counts from the first byte of the head"
           , `Quick
           , test_head_deadline )
+        ; ( "a slow error_handler does not delay another idle timeout"
+          , `Quick
+          , test_slow_error_handler_idle_timeout )
+        ; ( "the timer leader ending does not drop another 408"
+          , `Quick
+          , test_leader_ends_during_408 )
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
         ; ( "unread body after a closing response: response, then the end"

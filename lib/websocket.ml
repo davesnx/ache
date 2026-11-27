@@ -366,7 +366,9 @@ let read_header t bs ~off ~len =
     let control = opcode >= 0x8 in
     if
       b0 land 0x70 <> 0
-      || (not (List.mem opcode [ 0x0; 0x1; 0x2; 0x8; 0x9; 0xA ]))
+      || (match opcode with
+        | 0x0 | 0x1 | 0x2 | 0x8 | 0x9 | 0xA -> false
+        | _ -> true)
       || b1 land 0x80 = 0
       || (control && ((not fin) || len7 > 125))
       || (opcode = 0x0 && not t.fragmented)
@@ -425,7 +427,7 @@ let read_header t bs ~off ~len =
         size)
 
 let read_payload t bs ~off ~len =
-  let n = min len t.remaining in
+  let n = Int.min len t.remaining in
   let control = t.opcode >= 0x8 in
   let dst = if control then t.control else t.message in
   let check = (not control) && t.text in
@@ -500,6 +502,12 @@ let read_timeout t =
     (* RFC 6455 §7.1.1: the client did not answer our close frame in time. *)
     Some (`Close, fun () -> finish t)
   | (Header | Payload), (Open | Closed) | Stopped, _ -> None
+
+(* Decision 0024: once the peer's close frame is read, our close frame answered
+   it or was sent before it, so nothing may follow (RFC 6455 §5.5.1). A close
+   without it (a protocol error, an idle timeout, a drain) may leave the peer
+   still sending. *)
+let lingers t = Option.is_none t.peer_close
 
 let yield_reader t k =
   if t.reading = Stopped then k () else t.reader_k <- Some k
@@ -673,5 +681,9 @@ let upgrade
       (Runtime.make_with_hooks
          (module Engine)
          t
-         { protocol = `Websocket; drain = (fun t -> fail t 1001); read_timeout });
+         { protocol = `Websocket
+         ; drain = (fun t -> fail t 1001)
+         ; read_timeout
+         ; lingers
+         });
     Ok ()
