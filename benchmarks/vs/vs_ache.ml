@@ -34,7 +34,7 @@ module Http = struct
   let echo ws =
     { Websocket.on_message =
         (fun message ->
-          incr Vs.requests;
+          incr (Domain.DLS.get Vs.domain_requests);
           match message with
           | Text s -> Websocket.send_text ws s
           | Binary s -> Websocket.send_binary ws s)

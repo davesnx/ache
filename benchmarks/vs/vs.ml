@@ -45,6 +45,10 @@ let new_counter () =
   register ();
   r
 
+(* The counter of the calling domain, for handlers outside [Make] (the WebSocket
+   echo counts each message as a request). *)
+let domain_requests = Domain.DLS.new_key new_counter
+
 (* Domains of the server, set by [settings]. *)
 let domains = ref 1
 
