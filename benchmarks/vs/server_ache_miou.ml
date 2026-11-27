@@ -12,40 +12,64 @@ let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   (* [--timeouts off]: every server timeout [None]. *)
   let off = if s.timeouts then None else Some None in
-  let handler =
-    Ache_miou.Server.create_connection_handler
-      ~config:(Vs_ache.config s)
+  let config = Vs_ache.config s in
+  let request_handler _ reqd = Vs_ache.Handler.handle reqd
+  and error_handler _ = Vs_ache.error_handler in
+  match s.domains with
+  | Some domains ->
+    Miou_unix.run ~domains:(domains - 1) @@ fun () ->
+    Ache_miou.Server.run
+      ~config
       ?idle_timeout:off
       ?head_timeout:off
       ?close_timeout:off
       ?body_timeout:off
       ?write_timeout:off
-      ~request_handler:(fun _ reqd -> Vs_ache.Handler.handle reqd)
-      ~error_handler:(fun _ -> Vs_ache.error_handler)
-  in
-  Miou_unix.run ~domains:0 @@ fun () ->
-  let listening = Miou_unix.tcpv4 () in
-  Miou_unix.bind_and_listen
-    ~backlog:4096
-    listening
-    (Unix.ADDR_INET (Unix.inet_addr_loopback, s.port));
-  let rec accept orphans =
-    clean_up orphans;
-    match Miou_unix.accept listening with
-    | exception Unix.Unix_error ((EMFILE | ENFILE), _, _) ->
-      Miou.yield ();
-      accept orphans
-    | socket, addr ->
-      (try
-         Unix.setsockopt (Miou_unix.to_file_descr socket) Unix.TCP_NODELAY true
-       with
-      | Unix.Unix_error _ -> ());
-      ignore
-        (Miou.async ~orphans (fun () ->
-           Fun.protect
-             ~finally:(fun () -> Miou_unix.close socket)
-             (fun () -> handler socket addr))
-         : unit Miou.t);
-      accept orphans
-  in
-  accept (Miou.orphans ())
+      ~domains
+      ~backlog:4096
+      ~tcp_nodelay:true
+      ~on_error:(fun exn -> prerr_endline (Printexc.to_string exn))
+      ~request_handler
+      ~error_handler
+      (Unix.ADDR_INET (Unix.inet_addr_loopback, s.port))
+  | None ->
+    let handler =
+      Ache_miou.Server.create_connection_handler
+        ~config
+        ?idle_timeout:off
+        ?head_timeout:off
+        ?close_timeout:off
+        ?body_timeout:off
+        ?write_timeout:off
+        ~request_handler
+        ~error_handler
+    in
+    Miou_unix.run ~domains:0 @@ fun () ->
+    let listening = Miou_unix.tcpv4 () in
+    Miou_unix.bind_and_listen
+      ~backlog:4096
+      listening
+      (Unix.ADDR_INET (Unix.inet_addr_loopback, s.port));
+    let rec accept orphans =
+      clean_up orphans;
+      match Miou_unix.accept listening with
+      | exception Unix.Unix_error ((EMFILE | ENFILE), _, _) ->
+        Miou.yield ();
+        accept orphans
+      | socket, addr ->
+        (try
+           Unix.setsockopt
+             (Miou_unix.to_file_descr socket)
+             Unix.TCP_NODELAY
+             true
+         with
+        | Unix.Unix_error _ -> ());
+        ignore
+          (Miou.async ~orphans (fun () ->
+             Fun.protect
+               ~finally:(fun () -> Miou_unix.close socket)
+               (fun () -> handler socket addr))
+           : unit Miou.t);
+        accept orphans
+    in
+    accept (Miou.orphans ())
