@@ -193,6 +193,16 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   `Connection: close` 220.1k to 70.4k. ache-eio forks its watchdog fiber
   with the first deadline and runs the write loop in the connection's
   fiber, and the ache-miou server reads without a reader task.
+- A streaming response whose body ends before the writer runs goes out in
+  one write with its final chunk. A connection that shut down right after
+  the body was closed could send it without the terminating `0\r\n\r\n`.
+- Less work on realistic requests, bodies, WebSocket messages and large
+  responses: common field names are shared strings and field values are
+  scanned 16 bytes at a time; request body buffers are reused (see
+  Breaking); WebSocket payloads are unmasked a word at a time with one copy
+  per frame; ache-eio and ache-miou servers keep connection buffers in a
+  bounded per-domain pool; ache-eio shuts sockets down with the system call
+  and does not split timed writes to a socket into 64 KiB pieces.
 - Strict parsing and framing after RFC 9110 and RFC 9112. `docs/ache.md` lists
   what the server rejects.
 - Bodies are delivered in linear time.
