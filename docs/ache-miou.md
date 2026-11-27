@@ -188,6 +188,43 @@ let () =
     Unix.(ADDR_INET (inet_addr_loopback, port))
 ```
 
+### Set the minor heap size
+
+In OCaml 5, a minor collection stops every domain, and it runs when the
+first minor heap of any domain fills. With the default minor heap of 256k
+words per domain, a keep-alive request costs 104% more user CPU at 8 domains
+than at 1 in ache's benchmark. With a minor heap of 4M words (32 MiB on
+64-bit), it costs 3% more. Set the size for every domain with
+`OCAMLRUNPARAM`:
+
+```sh
+$ OCAMLRUNPARAM=s=4M dune exec examples/miou/miou_multicore_server.exe -- 8080 8
+```
+
+`Gc.set` changes the minor heap of the calling domain only. The domains of
+`Miou_unix.run` begin with the size from `OCAMLRUNPARAM`, so to use
+`Gc.set`, call it once in each domain, for example the first time a handler
+runs there.
+
+Each domain keeps the read and write buffers of the connections that ended
+and gives them to its next connections. A domain keeps at most 4 buffer
+sizes of up to 64 KiB each, and at most 64 buffers and 256 KiB per size:
+about 320 KiB with the default `Config`. With these buffers and `s=4M`, a
+connection that closes after one request costs 16-21% more at 8 domains
+than at 1, mostly in Miou's scheduler.
+
+### Lower the open file limit
+
+Miou 0.10.2 allocates two tables of `RLIMIT_NOFILE` bytes for each domain,
+and clears them when the domain starts. Where `ulimit -n` is very large
+(2^31 in some containers), each domain allocates 4 GiB: a server with 2
+domains took 4 s of CPU to start listening, and one with 4 or 8 domains did
+not start within 10 s. Lower the limit before you start the server:
+
+```sh
+$ ulimit -n 65536
+```
+
 ## Graceful stop
 
 `Server.run`, `Server.create_connection_handler` and the TLS
