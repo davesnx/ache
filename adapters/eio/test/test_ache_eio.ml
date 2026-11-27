@@ -3759,6 +3759,19 @@ let test_write_timeout () =
     Eio.Flow.close socket);
   stream_flush_closed := None
 
+(* A client that stops reading a response of 1 MiB writes: one write fills the
+   socket buffers and waits. *)
+let test_large_write_timeout () =
+  with_server ~write_timeout:0.3 (fun ~sw ~net addr ->
+    let clock = !real_clock in
+    let socket = Eio.Net.connect ~sw net addr in
+    let start = Eio.Time.now clock in
+    Eio.Flow.copy_string "GET /big HTTP/1.1\r\nhost: localhost\r\n\r\n" socket;
+    Eio.Stream.take connections_done;
+    let elapsed = elapsed_since clock start in
+    if elapsed > 1.5 then Alcotest.failf "closed after %.3f s" elapsed;
+    Eio.Flow.close socket)
+
 let test_slow_handler_not_timed_out () =
   later_reqd := None;
   with_server
@@ -4189,6 +4202,10 @@ let () =
         ; ( "a client that stops reading is closed after write_timeout"
           , `Quick
           , test_write_timeout )
+        ; ( "a client that stops reading 1 MiB writes is closed after \
+             write_timeout"
+          , `Quick
+          , test_large_write_timeout )
         ; ( "a slow handler that reads no body is not timed out"
           , `Quick
           , test_slow_handler_not_timed_out )
