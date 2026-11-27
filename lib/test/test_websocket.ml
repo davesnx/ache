@@ -1117,8 +1117,91 @@ let test_lingers () =
   feed_eof c;
   check "end of input" false c
 
+(* Every mask phase and chunk size, so the 8-byte loop, its tail and the UTF-8
+   fast path each start at every offset. *)
+let test_unmask_alignments () =
+  let binary =
+    String.init 300 (fun i -> Char.chr (((i * 37) + 11) land 0xff))
+  in
+  let text =
+    String.concat
+      ""
+      (List.init 40 (fun i -> String.make (i mod 9) 'a' ^ "\xe2\x82\xac"))
+  in
+  let frames =
+    client_frame 0x2 binary
+    ^ client_frame 0x1 text
+    ^ client_frame ~fin:false 0x1 (String.sub text 0 13)
+    ^ client_frame 0x0 (String.sub text 13 (String.length text - 13))
+  in
+  for chunk = 1 to 17 do
+    let c = upgraded () in
+    let i = ref 0 in
+    while !i < String.length frames do
+      let n = Int.min chunk (String.length frames - !i) in
+      feed c (String.sub frames !i n);
+      i := !i + n
+    done;
+    check_message_list c [ Binary binary; Text text; Text text ];
+    check_output c "" `Yield
+  done
+
+let test_utf8_at_every_offset () =
+  for k = 0 to 24 do
+    let c = upgraded () in
+    let text = String.make k 'a' ^ "\xf0\x9f\x98\x80" ^ String.make 20 'b' in
+    feed c (client_frame 0x1 text);
+    check_messages c [ text ];
+    fails_with
+      1007
+      (client_frame 0x1 (String.make k 'a' ^ "\xff" ^ String.make 20 'a'))
+      ();
+    fails_with
+      1007
+      (client_frame 0x1 (String.make k 'a' ^ "\xe2\x82" ^ String.make 20 'a'))
+      ()
+  done
+
+let test_large_then_small () =
+  let c = upgraded () in
+  let big = String.make 70000 'b' in
+  Websocket.send_binary (ws c) big;
+  check_output c ("\x82\x7f\x00\x00\x00\x00\x00\x01\x11\x70" ^ big) `Yield;
+  Websocket.send_binary (ws c) "hi";
+  check_output ~msg:"after a large frame" c "\x82\x02hi" `Yield;
+  feed c (client_frame 0x2 (String.make 70000 'y'));
+  feed c (client_frame 0x2 "z");
+  check_message_list c [ Binary (String.make 70000 'y'); Binary "z" ]
+
+(* Frames queued while a write is in flight follow it, in order. *)
+let test_queue_during_write () =
+  let c = upgraded () in
+  Websocket.send_text (ws c) "first";
+  (match Server_connection.next_write_operation c.server with
+  | `Write [ { IOVec.buffer; off; len } ] ->
+    Alcotest.(check string)
+      "in flight"
+      "\x81\x05first"
+      (Bigstring.substring buffer ~off ~len);
+    Server_connection.report_write_result c.server (`Ok 3)
+  | _ -> Alcotest.fail "expected one write");
+  Websocket.send_text (ws c) "second";
+  Websocket.send_text (ws c) (String.make 300 'c');
+  check_output
+    c
+    ("irst" ^ "\x81\x06second" ^ "\x81\x7e\x01\x2c" ^ String.make 300 'c')
+    `Yield;
+  for i = 1 to 3 do
+    Websocket.send_text (ws c) (string_of_int i);
+    check_output c ("\x81\x01" ^ string_of_int i) `Yield
+  done
+
 let tests =
   [ "accept key", `Quick, test_accept_key
+  ; "unmask at every alignment", `Quick, test_unmask_alignments
+  ; "UTF-8 checked at every offset", `Quick, test_utf8_at_every_offset
+  ; "a large frame, then small ones", `Quick, test_large_then_small
+  ; "frames queued during a write", `Quick, test_queue_during_write
   ; "lingers", `Quick, test_lingers
   ; "upgrade state", `Quick, test_upgrade_state
   ; "a failed handshake does not upgrade", `Quick, test_upgrade_state_rejected
