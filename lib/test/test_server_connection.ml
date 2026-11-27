@@ -5091,8 +5091,84 @@ let test_lingers () =
   | _ -> Alcotest.fail "expected an idle timeout");
   check "idle timeout" false t
 
+(* A connection gives its write buffer back once its writer is closed, and only
+   once. A handler that responds after that writes nothing into the buffer,
+   which the next connection took. Sizes no other test uses, so that the pool of
+   the domain holds only these buffers. *)
+let test_release_write_buffer () =
+  let size = 0x300 in
+  let config = { Config.default with response_buffer_size = size } in
+  let pooled () = Ache.Ache_private.Buffer_pool.pooled size in
+  let release t =
+    with_server_connection t Ache.Ache_private.Server_connection.release
+  in
+  let before = pooled () in
+  let late = ref None in
+  let t = create ~config (fun reqd -> late := Some reqd) in
+  read_request t (Request.create `GET "/");
+  release t;
+  Alcotest.(check int) "an open writer keeps its buffer" before (pooled ());
+  shutdown t;
+  release t;
+  release t;
+  Alcotest.(check int) "given back once" (before + 1) (pooled ());
+  let t' = create ~config (request_handler_with_body "fresh") in
+  Alcotest.(check int) "the next connection takes it" before (pooled ());
+  read_request t' (Request.create `GET "/");
+  (match
+     Request_descriptor.respond_with_string
+       (Option.get !late)
+       (Response.create `OK)
+       (String.make 600 'X')
+   with
+  | () | (exception Failure _) -> ());
+  write_response
+    t'
+    ~body:"fresh"
+    (Response.create ~headers:(Headers.encoding_fixed 5) `OK)
+
+(* A buffer from the pool may hold bytes of an earlier connection: the core
+   reads only the bytes that the runtime put in. *)
+let test_buffer_acquire_after_release () =
+  let module Buffer = Ache.Ache_private.Runtime.Buffer in
+  let size = 0x500 in
+  let b = Buffer.acquire size in
+  Buffer.put
+    b
+    ~f:(fun bs ~off ~len k ->
+      Ache.Bigstring.blit_from_string
+        (String.make len 'Z')
+        ~src_off:0
+        bs
+        ~dst_off:off
+        ~len;
+      k len)
+    ignore;
+  Buffer.release b;
+  let seen = ref [] in
+  let get b =
+    Buffer.get b ~f:(fun bs ~off ~len ->
+      seen := Ache.Bigstring.substring bs ~off ~len :: !seen;
+      len)
+  in
+  Alcotest.(check int) "a released buffer has nothing" 0 (get b);
+  let b = Buffer.acquire size in
+  Alcotest.(check int) "a pooled buffer starts empty" 0 (get b);
+  Buffer.put
+    b
+    ~f:(fun bs ~off ~len:_ k ->
+      Ache.Bigstring.blit_from_string "abc" ~src_off:0 bs ~dst_off:off ~len:3;
+      k 3)
+    ignore;
+  Alcotest.(check int) "then the bytes put in" 3 (get b);
+  Alcotest.(check (list string)) "only them" [ "abc"; ""; "" ] !seen
+
 let tests =
   [ "initial reader state", `Quick, test_initial_reader_state
+  ; "release gives the write buffer back", `Quick, test_release_write_buffer
+  ; ( "a pooled read buffer starts empty"
+    , `Quick
+    , test_buffer_acquire_after_release )
   ; "lingers", `Quick, test_lingers
   ; "shutdown reader closed", `Quick, test_reader_is_closed_after_eof
   ; "Date added with ?date", `Quick, test_date_added

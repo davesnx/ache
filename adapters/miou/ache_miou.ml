@@ -395,7 +395,7 @@ struct
        [main]. *)
     let start : type t.
       (module Ache.Runtime.ENGINE with type t = t)
-      -> read_buffer_size:int
+      -> read_buffer:Buffer.t
       -> read_closed:Read_closed.t
       -> interruptible:bool
       -> timeout:timeouts
@@ -411,7 +411,7 @@ struct
       -> unit
       =
      fun (module Runtime)
-       ~read_buffer_size
+       ~read_buffer
        ~read_closed
        ~interruptible
        ~timeout
@@ -475,7 +475,6 @@ struct
           ignore (Miou.Computation.try_return waker () : bool));
         await_or_raise waker
       in
-      let read_buffer = Buffer.create read_buffer_size in
       (* The read and write deadlines live in [entry], in the timers of the
          domain. Setting one later than its key costs nothing: no task wakes. *)
       let timers = Timers.get () in
@@ -1124,9 +1123,10 @@ struct
             true
           | Some _ | None -> false
         in
+        let read_buffer = Buffer.acquire config.read_buffer_size in
         IO_loop.start
           (module Observed)
-          ~read_buffer_size:config.read_buffer_size
+          ~read_buffer
           ~read_closed
           ~interruptible:false
           ~timeout:{ IO_loop.timed; deadline; ended; expire }
@@ -1147,6 +1147,15 @@ struct
           ~stopped:(Miou.Computation.create ())
           connection
           socket;
+        (* [IO_loop.start] returns once its tasks ended or were cancelled (a
+           cancelled task does not run again): no read or write runs, and none
+           starts. The application keeps no bytes of the read buffer (the parser
+           and [Ache.Websocket] copy them), unless it took over the connection
+           with a protocol of its own. *)
+        (match Ache.Server_connection.upgrade_state connection with
+        | `None | `Websocket -> Buffer.release read_buffer
+        | `Other -> ());
+        Ache.Ache_private.Server_connection.release connection;
         Option.iter
           (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
           !error_handler_failure
@@ -1230,7 +1239,7 @@ struct
         Miou.async (fun () ->
           IO_loop.start
             (module Upgradable)
-            ~read_buffer_size:config.read_buffer_size
+            ~read_buffer:(Buffer.create config.read_buffer_size)
             ~read_closed
             ~interruptible:true
             ~timeout:{ IO_loop.timed = true; deadline; ended = ignore; expire }

@@ -181,7 +181,7 @@ module IO_loop = struct
 
   let start : type t.
     (module Ache.Runtime.ENGINE with type t = t)
-    -> read_buffer_size:int
+    -> read_buffer:Buffer.t
     -> sw:Switch.t
     -> ?read_closed:unit Promise.t * unit Promise.u
     -> ?time:Time.t
@@ -195,7 +195,7 @@ module IO_loop = struct
     -> unit
     =
    fun (module Runtime)
-     ~read_buffer_size
+     ~read_buffer
      ~sw
      ?read_closed
      ?time
@@ -281,7 +281,6 @@ module IO_loop = struct
         cc := None;
         raise exn
     in
-    let read_buffer = Buffer.create read_buffer_size in
     (* The watchdog: one fiber that sleeps until the nearest deadline, so that a
        read or a write that ends in time costs no timer. It starts with the
        first finite deadline, so that a connection without one forks no fiber. A
@@ -1046,7 +1045,7 @@ module Server = struct
             | None -> Float.infinity)
           | None -> Float.infinity)
       in
-      let serve () =
+      let serve read_buffer =
         Switch.run (fun sw ->
           Fiber.with_binding
             connection_context
@@ -1066,7 +1065,7 @@ module Server = struct
                  stop;
                IO_loop.start
                  (module Observed)
-                 ~read_buffer_size:config.read_buffer_size
+                 ~read_buffer
                  ~sw
                  ~time
                  ~timeout:
@@ -1090,7 +1089,20 @@ module Server = struct
       (match stop with
       | Some stop when Promise.is_resolved stop -> drain ()
       | Some _ | None -> ());
-      (match serve () with () -> () | exception Grace_over -> ());
+      (* [Switch.run] returns once every fiber of the connection ended: no read
+         or write runs, and none starts. The application keeps no bytes of the
+         read buffer (the parser and [Ache.Websocket] copy them), unless it took
+         over the connection with a protocol of its own. *)
+      let release read_buffer =
+        (match Ache.Server_connection.upgrade_state connection with
+        | `None | `Websocket -> Buffer.release read_buffer
+        | `Other -> ());
+        Ache.Ache_private.Server_connection.release connection
+      in
+      let read_buffer = Buffer.acquire config.read_buffer_size in
+      (match serve read_buffer with
+      | () -> release read_buffer
+      | exception Grace_over -> release read_buffer);
       Option.iter
         (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
         !failure
@@ -1334,7 +1346,7 @@ module Client = struct
           Switch.run (fun sw ->
             IO_loop.start
               (module Observed)
-              ~read_buffer_size:config.read_buffer_size
+              ~read_buffer:(Buffer.create config.read_buffer_size)
               ~sw
               ~read_closed
               ~timeout:IO_loop.no_timeout

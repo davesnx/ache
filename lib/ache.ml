@@ -23,6 +23,14 @@ module Ache_private = struct
     module Buffer = Runtime.Buffer
   end
 
+  module Server_connection = struct
+    let release = Server_connection.release
+  end
+
+  module Buffer_pool = struct
+    let pooled = Buffer_pool.pooled
+  end
+
   module Http_date = Http_date
 
   module Response_descriptor = struct
