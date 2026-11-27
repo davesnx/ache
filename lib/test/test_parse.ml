@@ -1462,6 +1462,77 @@ let test_empty_transfer_encoding_client () =
      0\r\n\
      \r\n"
 
+(* Common names are matched exactly and keep their spelling; any other name,
+   including a common name with other bytes around it, is scanned. *)
+let test_field_names () =
+  let names =
+    [ "Host"
+    ; "host"
+    ; "HOST"
+    ; "User-Agent"
+    ; "user-agent"
+    ; "uSER-aGENT"
+    ; "TE"
+    ; "te"
+    ; "Accept"
+    ; "Accept-Foo"
+    ; "Acceptx"
+    ; "X-Accept"
+    ; "sec-ch-ua"
+    ; "Sec-WebSocket-Extensions"
+    ; String.make 40 'a'
+    ; "A"
+    ]
+  in
+  List.iter
+    (fun name ->
+       let input =
+         Printf.sprintf "GET / HTTP/1.1\r\nHost: a\r\n%s: v\r\n\r\n" name
+       in
+       match Ache_private.Parse.Grammar.request input with
+       | Ok r ->
+         Alcotest.(check (list (pair string string)))
+           name
+           [ "Host", "a"; name, "v" ]
+           (Headers.to_list r.headers)
+       | Error e -> Alcotest.failf "%s: %s" name e)
+    names;
+  List.iter
+    (fun line ->
+       let input = "GET / HTTP/1.1\r\nHost: a\r\n" ^ line ^ "\r\n\r\n" in
+       Alcotest.(check bool)
+         line
+         true
+         (Result.is_error (Ache_private.Parse.Grammar.request input)))
+    [ "Host : a"; " Host: a"; "Ho st: a"; "Host\x00: a"; ": a" ]
+
+(* RFC 9110 §5.5: a field value is HTAB, SP to 0x7e and 0x80 to 0xff. Each byte
+   at each offset of values long and short enough for every scan path. *)
+let test_field_value_bytes () =
+  for len = 1 to 40 do
+    for at = 0 to len - 1 do
+      List.iter
+        (fun byte ->
+           let value =
+             String.init len (fun i -> if i = at then byte else 'v')
+           in
+           let input =
+             "GET / HTTP/1.1\r\nHost: a\r\nX: v" ^ value ^ "v\r\n\r\n"
+           in
+           let valid = byte = '\t' || (byte >= ' ' && byte <> '\x7f') in
+           match Ache_private.Parse.Grammar.request input, valid with
+           | Ok r, true ->
+             Alcotest.(check (option string))
+               (Printf.sprintf "%d %d %C" len at byte)
+               (Some ("v" ^ value ^ "v"))
+               (Headers.get r.headers "x")
+           | Error _, false -> ()
+           | Ok _, false | Error _, true ->
+             Alcotest.failf "%d %d %C: valid is %b" len at byte valid)
+        [ '\x00'; '\t'; '\n'; '\r'; '\x1f'; ' '; '~'; '\x7f'; '\x80'; '\xff' ]
+    done
+  done
+
 let tests =
   [ "GET at every split", `Quick, test_get
   ; "POST fixed body at every split", `Quick, test_post_fixed
@@ -1548,4 +1619,6 @@ let tests =
   ; ( "reader: a raising handler leaves no fields behind"
     , `Quick
     , test_reader_handler_raises )
+  ; "field names: common names keep their spelling", `Quick, test_field_names
+  ; "field values: each byte at each offset", `Quick, test_field_value_bytes
   ]
