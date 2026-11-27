@@ -168,10 +168,14 @@ type t =
   ; mutable utf8_need : int
   ; mutable utf8_lo : int
   ; mutable utf8_hi : int
-  ; message : Stdlib.Buffer.t
-  ; control : Stdlib.Buffer.t
-  ; pending : Stdlib.Buffer.t
+  ; mutable message : Bytes.t
+  ; mutable message_len : int
+  ; control : Bytes.t
+  ; mutable control_len : int
+  ; mutable pending : Bigstring.t
+  ; mutable pending_len : int
   ; mutable inflight : Bigstring.t
+  ; mutable inflight_len : int
   ; mutable inflight_off : int
   ; mutable queued : int
   ; mutable written : int
@@ -190,21 +194,58 @@ let wake_writer t =
   t.writer_k <- None;
   Option.iter (fun k -> k ()) k
 
+(* The read and write buffers that grow are kept up to this size, like the
+   encoder's (decision 0022): a 64 KiB message with the longest frame header. A
+   larger message or frame gets a buffer of its own, dropped once used. *)
+let max_kept_buffer = 0x10000 + 14
+
+(* The size of a buffer of [size] bytes that must now hold [need]: it doubles,
+   and stops at [max_kept_buffer] while [need] fits in it. *)
+let grown ~size ~need =
+  let doubled = Int.max need (Int.max 256 (2 * size)) in
+  if need > max_kept_buffer then doubled else Int.min max_kept_buffer doubled
+
+(* Room for [need] bytes in the frames not yet written, keeping the first
+   [pending_len]. *)
+let grow_pending t need =
+  let b = Bigstring.create (grown ~size:(Bigstring.length t.pending) ~need) in
+  Bigstring.unsafe_blit t.pending ~src_off:0 b ~dst_off:0 ~len:t.pending_len;
+  t.pending <- b
+
 let frame t ~opcode payload =
   let len = String.length payload in
-  let before = Stdlib.Buffer.length t.pending in
-  Stdlib.Buffer.add_char t.pending (Char.chr (0x80 lor opcode));
+  let header = if len < 126 then 2 else if len < 0x10000 then 4 else 10 in
+  let o = t.pending_len in
+  if Bigstring.length t.pending < o + header + len
+  then grow_pending t (o + header + len);
+  let p = t.pending in
+  Bigstring.unsafe_set p o (Char.unsafe_chr (0x80 lor opcode));
   if len < 126
-  then Stdlib.Buffer.add_char t.pending (Char.chr len)
+  then Bigstring.unsafe_set p (o + 1) (Char.unsafe_chr len)
   else if len < 0x10000
   then (
-    Stdlib.Buffer.add_char t.pending '\126';
-    Stdlib.Buffer.add_uint16_be t.pending len)
+    Bigstring.unsafe_set p (o + 1) '\126';
+    Bigstring.unsafe_set p (o + 2) (Char.unsafe_chr (len lsr 8));
+    Bigstring.unsafe_set p (o + 3) (Char.unsafe_chr (len land 0xff)))
   else (
-    Stdlib.Buffer.add_char t.pending '\127';
-    Stdlib.Buffer.add_int64_be t.pending (Int64.of_int len));
-  Stdlib.Buffer.add_string t.pending payload;
-  t.queued <- t.queued + Stdlib.Buffer.length t.pending - before;
+    Bigstring.unsafe_set p (o + 1) '\127';
+    let len64 = Int64.of_int len in
+    for k = 0 to 7 do
+      Bigstring.unsafe_set
+        p
+        (o + 2 + k)
+        (Char.unsafe_chr
+           (Int64.to_int (Int64.shift_right_logical len64 (8 * (7 - k)))
+           land 0xff))
+    done);
+  Bigstring.unsafe_blit_from_string
+    payload
+    ~src_off:0
+    p
+    ~dst_off:(o + header)
+    ~len;
+  t.pending_len <- o + header + len;
+  t.queued <- t.queued + header + len;
   wake_writer t
 
 let close_payload ?(reason = "") code =
@@ -231,9 +272,13 @@ let fail t code =
 
 let finish t =
   t.writing <- Closed;
-  Stdlib.Buffer.clear t.pending;
+  t.pending <- Bigstring.empty;
+  t.pending_len <- 0;
   t.inflight <- Bigstring.empty;
+  t.inflight_len <- 0;
   t.inflight_off <- 0;
+  t.message <- Bytes.empty;
+  t.message_len <- 0;
   stop_reading t;
   Queue.iter (fun (_, k) -> k `Closed) t.flushes;
   Queue.clear t.flushes;
@@ -326,16 +371,16 @@ let start_message t opcode =
 
 let end_frame t =
   match t.opcode with
-  | 0x8 -> on_close_frame t (Stdlib.Buffer.contents t.control)
+  | 0x8 -> on_close_frame t (Bytes.sub_string t.control 0 t.control_len)
   | 0x9 ->
     (* RFC 6455 §5.5.2: a ping gets a pong until the peer's close frame, even
        after ours. *)
     if t.writing <> Closed
-    then frame t ~opcode:0xA (Stdlib.Buffer.contents t.control);
+    then frame t ~opcode:0xA (Bytes.sub_string t.control 0 t.control_len);
     t.reading <- Header
   | 0xA ->
     t.reading <- Header;
-    t.handler.on_pong (Stdlib.Buffer.contents t.control)
+    t.handler.on_pong (Bytes.sub_string t.control 0 t.control_len)
   | _ ->
     t.reading <- Header;
     if not t.fin
@@ -343,8 +388,9 @@ let end_frame t =
     else if t.text && t.utf8_need > 0
     then fail t 1007
     else
-      let message = Stdlib.Buffer.contents t.message in
-      Stdlib.Buffer.clear t.message;
+      let message = Bytes.sub_string t.message 0 t.message_len in
+      t.message_len <- 0;
+      if Bytes.length t.message > max_kept_buffer then t.message <- Bytes.empty;
       t.fragmented <- false;
       (* After our close frame, messages are dropped while we wait for the
          peer's (RFC 6455 §1.4). *)
@@ -406,45 +452,169 @@ let read_header t bs ~off ~len =
         (not control)
         && Int64.compare
              payload_len
-             (Int64.of_int
-                (t.max_message_size - Stdlib.Buffer.length t.message))
+             (Int64.of_int (t.max_message_size - t.message_len))
            > 0
       then (
         fail t 1009;
         len)
       else (
-        for i = 0 to 3 do
-          Bytes.set t.mask i (Bigstring.unsafe_get bs (off + 2 + ext + i))
+        (* The key four times, less the last byte: the 8 bytes from [mask_pos]
+           mask 8 payload bytes from there. *)
+        for i = 0 to 10 do
+          Bytes.unsafe_set
+            t.mask
+            i
+            (Bigstring.unsafe_get bs (off + 2 + ext + (i land 3)))
         done;
         if opcode = 0x1 || opcode = 0x2 then start_message t opcode;
         t.opcode <- opcode;
         t.fin <- fin;
         t.remaining <- Int64.to_int payload_len;
         t.mask_pos <- 0;
-        Stdlib.Buffer.clear t.control;
+        t.control_len <- 0;
         t.reading <- Payload;
         if t.remaining = 0 then end_frame t;
         size)
 
+external bytes_get64u : Bytes.t -> int -> int64 = "%caml_bytes_get64u"
+external bytes_set64u : Bytes.t -> int -> int64 -> unit = "%caml_bytes_set64u"
+
+let high_bits = 0x8080808080808080L
+
+(* XORs the bytes of [dst] from [from] to [stop] with the mask, one at a time;
+   the bytes from [pos] are the payload from [mask_pos]. The OR of the
+   results. *)
+let unmask_bytes t dst ~pos ~from ~stop =
+  let seen = ref 0 in
+  for i = from to stop - 1 do
+    let c =
+      Char.code (Bytes.unsafe_get dst i)
+      lxor Char.code (Bytes.unsafe_get t.mask (t.mask_pos + ((i - pos) land 7)))
+    in
+    Bytes.unsafe_set dst i (Char.unsafe_chr c);
+    seen := !seen lor c
+  done;
+  !seen
+
+(* Unmasks [n] bytes of [bs] from [off] into [dst] from [pos]: a copy, then an
+   XOR in place, 32 then 8 bytes at a time. The loops keep every access in
+   bounds, so they skip the checks. *)
+let unmask t bs ~off dst ~pos n =
+  Bigstring.unsafe_blit_to_bytes bs ~src_off:off dst ~dst_off:pos ~len:n;
+  let m = bytes_get64u t.mask t.mask_pos in
+  let i = ref pos
+  and stop = pos + n in
+  while !i + 32 <= stop do
+    let j = !i in
+    bytes_set64u dst j (Int64.logxor (bytes_get64u dst j) m);
+    bytes_set64u dst (j + 8) (Int64.logxor (bytes_get64u dst (j + 8)) m);
+    bytes_set64u dst (j + 16) (Int64.logxor (bytes_get64u dst (j + 16)) m);
+    bytes_set64u dst (j + 24) (Int64.logxor (bytes_get64u dst (j + 24)) m);
+    i := j + 32
+  done;
+  while !i + 8 <= stop do
+    bytes_set64u dst !i (Int64.logxor (bytes_get64u dst !i) m);
+    i := !i + 8
+  done;
+  ignore (unmask_bytes t dst ~pos ~from:!i ~stop : int)
+
+(* [unmask], and [true] when the bytes are all ASCII: text then needs no UTF-8
+   check outside a sequence. A loop of its own, so binary payloads do not pay
+   for the OR. *)
+let unmask_text t bs ~off dst ~pos n =
+  Bigstring.unsafe_blit_to_bytes bs ~src_off:off dst ~dst_off:pos ~len:n;
+  let m = bytes_get64u t.mask t.mask_pos in
+  let seen = ref 0L in
+  let i = ref pos
+  and stop = pos + n in
+  while !i + 32 <= stop do
+    let j = !i in
+    let w = Int64.logxor (bytes_get64u dst j) m in
+    bytes_set64u dst j w;
+    seen := Int64.logor !seen w;
+    let w = Int64.logxor (bytes_get64u dst (j + 8)) m in
+    bytes_set64u dst (j + 8) w;
+    seen := Int64.logor !seen w;
+    let w = Int64.logxor (bytes_get64u dst (j + 16)) m in
+    bytes_set64u dst (j + 16) w;
+    seen := Int64.logor !seen w;
+    let w = Int64.logxor (bytes_get64u dst (j + 24)) m in
+    bytes_set64u dst (j + 24) w;
+    seen := Int64.logor !seen w;
+    i := j + 32
+  done;
+  while !i + 8 <= stop do
+    let w = Int64.logxor (bytes_get64u dst !i) m in
+    bytes_set64u dst !i w;
+    seen := Int64.logor !seen w;
+    i := !i + 8
+  done;
+  let tail = unmask_bytes t dst ~pos ~from:!i ~stop in
+  Int64.equal (Int64.logand !seen high_bits) 0L && tail < 0x80
+
+(* Feeds the [n] bytes of [b] from [pos] to [utf8_byte], in order, and stops at
+   the first that makes the text invalid. Runs of ASCII outside a sequence are
+   skipped 32 then 8 bytes at a time: [utf8_byte] accepts them without a state
+   change. *)
+let valid_utf8 t b ~pos n =
+  let i = ref pos
+  and stop = pos + n
+  and ok = ref true in
+  while !ok && !i < stop do
+    if t.utf8_need = 0
+    then (
+      while
+        !i + 32 <= stop
+        && Int64.equal
+             (Int64.logand
+                (Int64.logor
+                   (Int64.logor (bytes_get64u b !i) (bytes_get64u b (!i + 8)))
+                   (Int64.logor
+                      (bytes_get64u b (!i + 16))
+                      (bytes_get64u b (!i + 24))))
+                high_bits)
+             0L
+      do
+        i := !i + 32
+      done;
+      while
+        !i + 8 <= stop
+        && Int64.equal (Int64.logand (bytes_get64u b !i) high_bits) 0L
+      do
+        i := !i + 8
+      done);
+    if !i < stop
+    then
+      let c = Char.code (Bytes.unsafe_get b !i) in
+      if (c >= 0x80 || t.utf8_need > 0) && not (utf8_byte t c)
+      then ok := false
+      else incr i
+  done;
+  !ok
+
 let read_payload t bs ~off ~len =
   let n = Int.min len t.remaining in
   let control = t.opcode >= 0x8 in
+  let pos = if control then t.control_len else t.message_len in
+  if (not control) && Bytes.length t.message < pos + n
+  then (
+    let size = grown ~size:(Bytes.length t.message) ~need:(pos + n) in
+    let b =
+      Bytes.create (Int.max (pos + n) (Int.min t.max_message_size size))
+    in
+    Bytes.blit t.message 0 b 0 pos;
+    t.message <- b);
   let dst = if control then t.control else t.message in
   let check = (not control) && t.text in
-  let i = ref 0 in
-  let valid = ref true in
-  while !valid && !i < n do
-    let c =
-      Char.code (Bigstring.unsafe_get bs (off + !i))
-      lxor Char.code (Bytes.unsafe_get t.mask ((t.mask_pos + !i) land 3))
-    in
-    if check && (c >= 0x80 || t.utf8_need > 0) && not (utf8_byte t c)
-    then valid := false
+  let ascii =
+    if check
+    then unmask_text t bs ~off dst ~pos n
     else (
-      Stdlib.Buffer.add_char dst (Char.unsafe_chr c);
-      incr i)
-  done;
-  if not !valid
+      unmask t bs ~off dst ~pos n;
+      true)
+  in
+  if control then t.control_len <- pos + n else t.message_len <- pos + n;
+  if check && (not (ascii && t.utf8_need = 0)) && not (valid_utf8 t dst ~pos n)
   then (
     (* Invalid text fails at once, without reading the rest of the message (RFC
        6455 §8.1). *)
@@ -513,16 +683,19 @@ let yield_reader t k =
   if t.reading = Stopped then k () else t.reader_k <- Some k
 
 let next_write_operation t =
-  if
-    t.writing <> Closed
-    && t.inflight_off = Bigstring.length t.inflight
-    && Stdlib.Buffer.length t.pending > 0
+  if t.writing <> Closed && t.inflight_off = t.inflight_len && t.pending_len > 0
   then (
-    let s = Stdlib.Buffer.contents t.pending in
-    Stdlib.Buffer.clear t.pending;
-    t.inflight <- Bigstring.of_string s ~off:0 ~len:(String.length s);
-    t.inflight_off <- 0);
-  let len = Bigstring.length t.inflight - t.inflight_off in
+    (* The two buffers swap: frames queued from now go to the written one. *)
+    let written = t.inflight in
+    t.inflight <- t.pending;
+    t.inflight_len <- t.pending_len;
+    t.inflight_off <- 0;
+    t.pending <-
+      (if Bigstring.length written > max_kept_buffer
+       then Bigstring.empty
+       else written);
+    t.pending_len <- 0);
+  let len = t.inflight_len - t.inflight_off in
   match t.writing with
   | Closed -> `Close 0
   | (Open | Closing) when len > 0 ->
@@ -540,6 +713,13 @@ let report_write_result t = function
   | `Ok n ->
     t.inflight_off <- t.inflight_off + n;
     t.written <- t.written + n;
+    if
+      t.inflight_off = t.inflight_len
+      && Bigstring.length t.inflight > max_kept_buffer
+    then (
+      t.inflight <- Bigstring.empty;
+      t.inflight_len <- 0;
+      t.inflight_off <- 0);
     let rec fire () =
       match Queue.peek_opt t.flushes with
       | Some (target, k) when target <= t.written ->
@@ -635,17 +815,21 @@ let upgrade
       ; opcode = 0
       ; fin = false
       ; remaining = 0
-      ; mask = Bytes.create 4
+      ; mask = Bytes.create 11
       ; mask_pos = 0
       ; fragmented = false
       ; text = false
       ; utf8_need = 0
       ; utf8_lo = 0x80
       ; utf8_hi = 0xbf
-      ; message = Stdlib.Buffer.create 256
-      ; control = Stdlib.Buffer.create 128
-      ; pending = Stdlib.Buffer.create 256
+      ; message = Bytes.empty
+      ; message_len = 0
+      ; control = Bytes.create 125
+      ; control_len = 0
+      ; pending = Bigstring.empty
+      ; pending_len = 0
       ; inflight = Bigstring.empty
+      ; inflight_len = 0
       ; inflight_off = 0
       ; queued = 0
       ; written = 0
