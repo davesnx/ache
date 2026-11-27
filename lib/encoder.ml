@@ -67,8 +67,6 @@ end = struct
   let is_empty t = t.front = t.back
 
   let ensure_space t =
-    (* An empty deque starts again at the front, so that steady use never shifts
-       elements (an array blit with a write barrier per element). *)
     if t.front = t.back && t.front > 0
     then begin
       t.front <- 0;

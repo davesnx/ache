@@ -94,8 +94,6 @@ let settings () =
   ; timeouts = !timeouts
   }
 
-(* Monomorphic tables: a polymorphic [Hashtbl] would put [caml_hash] and
-   [compare_val] of the benchmark itself into every server profile. *)
 module Int_table = Hashtbl.Make (Int)
 module String_table = Hashtbl.Make (String)
 

@@ -92,7 +92,8 @@ module type Server = sig
       Closing: when the connection stops reading (after a response with
       [Connection: close], an error response, or a timeout) while the peer
       may still be sending ({!Ache.Server_connection.lingers}: a request
-      partly read, or input left after the last one), it reads and discards
+      partly read, input or pipelined requests left after the last one, or
+      a WebSocket closed without the client's close frame), it reads and discards
       input until the peer stops sending, so that unread input does not make
       the kernel reset the connection before the peer has read the response
       (RFC 9112 §9.6). It waits at most [idle_timeout], or

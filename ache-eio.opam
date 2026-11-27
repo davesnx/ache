@@ -19,7 +19,7 @@ depends: [
   "ocaml" {>= "5.3"}
   "ache" {= version}
   "cstruct"
-  "eio"
+  "eio" {>= "1.0" & < "2.0"}
   "eio_main" {with-test}
   "alcotest" {with-test}
   "odoc" {with-doc}

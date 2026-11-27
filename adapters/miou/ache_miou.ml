@@ -778,7 +778,6 @@ struct
       let session_failed exn bt =
         if Option.is_none !unreported then unreported := Some (exn, bt)
       in
-      (* The ticker of the domain, while this connection leads. *)
       let ticker = ref None in
       let lead () =
         if entry.lead

@@ -1288,10 +1288,6 @@ let test_websocket_close_handshake_fin ~server_first () =
       (Printf.sprintf "end of input within 100 ms (%.3f s)" elapsed)
       true
       (elapsed < 0.1);
-    (* Known linger (runtime-cost F9, task 48): after its FIN the server reads
-       and drops input until the client's FIN or [idle_timeout], although
-       nothing may follow the client's close frame. When the server closes at
-       once, assert that the connection promise resolves here instead. *)
     Lwt.pick
       [ (Lwt.join !served >|= fun () -> true)
       ; (Lwt_unix.sleep 0.5 >|= fun () -> false)

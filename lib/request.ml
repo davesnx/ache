@@ -117,8 +117,7 @@ let rec skip_class_bytes s i stop cls =
   then skip_class_bytes s (i + 1) stop cls
   else i
 
-(* [stop] must not exceed [String.length s]. Four bytes per step while they
-   fit. *)
+(* [stop] must not exceed [String.length s]. *)
 let rec skip_class s i stop cls =
   if
     i + 4 <= stop
@@ -263,7 +262,6 @@ let received_framing
 let is_origin_form target =
   String.length target > 0 && String.unsafe_get target 0 = '/'
 
-(* [hosts] counts the Host fields and [host] is the last one seen. *)
 let check_received
       ({ meth; target; version; _ } as t)
       ~hosts

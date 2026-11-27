@@ -197,7 +197,6 @@ module IO_loop = struct
     and receive_shut = ref false
     and send_shut = ref false
     and failed = ref false
-    (* The cancel contexts of the loops, while they run. *)
     and read_cancel = ref None
     and loop_cancel = ref None
     and write_cancel = ref None
@@ -252,7 +251,6 @@ module IO_loop = struct
         let (_ : bool) = report_exn exn in
         fail_loops ()
     in
-    (* Runs [f] in a cancel context that [fail_loops] cancels. *)
     let cancellable cc f =
       if !failed then raise (Eio.Cancel.Cancelled Failed);
       match
@@ -287,7 +285,6 @@ module IO_loop = struct
     and timer_fired = ref false
     and expire_failed = ref None
     and write_expired = ref false
-    (* The loops ended: the watchdog stops. *)
     and stopped = ref false in
     (* Reading ended for good while a read waits: a timeout action ran, or a
        drain closed the connection. The read is not cancelled, which tls-eio
@@ -308,8 +305,6 @@ module IO_loop = struct
       | Unstarted, Some time ->
         watchdog := Awake;
         Fiber.fork_daemon ~sw (fun () -> watch time)
-    (* Sleeps in a cancellation context that [wake] cancels: cheaper than racing
-       the sleep against a wake-up in a [Fiber.first] each time. *)
     and sleep f =
       match
         Eio.Cancel.sub (fun cc ->
@@ -677,7 +672,6 @@ module IO_loop = struct
       | exception Eio.Cancel.Cancelled _ when !failed -> ()
       | exception exn -> fail exn
     in
-    (* The read loop in a fiber of its own, that starts first. *)
     let read_done, resolve_read_done = Promise.create () in
     Fiber.fork ~sw (fun () ->
       match read_loop () with
@@ -895,7 +889,6 @@ module Server = struct
           ?date:(if date then Some current_date else None)
           ?keep_alive_timeout
           (fun reqd ->
-             (* Usually already reset: skip the write barriers. *)
              if Option.is_some !head_deadline then head_deadline := None;
              if !body_spent <> 0. then body_spent := 0.;
              body_progress := 0;
@@ -1045,7 +1038,6 @@ module Server = struct
             (fun () ->
                Option.iter
                  (fun stop ->
-                    (* A daemon: it ends with the connection. *)
                     Fiber.fork_daemon ~sw (fun () ->
                       Promise.await stop;
                       drain ();

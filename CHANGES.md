@@ -177,7 +177,8 @@ Fork of httpun at 37fdcd8 (httpun 0.2.0 and 10 commits).
   WebSocket closed without the client's close frame. ache-eio and ache-miou
   linger only then: a request read whole and answered with
   `Connection: close` closes the socket at once. ache-miou no longer skips
-  the linger without timeouts. ache-lwt still lingers after every close.
+  the linger without timeouts. ache-lwt still lingers after every close, except after the end of input
+  and when a WebSocket closes at `close_timeout`.
 - ache-eio and ache-miou close the socket at once after a completed
   WebSocket close handshake. They kept reading until the client's end of
   input or `idle_timeout`.

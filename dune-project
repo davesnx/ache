@@ -48,7 +48,10 @@
   (ache
    (= :version))
   cstruct
-  eio
+  (eio
+   (and
+    (>= 1.0)
+    (< 2.0)))
   (eio_main :with-test)
   (alcotest :with-test)))
 

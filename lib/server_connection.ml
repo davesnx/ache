@@ -65,8 +65,7 @@ type t =
   ; error_handler : error_handler
   ; mutable current : Request_descriptor.t option
     (* The head of the request queue, which has already had [request_handler]
-       called on it. Kept out of [pipelined] because a queue push and take cost
-       four write barriers, and most connections never pipeline. *)
+       called on it. *)
   ; pipelined : Request_descriptor.t Queue.t
     (* The requests after [current]; empty when [current] is [None]. *)
   ; mutable error_code : error_code

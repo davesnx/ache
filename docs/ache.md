@@ -644,8 +644,8 @@ input is left after the last request, and on a WebSocket closed without
 the client's close frame (a protocol error, an idle timeout, a drain). It
 is `false` when every request was read whole, after the end of input, and
 after a completed WebSocket close handshake: nothing may follow the
-client's close frame (RFC 6455 §5.5.1). Go's `net/http` and nginx's
-`lingering_close on` linger on the same condition.
+client's close frame (RFC 6455 §5.5.1). Go's `net/http` also waits after
+its FIN only when the request body was not read to its end.
 
 ache-eio and ache-miou linger only when `lingers` is `true`; a request
 read whole and answered with `Connection: close` closes the socket at

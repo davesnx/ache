@@ -304,8 +304,6 @@ let version ~eof o bs stop p where =
         | _ ->
           { Version.major = Char.code major - 48; minor = Char.code minor - 48 }
       in
-      (* Most messages on a connection repeat the version: skip the write
-         barrier. *)
       if o.version != v then o.version <- v;
       p + 3
 
