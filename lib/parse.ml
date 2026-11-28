@@ -47,6 +47,11 @@ type out =
   ; mutable error : string
   ; mutable run : int
   ; mutable resume : int
+  ; mutable seen : int
+    (* [Message.Seen] bits of the fields of the head being read. *)
+  ; mutable host : string (* The value of its last Host field. *)
+  ; mutable bit : int
+    (* The [Message.Seen] bit of the last name [common_name] found. *)
   }
 
 let out () =
@@ -60,6 +65,9 @@ let out () =
   ; error = ""
   ; run = 0
   ; resume = 0
+  ; seen = 0
+  ; host = ""
+  ; bit = 0
   }
 
 let join_folds o =
@@ -179,41 +187,14 @@ let[@inline] first_mark m =
   Int64.to_int
     (Int64.shift_right_logical (Int64.mul low 0x0001020304050607L) 56)
 
-(* [skip table] for a table that accepts every byte from [below] up, except DEL,
-   and possibly some bytes under [below]. Eight bytes at a time: a word with no
-   byte under [below] and no DEL is accepted whole; a flagged byte is looked up
-   in [table]. [below] is the byte repeated in each lane, at most 0x80. *)
-let[@inline] skip_word ~below table bs stop i =
-  let i = ref i
-  and found = ref (-1) in
-  if not Sys.big_endian
-  then
-    while !found < 0 && !i + 8 <= stop do
-      let x = Bigstring.unsafe_get_int64_ne bs !i in
-      let m =
-        Int64.logor
-          (Int64.logand
-             (Int64.logand (Int64.sub x below) (Int64.lognot x))
-             0x8080808080808080L)
-          (zero_bytes (Int64.logxor x 0x7f7f7f7f7f7f7f7fL))
-      in
-      if m = 0L
-      then i := !i + 8
-      else
-        let m = ref m in
-        while !found < 0 && !m <> 0L do
-          let j = !i + first_mark !m in
-          if is table (Bigstring.unsafe_get bs j)
-          then m := Int64.logand !m (Int64.sub !m 1L)
-          else found := j
-        done;
-        if !found < 0 then i := !i + 8
-    done;
-  if !found >= 0 then !found else skip table bs stop !i
-
 (* field-char: HTAB, SP to 0x7e, 0x80 to 0xff. *)
-let skip_field bs stop i =
-  skip_word ~below:0x2020202020202020L field_char bs stop i
+external skip_field :
+   Bigstring.t
+  -> (int[@untagged])
+  -> (int[@untagged])
+  -> (int[@untagged])
+  = "ache_field_end_byte" "ache_field_end"
+[@@noalloc]
 
 (* A line that stops inside a run of one class of bytes stays an unfinished
    valid line when more bytes of that class follow. [o.run] names that class (an
@@ -237,7 +218,7 @@ let[@inline] skip_run o run bs stop i =
   j
 
 let[@inline] skip_field_run o bs stop i =
-  let j = skip_field bs stop i in
+  let j = skip_field bs i stop in
   if j >= stop then o.run <- run_field;
   j
 
@@ -412,6 +393,167 @@ let rec trim_end bs off i =
   then trim_end bs off (i - 1)
   else i
 
+external string_get64 : string -> int -> int64 = "%caml_string_get64u"
+external string_get32 : string -> int -> int32 = "%caml_string_get32u"
+
+let rec same_words bs off s i last =
+  if i >= last
+  then
+    Int64.equal
+      (Bigstring.unsafe_get_int64_ne bs (off + last))
+      (string_get64 s last)
+  else
+    Int64.equal (Bigstring.unsafe_get_int64_ne bs (off + i)) (string_get64 s i)
+    && same_words bs off s (i + 8) last
+
+(* Whether the bytes at [off] are [s], exactly. *)
+let same_at bs off s =
+  let len = String.length s in
+  if len >= 8
+  then same_words bs off s 0 (len - 8)
+  else if len >= 4
+  then
+    Int32.equal (Bigstring.unsafe_get_int32_ne bs off) (string_get32 s 0)
+    && Int32.equal
+         (Bigstring.unsafe_get_int32_ne bs (off + len - 4))
+         (string_get32 s (len - 4))
+  else same bs off s 0
+
+(* Field names that most requests and responses carry, as clients spell them. A
+   name received in exactly this spelling is this shared string, so parsing it
+   neither scans it byte by byte nor allocates. *)
+let common_names =
+  [ "Accept"
+  ; "Accept-Charset"
+  ; "Accept-Encoding"
+  ; "Accept-Language"
+  ; "Accept-Ranges"
+  ; "Access-Control-Request-Headers"
+  ; "Access-Control-Request-Method"
+  ; "Age"
+  ; "Authorization"
+  ; "Cache-Control"
+  ; "Connection"
+  ; "Content-Encoding"
+  ; "Content-Length"
+  ; "Content-Type"
+  ; "Cookie"
+  ; "Date"
+  ; "DNT"
+  ; "ETag"
+  ; "Expect"
+  ; "Expires"
+  ; "Forwarded"
+  ; "Host"
+  ; "If-Match"
+  ; "If-Modified-Since"
+  ; "If-None-Match"
+  ; "If-Range"
+  ; "Keep-Alive"
+  ; "Last-Modified"
+  ; "Location"
+  ; "Origin"
+  ; "Pragma"
+  ; "Priority"
+  ; "Range"
+  ; "Referer"
+  ; "Sec-Ch-Ua"
+  ; "Sec-Ch-Ua-Mobile"
+  ; "Sec-Ch-Ua-Platform"
+  ; "Sec-Fetch-Dest"
+  ; "Sec-Fetch-Mode"
+  ; "Sec-Fetch-Site"
+  ; "Sec-Fetch-User"
+  ; "Sec-WebSocket-Extensions"
+  ; "Sec-WebSocket-Key"
+  ; "Sec-WebSocket-Protocol"
+  ; "Sec-WebSocket-Version"
+  ; "Server"
+  ; "Set-Cookie"
+  ; "TE"
+  ; "Trailer"
+  ; "Transfer-Encoding"
+  ; "Upgrade"
+  ; "Upgrade-Insecure-Requests"
+  ; "User-Agent"
+  ; "Vary"
+  ; "Via"
+  ; "X-Forwarded-For"
+  ; "X-Forwarded-Host"
+  ; "X-Forwarded-Proto"
+  ; "X-Real-IP"
+  ; "X-Request-ID"
+  ; "X-Requested-With"
+  ]
+
+let[@inline] name_key len first middle last =
+  ((len * 31) + (first * 7) + (middle * 3) + last) land 511
+
+(* The common names by [name_key], and the [Message.Seen] bit of each. *)
+let common_table, common_bits =
+  let table = Array.make 512 [||] in
+  let bits = Array.make 512 [||] in
+  let add name =
+    let len = String.length name in
+    let code i = Char.code name.[i] in
+    let key = name_key len (code 0) (code (len / 2)) (code (len - 1)) in
+    table.(key) <- Array.append table.(key) [| name |];
+    bits.(key) <- Array.append bits.(key) [| Message.Seen.of_name name |]
+  in
+  List.iter
+    (fun name ->
+       add name;
+       add (String.lowercase_ascii name))
+    common_names;
+  table, bits
+
+let colons = 0x3a3a3a3a3a3a3a3aL
+
+(* The offset of the first ':' in the 32 bytes from [off], or -1 when there is
+   none or the words to load reach past [stop]. *)
+let rec colon_from bs off stop i =
+  if Sys.big_endian || i >= 32 || off + i + 8 > stop
+  then -1
+  else
+    let m =
+      zero_bytes
+        (Int64.logxor (Bigstring.unsafe_get_int64_ne bs (off + i)) colons)
+    in
+    if Int64.equal m 0L
+    then colon_from bs off stop (i + 8)
+    else i + first_mark m
+
+let rec find_name bs off len names i =
+  if i = Array.length names
+  then -1
+  else
+    let name = Array.unsafe_get names i in
+    if String.length name = len && same_at bs off name
+    then i
+    else find_name bs off len names (i + 1)
+
+(* The common name that is followed by ':' at [off], or "". Its [Message.Seen]
+   bit goes to [o.bit]. *)
+let common_name o bs off stop =
+  let len = colon_from bs off stop 0 in
+  if len <= 0
+  then ""
+  else
+    let key =
+      name_key
+        len
+        (Char.code (Bigstring.unsafe_get bs off))
+        (Char.code (Bigstring.unsafe_get bs (off + (len / 2))))
+        (Char.code (Bigstring.unsafe_get bs (off + len - 1)))
+    in
+    let names = Array.unsafe_get common_table key in
+    let i = find_name bs off len names 0 in
+    if i < 0
+    then ""
+    else (
+      o.bit <- Array.unsafe_get (Array.unsafe_get common_bits key) i;
+      Array.unsafe_get names i)
+
 (* RFC 9112 §5.2: a recipient of a response replaces each obs-fold with SP. *)
 let field_line ~eof ~obs_fold o bs off stop =
   let where = "field line" in
@@ -420,7 +562,14 @@ let field_line ~eof ~obs_fold o bs off stop =
     && (match o.fields with [] -> false | _ :: _ -> true)
     && is space (get bs stop off)
   in
-  let name_end = if fold then off else skip_run o run_tchar bs stop off in
+  let common = if fold then "" else common_name o bs off stop in
+  let name_end =
+    if fold
+    then off
+    else if String.length common > 0
+    then off + String.length common
+    else skip_run o run_tchar bs stop off
+  in
   if (not fold) && (name_end = off || get bs stop name_end <> ':')
   then unexpected ~eof o bs stop name_end where
   else
@@ -438,8 +587,18 @@ let field_line ~eof ~obs_fold o bs off stop =
        then o.folds <- value :: o.folds
        else (
          close_fold o;
-         o.fields <-
-           (substring bs ~off ~len:(name_end - off), value) :: o.fields));
+         let name, bit =
+           if String.length common > 0
+           then common, o.bit
+           else
+             let name = substring bs ~off ~len:(name_end - off) in
+             name, Message.Seen.of_name name
+         in
+         if bit <> 0
+         then (
+           o.seen <- Message.Seen.add o.seen bit;
+           if bit = Message.Seen.host then o.host <- value);
+         o.fields <- (name, value) :: o.fields));
     p
 
 let rec fields ~eof ~obs_fold o bs p stop where =
@@ -672,6 +831,7 @@ module Reader = struct
     ; mutable paused : bool
     ; mutable closed : bool
     ; mutable wakeup : Optional_thunk.t
+    ; mutable seen : int (* [Message.Seen] bits of the last head's fields. *)
     }
 
   type request = (Request.t, request_error) t
@@ -693,8 +853,10 @@ module Reader = struct
     ; paused = false
     ; closed = false
     ; wakeup = Optional_thunk.none
+    ; seen = 0
     }
 
+  let seen t = t.seen
   let is_closed t = t.closed
   let resume t = t.paused <- false
   let pause t = t.paused <- true
@@ -730,12 +892,25 @@ module Reader = struct
             (Headers.get_multi request.headers "connection")
             "upgrade")
 
+  let seen_may_switch_protocols seen (request : Request.t) =
+    request.meth = `CONNECT
+    || (Message.Seen.has seen Message.Seen.upgrade
+       && Message.Seen.has seen Message.Seen.connection
+       && Message.has_member
+            (Headers.get_multi request.headers "connection")
+            "upgrade")
+
   let request ~max_header_size handler =
     let on_head t =
-      let request = request_of t.out in
-      t.out.fields <- [];
-      t.paused <- may_switch_protocols request;
-      match Request.received_body_length request with
+      let o = t.out in
+      let request = request_of o in
+      o.fields <- [];
+      t.seen <- o.seen;
+      t.paused <- seen_may_switch_protocols o.seen request;
+      let host = o.host in
+      (* The reader outlives the head; its strings would be promoted. *)
+      o.host <- "";
+      match Request.received_body_length ~seen:o.seen ~host request with
       | Error error -> t.state <- Fail (`Invalid_request (request, error))
       | Ok (`Fixed 0L) ->
         handler request (Body.Reader.create_empty ());
@@ -822,7 +997,11 @@ module Reader = struct
         then request_line ~eof:false o bs p stop
         else status_line ~eof:false o bs p stop
       in
-      if q >= 0 then t.stage <- Fields;
+      if q >= 0
+      then (
+        t.stage <- Fields;
+        o.seen <- 0;
+        o.host <- "");
       q
     | (Fields | Trailer) when get bs stop p = '\r' ->
       let where =

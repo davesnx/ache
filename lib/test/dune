@@ -26,5 +26,6 @@
   test_version
   test_websocket
   test_testing
-  test_trailers)
+  test_trailers
+  test_seen_fields)
  (name test_ache))

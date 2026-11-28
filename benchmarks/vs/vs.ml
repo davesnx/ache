@@ -25,25 +25,51 @@ module type HTTP = sig
   val flush : writer -> (flushed -> unit) -> unit
   val close_writer : writer -> unit
   val writer_is_closed : writer -> bool
+
+  (* Upgrades [GET /ws] to a WebSocket that echoes each message and counts it in
+     [requests]; [None] where the library has no WebSocket. *)
+  val websocket_echo : (reqd -> unit) option
 end
 
-(* Requests the handler has started, for [cost.sh]. *)
-let requests = ref 0
+(* Requests the handler has started in each domain, for [cost.sh] and
+   [scale.sh]. A counter per domain, so that domains do not share a cache line
+   on every request. *)
+let counters = Atomic.make []
 
-(* On [SIGUSR1], one line on stderr with the request count and the GC counters
-   of this domain. [cost.sh] reads two such lines around its window and divides
-   by the requests between them. *)
+let new_counter () =
+  let r = ref 0 in
+  let rec register () =
+    let old = Atomic.get counters in
+    if not (Atomic.compare_and_set counters old (r :: old)) then register ()
+  in
+  register ();
+  r
+
+(* The counter of the calling domain, for handlers outside [Make] (the WebSocket
+   echo counts each message as a request). *)
+let domain_requests = Domain.DLS.new_key new_counter
+
+(* Domains of the server, set by [settings]. *)
+let domains = ref 1
+
+(* On [SIGUSR1], one line on stderr with the request count and the GC counters.
+   [cost.sh] reads two such lines around its window and divides by the requests
+   between them. [Gc.minor_words] counts this domain only; with several domains,
+   [Gc.quick_stat] sums them, as sampled at each domain's last minor collection.
+   [per_domain] lists the requests of each domain. *)
 let print_counters () =
   let s = Gc.quick_stat () in
+  let per_domain = List.rev_map (fun r -> !r) (Atomic.get counters) in
   Printf.eprintf
     "vs-counters requests=%d minor_words=%.0f promoted_words=%.0f \
-     minor_collections=%d major_collections=%d\n\
+     minor_collections=%d major_collections=%d per_domain=%s\n\
      %!"
-    !requests
-    (Gc.minor_words ())
+    (List.fold_left ( + ) 0 per_domain)
+    (if !domains > 1 then s.minor_words else Gc.minor_words ())
     s.promoted_words
     s.minor_collections
     s.major_collections
+    (String.concat "/" (List.map string_of_int per_domain))
 
 let () =
   match
@@ -59,6 +85,7 @@ type settings =
   ; response_buffer_size : int
   ; response_body_buffer_size : int
   ; timeouts : bool
+  ; domains : int option
   }
 
 let settings () =
@@ -67,7 +94,8 @@ let settings () =
   and request_body_buffer_size = ref 4096
   and response_buffer_size = ref 1024
   and response_body_buffer_size = ref 4096
-  and timeouts = ref true in
+  and timeouts = ref true
+  and domains_flag = ref None in
   Arg.parse
     [ "--port", Arg.Set_int port, " Port on 127.0.0.1 (8080)"
     ; "--read-buffer-size", Arg.Set_int read_buffer_size, " (4096)"
@@ -81,25 +109,35 @@ let settings () =
     ; ( "--timeouts"
       , Arg.Symbol ([ "on"; "off" ], fun mode -> timeouts := mode = "on")
       , " Timeouts of the ache servers: the defaults (on), or all off" )
+    ; ( "--domains"
+      , Arg.Int (fun n -> domains_flag := Some n)
+      , " Serve with Server.run on this many domains (ache eio and miou)" )
     ]
     (fun arg -> raise (Arg.Bad arg))
     "Benchmark server. Routes: GET /fixed/<bytes>, GET /string/<bytes>, GET \
      /close/<bytes>, GET /stream/<chunk>/<count>, GET \
-     /streamcl/<chunk>/<count>, POST /sink, POST /echo, GET /gc.";
+     /streamcl/<chunk>/<count>, POST /sink, POST /echo, GET /gc, GET /ws \
+     (WebSocket echo).";
+  Option.iter (fun n -> domains := n) !domains_flag;
   { port = !port
   ; read_buffer_size = !read_buffer_size
   ; request_body_buffer_size = !request_body_buffer_size
   ; response_buffer_size = !response_buffer_size
   ; response_body_buffer_size = !response_body_buffer_size
   ; timeouts = !timeouts
+  ; domains = !domains_flag
   }
 
 module Int_table = Hashtbl.Make (Int)
 module String_table = Hashtbl.Make (String)
 
-let bigstrings : bigstring Int_table.t = Int_table.create 16
+(* The tables are per domain: a Hashtbl must not be written by two domains at
+   once. *)
+let bigstrings : bigstring Int_table.t Domain.DLS.key =
+  Domain.DLS.new_key (fun () -> Int_table.create 16)
 
 let bigstring size =
+  let bigstrings = Domain.DLS.get bigstrings in
   match Int_table.find bigstrings size with
   | b -> b
   | exception Not_found ->
@@ -108,9 +146,11 @@ let bigstring size =
     Int_table.add bigstrings size b;
     b
 
-let strings : string Int_table.t = Int_table.create 16
+let strings : string Int_table.t Domain.DLS.key =
+  Domain.DLS.new_key (fun () -> Int_table.create 16)
 
 let string size =
+  let strings = Domain.DLS.get strings in
   match Int_table.find strings size with
   | s -> s
   | exception Not_found ->
@@ -138,6 +178,7 @@ module Make (Http : HTTP) = struct
     | Sink
     | Echo
     | Gc_stat
+    | Websocket of (Http.reqd -> unit)
     | Missing
 
   let with_length n = Http.response `OK [ "content-length", string_of_int n ]
@@ -183,11 +224,21 @@ module Make (Http : HTTP) = struct
     | [ ""; "sink" ] -> Sink
     | [ ""; "echo" ] -> Echo
     | [ ""; "gc" ] -> Gc_stat
+    | [ ""; "ws" ] ->
+      (match Http.websocket_echo with Some f -> Websocket f | None -> Missing)
     | _ -> Missing
 
-  let actions : action String_table.t = String_table.create 64
+  (* State of a domain, behind one [Domain.DLS.get] per request. *)
+  type local =
+    { requests : int ref
+    ; actions : action String_table.t
+    }
 
-  let action target =
+  let local =
+    Domain.DLS.new_key (fun () ->
+      { requests = new_counter (); actions = String_table.create 64 })
+
+  let action actions target =
     match String_table.find actions target with
     | a -> a
     | exception Not_found ->
@@ -227,8 +278,9 @@ module Make (Http : HTTP) = struct
     Http.schedule_read body ~on_eof ~on_read
 
   let handle reqd =
-    incr requests;
-    match action (Http.target reqd) with
+    let local = Domain.DLS.get local in
+    incr local.requests;
+    match action local.actions (Http.target reqd) with
     | Fixed (response, body) -> Http.respond_with_bigstring reqd response body
     | Copied (response, body) -> Http.respond_with_string reqd response body
     | Stream (response, chunk, count) ->
@@ -238,5 +290,6 @@ module Make (Http : HTTP) = struct
     | Gc_stat ->
       let s = gc_json () in
       Http.respond_with_string reqd (with_length (String.length s)) s
+    | Websocket upgrade -> upgrade reqd
     | Missing -> Http.respond_with_string reqd not_found ""
 end

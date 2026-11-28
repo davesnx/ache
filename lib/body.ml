@@ -45,6 +45,7 @@ module Reader = struct
     ; when_ready_to_read : Optional_thunk.t
     ; mutable on_first_read : Optional_thunk.t
     ; mutable trailers : Headers.t
+    ; mutable in_on_read : bool
     }
 
   let default_on_eof = Sys.opaque_identity (fun () -> ())
@@ -66,6 +67,7 @@ module Reader = struct
     ; when_ready_to_read
     ; on_first_read = Optional_thunk.none
     ; trailers = Headers.empty
+    ; in_on_read = false
     }
 
   let create_empty () =
@@ -79,10 +81,13 @@ module Reader = struct
   let set_on_first_read t f = t.on_first_read <- f
   let ready_to_read t = Optional_thunk.call_if_some t.when_ready_to_read
 
-  (* The application may keep bytes passed to [on_read]: never reuse them. *)
+  (* Bytes passed to [on_read] are valid until it returns (decision 0025): a
+     drained buffer is written from its start again, except while an [on_read]
+     runs (a write from inside it must not overwrite its bytes). *)
   let write t bs ~off ~len =
     if (not t.closed) && (not t.discarding) && len > 0
     then (
+      if t.len = 0 && not t.in_on_read then t.off <- 0;
       if Bigstring.length t.buffer - (t.off + t.len) < len
       then (
         let buffer = Bigstring.create (Int.max 0x1000 ((2 * t.len) + len)) in
@@ -106,7 +111,10 @@ module Reader = struct
       and len = t.len in
       t.off <- off + len;
       t.len <- 0;
+      let in_on_read = t.in_on_read in
+      t.in_on_read <- true;
       on_read t.buffer ~off ~len;
+      t.in_on_read <- in_on_read;
       execute_read t)
     else if t.closed
     then (
@@ -324,6 +332,17 @@ module Writer = struct
 
   let requires_output t = (not (is_closed t)) || has_pending_output t
 
+  let write_final_chunk t =
+    match t.encoding with
+    | Identity | Fixed _ | Discard -> ()
+    | Chunked ({ written_final_chunk; trailers; _ } as chunked) ->
+      if not written_final_chunk
+      then (
+        chunked.written_final_chunk <- true;
+        match Headers.to_rev_list trailers with
+        | [] -> Serialize.Writer.schedule_chunk t.writer []
+        | _ :: _ -> Serialize.Writer.write_last_chunk t.writer trailers)
+
   let transfer_to_writer t =
     let encoder = t.encoder in
     if Serialize.Writer.is_closed t.writer
@@ -331,16 +350,7 @@ module Writer = struct
     else
       match Encoder.operation encoder with
       | `Yield -> ()
-      | `Close ->
-        (match t.encoding with
-        | Identity | Fixed _ | Discard -> ()
-        | Chunked ({ written_final_chunk; trailers; _ } as chunked) ->
-          if not written_final_chunk
-          then (
-            chunked.written_final_chunk <- true;
-            match Headers.to_rev_list trailers with
-            | [] -> Serialize.Writer.schedule_chunk t.writer []
-            | _ :: _ -> Serialize.Writer.write_last_chunk t.writer trailers))
+      | `Close -> write_final_chunk t
       | `Writev iovecs when t.encoding = Discard ->
         Encoder.shift encoder (IOVec.lengthv iovecs)
       | `Writev iovecs ->
@@ -357,5 +367,8 @@ module Writer = struct
             | `Closed -> close_and_drain t
             | `Written ->
               Encoder.shift encoder lengthv;
-              t.buffered_bytes <- t.buffered_bytes - lengthv))
+              t.buffered_bytes <- t.buffered_bytes - lengthv));
+        (* A closed encoder takes no more bytes: the final chunk can follow its
+           last ones in the same write. *)
+        if Encoder.is_closed encoder then write_final_chunk t
 end

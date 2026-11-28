@@ -60,7 +60,8 @@ type t =
   { config : Config.t
   ; reader : Reader.request
   ; writer : Writer.t
-  ; response_body_buffer : Bigstring.t
+  ; response_body_buffer : Bigstring.t Lazy.t
+    (* Allocated by the first response body that streams. *)
   ; request_handler : request_handler
   ; error_handler : error_handler
   ; mutable current : Request_descriptor.t option
@@ -80,6 +81,7 @@ type t =
   ; mutable unread_input : bool
     (* The last read left bytes that the connection did not take. *)
   ; mutable input_ended : bool (* A linger would read nothing. *)
+  ; mutable released : bool
   }
 
 let is_closed t = Reader.is_closed t.reader && Writer.is_closed t.writer
@@ -198,8 +200,10 @@ let create
            d)
       date
   in
-  let writer = Writer.create ~buffer_size:response_buffer_size () in
-  let response_body_buffer = Bigstring.create response_body_buffer_size in
+  let writer = Writer.of_bigstring (Buffer_pool.take response_buffer_size) in
+  let response_body_buffer =
+    lazy (Bigstring.create response_body_buffer_size)
+  in
   let self = ref None in
   let handler request request_body =
     match !self with
@@ -257,6 +261,7 @@ let create
     ; draining = false
     ; unread_input = false
     ; input_ended = false
+    ; released = false
     }
   in
   self := Some (t, upgrade t);
@@ -312,7 +317,7 @@ let set_error_and_handle ?request t error =
                  | `Chunked, Some (request : Request.t) ->
                    Message.accepts_trailers request.headers
                  | _ -> false)
-               t.response_body_buffer
+               (Lazy.force t.response_body_buffer)
                ~encoding
                ~writer:t.writer
            in
@@ -703,3 +708,14 @@ let drain t =
         else if at_request_start t
         then shutdown t);
       wakeup_reader t)
+
+(* Every write into the encoder of a closed writer raises
+   ([Encoder.writable_exn]), so after the runtime's loops end nothing reads or
+   writes the write buffer: it goes back to the pool. A grown encoder (decision
+   0022) no longer uses it either. An open writer could still take a response
+   from the application: its buffer stays with it. *)
+let release t =
+  if (not t.released) && Writer.is_closed t.writer
+  then (
+    t.released <- true;
+    Buffer_pool.give (Writer.buffer t.writer))

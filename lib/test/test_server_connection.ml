@@ -910,8 +910,7 @@ let test_chunked_encoding () =
     ~msg:"First chunk written"
     ~body:"b\r\nFirst chunk\r\n"
     (Response.create `OK ~headers:Headers.encoding_chunked);
-  write_string t ~msg:"Second chunk" "c\r\nSecond chunk\r\n";
-  write_string t ~msg:"Final chunk written" "0\r\n\r\n";
+  write_string t ~msg:"Second and final chunk" "c\r\nSecond chunk\r\n0\r\n\r\n";
   reader_ready ~msg:"Keep-alive" t
 
 let test_chunked_encoding_for_error () =
@@ -938,8 +937,7 @@ let test_chunked_encoding_for_error () =
        `Bad_request
        ~headers:Headers.(encoding_chunked @ connection_close));
   write_string t "3\r\nBad\r\n";
-  write_string t "8\r\n request\r\n";
-  write_string t "0\r\n\r\n";
+  write_string t "8\r\n request\r\n0\r\n\r\n";
   connection_is_shutdown t
 
 let test_blocked_write_on_chunked_encoding () =
@@ -1276,8 +1274,7 @@ let test_malformed_request_chunked_error_response () =
   !continue_error ();
   write_string t ~msg:"Second chunk" "8\r\nchunk 2\n\r\n";
   !continue_error ();
-  write_string t ~msg:"Second chunk" "8\r\nchunk 3\n\r\n";
-  write_string t ~msg:"Final chunk written" "0\r\n\r\n";
+  write_string t ~msg:"Third and final chunk" "8\r\nchunk 3\n\r\n0\r\n\r\n";
   Alcotest.(check bool)
     "Writer woken up once more input is available"
     true
@@ -2382,8 +2379,27 @@ let test_flush_response_before_shutdown () =
   !continue ();
   shutdown t;
 
-  write_string t "b\r\nhello world\r\n";
+  write_string t "b\r\nhello world\r\n0\r\n\r\n";
   connection_is_shutdown t
+
+(* A streamed response whose body ends before the writer runs goes out in one
+   write: its last chunk and the final chunk (runtime-cost-2 G4). *)
+let test_streaming_response_ended_in_one_write () =
+  let response = Response.create `OK ~headers:Headers.encoding_chunked in
+  let request_handler reqd =
+    let request_body = Request_descriptor.request_body reqd in
+    let body = Request_descriptor.respond_with_streaming reqd response in
+    let rec on_read bs ~off ~len =
+      Body.Writer.write_bigstring body bs ~off ~len;
+      Body.Reader.schedule_read request_body ~on_eof ~on_error:ignore ~on_read
+    and on_eof () = Body.Writer.close body in
+    Body.Reader.schedule_read request_body ~on_eof ~on_error:ignore ~on_read
+  in
+  let t = create request_handler in
+  read_string t "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello";
+  write_response ~body:"5\r\nhello\r\n0\r\n\r\n" t response;
+  writer_yielded t;
+  reader_ready t
 
 let test_schedule_read_with_data_available () =
   let response = Response.create ~headers:(Headers.encoding_fixed 0) `OK in
@@ -4818,6 +4834,79 @@ let test_body_timeout_after_response_started () =
   check_one_ending "body read" "error" events;
   Alcotest.check read_operation "reader closed" `Close (Raw.read_op t)
 
+(* Decision 0025: the bytes given to [on_read] are the body's buffer, valid
+   until [on_read] returns. A write while [on_read] runs (here, a read from
+   inside it) must not overwrite them; a later read may. *)
+let test_on_read_bytes_valid_until_return () =
+  let conn = ref None in
+  let calls = ref 0 in
+  let first = ref None in
+  let check_first msg expected =
+    match !first with
+    | None -> Alcotest.fail "no first on_read"
+    | Some (bs, off) ->
+      Alcotest.(check string)
+        msg
+        expected
+        (Ache.Bigstring.substring bs ~off ~len:4)
+  in
+  let request_handler reqd =
+    let body = Request_descriptor.request_body reqd in
+    let rec on_read bs ~off ~len =
+      incr calls;
+      match !calls with
+      | 1 ->
+        Alcotest.(check string)
+          "first bytes"
+          "aaaa"
+          (Ache.Bigstring.substring bs ~off ~len);
+        first := Some (bs, off);
+        force_read_string (Option.get !conn) "bbbb";
+        check_first "intact after a write during on_read" "aaaa";
+        schedule ();
+        check_first "intact after a nested on_read" "aaaa"
+      | 2 ->
+        Alcotest.(check string)
+          "nested bytes"
+          "bbbb"
+          (Ache.Bigstring.substring bs ~off ~len);
+        check_first "intact in a nested on_read" "aaaa";
+        schedule ()
+      | _ ->
+        Alcotest.(check string)
+          "later bytes"
+          "cccc"
+          (Ache.Bigstring.substring bs ~off ~len);
+        let bs', off' = Option.get !first in
+        Alcotest.(check bool) "same buffer" true (bs == bs');
+        Alcotest.(check int) "same offset" off' off;
+        schedule ()
+    and on_eof () =
+      Request_descriptor.respond_with_string reqd (Response.create `OK) ""
+    and schedule () =
+      Body.Reader.schedule_read
+        body
+        ~on_error:(Helpers.body_must_complete __LOC__)
+        ~on_eof
+        ~on_read
+    in
+    schedule ()
+  in
+  let t = create request_handler in
+  conn := Some t;
+  read_request
+    t
+    (Request.create
+       `POST
+       "/"
+       ~headers:(Headers.of_list [ "content-length", "12" ]));
+  read_string t "aaaa";
+  check_first "kept after on_read returned" "aaaa";
+  Alcotest.(check int) "two reads" 2 !calls;
+  read_string t "cccc";
+  Alcotest.(check int) "three reads" 3 !calls;
+  check_first "a later read overwrote it" "cccc"
+
 let test_connect_upgrade_status () =
   let impl () =
     Ache.Runtime.make (module Recorder) { Recorder.got = ""; eof = false }
@@ -5091,8 +5180,84 @@ let test_lingers () =
   | _ -> Alcotest.fail "expected an idle timeout");
   check "idle timeout" false t
 
+(* A connection gives its write buffer back once its writer is closed, and only
+   once. A handler that responds after that writes nothing into the buffer,
+   which the next connection took. Sizes no other test uses, so that the pool of
+   the domain holds only these buffers. *)
+let test_release_write_buffer () =
+  let size = 0x300 in
+  let config = { Config.default with response_buffer_size = size } in
+  let pooled () = Ache.Ache_private.Buffer_pool.pooled size in
+  let release t =
+    with_server_connection t Ache.Ache_private.Server_connection.release
+  in
+  let before = pooled () in
+  let late = ref None in
+  let t = create ~config (fun reqd -> late := Some reqd) in
+  read_request t (Request.create `GET "/");
+  release t;
+  Alcotest.(check int) "an open writer keeps its buffer" before (pooled ());
+  shutdown t;
+  release t;
+  release t;
+  Alcotest.(check int) "given back once" (before + 1) (pooled ());
+  let t' = create ~config (request_handler_with_body "fresh") in
+  Alcotest.(check int) "the next connection takes it" before (pooled ());
+  read_request t' (Request.create `GET "/");
+  (match
+     Request_descriptor.respond_with_string
+       (Option.get !late)
+       (Response.create `OK)
+       (String.make 600 'X')
+   with
+  | () | (exception Failure _) -> ());
+  write_response
+    t'
+    ~body:"fresh"
+    (Response.create ~headers:(Headers.encoding_fixed 5) `OK)
+
+(* A buffer from the pool may hold bytes of an earlier connection: the core
+   reads only the bytes that the runtime put in. *)
+let test_buffer_acquire_after_release () =
+  let module Buffer = Ache.Ache_private.Runtime.Buffer in
+  let size = 0x500 in
+  let b = Buffer.acquire size in
+  Buffer.put
+    b
+    ~f:(fun bs ~off ~len k ->
+      Ache.Bigstring.blit_from_string
+        (String.make len 'Z')
+        ~src_off:0
+        bs
+        ~dst_off:off
+        ~len;
+      k len)
+    ignore;
+  Buffer.release b;
+  let seen = ref [] in
+  let get b =
+    Buffer.get b ~f:(fun bs ~off ~len ->
+      seen := Ache.Bigstring.substring bs ~off ~len :: !seen;
+      len)
+  in
+  Alcotest.(check int) "a released buffer has nothing" 0 (get b);
+  let b = Buffer.acquire size in
+  Alcotest.(check int) "a pooled buffer starts empty" 0 (get b);
+  Buffer.put
+    b
+    ~f:(fun bs ~off ~len:_ k ->
+      Ache.Bigstring.blit_from_string "abc" ~src_off:0 bs ~dst_off:off ~len:3;
+      k 3)
+    ignore;
+  Alcotest.(check int) "then the bytes put in" 3 (get b);
+  Alcotest.(check (list string)) "only them" [ "abc"; ""; "" ] !seen
+
 let tests =
   [ "initial reader state", `Quick, test_initial_reader_state
+  ; "release gives the write buffer back", `Quick, test_release_write_buffer
+  ; ( "a pooled read buffer starts empty"
+    , `Quick
+    , test_buffer_acquire_after_release )
   ; "lingers", `Quick, test_lingers
   ; "shutdown reader closed", `Quick, test_reader_is_closed_after_eof
   ; "Date added with ?date", `Quick, test_date_added
@@ -5256,6 +5421,9 @@ let tests =
   ; ( "flush response before shutdown"
     , `Quick
     , test_flush_response_before_shutdown )
+  ; ( "streaming response ended in one write"
+    , `Quick
+    , test_streaming_response_ended_in_one_write )
   ; ( "schedule read with data available"
     , `Quick
     , test_schedule_read_with_data_available )
@@ -5403,6 +5571,9 @@ let tests =
   ; ( "body timeout after the response started closes"
     , `Quick
     , test_body_timeout_after_response_started )
+  ; ( "on_read bytes are valid until it returns"
+    , `Quick
+    , test_on_read_bytes_valid_until_return )
   ]
 
 (* https://httpwg.org/specs/rfc9110.html For example, a CONNECT request (Section

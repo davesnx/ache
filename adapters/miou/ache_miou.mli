@@ -5,7 +5,7 @@
     connections. Otherwise a write to a peer that closed the connection kills
     the process. ache does not install signal handlers.
 
-    Each connection runs in tasks that the calling task creates with
+    Each connection runs in the calling task or in tasks that it creates with
     [Miou.async], in the domain of the caller. Callbacks given to ache (request
     and response handlers, body callbacks) run in these tasks: they must not
     leave a child task behind that they do not await, or Miou raises
@@ -97,6 +97,17 @@ module Server : sig
       same time. When the handler of a connection raises (see
       {!create_connection_handler}), [on_error] is called with the exception
       at once, in the task of the connection, and the socket is closed.
+
+      In OCaml 5, each minor collection stops every domain. With the default
+      minor heap (256k words per domain), a keep-alive request costs 104%
+      more CPU at 8 domains than at 1; with [OCAMLRUNPARAM=s=4M] it costs 3%
+      more. [Gc.set] changes the minor heap of the calling domain only: the
+      domains of [Miou_unix.run] begin with the size from [OCAMLRUNPARAM].
+      Each domain keeps the read and write buffers of ended connections for
+      its next connections: at most 4 sizes of up to 64 KiB, and at most 64
+      buffers and 256 KiB per size. Miou 0.10.2 allocates
+      [2 * RLIMIT_NOFILE] bytes for each domain when it starts: lower
+      [ulimit -n] (for example to 65536) where it is very large.
 
       When [accept] fails because the process or the system has no free file
       descriptors or memory ([EMFILE], [ENFILE], [ENOBUFS], [ENOMEM]),

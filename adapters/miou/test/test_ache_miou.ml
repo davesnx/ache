@@ -789,6 +789,79 @@ let test_connect_tunnel_bytes_after_head () =
     Miou_unix.close socket;
     wait_connection_done ())
 
+(* A closed connection gives its read and write buffers to the pool of the
+   domain, and the next connection, which takes them, answers from its own bytes
+   only. A CONNECT tunnel's protocol received slices of the read buffer: that
+   buffer stays out of the pool. *)
+let test_buffer_pool () =
+  let pooled () =
+    ( Ache.Ache_private.Buffer_pool.pooled Config.default.read_buffer_size
+    , Ache.Ache_private.Buffer_pool.pooled Config.default.response_buffer_size )
+  in
+  with_server (fun addr ->
+    let exchange request =
+      let socket = connect addr in
+      send socket request;
+      let response = read_all socket in
+      Miou_unix.close socket;
+      wait_connection_done ();
+      response
+    in
+    (* Fills most of the read buffer, and outgrows the write buffer: the encoder
+       replaces it (decision 0022). *)
+    let target = "/" ^ String.make 1500 'Z' in
+    let long =
+      Printf.sprintf
+        "GET %s HTTP/1.1\r\n\
+         host: localhost\r\n\
+         x: %s\r\n\
+         connection: close\r\n\
+         \r\n"
+        target
+        (String.make 2000 'Z')
+    in
+    Alcotest.(check string)
+      "a long exchange"
+      (Printf.sprintf
+         "HTTP/1.1 200 OK\r\n\
+          content-length: 1501\r\n\
+          connection: close\r\n\
+          \r\n\
+          %s"
+         target)
+      (exchange long);
+    let read, write = pooled () in
+    Alcotest.(check bool) "read buffer given back" true (read >= 1);
+    Alcotest.(check bool) "write buffer given back" true (write >= 1);
+    Alcotest.(check string)
+      "a connection on the given back buffers"
+      "HTTP/1.1 200 OK\r\n\
+       content-length: 11\r\n\
+       connection: close\r\n\
+       \r\n\
+       hello world"
+      (exchange
+         "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n");
+    Alcotest.(check (pair int int))
+      "buffers given back again"
+      (read, write)
+      (pooled ());
+    let socket = connect addr in
+    send
+      socket
+      "CONNECT localhost:443 HTTP/1.1\r\nhost: localhost:443\r\n\r\nping";
+    let expected = "HTTP/1.1 200 OK\r\n\r\nping" in
+    Alcotest.(check string)
+      "tunnel"
+      expected
+      (take socket (String.length expected));
+    Miou_unix.close socket;
+    wait_connection_done ();
+    Alcotest.(check (pair int int))
+      "a tunnel keeps its read buffer"
+      (read - 1, write)
+      (pooled ()))
+
 let test_upgrade_incomplete_token_reaches_new_protocol () =
   with_server (fun addr ->
     let socket = connect addr in
@@ -2130,6 +2203,67 @@ let test_leader_ends_during_408 () =
          "status line"
          "HTTP/1.1 408 Request Timeout"
          (status_line (read_all slow_client)))
+
+(* Short connections keep ending on the domain, so the timers change leader
+   again and again: the head timeout of a slow connection still fires on
+   time. *)
+let test_head_timeout_among_short_connections () =
+  Miou_unix.run ~domains:0 (fun () ->
+    with_timeout 8.0 (fun () ->
+      let pair () =
+        let client, server = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+        Miou_unix.of_file_descr client, Miou_unix.of_file_descr server
+      in
+      let serve socket =
+        Miou.async (fun () ->
+          Fun.protect
+            ~finally:(fun () -> Miou_unix.close socket)
+            (fun () ->
+               Ache_miou.Server.create_connection_handler
+                 ~date:false
+                 ~idle_timeout:(Some 5.0)
+                 ~head_timeout:(Some 0.3)
+                 ~body_timeout:None
+                 ~write_timeout:None
+                 ~close_timeout:None
+                 ~request_handler
+                 ~error_handler
+                 socket
+                 (Unix.ADDR_UNIX "")))
+      in
+      let slow_client, slow_server = pair () in
+      let from = Unix.gettimeofday () in
+      let slow = serve slow_server in
+      send slow_client "GET /hello HTTP/1.1\r\n";
+      let answered = ref false in
+      let short =
+        Miou.async (fun () ->
+          let rec loop served =
+            if not !answered
+            then (
+              let client, server = pair () in
+              let connection = serve server in
+              send client "GET /hello HTTP/1.1\r\nconnection: close\r\n\r\n";
+              let (_ : string) = read_all client in
+              Miou_unix.close client;
+              let (_ : (unit, exn) result) = Miou.await connection in
+              loop (served + 1))
+            else served
+          in
+          loop 0)
+      in
+      let output = read_all slow_client in
+      answered := true;
+      check_elapsed "head timeout" ~from ~min:0.25 ~max:0.8;
+      Alcotest.(check string)
+        "status line"
+        "HTTP/1.1 408 Request Timeout"
+        (status_line output);
+      Miou_unix.close slow_client;
+      let served = Miou.await_exn short in
+      if served < 10 then Alcotest.failf "only %d short connections" served;
+      let (_ : (unit, exn) result) = Miou.await slow in
+      ()))
 
 let test_head_deadline () =
   with_server ~head_timeout:0.4 (fun addr ->
@@ -3602,6 +3736,9 @@ let () =
         ; "POST echo larger than the read buffer", `Quick, test_post_echo
         ; "two pipelined requests", `Quick, test_pipelined
         ; "101 upgrade to an echo protocol", `Quick, test_upgrade
+        ; ( "a closed connection gives its buffers to the pool"
+          , `Quick
+          , test_buffer_pool )
         ; ( "CONNECT tunnel gets the bytes sent with the head"
           , `Quick
           , test_connect_tunnel_bytes_after_head )
@@ -3774,6 +3911,9 @@ let () =
         ; ( "the timer leader ending does not drop another 408"
           , `Quick
           , test_leader_ends_during_408 )
+        ; ( "a head timeout fires while short connections keep ending"
+          , `Quick
+          , test_head_timeout_among_short_connections )
         ; "slow request body is not cut", `Quick, test_slow_body_not_cut
         ; "no timeout configured", `Quick, test_no_timeout_configured
         ; ( "unread body after a closing response: response, then the end"

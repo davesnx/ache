@@ -105,8 +105,9 @@ module Body : sig
         calls. Bytes received before the end are given to [on_read] first.
 
         [on_read] receives every byte available at the time of the call. The
-        library does not reuse the bytes it passes to [on_read], so the
-        application may keep them after [on_read] returns.
+        bytes are valid only until [on_read] returns: the reader then writes
+        later input over them, on request and response bodies alike. Copy
+        the bytes to keep them ({!Bigstring.substring}, {!Bigstring.blit}).
 
         With {!Config.auto_continue}, the first call on a server request body
         may send [100 Continue]. *)
@@ -1250,6 +1251,19 @@ module Ache_private : sig
       type t
 
       val create : int -> t
+
+      val acquire : int -> t
+      (** [acquire size] is [create size], with a buffer of the domain's pool
+          when it has one. The buffer may hold bytes of an earlier
+          connection: {!get} passes on only the bytes that {!put} read. *)
+
+      val release : t -> unit
+      (** [release t] gives the buffer of [t] to the domain's pool and leaves
+          [t] empty, with no room. Call it once nothing reads into [t] any
+          more and no code holds the bytes that {!get} passed: not after an
+          upgrade to a protocol of the application ([`Other]), which
+          receives them. *)
+
       val get : t -> f:(Bigstring.t -> off:int -> len:int -> int) -> int
 
       val unread : t -> bool
@@ -1264,6 +1278,20 @@ module Ache_private : sig
         -> (int -> unit)
         -> unit
     end
+  end
+
+  module Server_connection : sig
+    val release : Server_connection.t -> unit
+    (** [release t] gives the write buffer of [t] to the domain's pool when
+        its writer is closed (every later write raises). Call it after the
+        runtime stopped reading and writing [t]; it does nothing after the
+        first time, or when the writer is open. *)
+  end
+
+  module Buffer_pool : sig
+    val pooled : int -> int
+    (** [pooled size] is the number of free buffers of [size] bytes in the
+        pool of the current domain. *)
   end
 
   module Http_date : sig

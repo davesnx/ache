@@ -60,8 +60,9 @@ module IO_loop = struct
      write, so that a peer that trickles bytes cannot keep it alive. *)
   let progress_bytes = 2048
 
-  (* The most that one timed write hands to the flow, so that a flow that writes
-     all it is given (tls-eio) shows progress. *)
+  (* The most that one timed write hands to a flow without a socket, so that a
+     flow that writes all it is given (tls-eio) shows progress. A socket's
+     [single_write] returns after a partial write, so it gets everything. *)
   let max_timed_write = 65536
 
   let rec take n = function
@@ -159,14 +160,29 @@ module IO_loop = struct
     | Some time -> Time.current time
     | None -> Float.infinity
 
-  let shutdown flow cmd =
-    try Eio.Flow.shutdown flow cmd with
-    | Eio.Cancel.Cancelled _ as exn -> raise exn
-    | _ -> ()
+  (* A socket shuts down with the system call: eio_linux hands a shutdown to an
+     io_uring worker thread, which costs more than the shutdown itself. *)
+  let shutdown flow fd cmd =
+    match fd with
+    | Some fd ->
+      Eio_unix.Fd.use fd ~if_closed:ignore (fun fd ->
+        try
+          Unix.shutdown
+            fd
+            (match cmd with
+            | `Receive -> Unix.SHUTDOWN_RECEIVE
+            | `Send -> Unix.SHUTDOWN_SEND
+            | `All -> Unix.SHUTDOWN_ALL)
+        with
+        | Unix.Unix_error _ -> ())
+    | None ->
+      (try Eio.Flow.shutdown flow cmd with
+      | Eio.Cancel.Cancelled _ as exn -> raise exn
+      | _ -> ())
 
   let start : type t.
     (module Ache.Runtime.ENGINE with type t = t)
-    -> read_buffer_size:int
+    -> read_buffer:Buffer.t
     -> sw:Switch.t
     -> ?read_closed:unit Promise.t * unit Promise.u
     -> ?time:Time.t
@@ -180,7 +196,7 @@ module IO_loop = struct
     -> unit
     =
    fun (module Runtime)
-     ~read_buffer_size
+     ~read_buffer
      ~sw
      ?read_closed
      ?time
@@ -200,7 +216,8 @@ module IO_loop = struct
     and read_cancel = ref None
     and loop_cancel = ref None
     and write_cancel = ref None
-    and unreported = ref None in
+    and unreported = ref None
+    and fd = Eio_unix.Resource.fd_opt socket in
     let shutdown_once cmd =
       let receive =
         (match cmd with `Receive | `All -> true | `Send -> false)
@@ -212,9 +229,9 @@ module IO_loop = struct
       if receive then receive_shut := true;
       if send then send_shut := true;
       match receive, send with
-      | true, true -> shutdown socket `All
-      | true, false -> shutdown socket `Receive
-      | false, true -> shutdown socket `Send
+      | true, true -> shutdown socket fd `All
+      | true, false -> shutdown socket fd `Receive
+      | false, true -> shutdown socket fd `Send
       | false, false -> ()
     in
     let cancel cc =
@@ -265,7 +282,6 @@ module IO_loop = struct
         cc := None;
         raise exn
     in
-    let read_buffer = Buffer.create read_buffer_size in
     (* The watchdog: one fiber that sleeps until the nearest deadline, so that a
        read or a write that ends in time costs no timer. It starts with the
        first finite deadline, so that a connection without one forks no fiber. A
@@ -379,11 +395,12 @@ module IO_loop = struct
     (* Writes [bufs], [len] bytes, with a clock that counts while the write
        waits, and restarts after [progress_bytes] written. At the deadline the
        watchdog cancels [write_cancel], around the whole write loop. *)
+    let max_write = if Option.is_some fd then max_int else max_timed_write in
     let rec write_timed limit bufs len progress =
       let n =
         Eio.Flow.single_write
           socket
-          (if len <= max_timed_write then bufs else take max_timed_write bufs)
+          (if len <= max_write then bufs else take max_write bufs)
       in
       if n < len
       then
@@ -1030,7 +1047,7 @@ module Server = struct
             | None -> Float.infinity)
           | None -> Float.infinity)
       in
-      let serve () =
+      let serve read_buffer =
         Switch.run (fun sw ->
           Fiber.with_binding
             connection_context
@@ -1050,7 +1067,7 @@ module Server = struct
                  stop;
                IO_loop.start
                  (module Observed)
-                 ~read_buffer_size:config.read_buffer_size
+                 ~read_buffer
                  ~sw
                  ~time
                  ~timeout:
@@ -1074,7 +1091,20 @@ module Server = struct
       (match stop with
       | Some stop when Promise.is_resolved stop -> drain ()
       | Some _ | None -> ());
-      (match serve () with () -> () | exception Grace_over -> ());
+      (* [Switch.run] returns once every fiber of the connection ended: no read
+         or write runs, and none starts. The application keeps no bytes of the
+         read buffer (the parser and [Ache.Websocket] copy them), unless it took
+         over the connection with a protocol of its own. *)
+      let release read_buffer =
+        (match Ache.Server_connection.upgrade_state connection with
+        | `None | `Websocket -> Buffer.release read_buffer
+        | `Other -> ());
+        Ache.Ache_private.Server_connection.release connection
+      in
+      let read_buffer = Buffer.acquire config.read_buffer_size in
+      (match serve read_buffer with
+      | () -> release read_buffer
+      | exception Grace_over -> release read_buffer);
       Option.iter
         (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
         !failure
@@ -1318,7 +1348,7 @@ module Client = struct
           Switch.run (fun sw ->
             IO_loop.start
               (module Observed)
-              ~read_buffer_size:config.read_buffer_size
+              ~read_buffer:(Buffer.create config.read_buffer_size)
               ~sw
               ~read_closed
               ~timeout:IO_loop.no_timeout

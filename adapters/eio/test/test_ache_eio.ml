@@ -643,6 +643,83 @@ let test_connect_tunnel_bytes_after_head () =
     Eio.Flow.close socket;
     Eio.Stream.take connections_done)
 
+(* A closed connection gives its read and write buffers to the pool of the
+   domain, and the next connection, which takes them, answers from its own bytes
+   only. A CONNECT tunnel's protocol received slices of the read buffer: that
+   buffer stays out of the pool. *)
+let test_buffer_pool () =
+  let pooled () =
+    ( Ache.Ache_private.Buffer_pool.pooled Config.default.read_buffer_size
+    , Ache.Ache_private.Buffer_pool.pooled Config.default.response_buffer_size )
+  in
+  with_server (fun ~sw ~net addr ->
+    let exchange request =
+      let socket = Eio.Net.connect ~sw net addr in
+      Eio.Flow.copy_string request socket;
+      let response = Eio.Buf_read.(parse_exn take_all) socket ~max_size:65536 in
+      Eio.Stream.take connections_done;
+      Eio.Flow.close socket;
+      response
+    in
+    let hello =
+      "HTTP/1.1 200 OK\r\n\
+       content-length: 11\r\n\
+       connection: close\r\n\
+       \r\n\
+       hello world"
+    in
+    (* Fills most of the read buffer, and outgrows the write buffer: the encoder
+       replaces it (decision 0022). *)
+    let target = "/" ^ String.make 1500 'Z' in
+    let long =
+      Printf.sprintf
+        "GET %s HTTP/1.1\r\n\
+         host: localhost\r\n\
+         x: %s\r\n\
+         connection: close\r\n\
+         \r\n"
+        target
+        (String.make 2000 'Z')
+    in
+    Alcotest.(check string)
+      "a long exchange"
+      (Printf.sprintf
+         "HTTP/1.1 200 OK\r\n\
+          content-length: 1501\r\n\
+          connection: close\r\n\
+          \r\n\
+          %s"
+         target)
+      (exchange long);
+    let read, write = pooled () in
+    Alcotest.(check bool) "read buffer given back" true (read >= 1);
+    Alcotest.(check bool) "write buffer given back" true (write >= 1);
+    Alcotest.(check string)
+      "a connection on the given back buffers"
+      hello
+      (exchange
+         "GET /hello HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n");
+    Alcotest.(check (pair int int))
+      "buffers given back again"
+      (read, write)
+      (pooled ());
+    let socket = Eio.Net.connect ~sw net addr in
+    let reader = Eio.Buf_read.of_flow socket ~max_size:65536 in
+    Eio.Flow.copy_string
+      "CONNECT localhost:443 HTTP/1.1\r\nhost: localhost:443\r\n\r\nping"
+      socket;
+    let expected = "HTTP/1.1 200 OK\r\n\r\nping" in
+    Alcotest.(check string)
+      "tunnel"
+      expected
+      (Eio.Buf_read.take (String.length expected) reader);
+    Eio.Flow.close socket;
+    Eio.Stream.take connections_done;
+    Alcotest.(check (pair int int))
+      "a tunnel keeps its read buffer"
+      (read - 1, write)
+      (pooled ()))
+
 let test_upgrade () =
   with_server (fun ~sw ~net addr ->
     let client =
@@ -3682,6 +3759,19 @@ let test_write_timeout () =
     Eio.Flow.close socket);
   stream_flush_closed := None
 
+(* A client that stops reading a response of 1 MiB writes: one write fills the
+   socket buffers and waits. *)
+let test_large_write_timeout () =
+  with_server ~write_timeout:0.3 (fun ~sw ~net addr ->
+    let clock = !real_clock in
+    let socket = Eio.Net.connect ~sw net addr in
+    let start = Eio.Time.now clock in
+    Eio.Flow.copy_string "GET /big HTTP/1.1\r\nhost: localhost\r\n\r\n" socket;
+    Eio.Stream.take connections_done;
+    let elapsed = elapsed_since clock start in
+    if elapsed > 1.5 then Alcotest.failf "closed after %.3f s" elapsed;
+    Eio.Flow.close socket)
+
 let test_slow_handler_not_timed_out () =
   later_reqd := None;
   with_server
@@ -4023,6 +4113,9 @@ let () =
           , `Quick
           , test_many_requests_bounded_stack )
         ; "101 upgrade to an echo protocol", `Quick, test_upgrade
+        ; ( "a closed connection gives its buffers to the pool"
+          , `Quick
+          , test_buffer_pool )
         ; ( "CONNECT tunnel through respond_with_upgrade and Client.upgrade"
           , `Quick
           , test_connect_tunnel )
@@ -4109,6 +4202,10 @@ let () =
         ; ( "a client that stops reading is closed after write_timeout"
           , `Quick
           , test_write_timeout )
+        ; ( "a client that stops reading 1 MiB writes is closed after \
+             write_timeout"
+          , `Quick
+          , test_large_write_timeout )
         ; ( "a slow handler that reads no body is not timed out"
           , `Quick
           , test_slow_handler_not_timed_out )

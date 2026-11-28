@@ -167,6 +167,31 @@ let () =
     (`Tcp (Eio.Net.Ipaddr.V4.loopback, port))
 ```
 
+### Set the minor heap size
+
+In OCaml 5, a minor collection stops every domain, and it runs when the
+first minor heap of any domain fills. With the default minor heap of 256k
+words per domain, a keep-alive request costs 24% more user CPU at 8 domains
+than at 1 in ache's benchmark. With a minor heap of 4M words (32 MiB on
+64-bit), it costs 1% more. Set the size for every domain with
+`OCAMLRUNPARAM`:
+
+```sh
+$ OCAMLRUNPARAM=s=4M dune exec examples/eio/eio_multicore_server.exe -- 8080 8
+```
+
+`Gc.set` changes the minor heap of the calling domain only. The domains
+that `run` starts begin with the size from `OCAMLRUNPARAM`, so to use
+`Gc.set`, call it once in each domain, for example the first time a handler
+runs there.
+
+Each domain keeps the read and write buffers of the connections that ended
+and gives them to its next connections. A domain keeps at most 4 buffer
+sizes of up to 64 KiB each, and at most 64 buffers and 256 KiB per size:
+about 320 KiB with the default `Config`. With these buffers and `s=4M`, a
+connection that closes after one request costs 6% more at 8 domains than at
+1.
+
 ## Timeouts
 
 The server entry points (`Server.create_connection_handler`, `Server.run`

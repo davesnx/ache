@@ -42,6 +42,14 @@ module Reader : sig
   val may_switch_protocols : Request.t -> bool
   (** [CONNECT], or an [Upgrade] field with the [upgrade] connection option. *)
 
+  val seen_may_switch_protocols : int -> Request.t -> bool
+  (** [seen_may_switch_protocols (seen t) request] is
+      [may_switch_protocols request] for the last request head [t] read. *)
+
+  val seen : request -> int
+  (** The {!Message.Seen} bits of the fields of the last request head read,
+      set before its handler runs. *)
+
   val request :
      max_header_size:int
     -> (Request.t -> Body.Reader.t -> unit)

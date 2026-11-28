@@ -1,13 +1,31 @@
 #!/usr/bin/env bash
 # Cost of one ache server per request: CPU instructions and GC words.
 #
-#   benchmarks/vs/cost.sh SERVER [--timeouts on|off] PATH CONN
+#   benchmarks/vs/cost.sh SERVER [OPTION...] PATH CONN
 #   benchmarks/vs/cost.sh idle RANGE N
 #
 # SERVER is lwt, eio or miou (server_ache_<SERVER>.exe). PATH is a route of
 # vs.ml, such as /fixed/5 or /close/12288. CONN is keep-alive or close; close
 # adds "Connection: close" to each request, so wrk opens a connection per
 # request.
+#
+# Options:
+#   --timeouts on|off  the servers' default timeouts (on), or all off
+#   --profile P        request fields besides Host: host (none, the default),
+#                      curl (2 fields) or browser (11 fields, 600-byte Cookie)
+#   --body N           send a body of N bytes; the method becomes POST
+#   --method M         request method (GET, or POST with --body)
+#   --chunked N        send the body with chunked coding, in chunks of N bytes
+#   --pipeline N       write N requests at once on each connection
+#   --tls              serve HTTPS (server_ache_SERVER_tls.exe, eio and miou)
+#   --ws N             WebSocket echo of N-byte binary messages, with
+#                      ws_load.exe instead of wrk (PATH /ws, CONN keep-alive);
+#                      a request is then one echoed message
+#   --ws-depth N       messages in flight per WebSocket connection (1)
+#
+# Without options, the request is wrk's own (GET with only Host). The other
+# request options give wrk a fixed request through wrk.lua. The options that
+# differ from the defaults are added to the output line after conn=.
 #
 # The script builds the server with --profile=release, starts it pinned to
 # SERVER_CPU, warms it up with wrk for 2 s, then runs
@@ -33,9 +51,14 @@
 #   SERVER_CPU  CPU for the server (required)
 #   WRK_CPUS    CPU list for wrk (required), such as 400-403
 #   PORT        port on 127.0.0.1 (18300)
+#   NOFILE      open file limit of the server (65536)
 #   DURATION    seconds of the measured wrk run (10); the window is 2 s less
 #   DUNE        dune command (dune); run under `opam exec --` or an opam env
 #   NO_BUILD=1  use the server already built in _build/default
+#   PERF_RECORD file: also record the window into this perf.data, with call
+#               branch stacks (perf record -e instructions:u -c 20000
+#               -j any_call,u); read it with
+#               perf script -F ip,sym,brstacksym -i file
 #
 # Needs wrk, perf (perf_event_paranoid <= 1 for instructions:k), taskset and
 # curl.
@@ -96,10 +119,34 @@ fi
 server=$1
 shift
 timeouts=on
-if [ "$1" = --timeouts ]; then
-  timeouts=${2:-}
+profile=host
+method=
+body=
+chunk=
+pipeline=1
+tls=
+ws=
+ws_depth=1
+number() { case ${1:-} in '' | *[!0-9]*) usage ;; esac }
+while [ $# -gt 2 ]; do
+  case $1 in
+    --timeouts) timeouts=${2:-} ;;
+    --profile) profile=${2:-} ;;
+    --method) method=${2:-} ;;
+    --body) number "${2:-}" && body=$2 ;;
+    --chunked) number "${2:-}" && chunk=$2 ;;
+    --pipeline) number "${2:-}" && pipeline=$2 ;;
+    --ws) number "${2:-}" && ws=$2 ;;
+    --ws-depth) number "${2:-}" && ws_depth=$2 ;;
+    --tls)
+      tls=1
+      shift
+      continue
+      ;;
+    *) usage ;;
+  esac
   shift 2
-fi
+done
 [ $# -eq 2 ] || usage
 path=$1
 conn=$2
@@ -107,6 +154,25 @@ case $server in lwt | eio | miou) ;; *) usage ;; esac
 case $timeouts in on | off) ;; *) usage ;; esac
 case $conn in keep-alive | close) ;; *) usage ;; esac
 case $path in /*) ;; *) usage ;; esac
+case $profile in host | curl | browser) ;; *) usage ;; esac
+[ -z "$method" ] && method=${body:+POST}
+[ -n "$chunk" ] && [ -z "$body" ] && usage
+[ "$pipeline" -ge 1 ] || usage
+[ -n "$tls" ] && [ "$server" = lwt ] && usage
+if [ -n "$ws" ] && { [ "$conn" != keep-alive ] || [ -n "$tls" ]; }; then
+  usage
+fi
+
+# The options that differ from the defaults, for the output line.
+options=
+[ "$profile" != host ] && options+=" profile=$profile"
+[ -n "$method" ] && options+=" method=$method"
+[ -n "$body" ] && options+=" body=$body"
+[ -n "$chunk" ] && options+=" chunked=$chunk"
+[ "$pipeline" != 1 ] && options+=" pipeline=$pipeline"
+[ -n "$tls" ] && options+=" tls=on"
+[ -n "$ws" ] && options+=" ws=$ws"
+[ "$ws_depth" != 1 ] && options+=" ws_depth=$ws_depth"
 
 : "${SERVER_CPU:?SERVER_CPU is required (one CPU; see cost.sh idle)}"
 : "${WRK_CPUS:?WRK_CPUS is required (a CPU list; see cost.sh idle)}"
@@ -119,18 +185,28 @@ window=$((duration - 2))
 }
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
-exe=$root/_build/default/benchmarks/vs/server_ache_$server.exe
+vs=$root/_build/default/benchmarks/vs
+exe=$vs/server_ache_$server${tls:+_tls}.exe
+targets=("benchmarks/vs/${exe##*/}")
+[ -n "$ws" ] && targets+=(benchmarks/vs/ws_load.exe)
 if [ "${NO_BUILD:-}" != 1 ]; then
   (cd "$root" && ${DUNE:-dune} build --root . --profile release \
-    "benchmarks/vs/server_ache_$server.exe") || exit 1
+    "${targets[@]}") || exit 1
 fi
 [ -x "$exe" ] || {
   echo "cost.sh: $exe is not built" >&2
   exit 1
 }
 
-url=http://127.0.0.1:$port$path
-if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$port/"; then
+# ocaml-tls rejects an IP address in SNI (RFC 6066 §3), which wrk sends for
+# 127.0.0.1.
+if [ -n "$tls" ]; then
+  origin=https://localhost:$port
+else
+  origin=http://127.0.0.1:$port
+fi
+url=$origin$path
+if curl -sk -o /dev/null --max-time 1 "$origin/"; then
   echo "cost.sh: something already listens on port $port" >&2
   exit 1
 fi
@@ -150,13 +226,18 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-taskset -c "$SERVER_CPU" "$exe" --port "$port" --timeouts "$timeouts" \
-  2>"$tmp/server.err" &
+# miou 0.10.2 makes two tables per domain of RLIMIT_NOFILE bytes each: with a
+# limit of 2^31 that is a 4 GiB major heap, and the major GC then almost never
+# runs, which hides its cost.
+(
+  ulimit -n "${NOFILE:-65536}" || exit 1
+  exec taskset -c "$SERVER_CPU" "$exe" --port "$port" --timeouts "$timeouts"
+) 2>"$tmp/server.err" &
 server_pid=$!
 
 ready=
 for _ in $(seq 100); do
-  if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$port/fixed/0"; then
+  if curl -sk -o /dev/null --max-time 1 "$origin/fixed/0"; then
     ready=1
     break
   fi
@@ -169,10 +250,79 @@ done
   exit 1
 }
 
-header=()
-[ "$conn" = close ] && header=(-H "Connection: close")
+fields=()
+case $profile in
+  host) ;;
+  curl) fields=("User-Agent: curl/8.5.0" "Accept: */*") ;;
+  browser)
+    cookie="_ga=GA1.1.1234567890.1700000000; _gid=GA1.1.987654321.1700000000"
+    cookie+="; session_id=8f14e45fceea167a5a36dedd4bea2543f1b2c3d4e5f60718293a4b5c6d7e8f90"
+    cookie+="; csrftoken=Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0FeDcBaZx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Ji1"
+    cookie+="; theme=dark; locale=en-US; ab_test=variant_b"
+    cookie+="; _fbp=fb.1.1700000000000.1234567890"
+    cookie+="; __stripe_mid=abcd1234-ef56-7890-abcd-ef1234567890abcdef"
+    cookie+="; consent=analytics:1,marketing:0,functional:1"
+    cookie+="; last_seen=2026-11-27T14:00:00Z"
+    fields=(
+      "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+      "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+      "Accept-Language: en-US,en;q=0.9,fr;q=0.8"
+      "Accept-Encoding: gzip, deflate, br, zstd"
+      "Cookie: $cookie"
+      "Referer: http://127.0.0.1/index.html"
+      "Sec-Fetch-Dest: document"
+      "Sec-Fetch-Mode: navigate"
+      "Sec-Fetch-Site: same-origin"
+      "Upgrade-Insecure-Requests: 1"
+      "Cache-Control: max-age=0"
+    )
+    ;;
+esac
+[ "$conn" = close ] && fields+=("Connection: close")
+
+# The request of the wrk.lua script: wrk sends these bytes as they are, and
+# counts the requests in them for pipelining.
+write_request() {
+  local field size left
+  printf '%s %s HTTP/1.1\r\nHost: %s\r\n' "${method:-GET}" "$path" \
+    "${origin#*://}"
+  for field in "${fields[@]}"; do printf '%s\r\n' "$field"; done
+  if [ -z "$body" ]; then
+    printf '\r\n'
+  elif [ -z "$chunk" ]; then
+    printf 'Content-Length: %d\r\n\r\n' "$body"
+    head -c "$body" /dev/zero | tr '\0' x
+  else
+    printf 'Transfer-Encoding: chunked\r\n\r\n'
+    left=$body
+    while [ "$left" -gt 0 ]; do
+      size=$((left < chunk ? left : chunk))
+      printf '%x\r\n' "$size"
+      head -c "$size" /dev/zero | tr '\0' x
+      printf '\r\n'
+      left=$((left - size))
+    done
+    printf '0\r\n\r\n'
+  fi
+}
+
+scripted=
+if [ "$profile" != host ] || [ -n "$method" ] || [ "$pipeline" != 1 ]; then
+  scripted=1
+  for ((i = 0; i < pipeline; i++)); do write_request; done >"$tmp/request"
+fi
 run_wrk() {
-  taskset -c "$WRK_CPUS" wrk -t4 -c64 -d"$1" "${header[@]}" "$url"
+  if [ -n "$ws" ]; then
+    taskset -c "$WRK_CPUS" "$vs/ws_load.exe" --port "$port" --path "$path" \
+      --size "$ws" --depth "$ws_depth" --duration "$1"
+  elif [ -n "$scripted" ]; then
+    taskset -c "$WRK_CPUS" wrk -t4 -c64 -d"$1" \
+      -s "$root/benchmarks/vs/wrk.lua" "$url" -- "$tmp/request"
+  elif [ "$conn" = close ]; then
+    taskset -c "$WRK_CPUS" wrk -t4 -c64 -d"$1" -H "Connection: close" "$url"
+  else
+    taskset -c "$WRK_CPUS" wrk -t4 -c64 -d"$1" "$url"
+  fi
 }
 
 # Waits for the counters line number $1 and prints it.
@@ -197,9 +347,16 @@ run_wrk "$duration" >"$tmp/wrk.out" 2>&1 &
 wrk_pid=$!
 sleep 1
 kill -USR1 "$server_pid"
+record_pid=
+if [ -n "${PERF_RECORD:-}" ]; then
+  perf record -q -o "$PERF_RECORD" -e instructions:u -c 20000 -j any_call,u \
+    -p "$server_pid" -- sleep "$window" 2>"$tmp/record.err" &
+  record_pid=$!
+fi
 perf stat -x, -o "$tmp/perf.out" -e instructions:u,instructions:k \
   -p "$server_pid" -- sleep "$window"
 kill -USR1 "$server_pid"
+[ -n "$record_pid" ] && wait "$record_pid"
 wait "$wrk_pid"
 wrk_pid=
 
@@ -217,7 +374,7 @@ requests=$(delta requests)
 }
 
 awk -v server="$server" -v timeouts="$timeouts" -v path="$path" \
-  -v conn="$conn" -v req_s="$req_s" -v user="$user" -v kernel="$kernel" \
+  -v conn="$conn$options" -v req_s="$req_s" -v user="$user" -v kernel="$kernel" \
   -v n="$requests" -v minor="$(delta minor_words)" \
   -v promoted="$(delta promoted_words)" \
   -v minor_gcs="$(delta minor_collections)" \

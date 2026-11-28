@@ -241,8 +241,7 @@ module Writer = struct
     ; mutable woken_while_held : bool
     }
 
-  let create ?(buffer_size = 0x800) () =
-    let buffer = Bigstring.create buffer_size in
+  let of_bigstring buffer =
     let encoder = Encoder.of_bigstring buffer in
     { buffer
     ; encoder
@@ -252,6 +251,10 @@ module Writer = struct
     ; woken_while_held = false
     }
 
+  let create ?(buffer_size = 0x800) () =
+    of_bigstring (Bigstring.create buffer_size)
+
+  let buffer t = t.buffer
   let encoder t = t.encoder
   let write_request t request = write_request t.encoder request
   let write_response t response = write_response t.encoder response

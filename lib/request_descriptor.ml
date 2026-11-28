@@ -83,7 +83,7 @@ type t =
   ; request_body : Body.Reader.t
   ; reader : Reader.request
   ; writer : Writer.t
-  ; response_body_buffer : Bigstring.t
+  ; response_body_buffer : Bigstring.t Lazy.t
   ; error_handler : error_handler
   ; upgrade : Runtime.impl -> unit
   ; max_discard_body : int
@@ -94,12 +94,20 @@ type t =
   ; proxy : bool
   ; date : (unit -> string) option
   ; keep_alive : string
+  ; mutable seen : int
+    (* [Reader.seen reader] for [request], and the [switch_known] and [switches]
+       bits. *)
   }
 
+(* Bits of [seen] above [Message.Seen]'s: [Reader.may_switch_protocols request]
+   is known, and is [true]. *)
+let switch_known = Message.Seen.all + 1
+let switches = 2 * switch_known
 let continue_response = Response.create `Continue
 
-let expects_continue (request : Request.t) =
-  Message.at_least_v1_1 request.version
+let expects_continue seen (request : Request.t) =
+  Message.Seen.has seen Message.Seen.expect
+  && Message.at_least_v1_1 request.version
   && Message.has_member
        (Headers.get_multi request.headers "expect")
        "100-continue"
@@ -125,6 +133,7 @@ let create
       request
       request_body
   =
+  let seen = Reader.seen reader in
   let t =
     { request
     ; request_body
@@ -135,18 +144,22 @@ let create
     ; upgrade
     ; max_discard_body
     ; discarded = 0
-    ; persistent = Request.persistent_connection request
+    ; persistent =
+        (if Message.Seen.has seen Message.Seen.connection
+         then Request.persistent_connection request
+         else Message.at_least_v1_1 request.version)
     ; response_state = Waiting
     ; error_code = `Ok
     ; proxy
     ; date
     ; keep_alive
+    ; seen
     }
   in
   if
     auto_continue
     && (not (Body.Reader.is_closed request_body))
-    && expects_continue request
+    && expects_continue seen request
   then
     Body.Reader.set_on_first_read
       request_body
@@ -346,13 +359,15 @@ let unsafe_respond_with_streaming ~flush_headers_immediately t response =
     in
     let send_trailers =
       match encoding with
-      | `Chunked -> Message.accepts_trailers t.request.headers
+      | `Chunked ->
+        Message.Seen.has t.seen Message.Seen.te
+        && Message.accepts_trailers t.request.headers
       | `Fixed _ | `Close_delimited | `No_body -> false
     in
     let response_body =
       Body.Writer.create
         ~send_trailers
-        t.response_body_buffer
+        (Lazy.force t.response_body_buffer)
         ~encoding
         ~writer:t.writer
     in
@@ -508,14 +523,25 @@ let drops_closed_body t =
   && (not (Reader.is_closed t.reader))
   && Reader.in_body t.reader t.request_body
 
+let may_switch_protocols t =
+  if t.seen land switch_known = 0
+  then
+    t.seen <-
+      (t.seen
+      lor switch_known
+      lor
+      if Reader.seen_may_switch_protocols t.seen t.request then switches else 0
+      );
+  t.seen land switches <> 0
+
 let input_state t : Io_state.t =
   match t.response_state, t.request.meth with
   | Upgrade _, _ when Reader.is_closed t.reader -> Complete
   | Upgrade _, _ -> Wait
   | Waiting, _
-    when Reader.may_switch_protocols t.request
-         && Body.Reader.is_closed t.request_body
-         && not (Reader.is_closed t.reader) ->
+    when Body.Reader.is_closed t.request_body
+         && (not (Reader.is_closed t.reader))
+         && may_switch_protocols t ->
     Wait
   | _ ->
     if Body.Reader.is_closed t.request_body

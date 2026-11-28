@@ -53,7 +53,11 @@ end
    A task must be cancelled by the task that started it, and a connection may
    end at any time, so the ticker is a child of the main task of one of the
    connections of the domain, the leader. When the leader ends, it cancels its
-   ticker and elects another connection that has a deadline.
+   ticker and elects another connection that has a deadline. A new leader starts
+   its ticker one round of the scheduler later. The domain cannot wait for
+   events meanwhile, since the leader's main task is ready to run; while leaders
+   keep ending before they start a ticker, each leader that ends looks at the
+   heap.
 
    A connection's key in the heap is a time at which to look at it again. A
    deadline that moves later does not change it: at the key, the connection runs
@@ -192,15 +196,18 @@ module Timers = struct
             leader.restart <- true;
             Signal.wake leader.main))
 
+  let expire t now =
+    while t.size > 0 && t.heap.(0).key <= now do
+      let e = t.heap.(0) in
+      remove t e;
+      e.due <- true;
+      Signal.wake e.main
+    done
+
   let tick t () =
     let rec loop () =
       let now = Unix.gettimeofday () in
-      while t.size > 0 && t.heap.(0).key <= now do
-        let e = t.heap.(0) in
-        remove t e;
-        e.due <- true;
-        Signal.wake e.main
-      done;
+      expire t now;
       (if t.size = 0
        then (
          t.target <- Float.infinity;
@@ -236,7 +243,10 @@ module Timers = struct
       e.restart <- false;
       t.leader <- None;
       t.target <- Float.infinity;
-      if t.size > 0 then elect t t.heap.(t.size - 1))
+      if t.size > 0
+      then (
+        expire t (Unix.gettimeofday ());
+        if t.size > 0 then elect t t.heap.(t.size - 1)))
 end
 
 let sleep_until at =
@@ -331,11 +341,21 @@ module type IO = Ache_miou_intf.IO
 module type Server = Ache_miou_intf.Server
 module type Client = Ache_miou_intf.Client
 
-module Make_with_idle_check
+module Make_runtime
     (Io : IO)
     (Idle : sig
        (* Response bytes or the end of input wait on the socket. *)
        val input_waiting : Io.socket -> bool
+     end)
+    (Write_now : sig
+       (* [try_writev socket iovecs] writes what the socket takes now, without
+          waiting; [`Would_block] when it takes nothing now. With it, the main
+          task of a connection runs its writes (see [IO_loop.start]). *)
+       val try_writev :
+         (Io.socket
+          -> Ache.Bigstring.t Ache.IOVec.t list
+          -> [ `Ok of int | `Closed | `Would_block ])
+           option
      end) =
 struct
   module IO_loop = struct
@@ -378,12 +398,20 @@ struct
       }
 
     (* The main task, which calls [start], waits on [main]: for the sessions to
-       start, for the end of both loops ([stopped]), and for the ticker of the
-       domain while the connection leads. Who resolves [stopped] wakes
-       [main]. *)
+       start, for the end of both loops ([stopped]), for the ticker of the
+       domain while the connection leads, and for output to write. Who resolves
+       [stopped] wakes [main].
+
+       The main task runs the write loop as long as the socket takes each write
+       at once ([Write_now.try_writev]): a write task costs a [Miou.async] per
+       connection. The first write that would wait starts a write task, which
+       runs the write loop from then on, so the main task never waits in a
+       write: the timers, the sessions and the write timeout do not wait behind
+       a peer that stops reading. Without [try_writev], the write task starts at
+       once. *)
     let start : type t.
       (module Ache.Runtime.ENGINE with type t = t)
-      -> read_buffer_size:int
+      -> read_buffer:Buffer.t
       -> read_closed:Read_closed.t
       -> interruptible:bool
       -> timeout:timeouts
@@ -399,7 +427,7 @@ struct
       -> unit
       =
      fun (module Runtime)
-       ~read_buffer_size
+       ~read_buffer
        ~read_closed
        ~interruptible
        ~timeout
@@ -463,7 +491,6 @@ struct
           ignore (Miou.Computation.try_return waker () : bool));
         await_or_raise waker
       in
-      let read_buffer = Buffer.create read_buffer_size in
       (* The read and write deadlines live in [entry], in the timers of the
          domain. Setting one later than its key costs nothing: no task wakes. *)
       let timers = Timers.get () in
@@ -748,10 +775,48 @@ struct
         Miou.async (fun () ->
           read_task ();
           stop ())
-      and writing =
-        Miou.async (fun () ->
-          write_task ();
-          stop ())
+      in
+      let writing = ref None in
+      let start_writing () =
+        writing :=
+          Some
+            (Miou.async (fun () ->
+               write_task ();
+               stop ()))
+      in
+      (* [write_ready]: the main task runs the write loop when it is set; it is
+         clear while the loop waits for the core's wake-up, or when the loop
+         runs in the write task or ended. *)
+      let write_ready = ref false in
+      let write_now =
+        match Write_now.try_writev with
+        | None ->
+          start_writing ();
+          fun () -> ()
+        | Some try_writev ->
+          write_ready := true;
+          let woken () =
+            write_ready := true;
+            Signal.wake main
+          in
+          let rec write_loop () =
+            match Runtime.next_write_operation t with
+            | `Write io_vectors ->
+              (match try_writev socket io_vectors with
+              | `Would_block -> start_writing ()
+              | (`Ok _ | `Closed) as result ->
+                Runtime.report_write_result t result;
+                write_loop ())
+            | `Yield -> Runtime.yield_writer t woken
+            | `Close _ ->
+              shutdown_once SHUTDOWN_SEND;
+              stop ()
+          in
+          fun () ->
+            if !write_ready
+            then (
+              write_ready := false;
+              match write_loop () with () -> () | exception exn -> fail exn)
       in
       let watcher =
         Option.map
@@ -783,7 +848,20 @@ struct
         if entry.lead
         then
           match !ticker with
-          | None -> ticker := Some (Miou.async (Timers.tick timers))
+          | None ->
+            (* See [Timers]: the ticker starts a round later, if this connection
+               still leads then. *)
+            Miou.yield ();
+            (* The response may have come meanwhile: writing it may end the
+               connection. *)
+            write_now ();
+            if
+              entry.lead
+              && Option.is_none !ticker
+              && Miou.Computation.is_running stopped
+            then (
+              entry.restart <- false;
+              ticker := Some (Miou.async (Timers.tick timers)))
           | Some old when entry.restart ->
             entry.restart <- false;
             Miou.cancel old;
@@ -822,16 +900,24 @@ struct
                      (fun () -> fire now)))
           else reschedule ())
       in
+      (* The main task wakes for each response: a round allocates nothing. *)
+      let ready () =
+        (not (Miou.Computation.is_running stopped))
+        || (match sessions with
+          | Some sessions -> sessions.Sessions.pending <> []
+          | None -> false)
+        || (entry.lead && (Option.is_none !ticker || entry.restart))
+        || (entry.due && Option.is_none !action)
+        || !action_ended
+        || !write_ready
+      in
       let rec serve () =
-        Signal.wait_until main (fun () ->
-          (not (Miou.Computation.is_running stopped))
-          || (match sessions with
-            | Some sessions -> sessions.Sessions.pending <> []
-            | None -> false)
-          || (entry.lead && (Option.is_none !ticker || entry.restart))
-          || (entry.due && Option.is_none !action)
-          || !action_ended);
-        Option.iter (Sessions.start ~on_exn:session_failed) sessions;
+        Signal.wait_until main ready;
+        write_now ();
+        (match sessions with
+        | Some ({ pending = _ :: _; _ } as sessions) ->
+          Sessions.start sessions ~on_exn:session_failed
+        | Some _ | None -> ());
         lead ();
         run_due ();
         if Miou.Computation.is_running stopped
@@ -849,7 +935,7 @@ struct
       (match serve () with
       | `Abort ->
         Miou.cancel reading;
-        Miou.cancel writing;
+        Option.iter Miou.cancel !writing;
         (* A write that was cancelled before it returned is lost: tell the core,
            so that the flushes that wait for it get [`Closed]. *)
         if !in_writev
@@ -864,7 +950,7 @@ struct
         shutdown_once SHUTDOWN_ALL
       | `Done ->
         let (_ : (unit, exn) result list) =
-          Miou.await_all [ reading; writing ]
+          Miou.await_all (reading :: Option.to_list !writing)
         in
         ());
       leave ();
@@ -1102,9 +1188,10 @@ struct
             true
           | Some _ | None -> false
         in
+        let read_buffer = Buffer.acquire config.read_buffer_size in
         IO_loop.start
           (module Observed)
-          ~read_buffer_size:config.read_buffer_size
+          ~read_buffer
           ~read_closed
           ~interruptible:false
           ~timeout:{ IO_loop.timed; deadline; ended; expire }
@@ -1125,6 +1212,15 @@ struct
           ~stopped:(Miou.Computation.create ())
           connection
           socket;
+        (* [IO_loop.start] returns once its tasks ended or were cancelled (a
+           cancelled task does not run again): no read or write runs, and none
+           starts. The application keeps no bytes of the read buffer (the parser
+           and [Ache.Websocket] copy them), unless it took over the connection
+           with a protocol of its own. *)
+        (match Ache.Server_connection.upgrade_state connection with
+        | `None | `Websocket -> Buffer.release read_buffer
+        | `Other -> ());
+        Ache.Ache_private.Server_connection.release connection;
         Option.iter
           (fun (exn, bt) -> Printexc.raise_with_backtrace exn bt)
           !error_handler_failure
@@ -1208,7 +1304,7 @@ struct
         Miou.async (fun () ->
           IO_loop.start
             (module Upgradable)
-            ~read_buffer_size:config.read_buffer_size
+            ~read_buffer:(Buffer.create config.read_buffer_size)
             ~read_closed
             ~interruptible:true
             ~timeout:{ IO_loop.timed = true; deadline; ended = ignore; expire }
@@ -1326,6 +1422,16 @@ module Io = struct
   let shutdown socket command =
     try Unix.shutdown (Miou_unix.to_file_descr socket) command with
     | Unix.Unix_error _ -> ()
+
+  (* [writev] without its wait: [`Would_block] also when the descriptor is not a
+     socket, so that [writev] writes it. *)
+  let try_writev socket iovecs =
+    match sendmsg (Miou_unix.to_file_descr socket) iovecs with
+    | -1 -> `Would_block
+    | n -> `Ok n
+    | exception Unix.Unix_error ((EPIPE | ECONNRESET | ENOTCONN), _, _) ->
+      `Closed
+    | exception Unix.Unix_error (ENOTSOCK, _, _) -> `Would_block
 end
 
 (* Bytes other than empty lines, or the end of input, that wait on [fd], without
@@ -1346,6 +1452,16 @@ let input_waiting fd =
     | exception Unix.Unix_error _ -> false)
   | exception Unix.Unix_error _ -> false
 
+module Make_with_idle_check
+    (Io : IO)
+    (Idle : sig
+       val input_waiting : Io.socket -> bool
+     end) =
+  Make_runtime (Io) (Idle)
+    (struct
+      let try_writev = None
+    end)
+
 module Make (Io : IO) =
   Make_with_idle_check
     (Io)
@@ -1354,10 +1470,13 @@ module Make (Io : IO) =
     end)
 
 include
-  Make_with_idle_check
+  Make_runtime
     (Io)
     (struct
       let input_waiting socket = input_waiting (Miou_unix.to_file_descr socket)
+    end)
+    (struct
+      let try_writev = Some Io.try_writev
     end)
 
 module Server = struct
