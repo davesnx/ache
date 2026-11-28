@@ -5,7 +5,7 @@
     connections. Otherwise a write to a peer that closed the connection kills
     the process. ache does not install signal handlers.
 
-    Each connection runs in tasks that the calling task creates with
+    Each connection runs in the calling task or in tasks that it creates with
     [Miou.async], in the domain of the caller. Callbacks given to ache (request
     and response handlers, body callbacks) run in these tasks: they must not
     leave a child task behind that they do not await, or Miou raises
