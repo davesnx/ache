@@ -385,8 +385,9 @@ scheduler, and a task stays on its domain.
 ### One connection
 
 The server handler runs in a task for each accepted socket, the
-connection task. It creates the core connection and starts the two loops
-as two child tasks:
+connection task. It creates the core connection, starts the read loop in a
+child task and runs the write loop itself while the socket takes each write
+at once:
 
 ```
  accept loop ── Miou.async: one task per accepted socket
@@ -394,7 +395,9 @@ as two child tasks:
         ▼
  connection task: starts sessions, runs timeout actions, may lead the ticker
   ├─ read task  ── Miou_unix.read into the read buffer
-  ├─ write task ── one sendmsg for all buffers
+  │  writes ───── one sendmsg for all buffers, in the connection task
+  ├─ write task ── from the first write that would wait (and always on
+  │                Make (Io), such as ache-miou-tls)
   ├─ timeout action task (while the action of a deadline runs)
   ├─ ticker task (while this connection leads the timers of its domain)
   ├─ stop task (with ?stop)
@@ -406,10 +409,17 @@ as two child tasks:
 - **Waiting.** On `Yield`, a loop gives the core a callback that wakes it
   (`yield_reader` or `yield_writer`), and waits on a signal. The core calls
   the callback when it has work.
-- **Writes.** The write task sends all the buffers of one `Write` with one
-  `sendmsg` (a C stub in `adapters/miou/ache_miou_stubs.c`). When the socket
-  buffer is full, it waits until the socket can be written. On a file
-  descriptor that is not a socket, it writes each buffer in turn.
+- **Writes.** The connection task sends all the buffers of one `Write`
+  with one `sendmsg` (a C stub in `adapters/miou/ache_miou_stubs.c`) that
+  does not wait. A task costs a `Miou.async`, about a quarter of a closed
+  connection on Miou 0.10.2. When the socket buffer is full (or the file
+  descriptor is not a socket), the connection task starts the write task,
+  which runs the write loop from then on: it waits until the socket can be
+  written, and on a file descriptor that is not a socket writes each buffer
+  in turn. So the connection task never waits in a write, and the timers,
+  the sessions and the write timeout of a connection whose peer stops
+  reading still run. A server or client of `Make (Io)` has no write that
+  does not wait, and starts the write task at once.
 - **Reads.** The server's read task reads with `Miou_unix.read` into free
   space in the read buffer, then gives the new bytes to the core. It has
   no reader task: a timeout does not cancel the read that waits. Before
@@ -423,7 +433,7 @@ as two child tasks:
   `Client.shutdown` can end the wait without cancelling the read. The
   reader task starts with the first read.
 - **Close timeout.** With `close_timeout`, the close clock of a WebSocket
-  starts when the server's close frame is queued. The write task sees the
+  starts when the server's close frame is queued. The write loop sees the
   frame first and sets the close deadline, which the read that waits takes
   at once. When the deadline passes, the connection closes without
   lingering.
@@ -435,7 +445,8 @@ as two child tasks:
   then (`on_error`, then 408 or a close), if the phase is still
   `` `Body ``.
 - **Write clock.** Before a write, the write task starts the clock if it
-  is not running; it stops it when the core has nothing more to write, and
+  is not running (a write of the connection task does not wait, so it needs
+  no clock); it stops it when the core has nothing more to write, and
   starts it again after each 2048 bytes written. If the clock is still
   running at its deadline, the connection stops as an error does: it
   cancels the read and write tasks, tells the core that the write was
